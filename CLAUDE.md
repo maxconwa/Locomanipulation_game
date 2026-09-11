@@ -75,3 +75,15 @@ whole-body triplicates mirror the curriculum stages in `ALMI_RL/README.md`.
 - Base class or `h1_2*` subclass?
 - Does it need a cfg key, and which config level does it belong at?
 - Does it change observation or action dimensions? (Old checkpoints won't load.)
+
+# This repo (`Locomanipulation_game`)
+
+An Isaac Lab manager-based external project — separate from `ALMI_RL`.
+
+- **Activate the env first:** `conda activate env_isaaclab`
+- **Tasks live in**
+  `source/locomanipulation_game/locomanipulation_game/tasks/manager_based/`
+- **Train:** `python scripts/rsl_rl/train.py --task=<TASK> --headless`
+- When adding a new task name, update the `"Template-"` search pattern in
+  `scripts/list_envs.py:60` — it only lists ids containing that substring, so a
+  task registered under a different prefix silently won't show up.
