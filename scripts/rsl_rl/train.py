@@ -172,6 +172,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
+    r = env.unwrapped.scene["robot"]
+    s = env.unwrapped.scene["contact_forces"]
+    env.reset()
+    for _ in range(10):
+        env.step(torch.zeros(env.action_space.shape, device=env.unwrapped.device))
+    f = s.data.net_forces_w.norm(dim=-1).mean(0)   # (num_bodies,)
+    for n, v in sorted(zip(s.body_names, f.tolist()), key=lambda x: -x[1])[:15]:
+        print(f"{n:32s} {v:8.1f} N")
+
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)

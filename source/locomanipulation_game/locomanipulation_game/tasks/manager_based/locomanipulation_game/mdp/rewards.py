@@ -212,20 +212,32 @@ def joint_deviation_l2(
     return torch.sum(torch.square(dev), dim=1)
 
 
-def ankle_action_rate_l2(env: ManagerBasedRLEnv, action_ids: list[int]) -> torch.Tensor:
+def ankle_action_rate_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    action_name: str = "joint_pos",
+) -> torch.Tensor:
     """ALMI `_reward_ankle_action_rate`: action_rate restricted to the ankles.
 
-    action_ids index the ACTION vector, not the joint array. With
-    preserve_order=True and LOWER_BODY_JOINTS ordered hip_yaw, hip_pitch,
-    hip_roll, knee, ankle_pitch, ankle_roll (left then right), the ankles are
-    [4, 5, 10, 11] -- the same indices ALMI uses. VERIFY this against the
-    action manager's ordering before trusting it; wrong indices here penalize
-    the wrong joints and the error is silent.
-    """
-    a = env.action_manager.action[:, action_ids]
-    prev = env.action_manager.prev_action[:, action_ids]
-    return torch.sum(torch.square(prev - a), dim=1)
+    Resolves action indices from the action term's own joint ordering rather
+    than hard-coding them. ALMI's [4, 5, 10, 11] is correct in legged_gym,
+    whose DOF order is per-leg; resolve_matching_names with preserve_order=True
+    over a PATTERN list groups by pattern instead, which puts the hip rolls at
+    4 and 5 and the ankles at 8-11.
 
+    SceneEntityCfg.resolve() fills joint_ids but leaves joint_names as the raw
+    patterns, so the real names come from the articulation.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    term = env.action_manager.get_term(action_name)
+
+    ankle_names = [asset.joint_names[i] for i in asset_cfg.joint_ids]
+    action_order = {n: i for i, n in enumerate(term._joint_names)}
+    ids = [action_order[n] for n in ankle_names]
+
+    a = env.action_manager.action[:, ids]
+    prev = env.action_manager.prev_action[:, ids]
+    return torch.sum(torch.square(prev - a), dim=1)
 
 
 # ---------------------------------------------------------------------------

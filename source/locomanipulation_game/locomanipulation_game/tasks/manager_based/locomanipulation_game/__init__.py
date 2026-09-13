@@ -4,7 +4,7 @@ from . import agents
 
 gym.register(
     id="Legs-R0-v0",
-    entry_point=f"{__name__}.legs_r0_env_cfg:PositiveRewardRLEnv",
+    entry_point=f"{__name__}.positive_reward_clip:PositiveRewardRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.legs_r0_env_cfg:LocoManipulationLegsR0EnvCfg",

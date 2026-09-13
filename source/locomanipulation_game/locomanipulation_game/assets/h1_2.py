@@ -58,8 +58,16 @@ _SPAWN_CFG = sim_utils.UsdFileCfg(
         max_angular_velocity=1000.0,
         max_depenetration_velocity=1.0,
     ),
+    # Set explicitly now that self-collisions are on: contacts between links
+    # are generated within contact_offset and held apart at rest_offset.
+    collision_props=sim_utils.CollisionPropertiesCfg(
+        collision_enabled=True,
+        contact_offset=0.01,
+        rest_offset=0.0,
+    ),
+
     articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-        enabled_self_collisions=False,
+        enabled_self_collisions=True,
         solver_position_iteration_count=4,
         solver_velocity_iteration_count=4,
         
@@ -68,7 +76,7 @@ _SPAWN_CFG = sim_utils.UsdFileCfg(
 
 
 _INIT_STATE = ArticulationCfg.InitialStateCfg(
-    pos=(0.0, 0.0, 1.0),  # pelvis height in meters; tune so feet start just above ground
+    pos=(0.0, 0.0, 1.04),  # pelvis height in meters
     joint_pos={
         # Matches the FixStand pose in unitree_rl_lab
         # deploy/robots/h1_2/config/config.yaml, i.e. the pose the real robot is
@@ -82,8 +90,7 @@ _INIT_STATE = ArticulationCfg.InitialStateCfg(
         ".*_ankle_roll_joint": 0.0,
         "torso_joint": 0.0,
         ".*_shoulder_pitch_joint": 0.0,
-        "left_shoulder_roll_joint": 0.0,
-        "right_shoulder_roll_joint": 0.0,
+        ".*_shoulder_roll_joint": 0.0,
         ".*_shoulder_yaw_joint": 0.0,
         ".*_elbow_joint": 0.0,
         ".*_wrist_.*_joint": 0.0,
@@ -111,7 +118,7 @@ _ACTUATORS = {
         armature=0.01
     ),
     "torso": ImplicitActuatorCfg(
-        joint_names_expr=["torso_joint"],
+        joint_names_expr=TORSO_JOINTS,
         effort_limit_sim=200.0,
         velocity_limit_sim=23.0,
         stiffness=300.0,
@@ -120,7 +127,7 @@ _ACTUATORS = {
 
     ),
     "arms": ImplicitActuatorCfg(
-        joint_names_expr=[".*_shoulder_.*_joint", ".*_elbow_joint", ".*_wrist_.*_joint"],
+        joint_names_expr=ARM_JOINTS,
         effort_limit_sim={
             ".*_shoulder_pitch_joint": 40.0,
             ".*_shoulder_roll_joint": 40.0,
@@ -157,6 +164,7 @@ _ACTUATORS = {
         velocity_limit_sim=3.14,
         stiffness=100.0,
         damping=5.0,
+        armature=0.01
     ),
 }
 

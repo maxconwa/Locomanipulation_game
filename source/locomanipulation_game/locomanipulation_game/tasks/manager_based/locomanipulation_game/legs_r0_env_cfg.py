@@ -49,20 +49,15 @@ BASE_HEIGHT_TARGET = 0.95
 FEET_SWING_HEIGHT = 0.08
 MIN_DIST = 0.3
 MAX_DIST = 0.6
-MAX_CONTACT_FORCE = 700.0
+MAX_CONTACT_FORCE = 1400.0
 TRACKING_STD = 0.5      # ALMI tracking_sigma = 0.25 = std^2
 
-# Indices into the 12-D action vector, valid because the action term uses
-# preserve_order=True with LOWER_BODY_JOINTS ordered hip_yaw, hip_pitch,
-# hip_roll, knee, ankle_pitch, ankle_roll (left then right). Matches ALMI's
-# [4, 5, 10, 11]. VERIFY against env.action_manager before trusting.
-ANKLE_ACTION_IDS = [4, 5, 10, 11]
 
 
 
 
 @configclass
-class LocoMotionSceneCfg(InteractiveSceneCfg):
+class LocoManipulationSceneCfg(InteractiveSceneCfg):
     # Must be named `terrain`: the terrain-level curriculum looks for
     # env.scene.terrain. Round 0 is a plane; later rounds switch
     # terrain_type to "generator" and add a TerrainGeneratorCfg.
@@ -80,6 +75,14 @@ class LocoMotionSceneCfg(InteractiveSceneCfg):
     light = AssetBaseCfg(
         prim_path="/World/light",
         spawn=sim_utils.DomeLightCfg(intensity=750.0, color=(0.75, 0.75, 0.75)),
+    )
+    height_scanner = RayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/pelvis",
+        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+        attach_yaw_only=True,
+        pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=(1.6, 1.0)),
+        debug_vis=False,
+        mesh_prim_paths=["/World/ground"],
     )
 
 
@@ -149,6 +152,15 @@ class ObservationsCfg:
             func=mdp.joint_vel_rel,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS)},
             noise=Unoise(n_min=-1.5, n_max=1.5),
+        )
+        # 17 x 11 = 187 values at 0.1 m resolution over 1.6 x 1.0 m. Constant
+        # on the round-0 plane, but the width is what later rounds need: adding
+        # this after a checkpoint exists would invalidate it.
+        height_scan = ObsTerm(
+            func=mdp.height_scan,
+            params={"sensor_cfg": SceneEntityCfg("height_scanner")},
+            noise=Unoise(n_min=-0.1, n_max=0.1),
+            clip=(-1.0, 1.0),
         )
         actions = ObsTerm(func=mdp.last_action)
         # ALMI's gait clock: sin of each leg's phase. The policy needs this to
@@ -251,7 +263,10 @@ class LowerRewardsCfg:
     base_height = RewTerm(
         func=mdp.base_height_l2,
         weight=-10.0,
-        params={"target_height": BASE_HEIGHT_TARGET},
+        params={
+            "target_height": BASE_HEIGHT_TARGET,
+            "sensor_cfg": SceneEntityCfg("height_scanner"),
+        },
     )
 
     # --- gait shaping (the ALMI-specific part) ---
@@ -344,7 +359,7 @@ class LowerRewardsCfg:
     ankle_action_rate = RewTerm(
         func=mdp.ankle_action_rate_l2,
         weight=-0.02,
-        params={"action_ids": ANKLE_ACTION_IDS},
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=ANKLE_ONLY)},
     )
 
     # --- safety ---
@@ -359,6 +374,23 @@ class LowerRewardsCfg:
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FEET),
             "max_force": MAX_CONTACT_FORCE,
+        },
+    )
+    self_collision = RewTerm(
+        func=mdp.undesired_contacts,
+        weight=-1.0,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=[
+                    ".*_shoulder_.*_link",
+                    ".*_elbow.*_link",
+                    ".*_wrist_.*_link",
+                    ".*_hip_roll_link",
+                    ".*_knee_link",
+                ],
+            ),
+            "threshold": 20.0,
         },
     )
 
@@ -382,7 +414,7 @@ class TerminationsCfg:
 
 @configclass
 class LocoManipulationLegsR0EnvCfg(ManagerBasedRLEnvCfg):
-    scene: LocoMotionSceneCfg = LocoMotionSceneCfg(num_envs=4096, env_spacing=2.5)
+    scene: LocoManipulationSceneCfg = LocoManipulationSceneCfg(num_envs=4096, env_spacing=2.5)
     observations: ObservationsCfg = ObservationsCfg()
     actions: LowerActionsCfg = LowerActionsCfg()
     commands: CommandsCfg = CommandsCfg()
@@ -392,36 +424,14 @@ class LocoManipulationLegsR0EnvCfg(ManagerBasedRLEnvCfg):
 
     def __post_init__(self):
         self.decimation = 4          # policy 50 Hz, physics 200 Hz
-        self.episode_length_s = 60.0*5
+        self.episode_length_s = 60.0*3
         self.sim.dt = 0.005
         self.sim.render_interval = self.decimation
         # Contacts every physics step (the phase-contact and swing-height terms
         # depend on it); height scan once per policy step.
+        self.scene.height_scanner.update_period = self.decimation * self.sim.dt
         self.scene.contact_forces.update_period = self.sim.dt
         self.viewer.eye = (6.0, 6.0, 3.0)
         self.viewer.lookat = (0.0, 0.0, 1.0)
 
 
-from isaaclab.envs import ManagerBasedRLEnv
-import torch
-class PositiveRewardRLEnv(ManagerBasedRLEnv):
-    """Clips the summed per-step reward at zero.
-
-    Equivalent to legged_gym's `only_positive_rewards = True`. Without it, a
-    policy facing large early penalties learns that terminating quickly beats
-    accumulating negative reward, so it falls over on purpose instead of
-    learning to walk.
-
-    Clips the TOTAL, not individual terms: the relative weighting between terms
-    still shapes behaviour whenever the sum is positive. Per-term TensorBoard
-    logging is unaffected, since the reward manager logs before this clamp.
-    """
-
-    def step(self, action: torch.Tensor):
-        obs, reward, terminated, truncated, extras = super().step(action)
-        clipped = torch.clamp(reward, min=0.0)
-        self._n = getattr(self, "_n", 0) + 1
-        # if self._n % 20 == 0:
-            # print(f"[clip] call {self._n}: raw {reward.mean().item():+.4f} -> {clipped.mean().item():+.4f}")
-        self.reward_buf = clipped
-        return obs, clipped, terminated, truncated, extras

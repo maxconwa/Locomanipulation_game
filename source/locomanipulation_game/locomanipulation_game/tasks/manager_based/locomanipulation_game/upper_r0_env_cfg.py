@@ -72,7 +72,7 @@ class UpperCommandsCfg:
         make_quat_unique=True,
         debug_vis=True,
         ranges=mdp.UniformPoseCommandCfg.Ranges(
-            pos_x=(0.10, 0.50), pos_y=(0.05, 0.45), pos_z=(0.05, 0.55),
+            pos_x=(0.20, 0.45), pos_y=(0.05, 0.45), pos_z=(0.15, 0.55),
             roll=(-0.5, 0.5), pitch=(-0.5, 0.5), yaw=(-0.5, 0.5),
         ),
     )
@@ -83,7 +83,7 @@ class UpperCommandsCfg:
         make_quat_unique=True,
         debug_vis=True,
         ranges=mdp.UniformPoseCommandCfg.Ranges(
-            pos_x=(0.10, 0.50), pos_y=(-0.45, -0.05), pos_z=(0.05, 0.55),
+            pos_x=(0.20, 0.45), pos_y=(-0.45, -0.05), pos_z=(0.15, 0.55),
             roll=(-0.5, 0.5), pitch=(-0.5, 0.5), yaw=(-0.5, 0.5),
         ),
     )
@@ -91,16 +91,6 @@ class UpperCommandsCfg:
 
 @configclass
 class UpperActionsCfg:
-    # q_target = default_joint_pos + 0.25 * action, arms only (14 joints).
-    # Torso, legs and the locked grippers are held at default by their
-    # actuators.
-    #
-    # ARM_JOINTS is a list of PATTERNS, so preserve_order groups the action
-    # vector by joint type with left/right interleaved -- L/R shoulder_pitch,
-    # L/R shoulder_roll, ... -- NOT left arm then right arm. Nothing in this
-    # file indexes actions, but the deployment index map does, and this is the
-    # same expansion that makes ANKLE_ACTION_IDS worth re-checking in the legs
-    # round.
     joint_pos = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=ARM_JOINTS,
@@ -308,12 +298,25 @@ class UpperRewardsCfg:
         weight=-5.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=ARM_JOINTS)},
     )
-    # No self-collision penalty: enabled_self_collisions=False in
-    # H1_2_MAGPIE_CFG, so the contact sensor never fires arm-vs-torso and the
-    # term would be dead weight. The consequence is real -- the arms will
-    # reach THROUGH the torso to a target on the far side. If the rollouts show
-    # that, enable self-collisions on the asset (it costs solver time) and add
-    # an undesired_contacts term here.
+    # undesired_contacts returns a COUNT of bodies over threshold, so this is
+    # -1.0 per contacting link per second against an 8.0/s task ceiling.
+    # Calibrate off the first run.
+    self_collision = RewTerm(
+        func=mdp.undesired_contacts,
+        weight=-1.0,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=[
+                    ".*_shoulder_.*_link",
+                    ".*_elbow.*_link",
+                    ".*_wrist_.*_link",
+                ],
+            ),
+            "threshold": 1.0,
+        },
+    )
+
 
 @configclass
 class UpperTerminationsCfg:
@@ -350,3 +353,4 @@ class LocoManipulationUpperR0EnvCfg(ManagerBasedRLEnvCfg):
         self.scene.contact_forces.update_period = self.sim.dt
         self.viewer.eye = (2.5, 2.5, 2.0)
         self.viewer.lookat = (0.0, 0.0, PELVIS_HEIGHT)
+        self.scene.height_scanner = None
