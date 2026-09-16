@@ -1,0 +1,72 @@
+# Conda environment for the Locomanipulation_game Isaac Lab project.
+#
+#   conda env create -f environment.yml
+#   conda activate env_isaaclab
+#
+# Scope: this file provisions the interpreter, Isaac Sim, and PyTorch. It
+# deliberately stops short of Isaac Lab itself, which cannot be expressed here
+# -- see "Post-install" at the bottom of this file.
+
+name: env_isaaclab
+
+channels:
+  - conda-forge
+  # Exclude the `defaults` channel: mixing it with conda-forge is a common
+  # source of incompatible builds, and it carries Anaconda's commercial ToS.
+  - nodefaults
+
+dependencies:
+  # Isaac Sim 5.x is Python 3.11 only -- the isaaclab wheel declares
+  # `requires_python == 3.11.*`. Do not widen this.
+  - python=3.11
+  - pip>=24.0
+
+  - pip:
+      # Isaac Sim wheels are on NVIDIA's index; the CUDA 12.8 PyTorch build is
+      # on PyTorch's. `--extra-index-url` gives pip no ordering guarantee
+      # between indexes, which is why torch is pinned by local version below.
+      - --extra-index-url https://pypi.nvidia.com
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+
+      - isaacsim[all,extscache]==5.1.0
+
+      # cu128 is required, not preferred. This project targets Blackwell
+      # (RTX 50-series, sm_120); the default PyPI `torch==2.7.0` is a cu126
+      # build with no sm_120 kernels and fails at the first CUDA launch.
+      # The `+cu128` local version exists only on the PyTorch index, so it
+      # pins the build unambiguously.
+      - torch==2.7.0+cu128
+      - torchvision==0.22.0+cu128
+
+      # Declared by source/locomanipulation_game/setup.py.
+      - psutil
+
+      # Runs the hooks in .pre-commit-config.yaml (ruff, codespell).
+      - pre-commit
+
+# ---------------------------------------------------------------------------
+# Post-install -- run after `conda activate env_isaaclab`
+# ---------------------------------------------------------------------------
+#
+# Isaac Lab is not installable from this file. Only a bootstrap shim is
+# published to PyPI as `isaaclab`; the extensions this project imports
+# (isaaclab_rl, isaaclab_tasks, isaaclab_assets) are not on PyPI at all.
+# Install them from source, outside this repository:
+#
+#   git clone https://github.com/isaac-sim/IsaacLab.git
+#   cd IsaacLab && ./isaaclab.sh --install rsl_rl
+#
+# Track IsaacLab `main`, not the 2.3.x release: scripts/rsl_rl/train.py imports
+# RslRlBaseRunnerCfg and handle_deprecated_rsl_rl_cfg, which the release does
+# not have. `--install rsl_rl` also pins the matching rsl-rl-lib, and pulls in
+# the runtime deps this file omits on purpose (gymnasium, prettytable,
+# tensorboard, hydra-core) so their versions stay Isaac Lab's to choose.
+#
+# Then, back in this repository:
+#
+#   pip install -e source/locomanipulation_game
+#   git submodule update --init --recursive     # third_party/CL_Assets
+#
+# Verify:
+#
+#   python scripts/list_envs.py
