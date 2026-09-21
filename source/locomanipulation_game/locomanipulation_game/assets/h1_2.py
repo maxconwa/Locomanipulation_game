@@ -4,40 +4,78 @@ from pathlib import Path
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
+from isaaclab.utils.string import resolve_matching_names
 
-
-
-# This file lives at: repo_root/source/locomanipulation_game/locomanipulation_game/assets/h1_2.py
+# repo_root/source/locomanipulation_game/locomanipulation_game/assets/h1_2.py
 # parents[0]=assets, [1]=locomanipulation_game, [2]=source/locomanipulation_game, [3]=source, [4]=repo_root
 REPO_ROOT = Path(__file__).resolve().parents[4]
 CL_ASSETS_DIR = Path(os.environ.get("CL_ASSETS_DIR", REPO_ROOT / "third_party" / "CL_Assets"))
 H1_2_MAGPIE_USD = CL_ASSETS_DIR / "isaac_assets/robots/h1_2_magpie/h1_2_magpie.usd"
 
 
-LEG_JOINTS = [
-    ".*_hip_yaw_joint", ".*_hip_pitch_joint", ".*_hip_roll_joint",
-    ".*_knee_joint", ".*_ankle_pitch_joint", ".*_ankle_roll_joint",
+LEG_JOINT_NAMES = [
+    "left_hip_yaw_joint", "left_hip_pitch_joint", "left_hip_roll_joint",
+    "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "right_hip_yaw_joint", "right_hip_pitch_joint", "right_hip_roll_joint",
+    "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
 ]
 
+ARM_JOINT_NAMES = [
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+]
+
+# Never actuated by any round -- held by its actuator alone. Still observed.
 TORSO_JOINTS = ["torso_joint"]
 
-ARM_JOINTS = [
-    ".*_shoulder_pitch_joint", ".*_shoulder_roll_joint", ".*_shoulder_yaw_joint",
-    ".*_elbow_joint", ".*_wrist_roll_joint", ".*_wrist_pitch_joint", ".*_wrist_yaw_joint",
-]
+# 27. The observation set, identical across rounds. Legs first so the first 12
+# slots match LOWER_BODY_JOINTS and the arm block sits at a fixed offset.
+# Grippers excluded: locked.
+BODY_JOINTS_NAMES = LEG_JOINT_NAMES + TORSO_JOINTS + ARM_JOINT_NAMES
+
+# Semantic aliases. The *_NAMES lists above are the ordered ground truth; these
+# say what a list MEANS to a round. LOWER/UPPER is the IBR split, BODY is the
+# observation set, CONTROLLED is what the debug task actuates.
+LEG_JOINTS = LEG_JOINT_NAMES
+ARM_JOINTS = ARM_JOINT_NAMES
+BODY_JOINTS = BODY_JOINTS_NAMES
+LOWER_BODY_JOINTS = LEG_JOINT_NAMES
+UPPER_BODY_JOINTS = TORSO_JOINTS + ARM_JOINT_NAMES
+CONTROLLED_JOINTS = BODY_JOINTS_NAMES
 
 
-# IBR split: which joints each policy controls.
-LOWER_BODY_JOINTS = LEG_JOINTS
-UPPER_BODY_JOINTS = TORSO_JOINTS + ARM_JOINTS
 
+# Patterns, not lists: the set matters, the order does not. `LEG_ONLY` also
+# expresses an INTENT that survives a joint being added; an explicit list
+# would silently miss it.
+LEG_ONLY = [".*_hip_.*_joint", ".*_knee_joint", ".*_ankle_.*_joint"]
+ANKLE_ONLY = [".*_ankle_.*_joint"]
+HIP_YAW_ROLL = [".*_hip_yaw_joint", ".*_hip_roll_joint"]
 
-BODY_JOINTS = LEG_JOINTS + TORSO_JOINTS + ARM_JOINTS  # 27
-
+# Must stay a pattern: the hinge count depends on the Magpie USD.
 GRIPPER_JOINTS = ["[lr]g_.*_hinge_.*"]
 
+# Body names, verified against the check_h1_2.py body list.
+FEET = ".*_ankle_roll_link"
+KNEES = ".*_knee_link"
+TRUNK = ["pelvis", "torso_link"]
 
-CONTROLLED_JOINTS = BODY_JOINTS
+LEFT_EE = "left_wrist_yaw_link"
+RIGHT_EE = "right_wrist_yaw_link"
+
+
+LIVOX_MOUNT_POS = (0.04874, 0.0, 0.67980)
+LIVOX_MOUNT_ROT = (0.99280, 0.0, 0.11979, 0.0)   # (w,x,y,z), 13.76 deg nose-down
+IMU_MOUNT_POS = (-0.04452, -0.01891, 0.27756)
+
+LIVOX_VFOV_DEG = (-7.0, 52.0)   # Mid-360 datasheet
+
+STANDING_PELVIS_HEIGHT = 1.0024
+SOLE_OFFSET = 0.0450
 
 
 _SPAWN_CFG = sim_utils.UsdFileCfg(
@@ -48,7 +86,6 @@ _SPAWN_CFG = sim_utils.UsdFileCfg(
         metallic=0.3,
         roughness=0.5,
     ),
-
     rigid_props=sim_utils.RigidBodyPropertiesCfg(
         disable_gravity=False,
         retain_accelerations=False,
@@ -58,30 +95,22 @@ _SPAWN_CFG = sim_utils.UsdFileCfg(
         max_angular_velocity=1000.0,
         max_depenetration_velocity=1.0,
     ),
-    # Set explicitly now that self-collisions are on: contacts between links
-    # are generated within contact_offset and held apart at rest_offset.
     collision_props=sim_utils.CollisionPropertiesCfg(
         collision_enabled=True,
         contact_offset=0.01,
         rest_offset=0.0,
     ),
-
     articulation_props=sim_utils.ArticulationRootPropertiesCfg(
         enabled_self_collisions=True,
         solver_position_iteration_count=4,
         solver_velocity_iteration_count=4,
-        
     ),
 )
 
 
 _INIT_STATE = ArticulationCfg.InitialStateCfg(
-    pos=(0.0, 0.0, 1.04),  # pelvis height in meters
+    pos=(0.0, 0.0, STANDING_PELVIS_HEIGHT),
     joint_pos={
-        # Matches the FixStand pose in unitree_rl_lab
-        # deploy/robots/h1_2/config/config.yaml, i.e. the pose the real robot is
-        # interpolated to before a policy takes over. This is also the offset
-        # that actions are measured from, so deployment must start from here.
         ".*_hip_yaw_joint": 0.0,
         ".*_hip_roll_joint": 0.0,
         ".*_hip_pitch_joint": -0.3,
@@ -99,7 +128,6 @@ _INIT_STATE = ArticulationCfg.InitialStateCfg(
     joint_vel={".*": 0.0},
 )
 
-
 _ACTUATORS = {
     "legs": ImplicitActuatorCfg(
         joint_names_expr=[".*_hip_.*_joint", ".*_knee_joint"],
@@ -107,15 +135,15 @@ _ACTUATORS = {
         velocity_limit_sim={".*_hip_.*_joint": 23.0, ".*_knee_joint": 14.0},
         stiffness={".*_hip_.*_joint": 200.0, ".*_knee_joint": 300.0},
         damping={".*_hip_.*_joint": 2.5, ".*_knee_joint": 4.0},
-        armature=0.01
+        armature=0.01,
     ),
     "feet": ImplicitActuatorCfg(
-        joint_names_expr=[".*_ankle_.*_joint"],
+        joint_names_expr=ANKLE_ONLY,
         effort_limit_sim={".*_ankle_pitch_joint": 60.0, ".*_ankle_roll_joint": 40.0},
         velocity_limit_sim=9.0,
         stiffness=40.0,
         damping=2.0,
-        armature=0.01
+        armature=0.01,
     ),
     "torso": ImplicitActuatorCfg(
         joint_names_expr=TORSO_JOINTS,
@@ -123,11 +151,10 @@ _ACTUATORS = {
         velocity_limit_sim=23.0,
         stiffness=300.0,
         damping=3.0,
-        armature=0.01
-
+        armature=0.01,
     ),
     "arms": ImplicitActuatorCfg(
-        joint_names_expr=ARM_JOINTS,
+        joint_names_expr=ARM_JOINT_NAMES,
         effort_limit_sim={
             ".*_shoulder_pitch_joint": 40.0,
             ".*_shoulder_roll_joint": 40.0,
@@ -143,28 +170,26 @@ _ACTUATORS = {
             ".*_wrist_.*_joint": 31.4,
         },
         stiffness={
-            ".*_shoulder_.*_joint": 120.0,   # ALMI
-            ".*_elbow_joint": 80.0,          # ALMI
-            ".*_wrist_.*_joint": 40.0,       # no ALMI reference; wrists are absent there
+            ".*_shoulder_.*_joint": 120.0,   
+            ".*_elbow_joint": 80.0,          
+            ".*_wrist_.*_joint": 40.0,      
         },
         damping={
-            ".*_shoulder_.*_joint": 2.0,   # ALMI
-            ".*_elbow_joint": 1.0,         # ALMI
-            ".*_wrist_.*_joint": 1.0,      # no ALMI reference
+            ".*_shoulder_.*_joint": 2.0,   
+            ".*_elbow_joint": 1.0,         
+            ".*_wrist_.*_joint": 1.0,      
         },
-        armature=0.01
-
+        armature=0.01,
     ),
-
-    # Locked open. No policy commands these; stiff gains hold every hinge at
-    # its default, which also substitutes for the missing linkage constraint.
+    # Locked open. Stiff gains hold each hinge at default, substituting for the
+    # missing linkage constraint.
     "grippers": ImplicitActuatorCfg(
         joint_names_expr=GRIPPER_JOINTS,
         effort_limit_sim=10.0,   # from the URDF
         velocity_limit_sim=3.14,
         stiffness=100.0,
         damping=5.0,
-        armature=0.01
+        armature=0.01,
     ),
 }
 

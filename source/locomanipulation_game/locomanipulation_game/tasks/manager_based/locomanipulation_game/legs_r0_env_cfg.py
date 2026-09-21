@@ -1,4 +1,4 @@
-"""Round 0: flat-ground velocity tracking for the lower body, no adversary.
+"""Round 0: locomotion velocity tracking for the lower body, no adversary.
 
 Reward structure follows ALMI-Open's h1_2_lower config. The upper body is held
 at its default pose by its actuators, so no frozen policy is needed yet.
@@ -11,8 +11,6 @@ previous round's checkpoint instead of training from scratch.
 
 import math
 
-import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -20,19 +18,20 @@ from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
-from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
-from isaaclab.terrains import TerrainImporterCfg
+
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
+from isaaclab.sensors import RayCasterCfg, patterns
 
 from locomanipulation_game.assets.h1_2 import (
     BODY_JOINTS,
-    H1_2_MAGPIE_CFG,
     LOWER_BODY_JOINTS,
+    STANDING_PELVIS_HEIGHT,
+    LIVOX_VFOV_DEG,
 )
 
 from . import mdp
+from .common.scenes import TerrainSceneCfg, CurriculumCfg
 
 # --- body-name patterns (verified against the check_h1_2.py body list) ---
 FEET = ".*_ankle_roll_link"
@@ -44,8 +43,8 @@ LEG_ONLY = [".*_hip_.*_joint", ".*_knee_joint", ".*_ankle_.*_joint"]
 ANKLE_ONLY = [".*_ankle_.*_joint"]
 HIP_YAW_ROLL = [".*_hip_yaw_joint", ".*_hip_roll_joint"]
 
-# --- ALMI reward parameters (h1_2_lower_config.py, class rewards) ---
-BASE_HEIGHT_TARGET = 0.95
+# --- reward parameters (h1_2_lower_config.py, class rewards) ---
+BASE_HEIGHT_TARGET = STANDING_PELVIS_HEIGHT   # NOT ALMI's 0.95; see h1_2.py
 FEET_SWING_HEIGHT = 0.08
 MIN_DIST = 0.3
 MAX_DIST = 0.6
@@ -55,50 +54,17 @@ TRACKING_STD = 0.5      # ALMI tracking_sigma = 0.25 = std^2
 
 
 
-
-@configclass
-class LocoManipulationSceneCfg(InteractiveSceneCfg):
-    # Must be named `terrain`: the terrain-level curriculum looks for
-    # env.scene.terrain. Round 0 is a plane; later rounds switch
-    # terrain_type to "generator" and add a TerrainGeneratorCfg.
-    terrain = TerrainImporterCfg(
-        prim_path="/World/ground",
-        terrain_type="plane",
-        collision_group=-1,
-        debug_vis=False,
-    )
-    robot: ArticulationCfg = H1_2_MAGPIE_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-    # All bodies: the reward terms need feet, knees, pelvis and torso.
-    contact_forces = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True
-    )
-    light = AssetBaseCfg(
-        prim_path="/World/light",
-        spawn=sim_utils.DomeLightCfg(intensity=750.0, color=(0.75, 0.75, 0.75)),
-    )
-    height_scanner = RayCasterCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/pelvis",
-        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
-        attach_yaw_only=True,
-        pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=(1.6, 1.0)),
-        debug_vis=False,
-        mesh_prim_paths=["/World/ground"],
-    )
-
-
-
 @configclass
 class CommandsCfg:
     base_velocity = mdp.UniformVelocityCommandCfg(
         asset_name="robot",
-        resampling_time_range=(10.0, 10.0),
+        resampling_time_range=(2.5, 10.0),
         # Some zero-command envs are required, not optional: stand_still,
         # stance_base_vel and the gait clock's standing branch are all
         # inactive without them.
         rel_standing_envs=0.05,
-        rel_heading_envs=1.0,
         heading_command=False,   # theta is a yaw RATE, like a joystick
-        debug_vis=True,
+        debug_vis=False,
         ranges=mdp.UniformVelocityCommandCfg.Ranges(
             lin_vel_x=(-0.7, 0.7),   # ALMI ranges
             lin_vel_y=(-0.3, 0.3),
@@ -131,41 +97,57 @@ class LowerActionsCfg:
 class ObservationsCfg:
     @configclass
     class PolicyCfg(ObsGroup):
-        # Not measurable on hardware: replace with a state estimate or drop
-        # before deployment.
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.1, n_max=0.1))
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
+        # 5-step (100 ms) history on the proprioceptive terms. The actor has no
+        # base_lin_vel, so body velocity has to be inferred from the sequence
+        # of gyro, gravity, accelerometer, joint states and past actions --
+        # a single frame cannot do it. height_scan is excluded: it is already
+        # spatial, and stacking 187 values five times is 935 redundant dims.
+        base_lin_acc = ObsTerm(
+            func=mdp.imu_lin_acc,
+            params={"asset_cfg": SceneEntityCfg("imu")},
+            noise=Unoise(n_min=-0.5, n_max=0.5),
+            history_length=5,
+            flatten_history_dim=True,
+        )
+        base_ang_vel = ObsTerm(
+            func=mdp.imu_ang_vel,
+            params={"asset_cfg": SceneEntityCfg("imu")},
+            noise=Unoise(n_min=-0.2, n_max=0.2),
+            history_length=5,
+            flatten_history_dim=True,
+        )
         projected_gravity = ObsTerm(
-            func=mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05)
+            func=mdp.imu_projected_gravity,
+            params={"asset_cfg": SceneEntityCfg("imu")},
+            noise=Unoise(n_min=-0.05, n_max=0.05),
+            history_length=5,
+            flatten_history_dim=True,
         )
         velocity_commands = ObsTerm(
             func=mdp.generated_commands, params={"command_name": "base_velocity"}
         )
-        # All 27 body joints, not just the 12 legs: keeps the obs space fixed
-        # across IBR rounds so later rounds can warm-start.
         joint_pos = ObsTerm(
             func=mdp.joint_pos_rel,
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS)},
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS, preserve_order=True)},
             noise=Unoise(n_min=-0.01, n_max=0.01),
+            history_length=5,
+            flatten_history_dim=True,
         )
         joint_vel = ObsTerm(
             func=mdp.joint_vel_rel,
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS)},
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS, preserve_order=True)},
             noise=Unoise(n_min=-1.5, n_max=1.5),
+            history_length=5,
+            flatten_history_dim=True,
         )
-        # 17 x 11 = 187 values at 0.1 m resolution over 1.6 x 1.0 m. Constant
-        # on the round-0 plane, but the width is what later rounds need: adding
-        # this after a checkpoint exists would invalidate it.
         height_scan = ObsTerm(
             func=mdp.height_scan,
-            params={"sensor_cfg": SceneEntityCfg("height_scanner")},
+            params={"sensor_cfg": SceneEntityCfg("height_scanner"),
+                    "offset":  BASE_HEIGHT_TARGET},
             noise=Unoise(n_min=-0.1, n_max=0.1),
             clip=(-1.0, 1.0),
         )
-        actions = ObsTerm(func=mdp.last_action)
-        # ALMI's gait clock: sin of each leg's phase. The policy needs this to
-        # exploit the contact_matches_phase reward, which is otherwise
-        # unlearnable -- it would be rewarded on a schedule it cannot observe.
+        actions = ObsTerm(func=mdp.last_action, history_length=5, flatten_history_dim=True)
         gait_phase = ObsTerm(
             func=mdp.gait_phase_sin, params={"command_name": "base_velocity"}
         )
@@ -174,7 +156,19 @@ class ObservationsCfg:
             self.enable_corruption = True
             self.concatenate_terms = True
 
+
+    @configclass
+    class CriticCfg(ObsGroup):
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
+        projected_gravity = ObsTerm(func=mdp.projected_gravity)
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
     policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
 
 
 
@@ -209,7 +203,7 @@ class EventCfg:
             # small and non-negative: a large drop fills early training with
             # spurious contacts and false terminations.
             "pose_range": {
-                "x": (-0.5, 0.5), "y": (-0.5, 0.5), "z": (0.0, 0.05),
+                "x": (-0.5, 0.5), "y": (-0.5, 0.5), "z": (0.0, 0.1),
                 "roll": (-0.2, 0.2), "pitch": (-0.2, 0.2), "yaw": (-math.pi, math.pi),
             },
             "velocity_range": {
@@ -221,7 +215,10 @@ class EventCfg:
     reset_joints = EventTerm(
         func=mdp.reset_joints_by_offset,   # additive, unlike _by_scale
         mode="reset",
-        params={"position_range": (-0.2, 0.2), "velocity_range": (-0.5, 0.5)},
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS, preserve_order=True),
+            "position_range": (-0.2, 0.2), "velocity_range": (-0.5, 0.5)
+            },
     )
     push_robot = EventTerm(
         func=mdp.push_by_setting_velocity,
@@ -259,7 +256,7 @@ class LowerRewardsCfg:
     # --- posture ---
     lin_vel_z = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
     ang_vel_xy = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.5)
-    orientation = RewTerm(func=mdp.flat_orientation_l2, weight=-1.0)
+    orientation = RewTerm(func=mdp.flat_orientation_l2, weight=-0.25)
     base_height = RewTerm(
         func=mdp.base_height_l2,
         weight=-10.0,
@@ -280,11 +277,12 @@ class LowerRewardsCfg:
     )
     feet_swing_height = RewTerm(
         func=mdp.feet_swing_height,
-        weight=-20.0,
+        weight=-2.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FEET),
             "asset_cfg": SceneEntityCfg("robot", body_names=FEET),
             "target_height": FEET_SWING_HEIGHT,
+            "terrain_sensor_cfg":SceneEntityCfg("height_scanner"),
         },
     )
     contact_no_vel = RewTerm(
@@ -334,7 +332,7 @@ class LowerRewardsCfg:
         params={"command_name": "base_velocity"},
     )
 
-    # --- effort and smoothness (leg joints only: ALMI slices [:, :12]) ---
+    # --- effort and smoothness (leg joints only) ---
     torques = RewTerm(
         func=mdp.joint_torques_l2,
         weight=-1.0e-5,
@@ -411,20 +409,20 @@ class TerminationsCfg:
         },
     )
 
-
 @configclass
 class LocoManipulationLegsR0EnvCfg(ManagerBasedRLEnvCfg):
-    scene: LocoManipulationSceneCfg = LocoManipulationSceneCfg(num_envs=4096, env_spacing=2.5)
+    scene: TerrainSceneCfg = TerrainSceneCfg(num_envs=4096, env_spacing=2.5)
     observations: ObservationsCfg = ObservationsCfg()
     actions: LowerActionsCfg = LowerActionsCfg()
     commands: CommandsCfg = CommandsCfg()
     events: EventCfg = EventCfg()
     rewards: LowerRewardsCfg = LowerRewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
+    curriculum: CurriculumCfg = CurriculumCfg()
 
     def __post_init__(self):
         self.decimation = 4          # policy 50 Hz, physics 200 Hz
-        self.episode_length_s = 60.0*3
+        self.episode_length_s = 20.0
         self.sim.dt = 0.005
         self.sim.render_interval = self.decimation
         # Contacts every physics step (the phase-contact and swing-height terms
@@ -433,5 +431,7 @@ class LocoManipulationLegsR0EnvCfg(ManagerBasedRLEnvCfg):
         self.scene.contact_forces.update_period = self.sim.dt
         self.viewer.eye = (6.0, 6.0, 3.0)
         self.viewer.lookat = (0.0, 0.0, 1.0)
+        self.scene.imu.update_period = self.decimation * self.sim.dt
+        
 
 

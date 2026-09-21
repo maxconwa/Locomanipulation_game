@@ -14,7 +14,7 @@ from . import mdp
 # The terrain, robot, contact sensor and light are shared with the legs round.
 # This couples the two files: switch the legs round to generated terrain later
 # and this round follows silently. Copy the class in if they should diverge.
-from .legs_r0_env_cfg import LocoManipulationSceneCfg
+from .common.scenes import FlatSceneCfg
 
 # --- body names: VERIFY against robot.data.body_names ---
 # ARM_JOINTS ends at .*_wrist_yaw_joint so these links exist, but the magpie
@@ -35,7 +35,6 @@ PELVIS_HEIGHT = 1.2
 POS_STD_COARSE = 0.30   # m, gradient across the whole workspace
 POS_STD_FINE = 0.10     # m, pays off only in the last few centimetres
 QUAT_STD = 0.50         # 
-
 
 
 @configclass
@@ -70,7 +69,7 @@ class UpperCommandsCfg:
         # Quaternion double cover: q and -q are the same rotation, so without
         # this the sampler can hand the policy either sign for one target.
         make_quat_unique=True,
-        debug_vis=True,
+        debug_vis=False,
         ranges=mdp.UniformPoseCommandCfg.Ranges(
             pos_x=(0.20, 0.45), pos_y=(0.05, 0.45), pos_z=(0.15, 0.55),
             roll=(-0.5, 0.5), pitch=(-0.5, 0.5), yaw=(-0.5, 0.5),
@@ -81,7 +80,7 @@ class UpperCommandsCfg:
         body_name=RIGHT_EE,
         resampling_time_range=(3.0, 5.0),
         make_quat_unique=True,
-        debug_vis=True,
+        debug_vis=False,
         ranges=mdp.UniformPoseCommandCfg.Ranges(
             pos_x=(0.20, 0.45), pos_y=(-0.45, -0.05), pos_z=(0.15, 0.55),
             roll=(-0.5, 0.5), pitch=(-0.5, 0.5), yaw=(-0.5, 0.5),
@@ -104,12 +103,29 @@ class UpperActionsCfg:
 class UpperObservationsCfg:
     @configclass
     class PolicyCfg(ObsGroup):
-        # Both are trivially zero while the pelvis is welded. They stay in the
-        # vector for the walking round, where they are not.
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.1, n_max=0.1))
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
+        # 402 total. No base_lin_vel: the actor must not see what the real
+        # H1-2 cannot measure, even though the weld makes it trivially zero
+        # here. 5-step (100 ms) history to match the other rounds.
+        base_lin_acc = ObsTerm(
+            func=mdp.imu_lin_acc,
+            params={"asset_cfg": SceneEntityCfg("imu")},
+            noise=Unoise(n_min=-0.5, n_max=0.5),
+            history_length=5,
+            flatten_history_dim=True,
+        )
+        base_ang_vel = ObsTerm(
+            func=mdp.imu_ang_vel,
+            params={"asset_cfg": SceneEntityCfg("imu")},
+            noise=Unoise(n_min=-0.2, n_max=0.2),
+            history_length=5,
+            flatten_history_dim=True,
+        )
         projected_gravity = ObsTerm(
-            func=mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05)
+            func=mdp.imu_projected_gravity,
+            params={"asset_cfg": SceneEntityCfg("imu")},
+            noise=Unoise(n_min=-0.05, n_max=0.05),
+            history_length=5,
+            flatten_history_dim=True,
         )
         velocity_commands = ObsTerm(
             func=mdp.generated_commands, params={"command_name": "base_velocity"}
@@ -121,34 +137,44 @@ class UpperObservationsCfg:
         right_ee_command = ObsTerm(
             func=mdp.generated_commands, params={"command_name": "right_ee_pose"}
         )
-        # All 27 body joints, not just the 14 actuated: fixes the obs space
-        # across rounds, and the arm policy needs leg state once the legs move
-        # underneath it.
+        # All 27 body joints, not just the 14 actuated: the arm policy needs leg
+        # state once the legs move underneath it.
         joint_pos = ObsTerm(
             func=mdp.joint_pos_rel,
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS)},
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS, preserve_order=True)},
             noise=Unoise(n_min=-0.01, n_max=0.01),
+            history_length=5,
+            flatten_history_dim=True,
         )
         joint_vel = ObsTerm(
             func=mdp.joint_vel_rel,
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS)},
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS, preserve_order=True)},
             noise=Unoise(n_min=-1.5, n_max=1.5),
+            history_length=5,
+            flatten_history_dim=True,
         )
-        actions = ObsTerm(func=mdp.last_action)
+        actions = ObsTerm(func=mdp.last_action, history_length=5, flatten_history_dim=True)
 
-        # No gait_phase: no gait here, and no contact_matches_phase reward for
-        # it to serve.
-        #
-        # No explicit end-effector pose either. The policy can do forward
-        # kinematics from joint_pos, so it is not required -- but adding it is
-        # the first thing to try if tracking learns slowly, since it turns
-        # "infer where my hand is" into a subtraction.
+        # No height_scan: the pelvis is welded and the ground never changes.
+        # No gait_phase: no gait, and no contact_matches_phase reward to serve.
 
         def __post_init__(self):
             self.enable_corruption = True
             self.concatenate_terms = True
 
+    @configclass
+    class CriticCfg(ObsGroup):
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
+        projected_gravity = ObsTerm(func=mdp.projected_gravity)
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
     policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
+
 
 
 @configclass
@@ -327,7 +353,7 @@ class UpperTerminationsCfg:
 
 @configclass
 class LocoManipulationUpperR0EnvCfg(ManagerBasedRLEnvCfg):
-    scene: LocoManipulationSceneCfg = LocoManipulationSceneCfg(num_envs=4096, env_spacing=2.5)
+    scene: FlatSceneCfg = FlatSceneCfg(num_envs=4096, env_spacing=2.5)
     observations: UpperObservationsCfg = UpperObservationsCfg()
     actions: UpperActionsCfg = UpperActionsCfg()
     commands: UpperCommandsCfg = UpperCommandsCfg()
@@ -351,6 +377,13 @@ class LocoManipulationUpperR0EnvCfg(ManagerBasedRLEnvCfg):
         self.scene.robot.init_state.pos = (0.0, 0.0, PELVIS_HEIGHT)
 
         self.scene.contact_forces.update_period = self.sim.dt
+        self.viewer.eye = (2.5, 2.5, 2.0)
+        self.viewer.lookat = (0.0, 0.0, PELVIS_HEIGHT)
+        self.scene.height_scanner = None
+
+
+        self.scene.contact_forces.update_period = self.sim.dt
+        self.scene.imu.update_period = self.decimation * self.sim.dt
         self.viewer.eye = (2.5, 2.5, 2.0)
         self.viewer.lookat = (0.0, 0.0, PELVIS_HEIGHT)
         self.scene.height_scanner = None

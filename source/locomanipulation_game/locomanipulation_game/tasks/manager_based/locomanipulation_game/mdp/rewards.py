@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.sensors import ContactSensor
+from isaaclab.sensors import ContactSensor, RayCaster
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -99,6 +99,42 @@ def feet_swing_height(
     in_contact = forces.norm(dim=-1).max(dim=1)[0] > 1.0
 
     foot_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+    return torch.sum(torch.square(foot_z - target_height) * ~in_contact, dim=1)
+
+
+def feet_swing_height(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg,
+    target_height: float = 0.08,
+    terrain_sensor_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """ALMI `_reward_feet_swing_height`: squared error to a target foot height,
+    counted only while the foot is airborne.
+
+    At weight -20.0 this is ALMI's largest single penalty. It is what stops the
+    robot dragging its feet, and it is the term most likely to need retuning if
+    the gait looks wrong.
+
+    ALMI trains on flat ground, so absolute world z is its ground reference.
+    Sub-terrain origins are NOT at z=0 -- height_field_to_mesh sets origin_z to
+    the max height of the patch centre -- so on generated terrain absolute z
+    charges the policy for standing on a hill. `terrain_sensor_cfg` supplies a
+    height-scanner whose MEAN ray hit is the local ground, the same reference
+    isaaclab's own base_height_l2 uses, so both height terms agree. Leave it
+    None on flat ground and the term is bit-for-bit what it was.
+    """
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    forces = sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+    in_contact = forces.norm(dim=-1).max(dim=1)[0] > 1.0
+
+    foot_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+    if terrain_sensor_cfg is not None:
+        scanner: RayCaster = env.scene.sensors[terrain_sensor_cfg.name]
+        foot_z = foot_z - torch.mean(scanner.data.ray_hits_w[..., 2], dim=1, keepdim=True)
+
     return torch.sum(torch.square(foot_z - target_height) * ~in_contact, dim=1)
 
 

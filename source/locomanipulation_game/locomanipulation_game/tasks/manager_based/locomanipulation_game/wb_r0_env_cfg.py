@@ -9,6 +9,8 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
+
+from .common.scenes import TerrainSceneCfg, CurriculumCfg
  
 from locomanipulation_game.assets.h1_2 import (
     ARM_JOINTS,
@@ -30,7 +32,6 @@ from .legs_r0_env_cfg import (
     MIN_DIST,
     TRACKING_STD,
     TRUNK,
-    LocoManipulationSceneCfg,
 )
 from .upper_r0_env_cfg import (
     LEFT_EE,
@@ -50,6 +51,8 @@ SELF_COLLISION_BODIES = [
     ".*_knee_link",
 ]
 SELF_COLLISION_THRESHOLD = 20.0
+from .common.scenes import TerrainSceneCfg, CurriculumCfg
+
 
 @configclass
 class WBCommandsCfg:
@@ -61,7 +64,7 @@ class WBCommandsCfg:
         rel_standing_envs=0.05,
         rel_heading_envs=1.0,
         heading_command=False,
-        debug_vis=True,
+        debug_vis=False,
         ranges=mdp.UniformVelocityCommandCfg.Ranges(
             lin_vel_x=(-0.7, 0.7),
             lin_vel_y=(-0.3, 0.3),
@@ -73,7 +76,7 @@ class WBCommandsCfg:
         body_name=LEFT_EE,
         resampling_time_range=(3.0, 5.0),
         make_quat_unique=True,
-        debug_vis=True,
+        debug_vis=False,
         ranges=mdp.UniformPoseCommandCfg.Ranges(
             pos_x=(0.20, 0.45), pos_y=(0.05, 0.45), pos_z=(0.15, 0.55),
             roll=(-0.5, 0.5), pitch=(-0.5, 0.5), yaw=(-0.5, 0.5),
@@ -84,7 +87,7 @@ class WBCommandsCfg:
         body_name=RIGHT_EE,
         resampling_time_range=(3.0, 5.0),
         make_quat_unique=True,
-        debug_vis=True,
+        debug_vis=False,
         ranges=mdp.UniformPoseCommandCfg.Ranges(
             pos_x=(0.20, 0.45), pos_y=(-0.45, -0.05), pos_z=(0.15, 0.55),
             roll=(-0.5, 0.5), pitch=(-0.5, 0.5), yaw=(-0.5, 0.5),
@@ -107,12 +110,28 @@ class WBActionsCfg:
 class WBObservationsCfg:
     @configclass
     class PolicyCfg(ObsGroup):
-        # 295 total: 3+3+3 base state, 3 velocity command, 7+7 pose commands,
-        # 27+27 joints, 187 height scan, 26 actions, 2 gait phase.
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.1, n_max=0.1))
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
+        # 651 total. No base_lin_vel: unmeasurable on the real H1-2 without a
+        # state estimator. height_scan is excluded from the history.
+        base_lin_acc = ObsTerm(
+            func=mdp.imu_lin_acc,
+            params={"asset_cfg": SceneEntityCfg("imu")},
+            noise=Unoise(n_min=-0.5, n_max=0.5),
+            history_length=5,
+            flatten_history_dim=True,
+        )
+        base_ang_vel = ObsTerm(
+            func=mdp.imu_ang_vel,
+            params={"asset_cfg": SceneEntityCfg("imu")},
+            noise=Unoise(n_min=-0.2, n_max=0.2),
+            history_length=5,
+            flatten_history_dim=True,
+        )
         projected_gravity = ObsTerm(
-            func=mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05)
+            func=mdp.imu_projected_gravity,
+            params={"asset_cfg": SceneEntityCfg("imu")},
+            noise=Unoise(n_min=-0.05, n_max=0.05),
+            history_length=5,
+            flatten_history_dim=True,
         )
         velocity_commands = ObsTerm(
             func=mdp.generated_commands, params={"command_name": "base_velocity"}
@@ -125,31 +144,47 @@ class WBObservationsCfg:
         )
         joint_pos = ObsTerm(
             func=mdp.joint_pos_rel,
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS)},
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS, preserve_order=True)},
             noise=Unoise(n_min=-0.01, n_max=0.01),
+            history_length=5,
+            flatten_history_dim=True,
         )
         joint_vel = ObsTerm(
             func=mdp.joint_vel_rel,
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS)},
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS, preserve_order=True)},
             noise=Unoise(n_min=-1.5, n_max=1.5),
+            history_length=5,
+            flatten_history_dim=True,
         )
         height_scan = ObsTerm(
             func=mdp.height_scan,
-            params={"sensor_cfg": SceneEntityCfg("height_scanner")},
+            params={"sensor_cfg": SceneEntityCfg("height_scanner"),
+                    "offset": BASE_HEIGHT_TARGET},
             noise=Unoise(n_min=-0.1, n_max=0.1),
             clip=(-1.0, 1.0),
         )
-        actions = ObsTerm(func=mdp.last_action)
         gait_phase = ObsTerm(
             func=mdp.gait_phase_sin, params={"command_name": "base_velocity"}
         )
+        actions = ObsTerm(func=mdp.last_action, history_length=5, flatten_history_dim=True)
 
- 
+
         def __post_init__(self):
             self.enable_corruption = True
             self.concatenate_terms = True
- 
+
+    @configclass
+    class CriticCfg(ObsGroup):
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
+        projected_gravity = ObsTerm(func=mdp.projected_gravity)
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
     policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
 
 
 @configclass
@@ -318,6 +353,7 @@ class WBRewardsCfg:
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FEET),
             "asset_cfg": SceneEntityCfg("robot", body_names=FEET),
             "target_height": FEET_SWING_HEIGHT,
+            "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
         },
     )
     contact_no_vel = RewTerm(
@@ -463,13 +499,15 @@ class WBTerminationsCfg:
 
 @configclass
 class LocoManipulationWBR0EnvCfg(ManagerBasedRLEnvCfg):
-    scene: LocoManipulationSceneCfg = LocoManipulationSceneCfg(num_envs=4096, env_spacing=2.5)
+    scene: TerrainSceneCfg = TerrainSceneCfg(num_envs=4096, env_spacing=2.5)
     observations: WBObservationsCfg = WBObservationsCfg()
     actions: WBActionsCfg = WBActionsCfg()
     commands: WBCommandsCfg = WBCommandsCfg()
     events: WBEventCfg = WBEventCfg()
     rewards: WBRewardsCfg = WBRewardsCfg()
     terminations: WBTerminationsCfg = WBTerminationsCfg()
+    curriculum: CurriculumCfg = CurriculumCfg()
+
  
     def __post_init__(self):
         self.decimation = 4
@@ -485,3 +523,4 @@ class LocoManipulationWBR0EnvCfg(ManagerBasedRLEnvCfg):
         self.scene.height_scanner.update_period = self.decimation * self.sim.dt
         self.viewer.eye = (4.0, 4.0, 2.5)
         self.viewer.lookat = (0.0, 0.0, 1.0)
+        self.scene.imu.update_period = self.decimation * self.sim.dt
