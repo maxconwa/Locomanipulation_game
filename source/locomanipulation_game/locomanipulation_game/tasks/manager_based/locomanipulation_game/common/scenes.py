@@ -26,7 +26,8 @@ _TERRAIN_COMMON = dict(
     horizontal_scale=0.1,
     vertical_scale=0.005,
     slope_threshold=0.75,
-    use_cache=False,
+    use_cache=True,
+    seed=0,
     curriculum=True,          # required by mdp.terrain_levels_vel
 )
 

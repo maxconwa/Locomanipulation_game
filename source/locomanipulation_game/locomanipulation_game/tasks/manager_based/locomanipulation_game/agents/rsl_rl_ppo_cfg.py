@@ -107,3 +107,37 @@ class LocoManipulationWBR0PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class LocoManipulationUpperAdvR1PPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    """PPO settings for round 0. Copied from Isaac Lab's H1 rough config, which
+    is tuned for a humanoid of roughly this scale."""
+
+    num_steps_per_env = 24
+    max_iterations = 15000
+    save_interval = 200
+    experiment_name = "locoManipulation_upper_adv_r1"
+    obs_groups = {"actor": ["policy"], "critic": ["policy", "critic"]}
+    policy = RslRlPpoActorCriticCfg(
+        init_noise_std=1.0,
+        actor_obs_normalization=False,
+        critic_obs_normalization=False,
+        actor_hidden_dims=[256, 128, 64],
+        critic_hidden_dims=[256, 128, 64],
+        activation="elu",
+    )
+    algorithm = RslRlPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.01,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+    )

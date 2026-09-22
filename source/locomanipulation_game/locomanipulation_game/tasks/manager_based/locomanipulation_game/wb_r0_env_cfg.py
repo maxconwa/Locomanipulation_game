@@ -116,21 +116,21 @@ class WBObservationsCfg:
             func=mdp.imu_lin_acc,
             params={"asset_cfg": SceneEntityCfg("imu")},
             noise=Unoise(n_min=-0.5, n_max=0.5),
-            history_length=5,
+            history_length=3,
             flatten_history_dim=True,
         )
         base_ang_vel = ObsTerm(
             func=mdp.imu_ang_vel,
             params={"asset_cfg": SceneEntityCfg("imu")},
             noise=Unoise(n_min=-0.2, n_max=0.2),
-            history_length=5,
+            history_length=3,
             flatten_history_dim=True,
         )
         projected_gravity = ObsTerm(
             func=mdp.imu_projected_gravity,
             params={"asset_cfg": SceneEntityCfg("imu")},
             noise=Unoise(n_min=-0.05, n_max=0.05),
-            history_length=5,
+            history_length=3,
             flatten_history_dim=True,
         )
         velocity_commands = ObsTerm(
@@ -146,14 +146,14 @@ class WBObservationsCfg:
             func=mdp.joint_pos_rel,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS, preserve_order=True)},
             noise=Unoise(n_min=-0.01, n_max=0.01),
-            history_length=5,
+            history_length=3,
             flatten_history_dim=True,
         )
         joint_vel = ObsTerm(
             func=mdp.joint_vel_rel,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS, preserve_order=True)},
             noise=Unoise(n_min=-1.5, n_max=1.5),
-            history_length=5,
+            history_length=3,
             flatten_history_dim=True,
         )
         height_scan = ObsTerm(
@@ -166,7 +166,7 @@ class WBObservationsCfg:
         gait_phase = ObsTerm(
             func=mdp.gait_phase_sin, params={"command_name": "base_velocity"}
         )
-        actions = ObsTerm(func=mdp.last_action, history_length=5, flatten_history_dim=True)
+        actions = ObsTerm(func=mdp.last_action, history_length=3, flatten_history_dim=True)
 
 
         def __post_init__(self):

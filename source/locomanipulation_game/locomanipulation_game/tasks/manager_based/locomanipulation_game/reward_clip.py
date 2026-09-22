@@ -21,3 +21,13 @@ class PositiveRewardRLEnv(ManagerBasedRLEnv):
             # print(f"[clip] call {self._n}: raw {reward.mean().item():+.4f} -> {clipped.mean().item():+.4f}")
         self.reward_buf = clipped
         return obs, clipped, terminated, truncated, extras
+
+class NegativeRewardRLEnv(ManagerBasedRLEnv):
+    def step(self, action: torch.Tensor):
+            obs, reward, terminated, truncated, extras = super().step(action)
+            clipped = torch.clamp(reward, max=0.0)
+            self._n = getattr(self, "_n", 0) + 1
+            # if self._n % 20 == 0:
+                # print(f"[clip] call {self._n}: raw {reward.mean().item():+.4f} -> {clipped.mean().item():+.4f}")
+            self.reward_buf = clipped
+            return obs, clipped, terminated, truncated, extras

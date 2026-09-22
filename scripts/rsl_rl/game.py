@@ -1,54 +1,124 @@
-"""Run the round-0 curriculum end to end: legs, then upper, then whole body.
+"""Run an ordered schedule of training rounds, handing policies between them.
 
-One subprocess per round. train.py launches Isaac at import and binds its task
-name into the hydra decorator at module scope, so one process can only ever
-host one task. Fail fast: a non-zero exit stops the queue.
+Each entry trains one task, then exports its policy. Tasks declare which
+environment variable they read their frozen opponent from and which one they
+write into, so the schedule is a flat list and the plumbing is a dict:
 
-Nothing is handed between rounds. The three have different observation and
-action dimensions (567/402/651, 12/14/26), so no checkpoint loads into the
-next -- this is a queue, not a curriculum handoff.
+    Legs-R0-v0       consumes nothing            produces LEGS_POLICY_PATH
+    Upper-Adv-R1-v0  consumes LEGS_POLICY_PATH   produces ADV_POLICY_PATH
+    Legs-R1-v0       consumes ADV_POLICY_PATH    produces LEGS_POLICY_PATH
 
-Run from the repo root: train.py writes to a relative logs/rsl_rl/ path.
+A task repeated later in the schedule resumes from its own previous run.
+Fail fast: a non-zero exit stops everything.
 """
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-TRAIN_PY = Path(__file__).parent / "train.py"
+HERE = Path(__file__).parent
+TRAIN, PLAY = HERE / "train.py", HERE / "play.py"
+LOGS = Path("logs/rsl_rl")
 
-# (task, max_iterations)
-ROUNDS = [
-    ("Legs-R0-v0", 15000),
-    ("Upper-R0-v0", 15000),
-    # ("WB-R0-v0", 15000),
+TASKS = {
+    "Legs-R0-v0": {
+        "experiment": "locoManipulation_legs_r0",
+        "consumes": None,
+        "produces": "LEGS_POLICY_PATH",
+    },
+    "Upper-Adv-R1-v0": {
+        "experiment": "locoManipulation_upper_adv_r1",
+        "consumes": "LEGS_POLICY_PATH",
+        "produces": "ADV_POLICY_PATH",
+    },
+    "Legs-R1-v0": {
+        "experiment": "locoManipulation_legs_r0",
+        "consumes": "ADV_POLICY_PATH",
+        "produces": "LEGS_POLICY_PATH",
+    },
+}
+
+SCHEDULE = [
+    ("Legs-R0-v0",      7500),
+    ("Upper-Adv-R1-v0", 7500),
+    ("Legs-R1-v0",      5000),
+    ("Upper-Adv-R1-v0", 5000),
+    ("Legs-R1-v0",      5000),
+    ("Upper-Adv-R1-v0", 5000),
+    ("Legs-R1-v0",      5000),
 ]
 
-parser = argparse.ArgumentParser(
-    description=__doc__,
-    formatter_class=argparse.RawDescriptionHelpFormatter,
-    epilog="Unrecognised arguments pass through to train.py, and come after the\n"
-           "per-round flags, so --max_iterations 5 overrides the table.\n"
-           "Smoke test: python scripts/rsl_rl/game.py --num_envs 4 --max_iterations 5",
-)
-parser.add_argument("--gui", action="store_true", help="Run with a window. Default is headless.")
-parser.add_argument("--dry-run", action="store_true", help="Print each command without running it.")
-args, passthrough = parser.parse_known_args()
+# Seed the pool to skip a round: e.g. start at the adversary by pre-supplying
+# the legs policy and deleting the Legs-R0-v0 entry above.
+POLICIES: dict[str, str] = {}
 
-for i, (task, iterations) in enumerate(ROUNDS, start=1):
-    cmd = [sys.executable, str(TRAIN_PY), f"--task={task}", f"--max_iterations={iterations}"]
-    if not args.gui:
-        cmd.append("--headless")
-    cmd += passthrough
 
-    print(f"\n=== round {i}/{len(ROUNDS)}: {task} ===", flush=True)
+def run(cmd, label):
+    print("  " + " ".join(f"{k}={v}" for k, v in POLICIES.items()), flush=True)
     print("  " + " ".join(cmd), flush=True)
-    if args.dry_run:
+    if subprocess.run(cmd, env={**os.environ, **POLICIES}).returncode != 0:
+        sys.exit(f"\n{label} exited non-zero. Stopping.")
+
+
+def newest_run(experiment):
+    runs = sorted((LOGS / experiment).glob("2*"), key=lambda p: p.name)
+    return runs[-1] if runs else None
+
+
+parser = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+parser.add_argument("--dry-run", action="store_true", help="Print the commands only.")
+parser.add_argument("--start", type=int, default=0, help="Schedule index to start from.")
+parser.add_argument("--smoke", type=int, default=None, help="Override every entry's iterations.")
+parser.add_argument("--num_envs", type=int, default=None, help="Forwarded to train and play.")
+args = parser.parse_args()
+
+seen = set()
+
+for index, (task, iterations) in enumerate(SCHEDULE):
+    spec = TASKS[task]
+    iterations = args.smoke or iterations
+
+    if index < args.start:
+        seen.add(spec["experiment"])
+        done = newest_run(spec["experiment"])
+        if done is not None:
+            POLICIES[spec["produces"]] = str(done / "exported" / "policy.pt")
         continue
 
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        sys.exit(f"\n{task} exited {result.returncode}. Stopping.")
+    if spec["consumes"] and spec["consumes"] not in POLICIES:
+        sys.exit(f"\nStep {index} ({task}) needs {spec['consumes']}, which nothing has produced.")
 
-print(f"\n=== {len(ROUNDS)} rounds complete ===")
+    print(f"\n===== step {index}: {task}  ({iterations} iterations) =====", flush=True)
+
+    train_cmd = [sys.executable, str(TRAIN), f"--task={task}", "--headless",
+                 f"--max_iterations={iterations}",
+                 f"--run_name=s{index:02d}-{task.removesuffix('-v0')}"]
+    if args.num_envs:
+        train_cmd.append(f"--num_envs={args.num_envs}")
+    # Keyed on the experiment, not the task: Legs-R1 shares r0's log root, so
+    # this is what warm-starts it from the r0 run.
+    if spec["experiment"] in seen:
+        train_cmd.append("--resume")
+    seen.add(spec["experiment"])
+
+    # play.py writes exported/policy.pt BEFORE its `while simulation_app
+    # .is_running()` loop, and --video is the only thing that makes that loop
+    # exit. --video_length=1 turns it into a one-step exporter.
+    export_cmd = [sys.executable, str(PLAY), f"--task={task}", "--headless", "--video", "--video_length=1"]
+    if args.num_envs:
+        export_cmd.append(f"--num_envs={args.num_envs}")
+
+    if args.dry_run:
+        print("  " + " ".join(train_cmd) + "\n  " + " ".join(export_cmd), flush=True)
+        POLICIES[spec["produces"]] = f"<step {index} export>"
+        continue
+
+    run(train_cmd, f"train {task}")
+    run(export_cmd, f"export {task}")
+    POLICIES[spec["produces"]] = str(newest_run(spec["experiment"]) / "exported" / "policy.pt")
+    print(f"  {spec['produces']} -> {POLICIES[spec['produces']]}", flush=True)
+
+print(f"\n===== schedule complete ({len(SCHEDULE) - args.start} steps) =====")
