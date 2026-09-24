@@ -95,11 +95,6 @@ _SPAWN_CFG = sim_utils.UsdFileCfg(
         max_angular_velocity=1000.0,
         max_depenetration_velocity=1.0,
     ),
-    collision_props=sim_utils.CollisionPropertiesCfg(
-        collision_enabled=True,
-        contact_offset=0.01,
-        rest_offset=0.0,
-    ),
     articulation_props=sim_utils.ArticulationRootPropertiesCfg(
         enabled_self_collisions=True,
         solver_position_iteration_count=4,
