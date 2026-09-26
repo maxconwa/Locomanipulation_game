@@ -4,7 +4,6 @@ from pathlib import Path
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
-from isaaclab.utils.string import resolve_matching_names
 
 # repo_root/source/locomanipulation_game/locomanipulation_game/assets/h1_2.py
 # parents[0]=assets, [1]=locomanipulation_game, [2]=source/locomanipulation_game, [3]=source, [4]=repo_root
@@ -13,66 +12,107 @@ CL_ASSETS_DIR = Path(os.environ.get("CL_ASSETS_DIR", REPO_ROOT / "third_party" /
 H1_2_MAGPIE_USD = CL_ASSETS_DIR / "isaac_assets/robots/h1_2_magpie/h1_2_magpie.usd"
 
 
-LEG_JOINT_NAMES = [
+
+
+FOOT_JOINT_NAMES = ["left_ankle_roll_joint", "right_ankle_roll_joint"]
+FOOT_LINK_NAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
+
+ANKLE_JOINT_NAMES = ["left_ankle_pitch_joint", "right_ankle_pitch_joint"] + FOOT_JOINT_NAMES
+ANKLE_LINK_NAMES = ["left_ankle_pitch_link", "right_ankle_pitch_link"] + FOOT_LINK_NAMES
+
+
+KNEE_JOINT_NAMES = ["left_knee_joint", "right_knee_joint"]
+KNEE_LINK_NAMES = ["left_knee_link", "right_knee_link"]
+
+HIP_YAW_ROLL_JOINT_NAMES = ["left_hip_yaw_joint", "right_hip_yaw_joint", "left_hip_roll_joint", "right_hip_roll_joint"]
+HIP_YAW_ROLL_LINK_NAMES = ["left_hip_yaw_link", "right_hip_yaw_link", "left_hip_roll_link", "right_hip_roll_link"]
+
+
+HIP_JOINT_NAMES = ["left_hip_pitch_joint", "right_hip_pitch_joint"] + HIP_YAW_ROLL_JOINT_NAMES
+HIP_LINK_NAMES = ["left_hip_pitch_link", "right_hip_pitch_link"] + HIP_YAW_ROLL_LINK_NAMES
+
+# Unitree LowCmd motor order (H1_2_JointIndex in unitree_sdk2_python's h1_2 example).
+# Actions and observations use preserve_order=True on these lists: do not reorder.
+LOWER_JOINT_NAMES = [
     "left_hip_yaw_joint", "left_hip_pitch_joint", "left_hip_roll_joint",
     "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
     "right_hip_yaw_joint", "right_hip_pitch_joint", "right_hip_roll_joint",
     "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
 ]
+LOWER_LINK_NAMES = [
+    "left_hip_yaw_link", "left_hip_pitch_link", "left_hip_roll_link",
+    "left_knee_link", "left_ankle_pitch_link", "left_ankle_roll_link",
+    "right_hip_yaw_link", "right_hip_pitch_link", "right_hip_roll_link",
+    "right_knee_link", "right_ankle_pitch_link", "right_ankle_roll_link",
+]
+
+
+
+SHOULDER_JOINT_NAMES = [
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+]
+SHOULDER_LINK_NAMES = [
+    "left_shoulder_pitch_link", "left_shoulder_roll_link", "left_shoulder_yaw_link",
+    "right_shoulder_pitch_link", "right_shoulder_roll_link", "right_shoulder_yaw_link",
+]
+
+ELBOW_JOINT_NAMES = ["left_elbow_joint", "right_elbow_joint"]
+ELBOW_LINK_NAMES = ["left_elbow_link", "right_elbow_link"]
+
+
+WRIST_JOINT_NAMES = [
+    "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+    "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+]
+WRIST_LINK_NAMES = [
+    "left_wrist_roll_link", "left_wrist_pitch_link", "left_wrist_yaw_link",
+    "right_wrist_roll_link", "right_wrist_pitch_link", "right_wrist_yaw_link",
+]
 
 ARM_JOINT_NAMES = [
     "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
-    "left_elbow_joint",
-    "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+    "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
     "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
-    "right_elbow_joint",
-    "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+    "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+]
+ARM_LINK_NAMES = [
+    "left_shoulder_pitch_link", "left_shoulder_roll_link", "left_shoulder_yaw_link",
+    "left_elbow_link", "left_wrist_roll_link", "left_wrist_pitch_link", "left_wrist_yaw_link",
+    "right_shoulder_pitch_link", "right_shoulder_roll_link", "right_shoulder_yaw_link",
+    "right_elbow_link", "right_wrist_roll_link", "right_wrist_pitch_link", "right_wrist_yaw_link",
 ]
 
-# Never actuated by any round -- held by its actuator alone. Still observed.
-TORSO_JOINTS = ["torso_joint"]
-
-# 27. The observation set, identical across rounds. Legs first so the first 12
-# slots match LOWER_BODY_JOINTS and the arm block sits at a fixed offset.
-# Grippers excluded: locked.
-BODY_JOINTS_NAMES = LEG_JOINT_NAMES + TORSO_JOINTS + ARM_JOINT_NAMES
-
-# Semantic aliases. The *_NAMES lists above are the ordered ground truth; these
-# say what a list MEANS to a round. LOWER/UPPER is the IBR split, BODY is the
-# observation set, CONTROLLED is what the debug task actuates.
-LEG_JOINTS = LEG_JOINT_NAMES
-ARM_JOINTS = ARM_JOINT_NAMES
-BODY_JOINTS = BODY_JOINTS_NAMES
-LOWER_BODY_JOINTS = LEG_JOINT_NAMES
-UPPER_BODY_JOINTS = TORSO_JOINTS + ARM_JOINT_NAMES
-CONTROLLED_JOINTS = BODY_JOINTS_NAMES
+TORSO_JOINTS_NAME = "torso_joint"
+TORSO_LINK_NAME = "torso_link"
+PELVIS_LINK_NAME = "pelvis"
+FINGER_LINK_NAMES = ["lg_left_finger", "lg_right_finger", "rg_left_finger", "rg_right_finger"]
 
 
 
-# Patterns, not lists: the set matters, the order does not. `LEG_ONLY` also
-# expresses an INTENT that survives a joint being added; an explicit list
-# would silently miss it.
-LEG_ONLY = [".*_hip_.*_joint", ".*_knee_joint", ".*_ankle_.*_joint"]
-ANKLE_ONLY = [".*_ankle_.*_joint"]
-HIP_YAW_ROLL = [".*_hip_yaw_joint", ".*_hip_roll_joint"]
+ALL_JOINTS_NAMES = LOWER_JOINT_NAMES + [TORSO_JOINTS_NAME] + ARM_JOINT_NAMES
+ALL_LINKS_NAMES = [PELVIS_LINK_NAME] + LOWER_LINK_NAMES + [TORSO_LINK_NAME] + ARM_LINK_NAMES + FINGER_LINK_NAMES
+
+
+# Real bodies (they move and have mass) with no collision geometry in the USD.
+NO_COLLIDER_LINK_NAMES = [
+    "left_hip_yaw_link", "right_hip_yaw_link",
+    "left_ankle_pitch_link", "right_ankle_pitch_link",
+    "left_wrist_yaw_link", "right_wrist_yaw_link",
+]
+COLLISION_LINK_NAMES = [n for n in ALL_LINKS_NAMES if n not in NO_COLLIDER_LINK_NAMES]
+
+
+
+
+CONTROLLED_JOINTS = LOWER_JOINT_NAMES + ARM_JOINT_NAMES
+CONTROLLED_LINKS = LOWER_LINK_NAMES + ARM_LINK_NAMES
+
+
+
 
 # Must stay a pattern: the hinge count depends on the Magpie USD.
 GRIPPER_JOINTS = ["[lr]g_.*_hinge_.*"]
-
-# Body names, verified against the check_h1_2.py body list.
-FEET = ".*_ankle_roll_link"
-KNEES = ".*_knee_link"
-TRUNK = ["pelvis", "torso_link"]
-
-LEFT_EE = "left_wrist_yaw_link"
-RIGHT_EE = "right_wrist_yaw_link"
-
-
-LIVOX_MOUNT_POS = (0.04874, 0.0, 0.67980)
-LIVOX_MOUNT_ROT = (0.99280, 0.0, 0.11979, 0.0)   # (w,x,y,z), 13.76 deg nose-down
-IMU_MOUNT_POS = (-0.04452, -0.01891, 0.27756)
-
-LIVOX_VFOV_DEG = (-7.0, 52.0)   # Mid-360 datasheet
 
 STANDING_PELVIS_HEIGHT = 1.0024
 SOLE_OFFSET = 0.0450
@@ -125,7 +165,7 @@ _INIT_STATE = ArticulationCfg.InitialStateCfg(
 
 _ACTUATORS = {
     "legs": ImplicitActuatorCfg(
-        joint_names_expr=[".*_hip_.*_joint", ".*_knee_joint"],
+        joint_names_expr=HIP_JOINT_NAMES + KNEE_JOINT_NAMES,
         effort_limit_sim={".*_hip_.*_joint": 200.0, ".*_knee_joint": 300.0},
         velocity_limit_sim={".*_hip_.*_joint": 23.0, ".*_knee_joint": 14.0},
         stiffness={".*_hip_.*_joint": 200.0, ".*_knee_joint": 300.0},
@@ -133,7 +173,7 @@ _ACTUATORS = {
         armature=0.01,
     ),
     "feet": ImplicitActuatorCfg(
-        joint_names_expr=ANKLE_ONLY,
+        joint_names_expr=ANKLE_JOINT_NAMES,
         effort_limit_sim={".*_ankle_pitch_joint": 60.0, ".*_ankle_roll_joint": 40.0},
         velocity_limit_sim=9.0,
         stiffness=40.0,
@@ -141,7 +181,7 @@ _ACTUATORS = {
         armature=0.01,
     ),
     "torso": ImplicitActuatorCfg(
-        joint_names_expr=TORSO_JOINTS,
+        joint_names_expr=[TORSO_JOINTS_NAME],
         effort_limit_sim=200.0,
         velocity_limit_sim=23.0,
         stiffness=300.0,

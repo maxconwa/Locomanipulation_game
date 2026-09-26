@@ -8,20 +8,21 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
-from locomanipulation_game.assets.h1_2 import ARM_JOINTS, BODY_JOINTS
+from locomanipulation_game.assets.h1_2 import ARM_JOINT_NAMES, ALL_JOINTS_NAMES
 
 from . import mdp
 from .common.scenes import TerrainSceneCfg
+from .common.reward_cfg import LowerRewardsCfg
 from .legs_r0_env_cfg import (
     CommandsCfg,
     EventCfg,
     LocoManipulationLegsR0EnvCfg,
-    LowerRewardsCfg,
     TerminationsCfg,
 )
+from .agents.rsl_rl_ppo_cfg import LocoManipulationLegsPPORunnerCfg
 
 LEGS_POLICY_PATH = os.environ.get(
-    "LEGS_POLICY_PATH", mdp.latest_export("locoManipulation_legs_r0")
+    "LEGS_POLICY_PATH", mdp.latest_export(LocoManipulationLegsPPORunnerCfg().experiment_name)
 )
 # Instantiated, not the class: the nested ObservationManager needs concrete
 # term configs, and the action term needs a built JointPositionActionCfg.
@@ -33,7 +34,7 @@ class AdvActionsCfg:
     # 14. The frozen term is action_dim 0, so the whole agent vector lands here.
     arm_pos = mdp.JointPositionActionCfg(
         asset_name="robot",
-        joint_names=ARM_JOINTS,
+        joint_names=ARM_JOINT_NAMES,
         scale=0.25,
         use_default_offset=True,
         preserve_order=True,
@@ -79,14 +80,14 @@ class AdvObservationsCfg:
         )
         joint_pos = ObsTerm(
             func=mdp.joint_pos_rel,
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS, preserve_order=True)},
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=ALL_JOINTS_NAMES, preserve_order=True)},
             noise=Unoise(n_min=-0.01, n_max=0.01),
             history_length=3,
             flatten_history_dim=True,
         )
         joint_vel = ObsTerm(
             func=mdp.joint_vel_rel,
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS, preserve_order=True)},
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=ALL_JOINTS_NAMES, preserve_order=True)},
             noise=Unoise(n_min=-1.5, n_max=1.5),
             history_length=3,
             flatten_history_dim=True,
@@ -132,7 +133,7 @@ class AdvRewardsCfg(LowerRewardsCfg):
 
 
 @configclass
-class LocoManipulationUpperAdvR1EnvCfg(ManagerBasedRLEnvCfg):
+class LocoManipulationUpperAdvRiEnvCfg(ManagerBasedRLEnvCfg):
     scene: TerrainSceneCfg = TerrainSceneCfg(num_envs=4096, env_spacing=2.5)
     observations: AdvObservationsCfg = AdvObservationsCfg()
     actions: AdvActionsCfg = AdvActionsCfg()

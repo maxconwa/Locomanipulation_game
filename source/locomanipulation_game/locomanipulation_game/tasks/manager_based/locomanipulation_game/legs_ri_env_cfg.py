@@ -1,40 +1,41 @@
-"""Round 1: the legs retrained against the frozen upper-body adversary."""
+"""Round i: the legs retrained against the frozen upper-body adversary."""
 
 import os
 
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.utils import configclass
 
-from locomanipulation_game.assets.h1_2 import LOWER_BODY_JOINTS
+from locomanipulation_game.assets.h1_2 import LOWER_JOINT_NAMES
 
 from . import mdp
 from .common.scenes import CurriculumCfg, TerrainSceneCfg
+from .common.reward_cfg import LowerRewardsCfg
 from .legs_r0_env_cfg import (
     CommandsCfg,
     EventCfg,
-    LowerRewardsCfg,
     ObservationsCfg,
     TerminationsCfg,
 )
-from .upper_adv_r1_env_cfg import LocoManipulationUpperAdvR1EnvCfg
+from .agents.rsl_rl_ppo_cfg import LocoManipulationUpperPPORunnerCfg
+from .upper_adv_ri_env_cfg import LocoManipulationUpperAdvRiEnvCfg
 
 ADV_POLICY_PATH = os.environ.get(
-    "ADV_POLICY_PATH", mdp.latest_export("locoManipulation_upper_adv_r1")
+    "ADV_POLICY_PATH", mdp.latest_export(LocoManipulationUpperPPORunnerCfg().experiment_name)
 )
 
 # Only arm_pos and observations.policy are read. The nested legs term inside
 # AdvActionsCfg is never built, so no second policy is loaded.
-ADV_CFG = LocoManipulationUpperAdvR1EnvCfg()
+ADV_CFG = LocoManipulationUpperAdvRiEnvCfg()
 
 
 @configclass
-class LegsR1ActionsCfg:
+class LegsRiActionsCfg:
     # Named joint_pos, not legs_pos: ankle_action_rate_l2 resolves
     # get_term("joint_pos") and looks the ankles up in its _joint_names. With
     # the 12 leg joints under that name the r0 reward set works unmodified.
     joint_pos = mdp.JointPositionActionCfg(
         asset_name="robot",
-        joint_names=LOWER_BODY_JOINTS,
+        joint_names=LOWER_JOINT_NAMES,
         scale=0.25,
         use_default_offset=True,
         preserve_order=True,
@@ -49,10 +50,10 @@ class LegsR1ActionsCfg:
 
 
 @configclass
-class LocoManipulationLegsR1EnvCfg(ManagerBasedRLEnvCfg):
+class LocoManipulationLegsRiEnvCfg(ManagerBasedRLEnvCfg):
     scene: TerrainSceneCfg = TerrainSceneCfg(num_envs=4096, env_spacing=2.5)
     observations: ObservationsCfg = ObservationsCfg()
-    actions: LegsR1ActionsCfg = LegsR1ActionsCfg()
+    actions: LegsRiActionsCfg = LegsRiActionsCfg()
     commands: CommandsCfg = CommandsCfg()
     events: EventCfg = EventCfg()
     rewards: LowerRewardsCfg = LowerRewardsCfg()

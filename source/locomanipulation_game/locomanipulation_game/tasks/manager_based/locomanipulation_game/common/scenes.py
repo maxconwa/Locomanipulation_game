@@ -9,7 +9,7 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg, ImuCfg, RayCasterCfg, patterns
 
 
-from locomanipulation_game.assets.h1_2 import H1_2_MAGPIE_CFG
+from locomanipulation_game.assets.h1_2 import H1_2_MAGPIE_CFG, COLLISION_LINK_NAMES
 
 from isaaclab.utils import configclass
 
@@ -18,7 +18,9 @@ from .. import mdp
 
 
 HEIGHT_SCAN_RAISE = 20.0
-
+SELF_CONTACT_LINK_NAMES = COLLISION_LINK_NAMES[:-1]
+SELF_CONTACT_SENSOR_NAMES = [f"self_contact_{link}" for link in SELF_CONTACT_LINK_NAMES]
+CONTACT_HISTORY = 4 # >= env decimation: one slot per physics substep
 
 _TERRAIN_COMMON = dict(
     size=(8.0, 8.0),
@@ -101,7 +103,7 @@ class TerrainSceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = H1_2_MAGPIE_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
     # All bodies: the reward terms need feet, knees, pelvis and torso.
     contact_forces = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True
+        prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=CONTACT_HISTORY, track_air_time=True
     )
     light = AssetBaseCfg(
         prim_path="/World/light",
@@ -119,13 +121,17 @@ class TerrainSceneCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/Robot/imu_link",
         debug_vis=False,
     )
-
-
-
-@configclass
-class FlatSceneCfg(TerrainSceneCfg):
     def __post_init__(self):
-        self.terrain.terrain_generator = TERRAINS_FLAT_CFG
+        # PhysX filters one body against many, never many against many, so each
+        # link gets its own sensor. Each filters only against the links after it
+        # in COLLISION_LINK_NAMES, so every pair is reported by exactly one sensor.
+        for i, link in enumerate(SELF_CONTACT_LINK_NAMES):
+            setattr(self, SELF_CONTACT_SENSOR_NAMES[i], ContactSensorCfg(
+                prim_path="{ENV_REGEX_NS}/Robot/" + link,
+                filter_prim_paths_expr=["{ENV_REGEX_NS}/Robot/" + other for other in COLLISION_LINK_NAMES[i + 1:]], #slice avoids double counting contacts
+                history_length=CONTACT_HISTORY,
+            ))
+
 
 @configclass
 class CurriculumCfg:

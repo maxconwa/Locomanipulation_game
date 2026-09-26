@@ -5,8 +5,8 @@ environment variable they read their frozen opponent from and which one they
 write into, so the schedule is a flat list and the plumbing is a dict:
 
     Legs-R0-v0       consumes nothing            produces LEGS_POLICY_PATH
-    Upper-Adv-R1-v0  consumes LEGS_POLICY_PATH   produces ADV_POLICY_PATH
-    Legs-R1-v0       consumes ADV_POLICY_PATH    produces LEGS_POLICY_PATH
+    Upper-Adv-Ri-v0  consumes LEGS_POLICY_PATH   produces ADV_POLICY_PATH
+    Legs-Ri-v0       consumes ADV_POLICY_PATH    produces LEGS_POLICY_PATH
 
 A task repeated later in the schedule resumes from its own previous run.
 Fail fast: a non-zero exit stops everything.
@@ -25,17 +25,17 @@ LOGS = Path("logs/rsl_rl")
 
 TASKS = {
     "Legs-R0-v0": {
-        "experiment": "locoManipulation_legs_r0",
+        "experiment": "locoManipulation_legs",
         "consumes": None,
         "produces": "LEGS_POLICY_PATH",
     },
-    "Upper-Adv-R1-v0": {
-        "experiment": "locoManipulation_upper_adv_r1",
+    "Upper-Adv-Ri-v0": {
+        "experiment": "locoManipulation_upper",
         "consumes": "LEGS_POLICY_PATH",
         "produces": "ADV_POLICY_PATH",
     },
-    "Legs-R1-v0": {
-        "experiment": "locoManipulation_legs_r0",
+    "Legs-Ri-v0": {
+        "experiment": "locoManipulation_legs",
         "consumes": "ADV_POLICY_PATH",
         "produces": "LEGS_POLICY_PATH",
     },
@@ -43,12 +43,12 @@ TASKS = {
 
 SCHEDULE = [
     ("Legs-R0-v0",      7500),
-    ("Upper-Adv-R1-v0", 7500),
-    ("Legs-R1-v0",      5000),
-    ("Upper-Adv-R1-v0", 5000),
-    ("Legs-R1-v0",      5000),
-    ("Upper-Adv-R1-v0", 5000),
-    ("Legs-R1-v0",      5000),
+    ("Upper-Adv-Ri-v0", 7500),
+    ("Legs-Ri-v0",      5000),
+    #("Upper-Adv-Ri-v0", 5000),
+    #("Legs-Ri-v0",      5000),
+    #("Upper-Adv-Ri-v0", 5000),
+    #("Legs-Ri-v0",      5000),
 ]
 
 # Seed the pool to skip a round: e.g. start at the adversary by pre-supplying
@@ -80,7 +80,8 @@ def run(cmd, label, experiment=None, stall_s=2400, timeout_s=None):
             if it != seen:
                 seen, moved = it, now
             elif now - moved > stall_s:
-                print(f"  {label}: no new checkpoint in {stall_s}s, killing.", flush=True)
+                print(f"  {label}: no new checkpoint in {stall_s}s, dumping stack.", flush=True)
+                subprocess.run(["py-spy", "dump", "--pid", str(proc.pid)])
                 proc.kill()
                 break
     return proc.wait()
