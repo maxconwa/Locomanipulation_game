@@ -45,10 +45,10 @@ SCHEDULE = [
     ("Legs-R0-v0",      7500),
     ("Upper-Adv-Ri-v0", 7500),
     ("Legs-Ri-v0",      5000),
-    #("Upper-Adv-Ri-v0", 5000),
-    #("Legs-Ri-v0",      5000),
-    #("Upper-Adv-Ri-v0", 5000),
-    #("Legs-Ri-v0",      5000),
+    ("Upper-Adv-Ri-v0", 5000),
+    ("Legs-Ri-v0",      5000),
+    ("Upper-Adv-Ri-v0", 5000),
+    ("Legs-Ri-v0",      5000),
 ]
 
 # Seed the pool to skip a round: e.g. start at the adversary by pre-supplying
@@ -81,7 +81,7 @@ def run(cmd, label, experiment=None, stall_s=2400, timeout_s=None):
                 seen, moved = it, now
             elif now - moved > stall_s:
                 print(f"  {label}: no new checkpoint in {stall_s}s, dumping stack.", flush=True)
-                subprocess.run(["py-spy", "dump", "--pid", str(proc.pid)])
+                subprocess.run(["py-spy", "dump", "--native", "--pid", str(proc.pid)])
                 proc.kill()
                 break
     return proc.wait()
