@@ -114,12 +114,12 @@ class TerrainSceneCfg(InteractiveSceneCfg):
         offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, HEIGHT_SCAN_RAISE)),
         ray_alignment="yaw",
         pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=(1.6, 1.0)),
-        debug_vis=False,
+        debug_vis=True,
         mesh_prim_paths=["/World/ground"],
     )
     imu = ImuCfg(
         prim_path="{ENV_REGEX_NS}/Robot/imu_link",
-        debug_vis=False,
+        debug_vis=True,
     )
     def __post_init__(self):
         # PhysX filters one body against many, never many against many, so each

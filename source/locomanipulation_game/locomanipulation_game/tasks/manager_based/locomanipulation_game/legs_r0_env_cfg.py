@@ -39,7 +39,7 @@ class CommandsCfg:
         # inactive without them.
         rel_standing_envs=0.05,
         heading_command=False,   # theta is a yaw RATE, like a joystick
-        debug_vis=False,
+        debug_vis=True,
         ranges=mdp.UniformVelocityCommandCfg.Ranges(
             lin_vel_x=(-0.7, 0.7),   # ALMI ranges
             lin_vel_y=(-0.3, 0.3),
