@@ -8,10 +8,10 @@ from locomanipulation_game.assets.h1_2 import LOWER_JOINT_NAMES
 from . import mdp
 from .common.scenes import CurriculumCfg, TerrainSceneCfg
 from .common.reward_cfg import LowerRewardsCfg
+from .common.observations import ObservationsCfg
 from .legs_r0_env_cfg import (
     CommandsCfg,
     EventCfg,
-    ObservationsCfg,
     TerminationsCfg,
 )
 from .upper_adv_ri_env_cfg import LocoManipulationUpperAdvRiEnvCfg
