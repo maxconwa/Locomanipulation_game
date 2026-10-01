@@ -1,7 +1,5 @@
 """Round i: the legs retrained against the frozen upper-body adversary."""
 
-import os
-
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.utils import configclass
 
@@ -16,15 +14,8 @@ from .legs_r0_env_cfg import (
     ObservationsCfg,
     TerminationsCfg,
 )
-from .agents.rsl_rl_ppo_cfg import LocoManipulationUpperPPORunnerCfg
 from .upper_adv_ri_env_cfg import LocoManipulationUpperAdvRiEnvCfg
 
-ADV_POLICY_PATH = os.environ.get(
-    "ADV_POLICY_PATH", mdp.latest_export(LocoManipulationUpperPPORunnerCfg().experiment_name)
-)
-
-# Only arm_pos and observations.policy are read. The nested legs term inside
-# AdvActionsCfg is never built, so no second policy is loaded.
 ADV_CFG = LocoManipulationUpperAdvRiEnvCfg()
 
 
@@ -40,9 +31,8 @@ class LegsRiActionsCfg:
         use_default_offset=True,
         preserve_order=True,
     )
-    arms = mdp.FrozenPolicyActionCfg(
+    opponent = mdp.FrozenPolicyActionCfg(
         asset_name="robot",
-        policy_path=ADV_POLICY_PATH,
         low_level_decimation=4,
         low_level_actions=ADV_CFG.actions.arm_pos,
         low_level_observations=ADV_CFG.observations.policy,

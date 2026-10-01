@@ -1,5 +1,3 @@
-import os
-
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -19,13 +17,6 @@ from .legs_r0_env_cfg import (
     LocoManipulationLegsR0EnvCfg,
     TerminationsCfg,
 )
-from .agents.rsl_rl_ppo_cfg import LocoManipulationLegsPPORunnerCfg
-
-LEGS_POLICY_PATH = os.environ.get(
-    "LEGS_POLICY_PATH", mdp.latest_export(LocoManipulationLegsPPORunnerCfg().experiment_name)
-)
-# Instantiated, not the class: the nested ObservationManager needs concrete
-# term configs, and the action term needs a built JointPositionActionCfg.
 LEGS_CFG = LocoManipulationLegsR0EnvCfg()
 
 
@@ -39,9 +30,8 @@ class AdvActionsCfg:
         use_default_offset=True,
         preserve_order=True,
     )
-    legs = mdp.FrozenPolicyActionCfg(
+    opponent = mdp.FrozenPolicyActionCfg(
         asset_name="robot",
-        policy_path=LEGS_POLICY_PATH,
         low_level_decimation=4,
         low_level_actions=LEGS_CFG.actions.joint_pos,
         low_level_observations=LEGS_CFG.observations.policy,
@@ -117,19 +107,15 @@ class AdvObservationsCfg:
 
 @configclass
 class AdvRewardsCfg(LowerRewardsCfg):
-    """-1 x the legs round's reward, plus the adversary's own effort costs.
-
-    Inherited rather than restated: a term added to LowerRewardsCfg becomes one
-    the adversary is automatically paid to defeat.
-    """
+    """-1 x the legs round's reward, plus the adversary's own effort costs."""
     def __post_init__(self):
         inherited = set(LowerRewardsCfg.__dataclass_fields__)
         for name, term in self.__dict__.items():
             if name in inherited and isinstance(term, RewTerm):
                 term.weight = -term.weight
-
         self.action_rate.weight = 0.0
         self.ankle_action_rate.weight = 0.0
+
 
 
 @configclass

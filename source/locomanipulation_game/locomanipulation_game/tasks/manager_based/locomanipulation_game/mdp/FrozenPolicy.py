@@ -13,19 +13,11 @@ from isaaclab.utils import configclass
 
 from isaaclab.utils.assets import check_file_path, read_file
 
-from locomanipulation_game.assets.h1_2 import REPO_ROOT
-
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-__all__ = ["FrozenPolicyAction", "FrozenPolicyActionCfg", "latest_export"]
+__all__ = ["FrozenPolicyAction", "FrozenPolicyActionCfg"]
 
-
-def latest_export(experiment: str) -> str:
-    """Newest exported policy in an experiment's log root; a missing path if none."""
-    root = REPO_ROOT / "logs/rsl_rl" / experiment
-    runs = sorted(p for p in root.glob("2*") if (p / "exported/policy.pt").is_file())
-    return str(runs[-1] / "exported/policy.pt" if runs else root / "NO_EXPORT/policy.pt")
 
 class FrozenPolicyAction(ActionTerm):
     """Runs an exported policy that consumes none of the agent's action vector.

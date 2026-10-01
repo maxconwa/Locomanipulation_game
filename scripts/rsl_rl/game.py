@@ -1,190 +1,196 @@
-"""Run an ordered schedule of training rounds, handing policies between them.
+"""Run an ordered schedule of training rounds in one process, handing policies between them.
 
-Each entry trains one task, then exports its policy. Tasks declare which
-environment variable they read their frozen opponent from and which one they
-write into, so the schedule is a flat list and the plumbing is a dict:
+Everything one game produces lives in one folder, one subfolder per step:
 
-    Legs-R0-v0       consumes nothing            produces LEGS_POLICY_PATH
-    Upper-Adv-Ri-v0  consumes LEGS_POLICY_PATH   produces ADV_POLICY_PATH
-    Legs-Ri-v0       consumes ADV_POLICY_PATH    produces LEGS_POLICY_PATH
+    logs/<game>/               --game NAME, or one past the highest game_run<N>
+        game.log               console output (Python and Kit)
+        s00-Legs-R0/           checkpoints, params/, TensorBoard events, exported/
+        s01-Upper-Adv-Ri/
+        ...
 
-A task repeated later in the schedule resumes from its own previous run.
-Fail fast: a non-zero exit stops everything.
+Each step trains one task against the frozen opponent it consumes, then exports
+the policy it produces:
+
+    Legs-R0-v0       consumes nothing   produces legs
+    Upper-Adv-Ri-v0  consumes legs      produces adv
+    Legs-Ri-v0       consumes adv       produces legs
+
+A task repeated later in the schedule resumes from its own previous step.
+Continue a game after a crash with --game <name> --start <step>. A step whose
+folder already exists is never overwritten: move it aside first.
+Fail fast: an exception stops everything.
 """
 
 import argparse
+import atexit
 import os
-import subprocess
 import sys
-import time
+import threading
 from pathlib import Path
 
-HERE = Path(__file__).parent
-TRAIN, PLAY = HERE / "train.py", HERE / "play.py"
-LOGS = Path("logs/rsl_rl")
+from isaaclab.app import AppLauncher
+
+LOGS = Path("logs")
 
 TASKS = {
     "Legs-R0-v0": {
         "experiment": "locoManipulation_legs",
         "consumes": None,
-        "produces": "LEGS_POLICY_PATH",
+        "produces": "legs",
     },
     "Upper-Adv-Ri-v0": {
         "experiment": "locoManipulation_upper",
-        "consumes": "LEGS_POLICY_PATH",
-        "produces": "ADV_POLICY_PATH",
+        "consumes": "legs",
+        "produces": "adv",
     },
     "Legs-Ri-v0": {
         "experiment": "locoManipulation_legs",
-        "consumes": "ADV_POLICY_PATH",
-        "produces": "LEGS_POLICY_PATH",
+        "consumes": "adv",
+        "produces": "legs",
     },
 }
 
 SCHEDULE = [
+    #Round 0
     ("Legs-R0-v0",      7500),
+    #Round 1
     ("Upper-Adv-Ri-v0", 7500),
     ("Legs-Ri-v0",      5000),
+    #Round 2
     ("Upper-Adv-Ri-v0", 5000),
     ("Legs-Ri-v0",      5000),
+    #Round 3
     ("Upper-Adv-Ri-v0", 5000),
     ("Legs-Ri-v0",      5000),
 ]
 
-# Seed the pool to skip a round: e.g. start at the adversary by pre-supplying
-# the legs policy and deleting the Legs-R0-v0 entry above.
-POLICIES: dict[str, str] = {}
+POLICIES: dict[str, str] = {}   # "legs" / "adv" -> exported policy.pt
+LAST_RUN: dict[str, str] = {}   # experiment -> its latest step folder in this game
 
 
-def run(cmd, label, experiment=None, stall_s=2400, timeout_s=None):
-    """Child inherits stdout; PYTHONUNBUFFERED keeps it live under tee.
-
-    experiment: kill if its log root gains no new checkpoint for stall_s.
-    timeout_s:  hard wall-clock cap, for the export (which saves nothing).
-    """
-    print("  " + " ".join(f"{k}={v}" for k, v in POLICIES.items()), flush=True)
-    print("  " + " ".join(cmd), flush=True)
-    proc = subprocess.Popen(cmd, env={**os.environ, "PYTHONUNBUFFERED": "1", **POLICIES})
-    started = moved = time.time()
-    seen = None
-    while proc.poll() is None:
-        time.sleep(30)
-        now = time.time()
-        if timeout_s and now - started > timeout_s:
-            print(f"  {label}: {timeout_s}s wall clock exceeded, killing.", flush=True)
-            proc.kill()
-            break
-        if experiment:
-            d = newest_run(experiment)
-            it = last_iteration(d) if d else None
-            if it != seen:
-                seen, moved = it, now
-            elif now - moved > stall_s:
-                print(f"  {label}: no new checkpoint in {stall_s}s, dumping stack.", flush=True)
-                subprocess.run(["py-spy", "dump", "--native", "--pid", str(proc.pid)])
-                proc.kill()
-                break
-    return proc.wait()
+def step_name(index, task):
+    return f"s{index:02d}-{task.removesuffix('-v0')}"
 
 
-def newest_run(experiment):
-    runs = sorted((LOGS / experiment).glob("2*"), key=lambda p: p.name)
-    return runs[-1] if runs else None
+def next_game_dir():
+    """logs/game_run<N>, one past the highest N already there."""
+    taken = [int(p.name.removeprefix("game_run")) for p in LOGS.glob("game_run*")
+             if p.name.removeprefix("game_run").isdigit()]
+    return LOGS / f"game_run{max(taken, default=0) + 1}"
 
 
-def last_iteration(run_dir):
-    """Highest model_<n>.pt in a run directory, or None if it saved nothing."""
-    saved = [int(p.stem.split("_")[1]) for p in run_dir.glob("model_*.pt")]
-    return max(saved) if saved else None
+def tee_output(path):
+    """Copy fds 1 and 2 (Python's and Kit's C++ output) into path while still
+    printing to the terminal. Returns a function that flushes and stops the copy."""
+    log = open(path, "ab", buffering=0)
+    terminal = os.dup(1)
+    read_end, write_end = os.pipe()
+    os.dup2(write_end, 1)
+    os.dup2(write_end, 2)
+    os.close(write_end)
+    # fd 1 is a pipe now, which Python would otherwise block-buffer
+    sys.stdout.reconfigure(line_buffering=True)
 
+    def pump():
+        while chunk := os.read(read_end, 65536):
+            os.write(terminal, chunk)
+            log.write(chunk)
 
-def train_command(task, index, iterations, resume_run=None):
-    cmd = [sys.executable, str(TRAIN), f"--task={task}", "--headless",
-           f"--max_iterations={iterations}",
-           f"--run_name=s{index:02d}-{task.removesuffix('-v0')}"]
-    if args.num_envs:
-        cmd.append(f"--num_envs={args.num_envs}")
-    if resume_run:
-        cmd += ["--resume", f"--load_run={resume_run}"]
-    return cmd
+    thread = threading.Thread(target=pump, daemon=True)
+    thread.start()
+
+    def stop():
+        if log.closed:
+            return
+        sys.stdout.flush()
+        sys.stderr.flush()
+        # point 1 and 2 back at the terminal; with the pipe's last writers gone, pump() reads EOF
+        os.dup2(terminal, 1)
+        os.dup2(terminal, 2)
+        thread.join(timeout=5)
+        log.close()
+
+    return stop
 
 
 parser = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-parser.add_argument("--dry-run", action="store_true", help="Print the commands only.")
+parser.add_argument("--game", default=None, help="Game folder under logs/; default: the next game_run<N>.")
+parser.add_argument("--dry-run", action="store_true", help="Print the plan only; doesn't start Kit.")
 parser.add_argument("--start", type=int, default=0, help="Schedule index to start from.")
 parser.add_argument("--smoke", type=int, default=None, help="Override every entry's iterations.")
-parser.add_argument("--num_envs", type=int, default=None, help="Forwarded to train and play.")
-parser.add_argument("--resume-from", action="append", default=[], metavar="EXPERIMENT=RUN",
-                    help="Pin an experiment's prior run; repeatable. Use with --start.")
+parser.add_argument("--num_envs", type=int, default=None, help="Override every task's num_envs.")
+AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
+args.headless = True
 
-LAST_RUN: dict[str, str] = {}
-for pair in args.resume_from:
-    experiment, _, run_dir = pair.partition("=")
-    LAST_RUN[experiment] = run_dir
+game_dir = LOGS / args.game if args.game else next_game_dir()
+
+# Refuse before Kit starts: an existing step folder holds an earlier attempt.
+for index, (task, _) in enumerate(SCHEDULE):
+    if index >= args.start and (game_dir / step_name(index, task)).exists():
+        sys.exit(f"{game_dir / step_name(index, task)} already exists; move it aside to rerun step {index}.")
+
+if not args.dry_run:
+    game_dir.mkdir(parents=True, exist_ok=True)
+    stop_tee = tee_output(game_dir / "game.log")
+    # atexit runs after an uncaught exception's traceback is printed, so crashes land in game.log
+    atexit.register(stop_tee)
+    simulation_app = AppLauncher(args).app
+    # after AppLauncher: both import isaaclab
+    from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
+    from train_lib import train
+
+print(f"game: {game_dir.resolve()}", flush=True)
 
 for index, (task, iterations) in enumerate(SCHEDULE):
     spec = TASKS[task]
     iterations = args.smoke or iterations
+    step = step_name(index, task)
+    export = game_dir / step / "exported" / "policy.pt"
 
     if index < args.start:
-        pinned = LAST_RUN.get(spec["experiment"])
-        done = (LOGS / spec["experiment"] / pinned) if pinned else newest_run(spec["experiment"])
-        if done is not None:
-            LAST_RUN[spec["experiment"]] = done.name
-            POLICIES[spec["produces"]] = str(done.resolve() / "exported" / "policy.pt")
+        # only finished steps count: train() exports after the last iteration
+        if export.is_file():
+            LAST_RUN[spec["experiment"]] = step
+            POLICIES[spec["produces"]] = str(export.resolve())
         continue
 
     if spec["consumes"] and spec["consumes"] not in POLICIES:
-        sys.exit(f"\nStep {index} ({task}) needs {spec['consumes']}, which nothing has produced.")
-
-    print(f"\n===== step {index}: {task}  ({iterations} iterations) =====", flush=True)
+        sys.exit(f"\nStep {index} ({task}) needs a {spec['consumes']} policy, which nothing in "
+                 f"{game_dir} has produced. To continue a game, pass its --game.")
 
     resume_run = LAST_RUN.get(spec["experiment"])
-    start_it = last_iteration(LOGS / spec["experiment"] / resume_run) if resume_run else None
-    # rsl-rl runs range(start, start + N), so the last checkpoint is N-1.
-    target = (start_it or 0) + iterations - 1
-    train_cmd = train_command(task, index, iterations, resume_run)
-
-
-    # play.py writes exported/policy.pt BEFORE its `while simulation_app
-    # .is_running()` loop, and --video is the only thing that makes that loop
-    # exit. --video_length=1 turns it into a one-step exporter.
-    export_cmd = [sys.executable, str(PLAY), f"--task={task}", "--headless", "--video", "--video_length=1"]
-    if args.num_envs:
-        export_cmd.append(f"--num_envs={args.num_envs}")
+    opponent_path = POLICIES.get(spec["consumes"])
+    print(f"\n===== step {index}: {task}  ({iterations} iterations) =====", flush=True)
+    print(f"  resume={resume_run}  opponent={opponent_path}", flush=True)
 
     if args.dry_run:
-        print("  " + " ".join(train_cmd) + "\n  " + " ".join(export_cmd), flush=True)
-        # Stand-ins, so later steps print the --load_run they would really get.
-        LAST_RUN[spec["experiment"]] = f"<step{index}-run>"
-        POLICIES[spec["produces"]] = f"<step {index} export>"
+        # step folders are deterministic, so later steps print the paths they would really use
+        LAST_RUN[spec["experiment"]] = step
+        POLICIES[spec["produces"]] = str(export)
         continue
 
-    if run(train_cmd, f"train {task}", experiment=spec["experiment"]) != 0:
-        crashed = newest_run(spec["experiment"])
-        got = last_iteration(crashed) if crashed else None
-        if got is None:                       # died before the first save
-            retry_run, remaining = resume_run, iterations
-        else:
-            retry_run, remaining = crashed.name, target - got
-        if remaining > 0:
-            print(f"  crashed at {target - remaining}/{target}; retrying {remaining} from "
-                  f"{retry_run}", flush=True)
-            if run(train_command(task, index, remaining, retry_run),
-                   f"retry {task}", experiment=spec["experiment"]) != 0:
-                sys.exit(f"\ntrain {task} failed twice. Stopping.")
-        else:
-            print(f"  non-zero exit but reached {target}; continuing.", flush=True)
+    env_cfg = load_cfg_from_registry(task, "env_cfg_entry_point")
+    agent_cfg = load_cfg_from_registry(task, "rsl_rl_cfg_entry_point")
+    agent_cfg.max_iterations = iterations
+    agent_cfg.run_name = step
+    if resume_run:
+        agent_cfg.resume = True
+        # a regex matched inside game_dir; "$" so s02-Legs-Ri can't also match a moved-aside s02-Legs-Ri.old
+        agent_cfg.load_run = f"{resume_run}$"
+    if args.num_envs:
+        env_cfg.scene.num_envs = args.num_envs
+    env_cfg.sim.device = args.device
 
-    if run(export_cmd, f"export {task}", timeout_s=1800) != 0:
-        sys.exit(f"\nexport {task} failed. Stopping.")
+    _, export_path = train(task, env_cfg, agent_cfg, opponent=opponent_path,
+                           log_dir=str(game_dir / step), export=True)
 
-    produced = newest_run(spec["experiment"])
-    LAST_RUN[spec["experiment"]] = produced.name
-    POLICIES[spec["produces"]] = str(produced.resolve() / "exported" / "policy.pt")
+    LAST_RUN[spec["experiment"]] = step
+    POLICIES[spec["produces"]] = export_path
+    print(f"  {spec['produces']} -> {export_path}", flush=True)
 
-    print(f"  {spec['produces']} -> {POLICIES[spec['produces']]}", flush=True)
-
-print(f"\n===== schedule complete ({len(SCHEDULE) - args.start} steps) =====")
+print(f"\n===== schedule complete ({len(SCHEDULE) - args.start} steps) =====", flush=True)
+if not args.dry_run:
+    stop_tee()
+    simulation_app.close()
