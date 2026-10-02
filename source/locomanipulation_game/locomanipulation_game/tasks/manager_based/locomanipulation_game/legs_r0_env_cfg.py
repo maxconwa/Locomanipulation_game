@@ -114,6 +114,11 @@ class EventCfg:
 class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
     fell = DoneTerm(func=mdp.bad_orientation, params={"limit_angle": 1.0})
+    terrain_out_of_bounds = DoneTerm(
+        func=mdp.terrain_out_of_bounds,
+        params={"distance_buffer": 3.0},
+        time_out=True,
+    )
 
 
 @configclass

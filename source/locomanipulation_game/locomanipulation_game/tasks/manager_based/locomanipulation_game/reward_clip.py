@@ -25,6 +25,20 @@ class PositiveRewardRLEnv(ManagerBasedRLEnv):
 class NegativeRewardRLEnv(ManagerBasedRLEnv):
     def step(self, action: torch.Tensor):
             obs, reward, terminated, truncated, extras = super().step(action)
+            step_rew = self.reward_manager._step_reward
+            nan_mask = torch.isnan(step_rew)
+            if nan_mask.any():
+                names = self.reward_manager._term_names
+                env_ids = nan_mask.any(dim=1).nonzero(as_tuple=True)[0]
+                bad_terms = [names[i] for i in nan_mask.any(dim=0).nonzero(as_tuple=True)[0].tolist()]
+                hits_z = self.scene["height_scanner"].data.ray_hits_w[env_ids, :, 2]
+                print(f"[nan] step {self.common_step_counter}  terms: {bad_terms}")
+                print(f"[nan] env ids:    {env_ids.tolist()}")
+                print(f"[nan] terminated: {terminated[env_ids].tolist()}")
+                print(f"[nan] truncated:  {truncated[env_ids].tolist()}")
+                print(f"[nan] root_pos_w: {self.scene['robot'].data.root_pos_w[env_ids].tolist()}")
+                print(f"[nan] inf rays:   {torch.isinf(hits_z).sum(dim=1).tolist()} of {hits_z.shape[1]}")
+                raise RuntimeError("NaN reward term, see [nan] lines above")
             clipped = torch.clamp(reward, max=0.0)
             self._n = getattr(self, "_n", 0) + 1
             # if self._n % 20 == 0:
