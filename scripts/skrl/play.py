@@ -116,6 +116,7 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import locomanipulation_game.tasks  # noqa: F401
+from locomanipulation_game.tasks.direct.locomanip_marl.odometry import estimator_checkpoint_for
 
 # config shortcuts
 if args_cli.agent is None:
@@ -167,6 +168,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
             log_root_path, run_dir=f".*_{algorithm}_{args_cli.ml_framework}", other_dirs=["checkpoints"]
         )
     log_dir = os.path.dirname(os.path.dirname(resume_path))
+
+    # LocoManip-Marl: the pelvis estimator is saved beside the skrl checkpoints, not in them
+    if hasattr(env_cfg, "estimator"):
+        env_cfg.estimator.train = False
+        env_cfg.estimator.checkpoint_path = estimator_checkpoint_for(resume_path)
+        if env_cfg.estimator.checkpoint_path is None:
+            print("[WARNING] No pelvis estimator next to this checkpoint: arm commands follow the true pelvis motion.")
+            env_cfg.estimator.use_estimate = False
 
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir

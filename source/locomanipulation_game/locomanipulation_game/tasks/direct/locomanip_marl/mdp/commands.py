@@ -1,4 +1,20 @@
-"""Wrist pose targets for both arms: reachable by construction, with a reach curriculum."""
+"""Commands for the two-agent task: navigation OR an arm goal, never both.
+
+ArmTargetsCommand decides, at every command event, which kind of goal an env
+gets next:
+
+  * navigation: the velocity command (ModalVelocityCommand) is live and the
+    arms hold their rest pose, fixed in the pelvis frame;
+  * arm goal: the velocity command is zero and each wrist has a target pose
+    fixed in the WORLD, so it stays put while the pelvis sways, crouches or is
+    pushed.
+
+The arms never see the world target. They see a pelvis-frame command, set
+exactly at the event and afterwards moved by the pelvis motion the env's
+odometry estimator reports (apply_pelvis_motion), the way the robot would do
+it without motion capture. Rewards, reach detection and the curriculum all
+use the true world target.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +24,7 @@ from dataclasses import MISSING
 from typing import TYPE_CHECKING
 
 from isaaclab.assets import Articulation
+from isaaclab.envs.mdp.commands import UniformVelocityCommand, UniformVelocityCommandCfg
 from isaaclab.managers import CommandTerm, CommandTermCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.markers.config import FRAME_MARKER_CFG
@@ -24,7 +41,13 @@ from isaaclab.utils.math import (
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
-__all__ = ["ArmTargetsCommand", "ArmTargetsCommandCfg", "ground_height"]
+__all__ = [
+    "ArmTargetsCommand",
+    "ArmTargetsCommandCfg",
+    "ModalVelocityCommand",
+    "ModalVelocityCommandCfg",
+    "ground_height",
+]
 
 
 def ground_height(scanner: RayCaster) -> torch.Tensor:
@@ -40,40 +63,81 @@ def ground_height(scanner: RayCaster) -> torch.Tensor:
     return torch.where(count > 0, total / count.clamp(min=1), torch.full_like(total, float("nan")))
 
 
+def _apply(pos_a, quat_a, pose_b):
+    """T_a o pose_b for (N, 3) / (N, 4) frames and (N, A, 7) poses."""
+    n, a = pose_b.shape[:2]
+    pos, rot = combine_frame_transforms(
+        pos_a.unsqueeze(1).expand(n, a, 3).reshape(-1, 3),
+        quat_a.unsqueeze(1).expand(n, a, 4).reshape(-1, 4),
+        pose_b[..., :3].reshape(-1, 3),
+        pose_b[..., 3:].reshape(-1, 4),
+    )
+    return torch.cat([pos, rot], dim=-1).view(n, a, 7)
+
+
+def _relative(pos_a, quat_a, pose_w):
+    """T_a^-1 o pose_w for (N, 3) / (N, 4) frames and (N, A, 7) poses, qw >= 0."""
+    n, a = pose_w.shape[:2]
+    pos, rot = subtract_frame_transforms(
+        pos_a.unsqueeze(1).expand(n, a, 3).reshape(-1, 3),
+        quat_a.unsqueeze(1).expand(n, a, 4).reshape(-1, 4),
+        pose_w[..., :3].reshape(-1, 3),
+        pose_w[..., 3:].reshape(-1, 4),
+    )
+    return torch.cat([pos, quat_unique(rot)], dim=-1).view(n, a, 7)
+
+
+class ModalVelocityCommand(UniformVelocityCommand):
+    """UniformVelocityCommand that is zero while the env has an arm goal."""
+
+    cfg: ModalVelocityCommandCfg
+
+    def _update_command(self):
+        super()._update_command()
+        arm_term: ArmTargetsCommand = self._env.command_manager.get_term(self.cfg.arm_command_name)
+        self.vel_command_b[arm_term.arm_mode] = 0.0
+
+
+@configclass
+class ModalVelocityCommandCfg(UniformVelocityCommandCfg):
+    class_type: type = ModalVelocityCommand
+    arm_command_name: str = MISSING
+
+
 class ArmTargetsCommand(CommandTerm):
-    """One wrist pose target per arm, in the robot's *standing frame*.
+    """Per env, either a navigation goal or an arm goal; for an arm goal, one wrist pose per arm.
 
-    **Standing frame.** Origin at the pelvis's x, y and at standing pelvis
-    height above the ground under the robot (the height scan); yaw of the
-    pelvis, no roll or pitch. A target held in this frame does not drop when
-    the pelvis drops, so a target below the standing workspace is reached by
-    crouching. Standing upright on flat ground, it is the pelvis frame. The
-    policies observe the target re-expressed in the actual pelvis frame.
+    **Events.** Reset, a reached arm goal (both wrists inside the tolerances
+    for reach_hold_s), or the goal's timer running out. At each event the env
+    draws its next goal: an arm goal with probability arm_goal_prob, else
+    navigation for nav_time_range seconds (the velocity command is resampled).
 
-    **Table.** At construction, for each arm: set its joints to uniform random
-    angles inside their soft limits (everything else at default, root at its
-    default pose), take one physics step, record the wrist pose in the pelvis
-    frame, and drop the sample if any of the arm's links is in contact. Every
-    target was reached once, collision-free, standing. Each table is sorted by
-    difficulty: the larger of the distance and the rotation from the arm's
-    default pose, each normalised by its maximum in the table.
+    **Arm goal targets.** Drawn from a per-arm table, then fixed in the world.
+    At construction, for each arm: set its joints to uniform random angles
+    inside their soft limits (everything else at default, root at its default
+    pose), take one physics step, record the wrist pose in the pelvis frame,
+    and drop the sample if any of the arm's links is in contact. Every target
+    was reached once, collision-free, standing. At the event the table pose is
+    placed in the *standing frame* (pelvis x, y and yaw; standing pelvis height
+    above the scanned ground; no roll or pitch) and that world pose is kept.
 
     **Curriculum.** Each env has a level. Levels 0..spread_levels draw from the
-    easiest fraction (level + 1) / (spread_levels + 1) of each table, so the
-    region starts in front of the robot around the default pose and widens to
-    the whole standing workspace, in position and orientation together. The
-    next drop_levels levels use the whole table and lower both targets by a
-    shared random drop up to max_height_drop * k / drop_levels; the legs see
-    the drop and their base-height target follows it. update_levels() moves
-    the level at episode end (called by the arm_target_levels curriculum term).
+    easiest fraction (level + 1) / (spread_levels + 1) of each table, sorted by
+    the larger of the distance and the rotation from the default pose (each
+    normalised by its maximum), so goals start in front of the robot and widen
+    to the whole standing workspace. The next drop_levels levels use the whole
+    table and lower both targets by a shared random drop up to
+    max_height_drop * k / drop_levels, which the legs must crouch for.
+    update_levels() moves the level at episode end.
 
-    **Goals.** A goal is both arms' targets. It is reached when both wrists are
-    inside the position and rotation tolerances for reach_hold_s; a new goal
-    is then drawn on the spot. The episode does not end. If not reached within
-    resampling_time_range, the goal is replaced anyway and counts as missed.
+    **What the policies see.** believed_b: the targets in the pelvis frame.
+    Exact at the event (on the robot: the operator's pelvis-frame command);
+    then each step apply_pelvis_motion() moves it by the pelvis motion the
+    env reports, estimated or true per goal (use_estimate, drawn at the event
+    with probability estimate_prob, which the env ramps up).
 
-    The command is (num_envs, num_arms * 7): per arm (x, y, z, qw, qx, qy, qz)
-    in the standing frame, w-first like UniformPoseCommand, with qw >= 0.
+    The command (get_command) is believed_b flattened: (num_envs, num_arms * 7),
+    per arm (x, y, z, qw, qx, qy, qz) in the pelvis frame, w-first.
     """
 
     cfg: ArmTargetsCommandCfg
@@ -86,36 +150,47 @@ class ArmTargetsCommand(CommandTerm):
         self.num_arms = len(cfg.body_names)
         self.body_ids = [self.robot.find_bodies(name)[0][0] for name in cfg.body_names]
         self.max_level = cfg.spread_levels + cfg.drop_levels
+        shape = (self.num_envs, self.num_arms, 7)
 
-        # -- command: per arm (x, y, z, qw, qx, qy, qz) in the standing frame
-        self.targets_s = torch.zeros(self.num_envs, self.num_arms, 7, device=self.device)
-        self.targets_s[..., 3] = 1.0
+        # -- goal state
+        self.arm_mode = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.anchor_w = torch.zeros(shape, device=self.device)  # arm goal: world-fixed targets
+        self.believed_b = torch.zeros(shape, device=self.device)  # what the policies see
+        self.anchor_w[..., 3] = 1.0
+        self.believed_b[..., 3] = 1.0
         self.height_drop = torch.zeros(self.num_envs, device=self.device)
+        self.use_estimate = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.estimate_prob = 0.0  # set by the env
         self.level = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        # -- goal bookkeeping
         self.hold_time = torch.zeros(self.num_envs, device=self.device)
         self.just_reached = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._at_reset = False
         # -- metrics (CommandTerm.reset logs their mean over the reset envs, then zeroes them)
         self.metrics["position_error"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["orientation_error"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["command_drift"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["goals_reached"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["goals_missed"] = torch.zeros(self.num_envs, device=self.device)
 
         self._tables: list[torch.Tensor] = []
         self._level_counts: list[torch.Tensor] = []
-        self._default_poses: list[torch.Tensor] = []
+        default_poses = []
         for arm in range(self.num_arms):
             table, default_pose = self._build_table(env, arm)
             sorted_table, counts = self._sort_by_difficulty(table, default_pose)
             self._tables.append(sorted_table)
             self._level_counts.append(counts)
-            self._default_poses.append(default_pose)
+            default_poses.append(default_pose)
+        # (num_arms, 7): the arms-forward default, also the navigation rest pose
+        self.rest_pose_b = torch.stack(default_poses)
 
     def __str__(self) -> str:
         msg = "ArmTargetsCommand:\n"
         msg += f"\tBodies: {self.cfg.body_names}\n"
         msg += f"\tCommand dimension: {tuple(self.command.shape[1:])}\n"
-        msg += f"\tGoal timeout range: {self.cfg.resampling_time_range}\n"
+        msg += f"\tArm goal probability: {self.cfg.arm_goal_prob}\n"
+        msg += f"\tArm goal timeout range: {self.cfg.resampling_time_range}\n"
+        msg += f"\tNavigation time range: {self.cfg.nav_time_range}\n"
         msg += f"\tLevels: {self.cfg.spread_levels + 1} spread + {self.cfg.drop_levels} drop\n"
         for arm, counts in enumerate(self._level_counts):
             msg += f"\tTargets per spread level ({self.cfg.body_names[arm]}): {counts.tolist()}\n"
@@ -127,8 +202,8 @@ class ArmTargetsCommand(CommandTerm):
 
     @property
     def command(self) -> torch.Tensor:
-        """Targets in the standing frame. Shape is (num_envs, num_arms * 7)."""
-        return self.targets_s.view(self.num_envs, -1)
+        """The pelvis-frame command the policies see. Shape is (num_envs, num_arms * 7), quaternion w-first."""
+        return self.believed_b.view(self.num_envs, -1)
 
     """
     Frames and errors. Recomputed from the current state on every call.
@@ -143,31 +218,17 @@ class ArmTargetsCommand(CommandTerm):
         return origin, yaw_quat(self.robot.data.root_quat_w)
 
     def targets_w(self) -> torch.Tensor:
-        """Targets in world. Shape is (num_envs, num_arms, 7), quaternion w-first."""
-        origin, quat = self.standing_frame_w()
-        n, a = self.num_envs, self.num_arms
-        pos, rot = combine_frame_transforms(
-            origin.unsqueeze(1).expand(n, a, 3).reshape(-1, 3),
-            quat.unsqueeze(1).expand(n, a, 4).reshape(-1, 4),
-            self.targets_s[..., :3].reshape(-1, 3),
-            self.targets_s[..., 3:].reshape(-1, 4),
-        )
-        return torch.cat([pos, rot], dim=-1).view(n, a, 7)
+        """True targets in world, (num_envs, num_arms, 7): the anchor for an arm goal, the rest pose otherwise."""
+        rest = self.rest_pose_b.unsqueeze(0).expand(self.num_envs, -1, -1)
+        rest_w = _apply(self.robot.data.root_pos_w, self.robot.data.root_quat_w, rest)
+        return torch.where(self.arm_mode.view(-1, 1, 1), self.anchor_w, rest_w)
 
-    def targets_in_root(self) -> torch.Tensor:
-        """Targets in the pelvis frame. Shape is (num_envs, num_arms, 7), quaternion w-first, qw >= 0."""
-        targets_w = self.targets_w()
-        n, a = self.num_envs, self.num_arms
-        pos, rot = subtract_frame_transforms(
-            self.robot.data.root_pos_w.unsqueeze(1).expand(n, a, 3).reshape(-1, 3),
-            self.robot.data.root_quat_w.unsqueeze(1).expand(n, a, 4).reshape(-1, 4),
-            targets_w[..., :3].reshape(-1, 3),
-            targets_w[..., 3:].reshape(-1, 4),
-        )
-        return torch.cat([pos, quat_unique(rot)], dim=-1).view(n, a, 7)
+    def true_targets_in_root(self) -> torch.Tensor:
+        """True targets in the pelvis frame, (num_envs, num_arms, 7), qw >= 0. Privileged: the critic's."""
+        return _relative(self.robot.data.root_pos_w, self.robot.data.root_quat_w, self.targets_w())
 
     def errors(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """(position error in m, rotation error in rad) per arm. Each is (num_envs, num_arms)."""
+        """(position error in m, rotation error in rad) per arm against the true targets. Each (num_envs, num_arms)."""
         targets_w = self.targets_w()
         body_pos = self.robot.data.body_pos_w[:, self.body_ids]
         body_quat = self.robot.data.body_quat_w[:, self.body_ids]
@@ -175,12 +236,34 @@ class ArmTargetsCommand(CommandTerm):
         rot_error = quat_error_magnitude(body_quat.reshape(-1, 4), targets_w[..., 3:].reshape(-1, 4))
         return pos_error, rot_error.view(self.num_envs, self.num_arms)
 
+    def apply_pelvis_motion(self, delta_pos: torch.Tensor, delta_quat: torch.Tensor, env_mask: torch.Tensor):
+        """Re-express the arm-goal commands after the pelvis moved by (delta_pos, delta_quat).
+
+        The motion is given in the previous pelvis frame. A world-fixed target
+        obeys T_prev o c_prev = T_new o c_new, so c_new = delta^-1 o c_prev.
+        Navigation commands are fixed in the pelvis frame and don't move.
+        """
+        mask = env_mask & self.arm_mode
+        moved = _relative(delta_pos, delta_quat, self.believed_b)
+        self.believed_b[mask] = moved[mask]
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
+        self._at_reset = True
+        try:
+            return super().reset(env_ids)
+        finally:
+            self._at_reset = False
+
     """
     Curriculum.
     """
 
     def update_levels(self, env_ids: Sequence[int], fell: torch.Tensor):
-        """At episode end: up if most goals were reached without a fall, down on a fall or mostly misses."""
+        """At episode end: up if most arm goals were reached without a fall, down on a fall or mostly misses.
+
+        A fall only counts against the level if it happened during an arm goal.
+        """
+        fell = fell & self.arm_mode[env_ids]
         reached = self.metrics["goals_reached"][env_ids]
         missed = self.metrics["goals_missed"][env_ids]
         finished = reached + missed
@@ -208,8 +291,8 @@ class ArmTargetsCommand(CommandTerm):
         default_q = robot.data.default_joint_pos.clone()
         zero_qd = torch.zeros_like(robot.data.default_joint_vel)
 
-        # the default pose: curriculum centre, rel_default_envs target, and a
-        # check that the contact test passes where we know nothing touches
+        # the default pose: curriculum centre, rest pose, rel_default_envs
+        # target, and a check that the contact test passes where nothing touches
         default_pose, default_ok = self._reach(env, body_idx, default_q, zero_qd, root_state, sensor, check_ids)
         if not default_ok.all():
             raise RuntimeError(
@@ -280,12 +363,15 @@ class ArmTargetsCommand(CommandTerm):
         pos_error, rot_error = self.errors()
         self.metrics["position_error"] = pos_error.mean(dim=1)
         self.metrics["orientation_error"] = rot_error.mean(dim=1)
+        believed_w = _apply(self.robot.data.root_pos_w, self.robot.data.root_quat_w, self.believed_b)
+        drift = torch.norm(believed_w[..., :3] - self.anchor_w[..., :3], dim=-1).mean(dim=1)
+        self.metrics["command_drift"] = drift * self.arm_mode
 
         within = (pos_error < self.cfg.reach_pos_tol).all(dim=1) & (rot_error < self.cfg.reach_rot_tol).all(dim=1)
         step_dt = self._env.step_dt
-        self.hold_time = torch.where(within, self.hold_time + step_dt, torch.zeros_like(self.hold_time))
+        self.hold_time = torch.where(within & self.arm_mode, self.hold_time + step_dt, torch.zeros_like(self.hold_time))
         self.just_reached = self.hold_time >= self.cfg.reach_hold_s
-        timed_out = (self.time_left - step_dt <= 0.0) & ~self.just_reached
+        timed_out = (self.time_left - step_dt <= 0.0) & ~self.just_reached & self.arm_mode
         self.metrics["goals_reached"] += self.just_reached.float()
         self.metrics["goals_missed"] += timed_out.float()
         # CommandTerm.compute counts time_left down next and resamples every env at <= 0
@@ -294,21 +380,50 @@ class ArmTargetsCommand(CommandTerm):
     def _resample_command(self, env_ids: Sequence[int]):
         env_ids = torch.as_tensor(env_ids, device=self.device)
         n = len(env_ids)
-        level = self.level[env_ids]
+        arm_goal = torch.rand(n, device=self.device) < self.cfg.arm_goal_prob
+        self.arm_mode[env_ids] = arm_goal
+        self.hold_time[env_ids] = 0.0
+        self.height_drop[env_ids] = 0.0
+        self.use_estimate[env_ids] = torch.rand(n, device=self.device) < self.estimate_prob
+
+        # -- navigation: rest pose in the pelvis frame, a fresh velocity command
+        nav_ids = env_ids[~arm_goal]
+        if len(nav_ids) > 0:
+            self.believed_b[nav_ids] = self.rest_pose_b
+            self.time_left[nav_ids] = torch.empty(len(nav_ids), device=self.device).uniform_(*self.cfg.nav_time_range)
+            self._env.command_manager.get_term(self.cfg.velocity_command_name)._resample(nav_ids)
+
+        # -- arm goal: table targets, anchored in the world now
+        arm_ids = env_ids[arm_goal]
+        if len(arm_ids) == 0:
+            return
+        m = len(arm_ids)
+        level = self.level[arm_ids]
         spread_level = level.clamp(max=self.cfg.spread_levels)
-        at_default = torch.rand(n, device=self.device) < self.cfg.rel_default_envs
+        at_default = torch.rand(m, device=self.device) < self.cfg.rel_default_envs
+        targets_s = torch.empty(m, self.num_arms, 7, device=self.device)
         for arm in range(self.num_arms):
             count = self._level_counts[arm][spread_level]
-            idx = (torch.rand(n, device=self.device) * count).long()
+            idx = (torch.rand(m, device=self.device) * count).long()
             pose = self._tables[arm][idx]
-            pose[at_default] = self._default_poses[arm]
-            self.targets_s[env_ids, arm] = pose
-
+            pose[at_default] = self.rest_pose_b[arm]
+            targets_s[:, arm] = pose
         drop_level = (level - self.cfg.spread_levels).clamp(min=0).float()
         max_drop = self.cfg.max_height_drop * drop_level / max(self.cfg.drop_levels, 1)
-        self.height_drop[env_ids] = torch.rand(n, device=self.device) * max_drop
-        self.targets_s[env_ids, :, 2] -= self.height_drop[env_ids].unsqueeze(1)
-        self.hold_time[env_ids] = 0.0
+        self.height_drop[arm_ids] = torch.rand(m, device=self.device) * max_drop
+        targets_s[..., 2] -= self.height_drop[arm_ids].unsqueeze(1)
+
+        origin, quat = self.standing_frame_w()
+        if self._at_reset:
+            # the height scan still shows where the robot was before the reset
+            # teleported it; the reset places it on its env origin's ground
+            origin[arm_ids, 2] = self._env.scene.env_origins[arm_ids, 2] + self.cfg.standing_height
+        self.anchor_w[arm_ids] = _apply(origin[arm_ids], quat[arm_ids], targets_s)
+        self.believed_b[arm_ids] = _relative(
+            self.robot.data.root_pos_w[arm_ids], self.robot.data.root_quat_w[arm_ids], self.anchor_w[arm_ids]
+        )
+        # stand still for it: zero now rather than at the velocity term's next update
+        self._env.command_manager.get_term(self.cfg.velocity_command_name).vel_command_b[arm_ids] = 0.0
 
     def _update_command(self):
         pass
@@ -317,30 +432,36 @@ class ArmTargetsCommand(CommandTerm):
         if debug_vis:
             if not hasattr(self, "goal_pose_visualizer"):
                 self.goal_pose_visualizer = VisualizationMarkers(self.cfg.goal_pose_visualizer_cfg)
+                self.believed_pose_visualizer = VisualizationMarkers(self.cfg.believed_pose_visualizer_cfg)
                 self.current_pose_visualizer = VisualizationMarkers(self.cfg.current_pose_visualizer_cfg)
             self.goal_pose_visualizer.set_visibility(True)
+            self.believed_pose_visualizer.set_visibility(True)
             self.current_pose_visualizer.set_visibility(True)
         else:
             if hasattr(self, "goal_pose_visualizer"):
                 self.goal_pose_visualizer.set_visibility(False)
+                self.believed_pose_visualizer.set_visibility(False)
                 self.current_pose_visualizer.set_visibility(False)
 
     def _debug_vis_callback(self, event):
         # the robot can be de-initialized while the callback is still subscribed
         if not self.robot.is_initialized:
             return
+        root_pos, root_quat = self.robot.data.root_pos_w, self.robot.data.root_quat_w
         targets_w = self.targets_w().reshape(-1, 7)
         self.goal_pose_visualizer.visualize(targets_w[:, :3], targets_w[:, 3:])
+        believed_w = _apply(root_pos, root_quat, self.believed_b).reshape(-1, 7)
+        self.believed_pose_visualizer.visualize(believed_w[:, :3], believed_w[:, 3:])
         body_pose_w = self.robot.data.body_link_pose_w[:, self.body_ids].reshape(-1, 7)
         self.current_pose_visualizer.visualize(body_pose_w[:, :3], body_pose_w[:, 3:])
 
 
-def _frame_marker(prim_path: str) -> VisualizationMarkersCfg:
+def _frame_marker(prim_path: str, scale: float = 0.1) -> VisualizationMarkersCfg:
     marker = FRAME_MARKER_CFG.replace(prim_path=prim_path)
     # replace() is shallow: copy the markers dict before rescaling, or every
     # FRAME_MARKER_CFG user in the process gets the new scale
     marker.markers = dict(marker.markers)
-    marker.markers["frame"] = marker.markers["frame"].replace(scale=(0.1, 0.1, 0.1))
+    marker.markers["frame"] = marker.markers["frame"].replace(scale=(scale, scale, scale))
     return marker
 
 
@@ -349,6 +470,8 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     class_type: type = ArmTargetsCommand
 
     asset_name: str = MISSING
+    velocity_command_name: str = MISSING
+    """The ModalVelocityCommand this term zeroes during arm goals and resamples for navigation."""
     body_names: list[str] = MISSING
     """One body per arm whose pose is commanded."""
     joint_names: list[list[str]] = MISSING
@@ -364,9 +487,11 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     table_size: int = 100_000
     max_build_batches: int = 4000
     rel_default_envs: float = 0.1
-    """Fraction of goals that are the default (arms-forward) pose, lowered by the drop like any other."""
+    """Fraction of arm goals that are the default (arms-forward) pose, lowered by the drop like any other."""
 
-    # -- goals
+    # -- goals. resampling_time_range is an arm goal's timeout.
+    arm_goal_prob: float = 0.5
+    nav_time_range: tuple[float, float] = (4.0, 8.0)
     reach_pos_tol: float = 0.05
     reach_rot_tol: float = 0.35
     reach_hold_s: float = 0.2
@@ -381,5 +506,6 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     promote_min_goals: int = 3
     demote_rate: float = 0.4
 
-    goal_pose_visualizer_cfg: VisualizationMarkersCfg = _frame_marker("/Visuals/Command/arm_goal_pose")
-    current_pose_visualizer_cfg: VisualizationMarkersCfg = _frame_marker("/Visuals/Command/arm_body_pose")
+    goal_pose_visualizer_cfg: VisualizationMarkersCfg = _frame_marker("/Visuals/Command/arm_goal_pose", 0.1)
+    believed_pose_visualizer_cfg: VisualizationMarkersCfg = _frame_marker("/Visuals/Command/arm_believed_pose", 0.06)
+    current_pose_visualizer_cfg: VisualizationMarkersCfg = _frame_marker("/Visuals/Command/arm_body_pose", 0.1)

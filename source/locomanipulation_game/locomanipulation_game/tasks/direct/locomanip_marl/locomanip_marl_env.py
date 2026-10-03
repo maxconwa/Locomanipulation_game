@@ -12,12 +12,20 @@ onto the per-agent dicts:
     rewards:      agent -> its own RewardManager
     dones:        one TerminationManager, shared (one body, one episode)
 
-Step order differs from ManagerBasedRLEnv in one place: the command manager
-updates inside _get_observations, after interval events rather than before.
+It also runs the pelvis odometry (odometry.py). After every step it estimates
+how the pelvis moved from the `odometry` observation group at both ends of the
+step and the action, moves the arm command by that (ArmTargetsCommand.
+apply_pelvis_motion), and fits the estimator to the true motion.
+
+_get_observations does, in order: odometry -> commands (events re-anchor arm
+goals, overriding the odometry update) -> the agents' groups. Unlike
+ManagerBasedRLEnv, the command manager updates after interval events, not
+before.
 """
 
 from __future__ import annotations
 
+import os
 import torch
 from collections.abc import Sequence
 
@@ -31,7 +39,8 @@ from isaaclab.managers import (
     TerminationManager,
 )
 
-from .locomanip_marl_env_cfg import LocoManipMarlEnvCfg
+from .locomanip_marl_env_cfg import ARM_COMMAND, LocoManipMarlEnvCfg
+from .odometry import EstimatorTrainer, motion_to_transform, pelvis_motion
 
 
 class LocoManipMarlEnv(DirectMARLEnv):
@@ -80,6 +89,24 @@ class LocoManipMarlEnv(DirectMARLEnv):
             f" actions {self.cfg.action_spaces}"
         )
 
+        # -- pelvis odometry
+        self._arm_command = self.command_manager.get_term(ARM_COMMAND)
+        self._robot = self.scene["robot"]
+        odometry_dim = group_dims["odometry"][0]
+        self.estimator = EstimatorTrainer(
+            self.cfg.estimator, 2 * odometry_dim + self.action_manager.total_action_dim, self.num_envs, self.device
+        )
+        if self.cfg.estimator.checkpoint_path:
+            self.estimator.load(self.cfg.estimator.checkpoint_path)
+            print(f"[INFO] Pelvis estimator loaded from: {self.cfg.estimator.checkpoint_path}")
+        print(f"[INFO] Pelvis estimator: {self.estimator.model}")
+        self._prev_odometry_obs: torch.Tensor | None = None
+        self._prev_root_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        self._prev_root_quat = torch.zeros(self.num_envs, 4, device=self.device)
+        # envs whose previous odometry sample belongs to an earlier episode
+        self._fresh = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        self._estimator_log: dict[str, torch.Tensor] = {}
+
         self._obs_buf: dict[str, torch.Tensor] = {}
 
     """
@@ -117,8 +144,11 @@ class LocoManipMarlEnv(DirectMARLEnv):
         return rewards
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
+        self._update_odometry()
         self.command_manager.compute(dt=self.step_dt)
-        self._obs_buf = self.observation_manager.compute(update_history=True)
+        groups = list(self.cfg.possible_agents) + ["critic"]
+        self._obs_buf = {g: self.observation_manager.compute_group(g, update_history=True) for g in groups}
+        self.extras.setdefault("log", {}).update(self._estimator_log)
         return {agent: self._obs_buf[agent] for agent in self.cfg.possible_agents}
 
     def _get_states(self) -> torch.Tensor:
@@ -131,6 +161,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
         # scene reset (it reads how far the robot got), managers after.
         self.curriculum_manager.compute(env_ids=env_ids)
         super()._reset_idx(env_ids)  # scene, reset events, episode_length_buf
+        self._fresh[env_ids] = True
 
         log = {}
         log.update(self.observation_manager.reset(env_ids))
@@ -147,6 +178,62 @@ class LocoManipMarlEnv(DirectMARLEnv):
             key: value if isinstance(value, torch.Tensor) else torch.tensor(float(value), device=self.device)
             for key, value in log.items()
         }
+
+    """
+    Pelvis odometry.
+    """
+
+    def _update_odometry(self):
+        """Estimate this step's pelvis motion, move the arm commands by it, and fit the estimator.
+
+        Runs after resets: reset envs are skipped (their previous sample is
+        from the old episode) and get a fresh, exact command from the command
+        manager anyway.
+        """
+        odometry_obs = self.observation_manager.compute_group("odometry", update_history=True)
+        root_pos = self._robot.data.root_pos_w.clone()
+        root_quat = self._robot.data.root_quat_w.clone()
+        cfg = self.cfg.estimator
+
+        if self._prev_odometry_obs is not None:
+            valid = ~self._fresh
+            inputs = torch.cat([self._prev_odometry_obs, odometry_obs, self.action_manager.action], dim=1)
+            true_motion = pelvis_motion(self._prev_root_pos, self._prev_root_quat, root_pos, root_quat, self.step_dt)
+            estimated_motion = self.estimator.model(inputs)
+            if cfg.use_estimate:
+                use_estimate = self._arm_command.use_estimate.unsqueeze(1)
+                motion = torch.where(use_estimate, estimated_motion, true_motion)
+            else:
+                motion = true_motion
+            delta_pos, delta_quat = motion_to_transform(motion, self.step_dt)
+            self._arm_command.apply_pelvis_motion(delta_pos, delta_quat, valid)
+
+            if cfg.train:
+                self.estimator.add(inputs, true_motion, valid)
+                if self.common_step_counter % cfg.train_every == 0:
+                    stats = self.estimator.train()
+                    self._estimator_log = {f"Estimator/{k}": v for k, v in stats.items()}
+                if cfg.save_every > 0 and self.common_step_counter % cfg.save_every == 0 and self.cfg.log_dir:
+                    self._save_estimator()
+
+        self._prev_odometry_obs = odometry_obs.clone()
+        self._prev_root_pos, self._prev_root_quat = root_pos, root_quat
+        self._fresh[:] = False
+
+        # teacher forcing: the share of new arm goals that follow the estimate
+        if not cfg.use_estimate:
+            prob = 0.0
+        elif not cfg.train:
+            prob = 1.0
+        else:
+            prob = min(max((self.common_step_counter - cfg.warmup_steps) / max(cfg.ramp_steps, 1), 0.0), 1.0)
+        self._arm_command.estimate_prob = prob
+        self._estimator_log["Estimator/estimate_prob"] = torch.tensor(prob, device=self.device)
+
+    def _save_estimator(self):
+        directory = os.path.join(self.cfg.log_dir, "estimator")
+        self.estimator.save(os.path.join(directory, f"estimator_{self.common_step_counter}.pt"))
+        self.estimator.save(os.path.join(directory, "estimator_latest.pt"))
 
     """
     Helpers.

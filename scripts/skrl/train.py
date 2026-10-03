@@ -120,6 +120,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 logger = logging.getLogger(__name__)
 
 import locomanipulation_game.tasks  # noqa: F401
+from locomanipulation_game.tasks.direct.locomanip_marl.odometry import estimator_checkpoint_for
 
 # config shortcuts
 if args_cli.agent is None:
@@ -187,6 +188,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # get checkpoint path (to resume training)
     resume_path = retrieve_file_path(args_cli.checkpoint) if args_cli.checkpoint else None
+    # LocoManip-Marl: the pelvis estimator is saved beside the skrl checkpoints, not in them
+    if resume_path and hasattr(env_cfg, "estimator"):
+        env_cfg.estimator.checkpoint_path = estimator_checkpoint_for(resume_path)
 
     # set the IO descriptors export flag if requested
     if isinstance(env_cfg, ManagerBasedRLEnvCfg):

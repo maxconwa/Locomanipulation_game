@@ -4,15 +4,22 @@ Trained together with IPPO (skrl). The scene, events, terminations and terrain
 curriculum are the IBR game's, imported from the manager-based task, and the
 legs start from the IBR legs reward set. What is new here:
 
-  * commands: arm_targets, both wrists' goals, with a reach curriculum
-    (mdp.ArmTargetsCommand): goals start in front of the robot, widen to the
+  * commands: at every command event an env gets a navigation goal (velocity
+    command, arms at rest) OR an arm goal (zero velocity, one wrist pose per
+    arm fixed in the world), never both. Arm goals have a reach curriculum
+    (mdp.ArmTargetsCommand): they start in front of the robot, widen to the
     whole standing workspace, then drop up to 25 cm below it so the legs must
     crouch. A reached goal is replaced on the spot; episodes don't end on it.
+  * the arm command the policies see is always in the pelvis frame: exact at
+    the event, then moved each step by the pelvis motion a learned estimator
+    reads from the IMU and joint states (odometry.py), as on the robot.
+    Rewards score the true world point.
   * actions:  both agents' joint targets in one ActionManager (legs first)
-  * observations: one group per agent, plus a privileged `critic` group that
-    becomes the env state and feeds both critics
-  * rewards: one reward set per agent. The legs also get LEGS_SHARE_OF_ARMS x
-    the arms' tracking terms, and their base-height target drops with the goal.
+  * observations: one group per agent, a privileged `critic` group that
+    becomes the env state and feeds both critics, and the estimator's
+    `odometry` group
+  * rewards: one reward set per agent, each with 0.1 x the other's
+    command-following terms. The legs' base-height target drops with the goal.
 
 torso_joint belongs to neither agent: its actuator holds it at default, as in
 the IBR rounds.
@@ -56,6 +63,7 @@ from locomanipulation_game.tasks.manager_based.locomanipulation_game.legs_r0_env
 )
 
 from . import mdp
+from .odometry import PelvisEstimatorCfg
 
 LEFT_ARM_JOINT_NAMES = ARM_JOINT_NAMES[:7]
 RIGHT_ARM_JOINT_NAMES = ARM_JOINT_NAMES[7:]
@@ -76,15 +84,19 @@ EE_POS_STD_COARSE = 0.25  # m
 EE_POS_STD_FINE = 0.05    # m
 EE_QUAT_STD = 0.5         # rad
 GOAL_BONUS = 5.0          # paid once per reached goal
-# The legs' reward includes this fraction of each arms tracking term (and the goal bonus).
+# Each agent's reward includes this fraction of the other's command-following
+# terms: the legs get the arms' tracking and goal bonus, the arms the legs' velocity tracking.
 LEGS_SHARE_OF_ARMS = 0.1
+ARMS_SHARE_OF_LEGS = 0.1
 
 
 @configclass
 class MarlCommandsCfg(CommandsCfg):
-    # base_velocity comes from the IBR rounds unchanged
+    # base_velocity: the IBR rounds' command, made modal in __post_init__.
+    # It must stay first: arm_targets zeroes and resamples it.
     arm_targets = mdp.ArmTargetsCommandCfg(
         asset_name="robot",
+        velocity_command_name="base_velocity",
         body_names=[LEFT_EE_BODY, RIGHT_EE_BODY],
         joint_names=[LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES],
         collision_body_names=[
@@ -92,10 +104,23 @@ class MarlCommandsCfg(CommandsCfg):
             ["right_(shoulder|elbow|wrist)_.*", "rg_.*"],
         ],
         standing_height=STANDING_PELVIS_HEIGHT,
-        # the give-up time: a goal both wrists reach is replaced at once
+        # an arm goal's give-up time: one both wrists reach is replaced at once
         resampling_time_range=(4.0, 6.0),
         debug_vis=True,
     )
+
+    def __post_init__(self):
+        # same ranges and timing as IBR, but zero while an arm goal is active
+        ibr = self.base_velocity
+        self.base_velocity = mdp.ModalVelocityCommandCfg(
+            asset_name=ibr.asset_name,
+            resampling_time_range=ibr.resampling_time_range,
+            rel_standing_envs=ibr.rel_standing_envs,
+            heading_command=ibr.heading_command,
+            debug_vis=ibr.debug_vis,
+            ranges=ibr.ranges,
+            arm_command_name=ARM_COMMAND,
+        )
 
 
 @configclass
@@ -138,7 +163,9 @@ class MarlObservationsCfg:
             noise=Unoise(n_min=-0.05, n_max=0.05),
         )
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
-        # (x, y, z, qx, qy, qz, qw) per wrist, left then right, in the pelvis frame
+        arm_goal = ObsTerm(func=mdp.arm_goal_active, params={"command_name": ARM_COMMAND})
+        # (x, y, z, qx, qy, qz, qw) per wrist, left then right, in the pelvis
+        # frame: the command as the robot would hold it, moved by odometry
         ee_targets = ObsTerm(func=mdp.arm_targets_in_root_xyzw, params={"command_name": ARM_COMMAND})
         height_drop = ObsTerm(func=mdp.arm_target_height_drop, params={"command_name": ARM_COMMAND})
         joint_pos = ObsTerm(
@@ -176,14 +203,47 @@ class MarlObservationsCfg:
             func=mdp.body_pose_in_root_xyzw,
             params={"asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_BODY, RIGHT_EE_BODY], preserve_order=True)},
         )
+        # the rewards score the true world point; the actors only see the believed one
+        true_ee_targets = ObsTerm(func=mdp.true_arm_targets_in_root_xyzw, params={"command_name": ARM_COMMAND})
 
         def __post_init__(self):
             self.enable_corruption = False
             self.concatenate_terms = True
 
+    @configclass
+    class OdometryCfg(ObsGroup):
+        """The pelvis-motion estimator's measurements, noisy like the actors'. Not a policy input."""
+
+        base_lin_acc = ObsTerm(
+            func=mdp.imu_lin_acc, params={"asset_cfg": SceneEntityCfg("imu")}, noise=Unoise(n_min=-0.5, n_max=0.5)
+        )
+        base_ang_vel = ObsTerm(
+            func=mdp.imu_ang_vel, params={"asset_cfg": SceneEntityCfg("imu")}, noise=Unoise(n_min=-0.2, n_max=0.2)
+        )
+        projected_gravity = ObsTerm(
+            func=mdp.imu_projected_gravity,
+            params={"asset_cfg": SceneEntityCfg("imu")},
+            noise=Unoise(n_min=-0.05, n_max=0.05),
+        )
+        joint_pos = ObsTerm(
+            func=mdp.joint_pos_rel,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=ALL_JOINTS_NAMES, preserve_order=True)},
+            noise=Unoise(n_min=-0.01, n_max=0.01),
+        )
+        joint_vel = ObsTerm(
+            func=mdp.joint_vel_rel,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=ALL_JOINTS_NAMES, preserve_order=True)},
+            noise=Unoise(n_min=-1.5, n_max=1.5),
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
     legs: LegsCfg = LegsCfg()
     arms: ArmsCfg = ArmsCfg()
     critic: CriticCfg = CriticCfg()
+    odometry: OdometryCfg = OdometryCfg()
 
 
 _SELF_CONTACT_PARAMS = {
@@ -280,12 +340,14 @@ class ArmsRewardsCfg:
     )
 
 
-# The arms' terms the legs share in: tracking, not the arms' effort or safety.
+# Each agent's command-following terms, which the other agent shares in. Not
+# effort or safety terms: an agent can't control the other's joints.
 ARM_TRACKING_TERMS = [
     "left_ee_pos", "left_ee_pos_fine", "left_ee_quat",
     "right_ee_pos", "right_ee_pos_fine", "right_ee_quat",
     "goal_reached",
 ]
+LEG_TRACKING_TERMS = ["track_lin_vel_xy", "track_ang_vel_z"]
 
 
 @configclass
@@ -294,11 +356,14 @@ class MarlRewardsCfg:
     arms: ArmsRewardsCfg = ArmsRewardsCfg()
 
     def __post_init__(self):
-        # Each arm tracking term, again in the legs' reward at LEGS_SHARE_OF_ARMS
-        # of its weight. Logged as Episode_Reward/legs/arms_<term>.
+        # Copies at the share of the original weight, logged as
+        # Episode_Reward/legs/arms_<term> and Episode_Reward/arms/legs_<term>.
         for name in ARM_TRACKING_TERMS:
             term: RewTerm = getattr(self.arms, name)
             setattr(self.legs, f"arms_{name}", term.replace(weight=LEGS_SHARE_OF_ARMS * term.weight))
+        for name in LEG_TRACKING_TERMS:
+            term = getattr(self.legs, name)
+            setattr(self.arms, f"legs_{name}", term.replace(weight=ARMS_SHARE_OF_LEGS * term.weight))
 
 
 @configclass
@@ -329,6 +394,8 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     rewards: MarlRewardsCfg = MarlRewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
     curriculum: MarlCurriculumCfg = MarlCurriculumCfg()
+    # pelvis odometry that keeps the arm command on its world point
+    estimator: PelvisEstimatorCfg = PelvisEstimatorCfg()
 
     # agent -> the action term it drives (see AGENT_ACTION_TERMS)
     agent_action_terms: dict[str, str] = AGENT_ACTION_TERMS

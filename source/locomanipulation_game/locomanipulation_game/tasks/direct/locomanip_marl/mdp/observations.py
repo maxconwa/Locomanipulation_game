@@ -19,16 +19,32 @@ def _wxyz_to_xyzw(quat: torch.Tensor) -> torch.Tensor:
     return torch.cat([quat[..., 1:4], quat[..., 0:1]], dim=-1)
 
 
-def arm_targets_in_root_xyzw(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
-    """Each arm's target as (x, y, z, qx, qy, qz, qw) in the pelvis frame, concatenated.
+def _xyzw_flat(env: ManagerBasedRLEnv, poses: torch.Tensor) -> torch.Tensor:
+    return torch.cat([poses[..., :3], _wxyz_to_xyzw(poses[..., 3:])], dim=-1).view(env.num_envs, -1)
 
-    The command term stores w-first in the standing frame, the Isaac Lab
-    convention the rewards use. The policy sees x-y-z-w in the pelvis frame,
+
+def arm_targets_in_root_xyzw(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """The arm command the policies act on: per wrist (x, y, z, qx, qy, qz, qw) in the pelvis frame.
+
+    This is the believed command, kept on the world target by the odometry
+    estimate (ArmTargetsCommand.apply_pelvis_motion), not the true one. The
+    term stores w-first, the Isaac Lab convention; the policy sees x-y-z-w,
     the ROS / Eigen order the robot side speaks.
     """
     term: ArmTargetsCommand = env.command_manager.get_term(command_name)
-    targets = term.targets_in_root()
-    return torch.cat([targets[..., :3], _wxyz_to_xyzw(targets[..., 3:])], dim=-1).view(env.num_envs, -1)
+    return _xyzw_flat(env, term.believed_b)
+
+
+def true_arm_targets_in_root_xyzw(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """The true targets in the pelvis frame, same layout. Privileged: for the critic, which scores the true point."""
+    term: ArmTargetsCommand = env.command_manager.get_term(command_name)
+    return _xyzw_flat(env, term.true_targets_in_root())
+
+
+def arm_goal_active(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """1 while the env has an arm goal, 0 while it navigates. Shape (num_envs, 1)."""
+    term: ArmTargetsCommand = env.command_manager.get_term(command_name)
+    return term.arm_mode.float().unsqueeze(1)
 
 
 def arm_target_height_drop(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
