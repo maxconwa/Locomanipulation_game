@@ -1,8 +1,10 @@
 """Pelvis odometry: estimate the pelvis's 6-DoF motion over one policy step from what the robot measures.
 
 An estimate, not a prediction: it runs after the step, on the measurements
-from both ends of it (IMU and joint states at t and t+1) plus the action
-applied in between. The output is the motion expressed in the pelvis frame at
+up to its end (the odometry group's last history_length frames of IMU,
+joint states and leg torques, which include t and t+1) plus the action
+applied in between. The history lets it filter sensor noise; the leg torques
+carry the contact information that says which foot is planted. The output is the motion expressed in the pelvis frame at
 t, as the average linear and angular velocity over the step (m/s, rad/s):
 well-scaled regression targets, and dt * velocity is the transform.
 
@@ -123,15 +125,30 @@ class EstimatorTrainer:
             "ang_vel_error": torch.norm(error[:, 3:], dim=-1).mean(),  # rad/s
         }
 
-    def save(self, path: str):
+    def save(self, path: str, env_state: dict | None = None):
+        """Model, optimizer and the env-side state (curriculum levels, gate) to resume or play with."""
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save({"model": self.model.state_dict(), "optimizer": self.optimizer.state_dict()}, path)
+        state = {"model": self.model.state_dict(), "optimizer": self.optimizer.state_dict()}
+        if env_state is not None:
+            state["env_state"] = env_state
+        torch.save(state, path)
 
-    def load(self, path: str):
+    def load(self, path: str) -> tuple[bool, dict | None]:
+        """Returns (whether the model loaded, the saved env state or None).
+
+        A model saved with other inputs (e.g. before the history window) is
+        skipped with a warning, so its run's policies can still be resumed;
+        the estimator then starts fresh behind the drift gate.
+        """
         state = torch.load(path, map_location=self.inputs.device)
-        self.model.load_state_dict(state["model"])
+        try:
+            self.model.load_state_dict(state["model"])
+        except RuntimeError as error:
+            print(f"[WARNING] Pelvis estimator in {path} doesn't fit this model, starting fresh: {str(error)[:200]}")
+            return False, state.get("env_state")
         if "optimizer" in state:
             self.optimizer.load_state_dict(state["optimizer"])
+        return True, state.get("env_state")
 
 
 def estimator_checkpoint_for(agent_checkpoint: str) -> str | None:

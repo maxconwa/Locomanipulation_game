@@ -124,13 +124,16 @@ def base_height_l2_lowered(
     return torch.nan_to_num(error, nan=0.0)
 
 
-def stand_still_lowered(
+def stand_still_navigation(
     env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, command_name: str, arm_command_name: str
 ) -> torch.Tensor:
-    """stand_still, except while the arm goal asks for a crouch.
+    """stand_still, during navigation only.
 
     stand_still pulls the legs to their default angles whenever the velocity
-    command is zero, which is a standing posture: it would fight the crouch.
+    command is zero. Every arm goal zeroes it, so it was the legs' largest
+    penalty (-0.27/s, run 5) and fought the posture changes the arms' reaching
+    and the crouch levels need. During navigation it still holds the 5% of
+    standing commands still.
     """
-    lowered = env.command_manager.get_term(arm_command_name).height_drop > 0.0
-    return stand_still(env, asset_cfg, command_name) * ~lowered
+    navigating = ~env.command_manager.get_term(arm_command_name).arm_mode
+    return stand_still(env, asset_cfg, command_name) * navigating

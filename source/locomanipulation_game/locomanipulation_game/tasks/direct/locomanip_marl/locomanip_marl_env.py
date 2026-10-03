@@ -13,9 +13,11 @@ onto the per-agent dicts:
     dones:        one TerminationManager, shared (one body, one episode)
 
 It also runs the pelvis odometry (odometry.py). After every step it estimates
-how the pelvis moved from the `odometry` observation group at both ends of the
-step and the action, moves the arm command by that (ArmTargetsCommand.
-apply_pelvis_motion), and fits the estimator to the true motion.
+how the pelvis moved from the `odometry` observation group's history window
+(which ends at the step's end) and the action, moves the arm command by that
+(ArmTargetsCommand.apply_pelvis_motion), and fits the estimator to the true
+motion. The estimator's file also carries the env-side state a resume or
+play.py needs: the arm and terrain curriculum levels and the drift gate.
 
 _get_observations does, in order: odometry -> commands (events re-anchor arm
 goals, overriding the odometry update) -> the agents' groups. Unlike
@@ -94,13 +96,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._robot = self.scene["robot"]
         odometry_dim = group_dims["odometry"][0]
         self.estimator = EstimatorTrainer(
-            self.cfg.estimator, 2 * odometry_dim + self.action_manager.total_action_dim, self.num_envs, self.device
+            self.cfg.estimator, odometry_dim + self.action_manager.total_action_dim, self.num_envs, self.device
         )
-        if self.cfg.estimator.checkpoint_path:
-            self.estimator.load(self.cfg.estimator.checkpoint_path)
-            print(f"[INFO] Pelvis estimator loaded from: {self.cfg.estimator.checkpoint_path}")
         print(f"[INFO] Pelvis estimator: {self.estimator.model}")
-        self._prev_odometry_obs: torch.Tensor | None = None
+        self._have_prev = False
         self._prev_root_pos = torch.zeros(self.num_envs, 3, device=self.device)
         self._prev_root_quat = torch.zeros(self.num_envs, 4, device=self.device)
         # envs whose previous odometry sample belongs to an earlier episode
@@ -108,6 +107,11 @@ class LocoManipMarlEnv(DirectMARLEnv):
         # running mean of the estimate's drift at the end of an arm goal; starts closed
         self._goal_drift_ema = torch.tensor(1.0, device=self.device)
         self._estimator_log: dict[str, torch.Tensor] = {}
+        if self.cfg.estimator.checkpoint_path:
+            model_loaded, env_state = self.estimator.load(self.cfg.estimator.checkpoint_path)
+            print(f"[INFO] Pelvis estimator file: {self.cfg.estimator.checkpoint_path} (model loaded: {model_loaded})")
+            if env_state is not None:
+                self._load_env_state(env_state, restore_gate=model_loaded)
 
         self._obs_buf: dict[str, torch.Tensor] = {}
 
@@ -202,9 +206,9 @@ class LocoManipMarlEnv(DirectMARLEnv):
         root_quat = self._robot.data.root_quat_w.clone()
         cfg = self.cfg.estimator
 
-        if self._prev_odometry_obs is not None:
+        if self._have_prev:
             valid = ~self._fresh
-            inputs = torch.cat([self._prev_odometry_obs, odometry_obs, self.action_manager.action], dim=1)
+            inputs = torch.cat([odometry_obs, self.action_manager.action], dim=1)
             true_motion = pelvis_motion(self._prev_root_pos, self._prev_root_quat, root_pos, root_quat, self.step_dt)
             estimated_motion = self.estimator.model(inputs)
             self._arm_command.apply_pelvis_motion(
@@ -221,7 +225,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
                 if cfg.save_every > 0 and self.common_step_counter % cfg.save_every == 0 and self.cfg.log_dir:
                     self._save_estimator()
 
-        self._prev_odometry_obs = odometry_obs.clone()
+        self._have_prev = True
         self._prev_root_pos, self._prev_root_quat = root_pos, root_quat
         self._fresh[:] = False
 
@@ -253,8 +257,36 @@ class LocoManipMarlEnv(DirectMARLEnv):
 
     def _save_estimator(self):
         directory = os.path.join(self.cfg.log_dir, "estimator")
-        self.estimator.save(os.path.join(directory, f"estimator_{self.common_step_counter}.pt"))
-        self.estimator.save(os.path.join(directory, "estimator_latest.pt"))
+        env_state = self._env_state()
+        self.estimator.save(os.path.join(directory, f"estimator_{self.common_step_counter}.pt"), env_state)
+        self.estimator.save(os.path.join(directory, "estimator_latest.pt"), env_state)
+
+    def _env_state(self) -> dict:
+        terrain = self.scene.terrain
+        return {
+            "arm_targets": self._arm_command.state_dict(),
+            "terrain_levels": terrain.terrain_levels.clone(),
+            "terrain_types": terrain.terrain_types.clone(),
+            "goal_drift_ema": self._goal_drift_ema.clone(),
+        }
+
+    def _load_env_state(self, state: dict, restore_gate: bool):
+        """Curriculum levels (and, with a matching estimator, the drift gate) saved by _save_estimator."""
+        self._arm_command.load_state_dict(state["arm_targets"])
+        terrain = self.scene.terrain
+        levels = state["terrain_levels"].to(self.device)
+        if len(levels) == self.num_envs:
+            terrain.terrain_levels[:] = levels
+            terrain.terrain_types[:] = state["terrain_types"].to(self.device)
+        else:
+            terrain.terrain_levels[:] = levels[torch.randint(0, len(levels), (self.num_envs,), device=self.device)]
+        terrain.env_origins[:] = terrain.terrain_origins[terrain.terrain_levels, terrain.terrain_types]
+        if restore_gate:
+            self._goal_drift_ema = state["goal_drift_ema"].to(self.device)
+        print(
+            f"[INFO] Restored curriculum: arm level mean {self._arm_command.level.float().mean().item():.2f},"
+            f" terrain level mean {terrain.terrain_levels.float().mean().item():.2f}"
+        )
 
     """
     Helpers.

@@ -52,9 +52,13 @@ agent:
   gae_lambda: 0.95
   learning_rate: 1.0e-03
   learning_rate_scheduler: KLAdaptiveLR
+  # rsl_rl's desired_kl was 0.01 / min 1e-5. Under skrl IPPO that drove both
+  # agents' learning rates down to ~1e-4 (arms) / 3e-4 (legs) and run 5's
+  # metrics went flat for 3000 updates. KLAdaptiveLR divides when KL >
+  # 2 x kl_threshold, so 0.02 tolerates KL up to 0.04; the floor keeps learning going.
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.01       # desired_kl
-    min_lr: 1.0e-05
+    kl_threshold: 0.02
+    min_lr: 2.0e-04
     max_lr: 1.0e-02
   observation_preprocessor: RunningStandardScaler
   observation_preprocessor_kwargs: null

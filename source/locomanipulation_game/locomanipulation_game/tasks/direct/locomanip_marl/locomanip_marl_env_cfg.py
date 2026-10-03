@@ -70,6 +70,7 @@ RIGHT_ARM_JOINT_NAMES = ARM_JOINT_NAMES[7:]
 LEFT_EE_BODY = "left_wrist_yaw_link"
 RIGHT_EE_BODY = "right_wrist_yaw_link"
 ARM_COMMAND = "arm_targets"
+ODOMETRY_HISTORY = 4  # frames in the estimator's window
 
 # Each agent is charged for the self-contact pairs that include one of its links.
 LEGS_OWN_LINKS = [PELVIS_LINK_NAME] + LOWER_LINK_NAMES
@@ -216,32 +217,46 @@ class MarlObservationsCfg:
 
         Sensor-level noise, not the actors' domain-randomization noise: at
         50 Hz a walking foot moves ~1 cm per step, and the actors' +-0.01 rad
-        joint noise alone is that big once it goes through the leg. With it
-        the estimator plateaued at ~0.28 m/s error and the arm command
-        drifted ~0.25 m per goal. Assumed sensors: absolute joint encoders
-        (~1e-3 rad), differentiated joint velocity, a MEMS IMU.
+        joint noise alone is that big once it goes through the leg (run 2:
+        0.28 m/s error, ~0.25 m drift per goal). Assumed sensors: absolute
+        joint encoders (~1e-3 rad), differentiated joint velocity, a MEMS IMU,
+        motor-current torque (+-2 Nm). Each term keeps the last
+        ODOMETRY_HISTORY frames, which end at the step's end: the estimate
+        sees t and t+1 and a little before, to filter noise. Leg torques say
+        which foot carries the robot.
         """
 
         base_lin_acc = ObsTerm(
-            func=mdp.imu_lin_acc, params={"asset_cfg": SceneEntityCfg("imu")}, noise=Unoise(n_min=-0.05, n_max=0.05)
+            func=mdp.imu_lin_acc, params={"asset_cfg": SceneEntityCfg("imu")}, noise=Unoise(n_min=-0.05, n_max=0.05),
+            history_length=ODOMETRY_HISTORY, flatten_history_dim=True,
         )
         base_ang_vel = ObsTerm(
-            func=mdp.imu_ang_vel, params={"asset_cfg": SceneEntityCfg("imu")}, noise=Unoise(n_min=-0.02, n_max=0.02)
+            func=mdp.imu_ang_vel, params={"asset_cfg": SceneEntityCfg("imu")}, noise=Unoise(n_min=-0.02, n_max=0.02),
+            history_length=ODOMETRY_HISTORY, flatten_history_dim=True,
         )
         projected_gravity = ObsTerm(
             func=mdp.imu_projected_gravity,
             params={"asset_cfg": SceneEntityCfg("imu")},
             noise=Unoise(n_min=-0.005, n_max=0.005),
+            history_length=ODOMETRY_HISTORY, flatten_history_dim=True,
         )
         joint_pos = ObsTerm(
             func=mdp.joint_pos_rel,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=ALL_JOINTS_NAMES, preserve_order=True)},
             noise=Unoise(n_min=-0.001, n_max=0.001),
+            history_length=ODOMETRY_HISTORY, flatten_history_dim=True,
         )
         joint_vel = ObsTerm(
             func=mdp.joint_vel_rel,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=ALL_JOINTS_NAMES, preserve_order=True)},
             noise=Unoise(n_min=-0.05, n_max=0.05),
+            history_length=ODOMETRY_HISTORY, flatten_history_dim=True,
+        )
+        leg_torques = ObsTerm(
+            func=mdp.joint_effort,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=LOWER_JOINT_NAMES, preserve_order=True)},
+            noise=Unoise(n_min=-2.0, n_max=2.0),
+            history_length=ODOMETRY_HISTORY, flatten_history_dim=True,
         )
 
         def __post_init__(self):
@@ -264,10 +279,13 @@ _SELF_CONTACT_PARAMS = {
 
 @configclass
 class LegsRewardsCfg(LowerRewardsCfg):
-    """The IBR legs reward, with four terms changed for the shared body.
+    """The IBR legs reward, with five terms changed for the shared body.
 
     action_rate and self_collision would otherwise see the arms; base_height
-    and stand_still would otherwise fight a crouch the arm goal asks for.
+    would otherwise fight a crouch the arm goal asks for; stand_still would
+    pull the legs to default through every arm goal. track_ang_vel_z is
+    weighted up: yaw tracking earned 0.48 of its 1.0 in run 5, against 1.65
+    of 2.0 for xy.
     """
 
     def __post_init__(self):
@@ -281,8 +299,9 @@ class LegsRewardsCfg(LowerRewardsCfg):
             "command_name": ARM_COMMAND,
             "sensor_cfg": SceneEntityCfg("height_scanner"),
         }
-        self.stand_still.func = mdp.stand_still_lowered
+        self.stand_still.func = mdp.stand_still_navigation
         self.stand_still.params = {**self.stand_still.params, "arm_command_name": ARM_COMMAND}
+        self.track_ang_vel_z.weight = 1.5
 
 
 def _arm_tracking_terms(arm: int) -> dict[str, RewTerm]:
@@ -376,8 +395,12 @@ class MarlRewardsCfg:
 
 @configclass
 class MarlCurriculumCfg(CurriculumCfg):
-    # terrain_levels comes from the IBR rounds unchanged
+    # terrain_levels: on how well navigation commands were followed, not on
+    # distance from the origin (see mdp.terrain_levels_tracking)
     arm_target_levels = CurrTerm(func=mdp.arm_target_levels, params={"command_name": ARM_COMMAND})
+
+    def __post_init__(self):
+        self.terrain_levels = CurrTerm(func=mdp.terrain_levels_tracking, params={"command_name": "base_velocity"})
 
 
 @configclass
@@ -422,6 +445,14 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
         self.scene.height_scanner.update_period = self.decimation * self.sim.dt
         self.scene.contact_forces.update_period = self.sim.dt
         self.scene.imu.update_period = self.decimation * self.sim.dt
+        # The 25 filtered self-contact sensors: once per policy step, not every
+        # physics step. Env stepping was 91 ms/step (run 5) and these were the
+        # IBR prime suspect for slowdown. self_contacts_involving reads the
+        # latest reading; a contact shorter than a policy step can be missed.
+        for name in SELF_CONTACT_SENSOR_NAMES:
+            sensor = getattr(self.scene, name)
+            sensor.update_period = self.decimation * self.sim.dt
+            sensor.history_length = 1
         if abs(self.decimation * self.sim.dt - POLICY_DT) > 1e-9:
             raise ValueError(f"POLICY_DT ({POLICY_DT}) must equal decimation * sim.dt: the goal bonus is sized by it.")
         self.viewer.eye = (4.0, 4.0, 2.5)

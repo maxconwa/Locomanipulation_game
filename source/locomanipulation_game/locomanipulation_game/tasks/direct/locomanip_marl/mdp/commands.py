@@ -18,6 +18,7 @@ use the true world target.
 
 from __future__ import annotations
 
+import os
 import torch
 from collections.abc import Sequence
 from dataclasses import MISSING
@@ -87,15 +88,78 @@ def _relative(pos_a, quat_a, pose_w):
     return torch.cat([pos, quat_unique(rot)], dim=-1).view(n, a, 7)
 
 
+def _add_weighted_mean(extras: dict, key: str, total: torch.Tensor, count: torch.Tensor):
+    """extras[key] = sum(total) / sum(count) over the envs being logged.
+
+    Left out when none of them had a step in that mode: a 0 there would drag
+    the logged average down.
+    """
+    steps = count.sum().item()
+    if steps > 0:
+        extras[key] = total.sum().item() / steps
+
+
 class ModalVelocityCommand(UniformVelocityCommand):
-    """UniformVelocityCommand that is zero while the env has an arm goal."""
+    """UniformVelocityCommand that is zero while the env has an arm goal.
+
+    Besides the parent's metrics (which average over every step, arm goals
+    included) it logs, per episode:
+
+      * nav_error_vel_xy / nav_error_vel_yaw: mean tracking error over
+        navigation steps only (m/s, rad/s);
+      * arm_goal_yaw_rate: mean |yaw rate| while an arm goal holds the
+        command at zero: how much reaching turns the robot;
+      * commanded_path / tracked_path (m): distance the navigation commands
+        asked for, and the part of it the base covered along the commanded
+        direction (capped at the commanded speed). The terrain curriculum
+        (terrain_levels_tracking) reads these before the reset zeroes them.
+    """
 
     cfg: ModalVelocityCommandCfg
 
+    def __init__(self, cfg: ModalVelocityCommandCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        zeros = lambda: torch.zeros(self.num_envs, device=self.device)  # noqa: E731
+        self.metrics["commanded_path"] = zeros()
+        self.metrics["tracked_path"] = zeros()
+        self._nav_steps, self._nav_err_xy, self._nav_err_yaw = zeros(), zeros(), zeros()
+        self._arm_steps, self._arm_yaw_rate = zeros(), zeros()
+
+    def _arm_mode(self) -> torch.Tensor:
+        return self._env.command_manager.get_term(self.cfg.arm_command_name).arm_mode
+
     def _update_command(self):
         super()._update_command()
-        arm_term: ArmTargetsCommand = self._env.command_manager.get_term(self.cfg.arm_command_name)
-        self.vel_command_b[arm_term.arm_mode] = 0.0
+        self.vel_command_b[self._arm_mode()] = 0.0
+
+    def _update_metrics(self):
+        super()._update_metrics()
+        dt = self._env.step_dt
+        arm = self._arm_mode().float()
+        nav = 1.0 - arm
+        cmd_xy = self.vel_command_b[:, :2]
+        vel_xy = self.robot.data.root_lin_vel_b[:, :2]
+        yaw_rate = self.robot.data.root_ang_vel_b[:, 2]
+        speed = torch.norm(cmd_xy, dim=-1)
+        along = (vel_xy * cmd_xy).sum(dim=-1) / speed.clamp(min=1e-6)
+        self.metrics["commanded_path"] += speed * dt * nav
+        self.metrics["tracked_path"] += torch.minimum(along.clamp(min=0.0), speed) * dt * nav
+        self._nav_steps += nav
+        self._nav_err_xy += torch.norm(cmd_xy - vel_xy, dim=-1) * nav
+        self._nav_err_yaw += torch.abs(self.vel_command_b[:, 2] - yaw_rate) * nav
+        self._arm_steps += arm
+        self._arm_yaw_rate += torch.abs(yaw_rate) * arm
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
+        ids = slice(None) if env_ids is None else env_ids
+        extras = {}
+        _add_weighted_mean(extras, "nav_error_vel_xy", self._nav_err_xy[ids], self._nav_steps[ids])
+        _add_weighted_mean(extras, "nav_error_vel_yaw", self._nav_err_yaw[ids], self._nav_steps[ids])
+        _add_weighted_mean(extras, "arm_goal_yaw_rate", self._arm_yaw_rate[ids], self._arm_steps[ids])
+        for buffer in (self._nav_steps, self._nav_err_xy, self._nav_err_yaw, self._arm_steps, self._arm_yaw_rate):
+            buffer[ids] = 0.0
+        extras.update(super().reset(env_ids))
+        return extras
 
 
 @configclass
@@ -113,22 +177,30 @@ class ArmTargetsCommand(CommandTerm):
     navigation for nav_time_range seconds (the velocity command is resampled).
 
     **Arm goal targets.** Drawn from a per-arm table, then fixed in the world.
-    At construction, for each arm: set its joints to uniform random angles
-    inside their soft limits (everything else at default, root at its default
-    pose), take one physics step, record the wrist pose in the pelvis frame,
-    and drop the sample if any of the arm's links is in contact. Every target
-    was reached once, collision-free, standing. At the event the table pose is
-    placed in the *standing frame* (pelvis x, y and yaw; standing pelvis height
-    above the scanned ground; no roll or pitch) and that world pose is kept.
+    The table: for each arm, set its joints to uniform random angles inside
+    their soft limits (everything else at default, root at its default pose),
+    take one physics step, record the wrist pose in the pelvis frame, and drop
+    the sample if any of the arm's links is in contact. Every target was
+    reached once, collision-free, standing. It is built once per run and saved
+    to <log_dir>/<table_file>; a later env with the same log_dir (play.py)
+    loads it. At the event the table pose is placed in the *standing frame*
+    (pelvis x, y and yaw; standing pelvis height above the scanned ground; no
+    roll or pitch) and that world pose is kept.
 
-    **Curriculum.** Each env has a level. Levels 0..spread_levels draw from the
-    easiest fraction (level + 1) / (spread_levels + 1) of each table, sorted by
-    the larger of the distance and the rotation from the default pose (each
-    normalised by its maximum), so goals start in front of the robot and widen
-    to the whole standing workspace. The next drop_levels levels use the whole
-    table and lower both targets by a shared random drop up to
-    max_height_drop * k / drop_levels, which the legs must crouch for.
-    update_levels() moves the level at episode end.
+    **Curriculum.** Each env has a level. Each table is sorted by difficulty:
+    the larger of the distance and the rotation from the default pose, each
+    normalised by its maximum. Spread level k (0..spread_levels) draws from the
+    easiest first_level_fraction ** (1 - k / spread_levels) of it, a geometric
+    spacing, so goals start in front of the robot and every level widens the
+    region until the last is the whole standing workspace. The next
+    drop_levels levels use the whole table and lower both targets by a shared
+    random drop up to max_height_drop * k / drop_levels, which the legs must
+    crouch for.
+
+    A level moves on the env's last level_window arm goals, across episodes:
+    up at >= promote_rate reached, down below demote_rate, and the window
+    restarts at each move. A fall during an arm goal moves it down at the end
+    of the episode (update_levels, from the arm_target_levels curriculum term).
 
     **What the policies see.** believed_b: the targets in the pelvis frame.
     Exact at the event (on the robot: the operator's pelvis-frame command);
@@ -141,6 +213,11 @@ class ArmTargetsCommand(CommandTerm):
 
     The command (get_command) is believed_b flattened: (num_envs, num_arms * 7),
     per arm (x, y, z, qw, qx, qy, qz) in the pelvis frame, w-first.
+
+    **Metrics**, per episode, split by mode: goal_position_error /
+    goal_orientation_error (mean over arm-goal steps), rest_position_error
+    (mean over navigation steps), command_drift / estimator_drift, and the
+    goals reached and missed.
     """
 
     cfg: ArmTargetsCommandCfg
@@ -154,6 +231,7 @@ class ArmTargetsCommand(CommandTerm):
         self.body_ids = [self.robot.find_bodies(name)[0][0] for name in cfg.body_names]
         self.max_level = cfg.spread_levels + cfg.drop_levels
         shape = (self.num_envs, self.num_arms, 7)
+        zeros = lambda: torch.zeros(self.num_envs, device=self.device)  # noqa: E731
 
         # -- goal state
         self.arm_mode = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -163,33 +241,39 @@ class ArmTargetsCommand(CommandTerm):
         self.anchor_w[..., 3] = 1.0
         self.believed_b[..., 3] = 1.0
         self.shadow_b[..., 3] = 1.0
-        self.height_drop = torch.zeros(self.num_envs, device=self.device)
+        self.height_drop = zeros()
         self.use_estimate = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.estimate_prob = 0.0  # set by the env
-        self.level = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        self.hold_time = torch.zeros(self.num_envs, device=self.device)
+        self.hold_time = zeros()
         self.just_reached = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._at_reset = False
-        # -- metrics (CommandTerm.reset logs their mean over the reset envs, then zeroes them)
-        self.metrics["position_error"] = torch.zeros(self.num_envs, device=self.device)
-        self.metrics["orientation_error"] = torch.zeros(self.num_envs, device=self.device)
-        self.metrics["command_drift"] = torch.zeros(self.num_envs, device=self.device)
-        self.metrics["estimator_drift"] = torch.zeros(self.num_envs, device=self.device)
+        self._errors_cache: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._errors_step = -1
+
+        # -- curriculum: level, and the env's recent arm-goal outcomes (1 reached, 0 missed)
+        self.level = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.outcomes = torch.zeros(self.num_envs, cfg.level_window, device=self.device)
+        self.outcome_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+        # -- metrics. CommandTerm.reset logs their mean over the reset envs, then zeroes them.
+        self.metrics["command_drift"] = zeros()
+        self.metrics["estimator_drift"] = zeros()
+        self.metrics["goals_reached"] = zeros()
+        self.metrics["goals_missed"] = zeros()
+        # per-episode sums for the mode-split metrics, logged as weighted means by reset()
+        self._goal_steps, self._goal_pos_err, self._goal_rot_err = zeros(), zeros(), zeros()
+        self._rest_steps, self._rest_pos_err = zeros(), zeros()
         # shadow drift summed over arm goals that ended since the env last read it
         self.ended_goal_drift_sum = torch.zeros((), device=self.device)
         self.ended_goal_count = torch.zeros((), device=self.device)
-        self.metrics["goals_reached"] = torch.zeros(self.num_envs, device=self.device)
-        self.metrics["goals_missed"] = torch.zeros(self.num_envs, device=self.device)
 
+        raw_tables, default_poses = self._load_or_build_tables(env)
         self._tables: list[torch.Tensor] = []
         self._level_counts: list[torch.Tensor] = []
-        default_poses = []
-        for arm in range(self.num_arms):
-            table, default_pose = self._build_table(env, arm)
+        for table, default_pose in zip(raw_tables, default_poses):
             sorted_table, counts = self._sort_by_difficulty(table, default_pose)
             self._tables.append(sorted_table)
             self._level_counts.append(counts)
-            default_poses.append(default_pose)
         # (num_arms, 7): the arms-forward default, also the navigation rest pose
         self.rest_pose_b = torch.stack(default_poses)
 
@@ -215,7 +299,7 @@ class ArmTargetsCommand(CommandTerm):
         return self.believed_b.view(self.num_envs, -1)
 
     """
-    Frames and errors. Recomputed from the current state on every call.
+    Frames and errors.
     """
 
     def standing_frame_w(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -237,13 +321,25 @@ class ArmTargetsCommand(CommandTerm):
         return _relative(self.robot.data.root_pos_w, self.robot.data.root_quat_w, self.targets_w())
 
     def errors(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """(position error in m, rotation error in rad) per arm against the true targets. Each (num_envs, num_arms)."""
-        targets_w = self.targets_w()
-        body_pos = self.robot.data.body_pos_w[:, self.body_ids]
-        body_quat = self.robot.data.body_quat_w[:, self.body_ids]
-        pos_error = torch.norm(body_pos - targets_w[..., :3], dim=-1)
-        rot_error = quat_error_magnitude(body_quat.reshape(-1, 4), targets_w[..., 3:].reshape(-1, 4))
-        return pos_error, rot_error.view(self.num_envs, self.num_arms)
+        """(position error in m, rotation error in rad) per arm against the true targets. Each (num_envs, num_arms).
+
+        Cached per physics step: the arms' and the legs' tracking terms all ask
+        for it. invalidate_errors() drops the cache when targets or robot state
+        are written outside a physics step (goal events, env resets).
+        """
+        step = self._env._sim_step_counter
+        if self._errors_cache is None or self._errors_step != step:
+            targets_w = self.targets_w()
+            body_pos = self.robot.data.body_pos_w[:, self.body_ids]
+            body_quat = self.robot.data.body_quat_w[:, self.body_ids]
+            pos_error = torch.norm(body_pos - targets_w[..., :3], dim=-1)
+            rot_error = quat_error_magnitude(body_quat.reshape(-1, 4), targets_w[..., 3:].reshape(-1, 4))
+            self._errors_cache = (pos_error, rot_error.view(self.num_envs, self.num_arms))
+            self._errors_step = step
+        return self._errors_cache
+
+    def invalidate_errors(self):
+        self._errors_cache = None
 
     def apply_pelvis_motion(
         self,
@@ -268,33 +364,82 @@ class ArmTargetsCommand(CommandTerm):
         self.shadow_b[mask] = shadow[mask]
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
+        ids = slice(None) if env_ids is None else env_ids
+        extras = {}
+        _add_weighted_mean(extras, "goal_position_error", self._goal_pos_err[ids], self._goal_steps[ids])
+        _add_weighted_mean(extras, "goal_orientation_error", self._goal_rot_err[ids], self._goal_steps[ids])
+        _add_weighted_mean(extras, "rest_position_error", self._rest_pos_err[ids], self._rest_steps[ids])
+        for buffer in (self._goal_steps, self._goal_pos_err, self._goal_rot_err, self._rest_steps, self._rest_pos_err):
+            buffer[ids] = 0.0
+        self.invalidate_errors()
         self._at_reset = True
         try:
-            return super().reset(env_ids)
+            extras.update(super().reset(env_ids))
         finally:
             self._at_reset = False
+        return extras
 
     """
     Curriculum.
     """
 
     def update_levels(self, env_ids: Sequence[int], fell: torch.Tensor):
-        """At episode end: up if most arm goals were reached without a fall, down on a fall or mostly misses.
+        """At episode end: one level down if the robot fell during an arm goal. Restarts its outcome window."""
+        down = fell & self.arm_mode[env_ids]
+        self.level[env_ids] = (self.level[env_ids] - down.long()).clamp(min=0)
+        self.outcome_count[env_ids] = torch.where(down, 0, self.outcome_count[env_ids])
 
-        A fall only counts against the level if it happened during an arm goal.
-        """
-        fell = fell & self.arm_mode[env_ids]
-        reached = self.metrics["goals_reached"][env_ids]
-        missed = self.metrics["goals_missed"][env_ids]
-        finished = reached + missed
-        rate = reached / finished.clamp(min=1.0)
-        up = ~fell & (reached >= self.cfg.promote_min_goals) & (rate >= self.cfg.promote_rate)
-        down = fell | ((finished >= 1.0) & (rate < self.cfg.demote_rate))
-        self.level[env_ids] = (self.level[env_ids] + up.long() - down.long()).clamp(0, self.max_level)
+    def _record_outcomes(self, reached: torch.Tensor, missed: torch.Tensor):
+        """Push this step's ended arm goals into each env's window; move levels on full windows."""
+        ended = reached | missed
+        slot = self.outcome_count % self.cfg.level_window
+        current = self.outcomes.gather(1, slot.unsqueeze(1)).squeeze(1)
+        value = torch.where(ended, reached.float(), current)
+        self.outcomes.scatter_(1, slot.unsqueeze(1), value.unsqueeze(1))
+        self.outcome_count += ended.long()
+
+        judged = ended & (self.outcome_count >= self.cfg.level_window)
+        rate = self.outcomes.mean(dim=1)
+        up = judged & (rate >= self.cfg.promote_rate)
+        down = judged & (rate < self.cfg.demote_rate)
+        self.level = (self.level + up.long() - down.long()).clamp(0, self.max_level)
+        self.outcome_count = torch.where(up | down, 0, self.outcome_count)
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        """Env-side curriculum state, saved with the estimator so a resumed or played run keeps its levels."""
+        return {"level": self.level.clone()}
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]):
+        level = state["level"].to(self.device)
+        if len(level) == self.num_envs:
+            self.level[:] = level
+        else:
+            # a different env count (e.g. play.py): draw from the saved levels
+            self.level[:] = level[torch.randint(0, len(level), (self.num_envs,), device=self.device)]
 
     """
     Table construction.
     """
+
+    def _load_or_build_tables(self, env: ManagerBasedEnv) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        log_dir = getattr(env.cfg, "log_dir", None)
+        path = os.path.join(log_dir, self.cfg.table_file) if log_dir else None
+        if path and os.path.isfile(path):
+            saved = torch.load(path, map_location=self.device)
+            if saved.get("body_names") == list(self.cfg.body_names):
+                print(f"[INFO] ArmTargetsCommand: loaded the target tables from {path}")
+                return saved["tables"], saved["default_poses"]
+        tables, default_poses = [], []
+        for arm in range(self.num_arms):
+            table, default_pose = self._build_table(env, arm)
+            tables.append(table)
+            default_poses.append(default_pose)
+        if path:
+            os.makedirs(log_dir, exist_ok=True)
+            torch.save(
+                {"body_names": list(self.cfg.body_names), "tables": tables, "default_poses": default_poses}, path
+            )
+        return tables, default_poses
 
     def _build_table(self, env: ManagerBasedEnv, arm: int) -> tuple[torch.Tensor, torch.Tensor]:
         robot = self.robot
@@ -364,14 +509,14 @@ class ArmTargetsCommand(CommandTerm):
         return torch.cat([pos_b, quat_unique(quat_b)], dim=-1), ok
 
     def _sort_by_difficulty(self, table: torch.Tensor, default_pose: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Table sorted easiest first, and how many entries each spread level may draw from."""
+        """Table sorted easiest first, and how many entries each spread level may draw from (geometric)."""
         distance = torch.norm(table[:, :3] - default_pose[:3], dim=-1)
         angle = quat_error_magnitude(table[:, 3:], default_pose[3:].expand(len(table), 4))
         difficulty = torch.maximum(distance / distance.max(), angle / angle.max())
         order = torch.argsort(difficulty)
-        fractions = torch.arange(1, self.cfg.spread_levels + 2, device=self.device) / (self.cfg.spread_levels + 1)
-        counts = torch.searchsorted(difficulty[order].contiguous(), fractions, right=True)
-        counts = counts.clamp(min=min(self.cfg.min_targets_per_level, len(table)))
+        levels = torch.arange(self.cfg.spread_levels + 1, device=self.device, dtype=torch.float32)
+        fractions = self.cfg.first_level_fraction ** (1.0 - levels / max(self.cfg.spread_levels, 1))
+        counts = (fractions * len(table)).long().clamp(min=1, max=len(table))
         counts[-1] = len(table)
         return table[order], counts
 
@@ -381,14 +526,19 @@ class ArmTargetsCommand(CommandTerm):
 
     def _update_metrics(self):
         pos_error, rot_error = self.errors()
-        self.metrics["position_error"] = pos_error.mean(dim=1)
-        self.metrics["orientation_error"] = rot_error.mean(dim=1)
-        believed_w = _apply(self.robot.data.root_pos_w, self.robot.data.root_quat_w, self.believed_b)
-        drift = torch.norm(believed_w[..., :3] - self.anchor_w[..., :3], dim=-1).mean(dim=1)
-        self.metrics["command_drift"] = drift * self.arm_mode
-        shadow_w = _apply(self.robot.data.root_pos_w, self.robot.data.root_quat_w, self.shadow_b)
+        arm = self.arm_mode.float()
+        self._goal_steps += arm
+        self._goal_pos_err += pos_error.mean(dim=1) * arm
+        self._goal_rot_err += rot_error.mean(dim=1) * arm
+        self._rest_steps += 1.0 - arm
+        self._rest_pos_err += pos_error.mean(dim=1) * (1.0 - arm)
+
+        root_pos, root_quat = self.robot.data.root_pos_w, self.robot.data.root_quat_w
+        believed_w = _apply(root_pos, root_quat, self.believed_b)
+        self.metrics["command_drift"] = torch.norm(believed_w[..., :3] - self.anchor_w[..., :3], dim=-1).mean(1) * arm
+        shadow_w = _apply(root_pos, root_quat, self.shadow_b)
         shadow_drift = torch.norm(shadow_w[..., :3] - self.anchor_w[..., :3], dim=-1).mean(dim=1)
-        self.metrics["estimator_drift"] = shadow_drift * self.arm_mode
+        self.metrics["estimator_drift"] = shadow_drift * arm
 
         within = (pos_error < self.cfg.reach_pos_tol).all(dim=1) & (rot_error < self.cfg.reach_rot_tol).all(dim=1)
         step_dt = self._env.step_dt
@@ -400,10 +550,13 @@ class ArmTargetsCommand(CommandTerm):
         self.ended_goal_count += ended.sum()
         self.metrics["goals_reached"] += self.just_reached.float()
         self.metrics["goals_missed"] += timed_out.float()
+        # before the resample below, so the next goal is drawn at the new level
+        self._record_outcomes(self.just_reached, timed_out)
         # CommandTerm.compute counts time_left down next and resamples every env at <= 0
         self.time_left[self.just_reached] = 0.0
 
     def _resample_command(self, env_ids: Sequence[int]):
+        self.invalidate_errors()
         env_ids = torch.as_tensor(env_ids, device=self.device)
         n = len(env_ids)
         arm_goal = torch.rand(n, device=self.device) < self.cfg.arm_goal_prob
@@ -514,6 +667,8 @@ class ArmTargetsCommandCfg(CommandTermCfg):
 
     table_size: int = 100_000
     max_build_batches: int = 4000
+    table_file: str = "arm_target_tables.pt"
+    """Saved under the env's log_dir after the first build; loaded instead of rebuilding when present."""
     rel_default_envs: float = 0.1
     """Fraction of arm goals that are the default (arms-forward) pose, lowered by the drop like any other."""
 
@@ -527,11 +682,13 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     # -- curriculum
     spread_levels: int = 10
     """Levels 0..spread_levels widen the region; the last one is the whole standing table."""
-    min_targets_per_level: int = 256
+    first_level_fraction: float = 0.005
+    """Share of each table (easiest first) that level 0 draws from; levels grow geometrically to 1."""
     drop_levels: int = 5
     max_height_drop: float = 0.25
+    level_window: int = 5
+    """Arm goals per judgement: the level moves on the env's last level_window outcomes."""
     promote_rate: float = 0.8
-    promote_min_goals: int = 3
     demote_rate: float = 0.4
 
     goal_pose_visualizer_cfg: VisualizationMarkersCfg = _frame_marker("/Visuals/Command/arm_goal_pose", 0.1)
