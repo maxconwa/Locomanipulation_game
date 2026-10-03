@@ -134,7 +134,10 @@ class ArmTargetsCommand(CommandTerm):
     Exact at the event (on the robot: the operator's pelvis-frame command);
     then each step apply_pelvis_motion() moves it by the pelvis motion the
     env reports, estimated or true per goal (use_estimate, drawn at the event
-    with probability estimate_prob, which the env ramps up).
+    with probability estimate_prob, which the env ramps up and gates). shadow_b
+    is the same command moved by the estimate on every arm goal, whatever
+    use_estimate says: its drift (metric estimator_drift) measures the
+    estimator even while the policies are still given the true motion.
 
     The command (get_command) is believed_b flattened: (num_envs, num_arms * 7),
     per arm (x, y, z, qw, qx, qy, qz) in the pelvis frame, w-first.
@@ -156,8 +159,10 @@ class ArmTargetsCommand(CommandTerm):
         self.arm_mode = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.anchor_w = torch.zeros(shape, device=self.device)  # arm goal: world-fixed targets
         self.believed_b = torch.zeros(shape, device=self.device)  # what the policies see
+        self.shadow_b = torch.zeros(shape, device=self.device)  # moved by the estimate, always
         self.anchor_w[..., 3] = 1.0
         self.believed_b[..., 3] = 1.0
+        self.shadow_b[..., 3] = 1.0
         self.height_drop = torch.zeros(self.num_envs, device=self.device)
         self.use_estimate = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.estimate_prob = 0.0  # set by the env
@@ -169,6 +174,10 @@ class ArmTargetsCommand(CommandTerm):
         self.metrics["position_error"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["orientation_error"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["command_drift"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["estimator_drift"] = torch.zeros(self.num_envs, device=self.device)
+        # shadow drift summed over arm goals that ended since the env last read it
+        self.ended_goal_drift_sum = torch.zeros((), device=self.device)
+        self.ended_goal_count = torch.zeros((), device=self.device)
         self.metrics["goals_reached"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["goals_missed"] = torch.zeros(self.num_envs, device=self.device)
 
@@ -236,16 +245,27 @@ class ArmTargetsCommand(CommandTerm):
         rot_error = quat_error_magnitude(body_quat.reshape(-1, 4), targets_w[..., 3:].reshape(-1, 4))
         return pos_error, rot_error.view(self.num_envs, self.num_arms)
 
-    def apply_pelvis_motion(self, delta_pos: torch.Tensor, delta_quat: torch.Tensor, env_mask: torch.Tensor):
-        """Re-express the arm-goal commands after the pelvis moved by (delta_pos, delta_quat).
+    def apply_pelvis_motion(
+        self,
+        estimated: tuple[torch.Tensor, torch.Tensor],
+        true: tuple[torch.Tensor, torch.Tensor],
+        env_mask: torch.Tensor,
+    ):
+        """Re-express the arm-goal commands after the pelvis moved; each motion is (delta_pos, delta_quat).
 
         The motion is given in the previous pelvis frame. A world-fixed target
         obeys T_prev o c_prev = T_new o c_new, so c_new = delta^-1 o c_prev.
-        Navigation commands are fixed in the pelvis frame and don't move.
+        believed_b moves by the estimate where use_estimate, else by the true
+        motion; shadow_b always by the estimate. Navigation commands are fixed
+        in the pelvis frame and don't move.
         """
         mask = env_mask & self.arm_mode
-        moved = _relative(delta_pos, delta_quat, self.believed_b)
+        by_estimate = _relative(estimated[0], estimated[1], self.believed_b)
+        by_truth = _relative(true[0], true[1], self.believed_b)
+        moved = torch.where(self.use_estimate.view(-1, 1, 1), by_estimate, by_truth)
         self.believed_b[mask] = moved[mask]
+        shadow = _relative(estimated[0], estimated[1], self.shadow_b)
+        self.shadow_b[mask] = shadow[mask]
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
         self._at_reset = True
@@ -366,12 +386,18 @@ class ArmTargetsCommand(CommandTerm):
         believed_w = _apply(self.robot.data.root_pos_w, self.robot.data.root_quat_w, self.believed_b)
         drift = torch.norm(believed_w[..., :3] - self.anchor_w[..., :3], dim=-1).mean(dim=1)
         self.metrics["command_drift"] = drift * self.arm_mode
+        shadow_w = _apply(self.robot.data.root_pos_w, self.robot.data.root_quat_w, self.shadow_b)
+        shadow_drift = torch.norm(shadow_w[..., :3] - self.anchor_w[..., :3], dim=-1).mean(dim=1)
+        self.metrics["estimator_drift"] = shadow_drift * self.arm_mode
 
         within = (pos_error < self.cfg.reach_pos_tol).all(dim=1) & (rot_error < self.cfg.reach_rot_tol).all(dim=1)
         step_dt = self._env.step_dt
         self.hold_time = torch.where(within & self.arm_mode, self.hold_time + step_dt, torch.zeros_like(self.hold_time))
         self.just_reached = self.hold_time >= self.cfg.reach_hold_s
         timed_out = (self.time_left - step_dt <= 0.0) & ~self.just_reached & self.arm_mode
+        ended = self.just_reached | timed_out
+        self.ended_goal_drift_sum += (shadow_drift * ended).sum()
+        self.ended_goal_count += ended.sum()
         self.metrics["goals_reached"] += self.just_reached.float()
         self.metrics["goals_missed"] += timed_out.float()
         # CommandTerm.compute counts time_left down next and resamples every env at <= 0
@@ -390,6 +416,7 @@ class ArmTargetsCommand(CommandTerm):
         nav_ids = env_ids[~arm_goal]
         if len(nav_ids) > 0:
             self.believed_b[nav_ids] = self.rest_pose_b
+            self.shadow_b[nav_ids] = self.rest_pose_b
             self.time_left[nav_ids] = torch.empty(len(nav_ids), device=self.device).uniform_(*self.cfg.nav_time_range)
             self._env.command_manager.get_term(self.cfg.velocity_command_name)._resample(nav_ids)
 
@@ -422,6 +449,7 @@ class ArmTargetsCommand(CommandTerm):
         self.believed_b[arm_ids] = _relative(
             self.robot.data.root_pos_w[arm_ids], self.robot.data.root_quat_w[arm_ids], self.anchor_w[arm_ids]
         )
+        self.shadow_b[arm_ids] = self.believed_b[arm_ids]
         # stand still for it: zero now rather than at the velocity term's next update
         self._env.command_manager.get_term(self.cfg.velocity_command_name).vel_command_b[arm_ids] = 0.0
 

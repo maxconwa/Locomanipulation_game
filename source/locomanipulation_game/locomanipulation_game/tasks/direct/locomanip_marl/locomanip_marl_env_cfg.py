@@ -212,28 +212,36 @@ class MarlObservationsCfg:
 
     @configclass
     class OdometryCfg(ObsGroup):
-        """The pelvis-motion estimator's measurements, noisy like the actors'. Not a policy input."""
+        """The pelvis-motion estimator's measurements. Not a policy input.
+
+        Sensor-level noise, not the actors' domain-randomization noise: at
+        50 Hz a walking foot moves ~1 cm per step, and the actors' +-0.01 rad
+        joint noise alone is that big once it goes through the leg. With it
+        the estimator plateaued at ~0.28 m/s error and the arm command
+        drifted ~0.25 m per goal. Assumed sensors: absolute joint encoders
+        (~1e-3 rad), differentiated joint velocity, a MEMS IMU.
+        """
 
         base_lin_acc = ObsTerm(
-            func=mdp.imu_lin_acc, params={"asset_cfg": SceneEntityCfg("imu")}, noise=Unoise(n_min=-0.5, n_max=0.5)
+            func=mdp.imu_lin_acc, params={"asset_cfg": SceneEntityCfg("imu")}, noise=Unoise(n_min=-0.05, n_max=0.05)
         )
         base_ang_vel = ObsTerm(
-            func=mdp.imu_ang_vel, params={"asset_cfg": SceneEntityCfg("imu")}, noise=Unoise(n_min=-0.2, n_max=0.2)
+            func=mdp.imu_ang_vel, params={"asset_cfg": SceneEntityCfg("imu")}, noise=Unoise(n_min=-0.02, n_max=0.02)
         )
         projected_gravity = ObsTerm(
             func=mdp.imu_projected_gravity,
             params={"asset_cfg": SceneEntityCfg("imu")},
-            noise=Unoise(n_min=-0.05, n_max=0.05),
+            noise=Unoise(n_min=-0.005, n_max=0.005),
         )
         joint_pos = ObsTerm(
             func=mdp.joint_pos_rel,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=ALL_JOINTS_NAMES, preserve_order=True)},
-            noise=Unoise(n_min=-0.01, n_max=0.01),
+            noise=Unoise(n_min=-0.001, n_max=0.001),
         )
         joint_vel = ObsTerm(
             func=mdp.joint_vel_rel,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=ALL_JOINTS_NAMES, preserve_order=True)},
-            noise=Unoise(n_min=-1.5, n_max=1.5),
+            noise=Unoise(n_min=-0.05, n_max=0.05),
         )
 
         def __post_init__(self):

@@ -105,6 +105,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._prev_root_quat = torch.zeros(self.num_envs, 4, device=self.device)
         # envs whose previous odometry sample belongs to an earlier episode
         self._fresh = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        # running mean of the estimate's drift at the end of an arm goal; starts closed
+        self._goal_drift_ema = torch.tensor(1.0, device=self.device)
         self._estimator_log: dict[str, torch.Tensor] = {}
 
         self._obs_buf: dict[str, torch.Tensor] = {}
@@ -186,6 +188,11 @@ class LocoManipMarlEnv(DirectMARLEnv):
     def _update_odometry(self):
         """Estimate this step's pelvis motion, move the arm commands by it, and fit the estimator.
 
+        Arm goals follow the estimate with probability estimate_prob: 0 during
+        warmup, then ramping to 1, but only while the estimate's drift over a
+        whole arm goal (Estimator/goal_drift) is under drift_gate. A worse
+        estimate would hand the arms targets they can't reach.
+
         Runs after resets: reset envs are skipped (their previous sample is
         from the old episode) and get a fresh, exact command from the command
         manager anyway.
@@ -200,19 +207,17 @@ class LocoManipMarlEnv(DirectMARLEnv):
             inputs = torch.cat([self._prev_odometry_obs, odometry_obs, self.action_manager.action], dim=1)
             true_motion = pelvis_motion(self._prev_root_pos, self._prev_root_quat, root_pos, root_quat, self.step_dt)
             estimated_motion = self.estimator.model(inputs)
-            if cfg.use_estimate:
-                use_estimate = self._arm_command.use_estimate.unsqueeze(1)
-                motion = torch.where(use_estimate, estimated_motion, true_motion)
-            else:
-                motion = true_motion
-            delta_pos, delta_quat = motion_to_transform(motion, self.step_dt)
-            self._arm_command.apply_pelvis_motion(delta_pos, delta_quat, valid)
+            self._arm_command.apply_pelvis_motion(
+                estimated=motion_to_transform(estimated_motion, self.step_dt),
+                true=motion_to_transform(true_motion, self.step_dt),
+                env_mask=valid,
+            )
 
             if cfg.train:
                 self.estimator.add(inputs, true_motion, valid)
                 if self.common_step_counter % cfg.train_every == 0:
                     stats = self.estimator.train()
-                    self._estimator_log = {f"Estimator/{k}": v for k, v in stats.items()}
+                    self._estimator_log.update({f"Estimator/{k}": v for k, v in stats.items()})
                 if cfg.save_every > 0 and self.common_step_counter % cfg.save_every == 0 and self.cfg.log_dir:
                     self._save_estimator()
 
@@ -220,15 +225,31 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._prev_root_pos, self._prev_root_quat = root_pos, root_quat
         self._fresh[:] = False
 
-        # teacher forcing: the share of new arm goals that follow the estimate
+        # Quality gate: the estimate's drift over whole arm goals (shadow command),
+        # one EMA sample per ended goal. No GPU sync: everything stays a tensor.
+        arm = self._arm_command
+        count = arm.ended_goal_count
+        mean_drift = arm.ended_goal_drift_sum / count.clamp(min=1.0)
+        alpha = 1.0 - (1.0 - cfg.drift_ema_per_goal) ** count
+        self._goal_drift_ema = torch.where(
+            count > 0, (1.0 - alpha) * self._goal_drift_ema + alpha * mean_drift, self._goal_drift_ema
+        )
+        arm.ended_goal_drift_sum.zero_()
+        arm.ended_goal_count.zero_()
+        gate_open = (self._goal_drift_ema < cfg.drift_gate).float()
+
+        # teacher forcing: the share of new arm goals whose command follows the estimate
         if not cfg.use_estimate:
-            prob = 0.0
+            prob = torch.tensor(0.0, device=self.device)
         elif not cfg.train:
-            prob = 1.0
+            prob = torch.tensor(1.0, device=self.device)
         else:
-            prob = min(max((self.common_step_counter - cfg.warmup_steps) / max(cfg.ramp_steps, 1), 0.0), 1.0)
-        self._arm_command.estimate_prob = prob
-        self._estimator_log["Estimator/estimate_prob"] = torch.tensor(prob, device=self.device)
+            ramp = min(max((self.common_step_counter - cfg.warmup_steps) / max(cfg.ramp_steps, 1), 0.0), 1.0)
+            prob = ramp * gate_open
+        arm.estimate_prob = prob
+        self._estimator_log["Estimator/estimate_prob"] = prob
+        self._estimator_log["Estimator/goal_drift"] = self._goal_drift_ema
+        self._estimator_log["Estimator/gate_open"] = gate_open
 
     def _save_estimator(self):
         directory = os.path.join(self.cfg.log_dir, "estimator")

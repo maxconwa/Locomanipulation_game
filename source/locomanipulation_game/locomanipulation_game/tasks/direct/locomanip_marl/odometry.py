@@ -163,8 +163,13 @@ class PelvisEstimatorCfg:
     epochs: int = 2
     mini_batches: int = 4
     # Teacher forcing: each arm goal follows the estimate with probability
-    # estimate_prob, 0 until warmup_steps, then rising linearly to 1 over ramp_steps.
+    # estimate_prob, 0 until warmup_steps, then rising linearly to 1 over
+    # ramp_steps; and 0 whenever the drift gate is closed.
     warmup_steps: int = 4800
     ramp_steps: int = 19200
     save_every: int = 4800
     """Env steps between saves; 4800 matches the skrl checkpoint interval."""
+    drift_gate: float = 0.05
+    """Arm goals follow the estimate only while its mean drift over a whole goal is below this (m): the reach tolerance."""
+    drift_ema_per_goal: float = 0.001
+    """EMA weight of each ended arm goal's drift."""
