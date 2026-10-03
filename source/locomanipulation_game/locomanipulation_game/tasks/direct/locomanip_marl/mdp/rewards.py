@@ -11,8 +11,12 @@ from __future__ import annotations
 import torch
 from typing import TYPE_CHECKING
 
-from isaaclab.managers import ManagerTermBase, RewardTermCfg
+from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
 from isaaclab.sensors import ContactSensor
+
+from locomanipulation_game.tasks.manager_based.locomanipulation_game.mdp.rewards import stand_still
+
+from .commands import ground_height
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -73,3 +77,60 @@ class self_contacts_involving(ManagerTermBase):
             peak = sensor.data.force_matrix_w_history.norm(dim=-1).max(dim=1)[0][:, 0]
             count += torch.sum((peak > threshold) & mask, dim=1)
         return count
+
+
+# ---------------------------------------------------------------------------
+# Arm targets (ArmTargetsCommand). The command computes the errors, so the
+# arms' and the legs' copies of these terms read the same numbers.
+# ---------------------------------------------------------------------------
+
+
+def arm_target_pos_exp(env: ManagerBasedRLEnv, command_name: str, arm: int, std: float) -> torch.Tensor:
+    """exp(-d^2 / std^2) on one arm's wrist position error."""
+    pos_error, _ = env.command_manager.get_term(command_name).errors()
+    return torch.exp(-pos_error[:, arm].square() / std**2)
+
+
+def arm_target_quat_exp(env: ManagerBasedRLEnv, command_name: str, arm: int, std: float) -> torch.Tensor:
+    """exp(-theta^2 / std^2) on one arm's wrist rotation error, std in radians."""
+    _, rot_error = env.command_manager.get_term(command_name).errors()
+    return torch.exp(-rot_error[:, arm].square() / std**2)
+
+
+def arm_goal_reached(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """1 on the step after both wrists reached the goal (and a new one was drawn).
+
+    The smooth tracking kernels alone would pay the arms to hover just outside
+    the tolerance: reaching swaps a near goal for a far one. This one-off bonus
+    makes finishing a goal worth more than hovering. It lands one step late,
+    since goals are checked after the reward is computed.
+    """
+    return env.command_manager.get_term(command_name).just_reached.float()
+
+
+def base_height_l2_lowered(
+    env: ManagerBasedRLEnv, target_height: float, command_name: str, sensor_cfg: SceneEntityCfg
+) -> torch.Tensor:
+    """base_height_l2 with the target lowered by the arm goal's height drop.
+
+    Same terrain-relative height as base_height_l2, but rays that missed the
+    mesh are ignored instead of making the reward inf.
+    """
+    asset = env.scene["robot"]
+    drop = env.command_manager.get_term(command_name).height_drop
+    ground = ground_height(env.scene.sensors[sensor_cfg.name])
+    error = torch.square(asset.data.root_pos_w[:, 2] - (target_height - drop + ground))
+    # every ray missed: the robot is off the mesh, and terrain_out_of_bounds ends it
+    return torch.nan_to_num(error, nan=0.0)
+
+
+def stand_still_lowered(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, command_name: str, arm_command_name: str
+) -> torch.Tensor:
+    """stand_still, except while the arm goal asks for a crouch.
+
+    stand_still pulls the legs to their default angles whenever the velocity
+    command is zero, which is a standing posture: it would fight the crouch.
+    """
+    lowered = env.command_manager.get_term(arm_command_name).height_drop > 0.0
+    return stand_still(env, asset_cfg, command_name) * ~lowered

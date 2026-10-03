@@ -1,20 +1,25 @@
 """Two agents, one H1-2: the legs track (vx, vy, yaw rate), the arms track a wrist pose each.
 
-Trained together with IPPO (skrl). The scene, events, terminations, curriculum
-and the legs' reward set are the IBR game's, imported from the manager-based
-task, so the two setups stay comparable. What is new here:
+Trained together with IPPO (skrl). The scene, events, terminations and terrain
+curriculum are the IBR game's, imported from the manager-based task, and the
+legs start from the IBR legs reward set. What is new here:
 
-  * commands: two ReachablePoseCommand terms, one per wrist, in the pelvis frame
+  * commands: arm_targets, both wrists' goals, with a reach curriculum
+    (mdp.ArmTargetsCommand): goals start in front of the robot, widen to the
+    whole standing workspace, then drop up to 25 cm below it so the legs must
+    crouch. A reached goal is replaced on the spot; episodes don't end on it.
   * actions:  both agents' joint targets in one ActionManager (legs first)
   * observations: one group per agent, plus a privileged `critic` group that
     becomes the env state and feeds both critics
-  * rewards: one reward set per agent
+  * rewards: one reward set per agent. The legs also get LEGS_SHARE_OF_ARMS x
+    the arms' tracking terms, and their base-height target drops with the goal.
 
 torso_joint belongs to neither agent: its actuator holds it at default, as in
 the IBR rounds.
 """
 
 from isaaclab.envs import DirectMARLEnvCfg
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
@@ -32,8 +37,12 @@ from locomanipulation_game.assets.h1_2 import (
     LOWER_JOINT_NAMES,
     LOWER_LINK_NAMES,
     PELVIS_LINK_NAME,
+    STANDING_PELVIS_HEIGHT,
 )
-from locomanipulation_game.tasks.manager_based.locomanipulation_game.common.reward_cfg import LowerRewardsCfg
+from locomanipulation_game.tasks.manager_based.locomanipulation_game.common.reward_cfg import (
+    BASE_HEIGHT_TARGET,
+    LowerRewardsCfg,
+)
 from locomanipulation_game.tasks.manager_based.locomanipulation_game.common.scenes import (
     SELF_CONTACT_LINK_NAMES,
     SELF_CONTACT_SENSOR_NAMES,
@@ -52,6 +61,7 @@ LEFT_ARM_JOINT_NAMES = ARM_JOINT_NAMES[:7]
 RIGHT_ARM_JOINT_NAMES = ARM_JOINT_NAMES[7:]
 LEFT_EE_BODY = "left_wrist_yaw_link"
 RIGHT_EE_BODY = "right_wrist_yaw_link"
+ARM_COMMAND = "arm_targets"
 
 # Each agent is charged for the self-contact pairs that include one of its links.
 LEGS_OWN_LINKS = [PELVIS_LINK_NAME] + LOWER_LINK_NAMES
@@ -61,28 +71,29 @@ ARMS_OWN_LINKS = ARM_LINK_NAMES + FINGER_LINK_NAMES
 # term order in MarlActionsCfg: the env concatenates actions in that order.
 AGENT_ACTION_TERMS = {"legs": "joint_pos", "arms": "arm_pos"}
 
+POLICY_DT = 0.02          # decimation 4 x sim dt 0.005; reward weights are per second
 EE_POS_STD_COARSE = 0.25  # m
 EE_POS_STD_FINE = 0.05    # m
 EE_QUAT_STD = 0.5         # rad
+GOAL_BONUS = 5.0          # paid once per reached goal
+# The legs' reward includes this fraction of each arms tracking term (and the goal bonus).
+LEGS_SHARE_OF_ARMS = 0.1
 
 
 @configclass
 class MarlCommandsCfg(CommandsCfg):
     # base_velocity comes from the IBR rounds unchanged
-    left_ee_pose = mdp.ReachablePoseCommandCfg(
+    arm_targets = mdp.ArmTargetsCommandCfg(
         asset_name="robot",
-        body_name=LEFT_EE_BODY,
-        joint_names=LEFT_ARM_JOINT_NAMES,
-        collision_body_names=["left_(shoulder|elbow|wrist)_.*", "lg_.*"],
-        resampling_time_range=(3.0, 6.0),
-        debug_vis=True,
-    )
-    right_ee_pose = mdp.ReachablePoseCommandCfg(
-        asset_name="robot",
-        body_name=RIGHT_EE_BODY,
-        joint_names=RIGHT_ARM_JOINT_NAMES,
-        collision_body_names=["right_(shoulder|elbow|wrist)_.*", "rg_.*"],
-        resampling_time_range=(3.0, 6.0),
+        body_names=[LEFT_EE_BODY, RIGHT_EE_BODY],
+        joint_names=[LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES],
+        collision_body_names=[
+            ["left_(shoulder|elbow|wrist)_.*", "lg_.*"],
+            ["right_(shoulder|elbow|wrist)_.*", "rg_.*"],
+        ],
+        standing_height=STANDING_PELVIS_HEIGHT,
+        # the give-up time: a goal both wrists reach is replaced at once
+        resampling_time_range=(4.0, 6.0),
         debug_vis=True,
     )
 
@@ -113,7 +124,7 @@ class MarlActionsCfg:
 class MarlObservationsCfg:
     @configclass
     class ProprioCfg(ObsGroup):
-        """What both actors see: the IBR policy observation plus both wrist targets."""
+        """What both actors see: the IBR policy observation plus the arm goal."""
 
         base_lin_acc = ObsTerm(
             func=mdp.imu_lin_acc, params={"asset_cfg": SceneEntityCfg("imu")}, noise=Unoise(n_min=-0.5, n_max=0.5)
@@ -127,8 +138,9 @@ class MarlObservationsCfg:
             noise=Unoise(n_min=-0.05, n_max=0.05),
         )
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
-        left_ee_target = ObsTerm(func=mdp.pose_command_xyzw, params={"command_name": "left_ee_pose"})
-        right_ee_target = ObsTerm(func=mdp.pose_command_xyzw, params={"command_name": "right_ee_pose"})
+        # (x, y, z, qx, qy, qz, qw) per wrist, left then right, in the pelvis frame
+        ee_targets = ObsTerm(func=mdp.arm_targets_in_root_xyzw, params={"command_name": ARM_COMMAND})
+        height_drop = ObsTerm(func=mdp.arm_target_height_drop, params={"command_name": ARM_COMMAND})
         joint_pos = ObsTerm(
             func=mdp.joint_pos_rel,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=ALL_JOINTS_NAMES, preserve_order=True)},
@@ -184,39 +196,38 @@ _SELF_CONTACT_PARAMS = {
 
 @configclass
 class LegsRewardsCfg(LowerRewardsCfg):
-    """The IBR legs reward, with the two terms that would otherwise see the arms."""
+    """The IBR legs reward, with four terms changed for the shared body.
+
+    action_rate and self_collision would otherwise see the arms; base_height
+    and stand_still would otherwise fight a crouch the arm goal asks for.
+    """
 
     def __post_init__(self):
-        # action_rate_l2 differences the whole action vector, arms included
         self.action_rate.func = mdp.action_term_rate_l2
         self.action_rate.params = {"action_name": AGENT_ACTION_TERMS["legs"]}
         self.self_collision.func = mdp.self_contacts_involving
         self.self_collision.params = {**_SELF_CONTACT_PARAMS, "own_links": LEGS_OWN_LINKS}
+        self.base_height.func = mdp.base_height_l2_lowered
+        self.base_height.params = {
+            "target_height": BASE_HEIGHT_TARGET,
+            "command_name": ARM_COMMAND,
+            "sensor_cfg": SceneEntityCfg("height_scanner"),
+        }
+        self.stand_still.func = mdp.stand_still_lowered
+        self.stand_still.params = {**self.stand_still.params, "arm_command_name": ARM_COMMAND}
 
 
-def _ee_terms(command_name: str, body_name: str) -> dict[str, RewTerm]:
-    asset_cfg = SceneEntityCfg("robot", body_names=body_name)
+def _arm_tracking_terms(arm: int) -> dict[str, RewTerm]:
+    params = {"command_name": ARM_COMMAND, "arm": arm}
     return {
-        "pos": RewTerm(
-            func=mdp.track_ee_pos_exp,
-            weight=1.0,
-            params={"command_name": command_name, "asset_cfg": asset_cfg, "std": EE_POS_STD_COARSE},
-        ),
-        "pos_fine": RewTerm(
-            func=mdp.track_ee_pos_exp,
-            weight=1.0,
-            params={"command_name": command_name, "asset_cfg": asset_cfg, "std": EE_POS_STD_FINE},
-        ),
-        "quat": RewTerm(
-            func=mdp.track_ee_quat_exp,
-            weight=1.0,
-            params={"command_name": command_name, "asset_cfg": asset_cfg, "std": EE_QUAT_STD},
-        ),
+        "pos": RewTerm(func=mdp.arm_target_pos_exp, weight=1.0, params={**params, "std": EE_POS_STD_COARSE}),
+        "pos_fine": RewTerm(func=mdp.arm_target_pos_exp, weight=1.0, params={**params, "std": EE_POS_STD_FINE}),
+        "quat": RewTerm(func=mdp.arm_target_quat_exp, weight=1.0, params={**params, "std": EE_QUAT_STD}),
     }
 
 
-_LEFT = _ee_terms("left_ee_pose", LEFT_EE_BODY)
-_RIGHT = _ee_terms("right_ee_pose", RIGHT_EE_BODY)
+_LEFT = _arm_tracking_terms(0)
+_RIGHT = _arm_tracking_terms(1)
 
 
 @configclass
@@ -228,6 +239,10 @@ class ArmsRewardsCfg:
     right_ee_pos = _RIGHT["pos"]
     right_ee_pos_fine = _RIGHT["pos_fine"]
     right_ee_quat = _RIGHT["quat"]
+    # weights are per second (the manager multiplies by dt), so this is GOAL_BONUS per goal
+    goal_reached = RewTerm(
+        func=mdp.arm_goal_reached, weight=GOAL_BONUS / POLICY_DT, params={"command_name": ARM_COMMAND}
+    )
 
     # --- shared survival: the legs' alive bonus (the fall penalty is the env's termination_penalty) ---
     alive = RewTerm(func=mdp.is_alive, weight=0.15)
@@ -265,10 +280,31 @@ class ArmsRewardsCfg:
     )
 
 
+# The arms' terms the legs share in: tracking, not the arms' effort or safety.
+ARM_TRACKING_TERMS = [
+    "left_ee_pos", "left_ee_pos_fine", "left_ee_quat",
+    "right_ee_pos", "right_ee_pos_fine", "right_ee_quat",
+    "goal_reached",
+]
+
+
 @configclass
 class MarlRewardsCfg:
     legs: LegsRewardsCfg = LegsRewardsCfg()
     arms: ArmsRewardsCfg = ArmsRewardsCfg()
+
+    def __post_init__(self):
+        # Each arm tracking term, again in the legs' reward at LEGS_SHARE_OF_ARMS
+        # of its weight. Logged as Episode_Reward/legs/arms_<term>.
+        for name in ARM_TRACKING_TERMS:
+            term: RewTerm = getattr(self.arms, name)
+            setattr(self.legs, f"arms_{name}", term.replace(weight=LEGS_SHARE_OF_ARMS * term.weight))
+
+
+@configclass
+class MarlCurriculumCfg(CurriculumCfg):
+    # terrain_levels comes from the IBR rounds unchanged
+    arm_target_levels = CurrTerm(func=mdp.arm_target_levels, params={"command_name": ARM_COMMAND})
 
 
 @configclass
@@ -292,7 +328,7 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     observations: MarlObservationsCfg = MarlObservationsCfg()
     rewards: MarlRewardsCfg = MarlRewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
-    curriculum: CurriculumCfg = CurriculumCfg()
+    curriculum: MarlCurriculumCfg = MarlCurriculumCfg()
 
     # agent -> the action term it drives (see AGENT_ACTION_TERMS)
     agent_action_terms: dict[str, str] = AGENT_ACTION_TERMS
@@ -311,5 +347,7 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
         self.scene.height_scanner.update_period = self.decimation * self.sim.dt
         self.scene.contact_forces.update_period = self.sim.dt
         self.scene.imu.update_period = self.decimation * self.sim.dt
+        if abs(self.decimation * self.sim.dt - POLICY_DT) > 1e-9:
+            raise ValueError(f"POLICY_DT ({POLICY_DT}) must equal decimation * sim.dt: the goal bonus is sized by it.")
         self.viewer.eye = (4.0, 4.0, 2.5)
         self.viewer.lookat = (0.0, 0.0, 1.0)
