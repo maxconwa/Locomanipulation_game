@@ -13,7 +13,7 @@ models:
   policy:
     class: GaussianMixin
     clip_actions: False      # the env clips at cfg.clip_actions, like rsl_rl's clip_actions
-    clip_log_std: True
+    clip_log_std: True       # scripts/skrl/train.py also clamps the parameter after each update
     min_log_std: -3.0        # std 0.05: ClampedGaussianDistribution's min_std
     max_log_std: 0.0         # std 1.0:  its max_std
     initial_log_std: 0.0     # std 1.0:  its init_std

@@ -131,6 +131,40 @@ else:
     algorithm = agent_cfg_entry_point.split("_cfg")[0].split("skrl_")[-1].lower()
 
 
+def project_log_std_after_updates(agent, policy_cfg: dict):
+    """Keep each multi-agent policy's log_std *parameter* inside [min_log_std, max_log_std].
+
+    skrl's GaussianMixin clamps log_std only in the forward pass. A parameter
+    pushed past max_log_std (the entropy bonus does this) then gets zero
+    gradient and stays there: the std is pinned at its maximum for good.
+    LocoManip-Marl run 3 sat at std 1.0 for both agents for 1077 updates.
+    Clamping the parameter after every update, and once now (a loaded
+    checkpoint may be past the bound), gives the bounded std of the IBR
+    runner's ClampedGaussianDistribution.
+    """
+    import torch
+
+    if not hasattr(agent, "policies") or not policy_cfg.get("clip_log_std", True):
+        return
+    low, high = policy_cfg["min_log_std"], policy_cfg["max_log_std"]
+
+    def project(uid):
+        parameter = getattr(agent.policies[uid], "log_std_parameter", None)
+        if parameter is not None:
+            with torch.no_grad():
+                parameter.clamp_(low, high)
+
+    for uid in agent.policies:
+        project(uid)
+    update = agent.update
+
+    def update_and_project(*, timestep, timesteps, uid):
+        update(timestep=timestep, timesteps=timesteps, uid=uid)
+        project(uid)
+
+    agent.update = update_and_project
+
+
 @hydra_task_config(args_cli.task, agent_cfg_entry_point)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict):
     """Train with skrl agent."""
@@ -235,6 +269,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if resume_path:
         print(f"[INFO] Loading model checkpoint from: {resume_path}")
         runner.agent.load(resume_path)
+    project_log_std_after_updates(runner.agent, agent_cfg["models"]["policy"])
 
     # run training
     runner.run()
