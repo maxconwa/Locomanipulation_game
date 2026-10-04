@@ -87,7 +87,9 @@ EE_QUAT_STD = 0.5         # rad
 GOAL_BONUS = 5.0          # paid once per reached goal
 # Each agent's reward includes this fraction of the other's command-following
 # terms: the legs get the arms' tracking and goal bonus, the arms the legs' velocity tracking.
-LEGS_SHARE_OF_ARMS = 0.1
+# 0.5 for the legs: lowering the pelvis for a low target pays mostly through
+# the arms' tracking, and at 0.1 that was ~11% of the legs' reward.
+LEGS_SHARE_OF_ARMS = 0.5
 ARMS_SHARE_OF_LEGS = 0.1
 
 
@@ -168,7 +170,11 @@ class MarlObservationsCfg:
         # (x, y, z, qx, qy, qz, qw) per wrist, left then right, in the pelvis
         # frame: the command as the robot would hold it, moved by odometry
         ee_targets = ObsTerm(func=mdp.arm_targets_in_root_xyzw, params={"command_name": ARM_COMMAND})
-        height_drop = ObsTerm(func=mdp.arm_target_height_drop, params={"command_name": ARM_COMMAND})
+        # Zeros: crouching should emerge from low targets, not be commanded.
+        # Kept as an input so checkpoints from before still load.
+        height_drop = ObsTerm(
+            func=mdp.arm_target_height_drop, params={"command_name": ARM_COMMAND, "visible": False}
+        )
         joint_pos = ObsTerm(
             func=mdp.joint_pos_rel,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=ALL_JOINTS_NAMES, preserve_order=True)},
@@ -206,6 +212,9 @@ class MarlObservationsCfg:
         )
         # the rewards score the true world point; the actors only see the believed one
         true_ee_targets = ObsTerm(func=mdp.true_arm_targets_in_root_xyzw, params={"command_name": ARM_COMMAND})
+        # how low the pelvis is, and how far the goal was lowered: what a crouch is worth
+        pelvis_height = ObsTerm(func=mdp.pelvis_height_above_ground)
+        target_drop = ObsTerm(func=mdp.arm_target_height_drop, params={"command_name": ARM_COMMAND, "visible": True})
 
         def __post_init__(self):
             self.enable_corruption = False
@@ -282,8 +291,9 @@ class LegsRewardsCfg(LowerRewardsCfg):
     """The IBR legs reward, with five terms changed for the shared body.
 
     action_rate and self_collision would otherwise see the arms; base_height
-    would otherwise fight a crouch the arm goal asks for; stand_still would
-    pull the legs to default through every arm goal. track_ang_vel_z is
+    and stand_still apply during navigation only, so nothing holds the legs
+    at standing height during an arm goal and a crouch can emerge when low
+    targets reward it. track_ang_vel_z is
     weighted up: yaw tracking earned 0.48 of its 1.0 in run 5, against 1.65
     of 2.0 for xy.
     """
@@ -299,11 +309,11 @@ class LegsRewardsCfg(LowerRewardsCfg):
         self.action_rate.params = {"action_name": AGENT_ACTION_TERMS["legs"]}
         self.self_collision.func = mdp.self_contacts_involving
         self.self_collision.params = {**_SELF_CONTACT_PARAMS, "own_links": LEGS_OWN_LINKS}
-        self.base_height.func = mdp.base_height_l2_lowered
+        self.base_height.func = mdp.base_height_l2_navigation
         self.base_height.params = {
             "target_height": BASE_HEIGHT_TARGET,
-            "command_name": ARM_COMMAND,
             "sensor_cfg": SceneEntityCfg("height_scanner"),
+            "arm_command_name": ARM_COMMAND,
         }
         self.stand_still.func = mdp.stand_still_navigation
         self.stand_still.params = {**self.stand_still.params, "arm_command_name": ARM_COMMAND}
@@ -441,6 +451,10 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
 
     # agent -> the action term it drives (see AGENT_ACTION_TERMS)
     agent_action_terms: dict[str, str] = AGENT_ACTION_TERMS
+    # The env state (both critics' input under MAPPO): both actors'
+    # observations + the privileged critic group, so each critic can see what
+    # the other agent saw and did (its last action is in its observation).
+    state_includes_agent_obs: bool = True
     # Same as the IBR rounds' rsl_rl clip_actions.
     clip_actions: float = 10.0
     # Per-agent floor on the summed step reward, like PositiveRewardRLEnv.
@@ -468,3 +482,17 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
             raise ValueError(f"POLICY_DT ({POLICY_DT}) must equal decimation * sim.dt: the goal bonus is sized by it.")
         self.viewer.eye = (4.0, 4.0, 2.5)
         self.viewer.lookat = (0.0, 0.0, 1.0)
+
+
+@configclass
+class LocoManipMarlStandEnvCfg(LocoManipMarlEnvCfg):
+    """Stand and reach: navigation paused, every goal is an arm goal.
+
+    The experiment for an emergent crouch: the legs only have to keep the
+    robot up while the arms chase targets that the drop curriculum lowers
+    below the standing workspace.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.arm_targets.arm_goal_prob = 1.0

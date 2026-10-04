@@ -108,20 +108,22 @@ def arm_goal_reached(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     return env.command_manager.get_term(command_name).just_reached.float()
 
 
-def base_height_l2_lowered(
-    env: ManagerBasedRLEnv, target_height: float, command_name: str, sensor_cfg: SceneEntityCfg
+def base_height_l2_navigation(
+    env: ManagerBasedRLEnv, target_height: float, sensor_cfg: SceneEntityCfg, arm_command_name: str
 ) -> torch.Tensor:
-    """base_height_l2 with the target lowered by the arm goal's height drop.
+    """base_height_l2 during navigation only: the legs walk at standing height but may crouch for an arm goal.
 
     Same terrain-relative height as base_height_l2, but rays that missed the
-    mesh are ignored instead of making the reward inf.
+    mesh are ignored instead of making the reward inf. During arm goals there
+    is no height target at all: any crouch has to emerge from what makes the
+    arms' targets reachable.
     """
     asset = env.scene["robot"]
-    drop = env.command_manager.get_term(command_name).height_drop
     ground = ground_height(env.scene.sensors[sensor_cfg.name])
-    error = torch.square(asset.data.root_pos_w[:, 2] - (target_height - drop + ground))
+    error = torch.square(asset.data.root_pos_w[:, 2] - (target_height + ground))
+    navigating = ~env.command_manager.get_term(arm_command_name).arm_mode
     # every ray missed: the robot is off the mesh, and terrain_out_of_bounds ends it
-    return torch.nan_to_num(error, nan=0.0)
+    return torch.nan_to_num(error, nan=0.0) * navigating
 
 
 def stand_still_navigation(

@@ -47,15 +47,23 @@ def arm_goal_active(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     return term.arm_mode.float().unsqueeze(1)
 
 
-def arm_target_height_drop(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
-    """How far below the standing workspace the current goal is (m). Shape (num_envs, 1).
+def arm_target_height_drop(env: ManagerBasedRLEnv, command_name: str, visible: bool = True) -> torch.Tensor:
+    """How far the current arm goal was lowered below the standing workspace (m). Shape (num_envs, 1).
 
-    The legs' base-height target is standing height minus this, so they need to
-    see it: a low target in the pelvis frame alone doesn't say whether the arm
-    or the legs should go lower.
+    visible=False returns zeros: the actors keep the input (same size, so
+    older checkpoints load) but are no longer told to crouch; they have to
+    read it from the targets' height. The critic keeps the true value.
     """
     term: ArmTargetsCommand = env.command_manager.get_term(command_name)
-    return term.height_drop.unsqueeze(1)
+    return term.height_drop.unsqueeze(1) * float(visible)
+
+
+def pelvis_height_above_ground(env: ManagerBasedRLEnv, sensor_name: str = "height_scanner") -> torch.Tensor:
+    """Pelvis height over the mean of the height scan (m), 0 where every ray missed. Shape (num_envs, 1). Privileged."""
+    from .commands import ground_height
+
+    height = env.scene["robot"].data.root_pos_w[:, 2] - ground_height(env.scene.sensors[sensor_name])
+    return torch.nan_to_num(height, nan=0.0).unsqueeze(1)
 
 
 def body_pose_in_root_xyzw(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:

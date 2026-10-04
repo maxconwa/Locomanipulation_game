@@ -10,14 +10,15 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
-def arm_target_levels(env: ManagerBasedRLEnv, env_ids: Sequence[int], command_name: str) -> torch.Tensor:
-    """At episode end, a fall during an arm goal costs a level (ArmTargetsCommand.update_levels). Logs the mean level.
+def arm_target_levels(env: ManagerBasedRLEnv, env_ids: Sequence[int], command_name: str) -> dict[str, torch.Tensor]:
+    """At episode end, a fall during an arm goal is a demotion (ArmTargetsCommand.update_levels).
 
     The rest of the arm curriculum moves at goal events, inside the command.
+    Logs the mean spread and drop levels.
     """
     term = env.command_manager.get_term(command_name)
     term.update_levels(env_ids, fell=env.termination_manager.terminated[env_ids])
-    return torch.mean(term.level.float())
+    return {"spread": torch.mean(term.spread_level.float()), "drop": torch.mean(term.drop_level.float())}
 
 
 def terrain_levels_tracking(

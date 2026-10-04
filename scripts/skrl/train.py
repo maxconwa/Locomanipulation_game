@@ -38,6 +38,15 @@ parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint to resume training.")
+parser.add_argument(
+    "--init_policies",
+    type=str,
+    default=None,
+    help=(
+        "Warm start: load only each agent's policy (and observation preprocessor) from this skrl checkpoint;"
+        " critics, optimizers and the rest start fresh. For a new algorithm or critic input."
+    ),
+)
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
 parser.add_argument(
@@ -165,6 +174,24 @@ def project_log_std_after_updates(agent, policy_cfg: dict):
     agent.update = update_and_project
 
 
+def load_policies_only(agent, path: str):
+    """Load each agent's policy and observation preprocessor from a multi-agent skrl checkpoint.
+
+    The policy's inputs (the agent's observations) are unchanged across IPPO
+    and MAPPO; the critic's, its optimizer's and the state preprocessor's are
+    not, so those start fresh.
+    """
+    import torch
+
+    modules = torch.load(path, map_location=agent.device, weights_only=False)
+    for uid in agent.possible_agents:
+        for name in ("policy", "observation_preprocessor"):
+            module = agent.checkpoint_modules[uid].get(name)
+            if module is not None and name in modules.get(uid, {}):
+                module.load_state_dict(modules[uid][name])
+                print(f"[INFO] Warm start: {uid}/{name} from {path}")
+
+
 @hydra_task_config(args_cli.task, agent_cfg_entry_point)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict):
     """Train with skrl agent."""
@@ -222,9 +249,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # get checkpoint path (to resume training)
     resume_path = retrieve_file_path(args_cli.checkpoint) if args_cli.checkpoint else None
-    # LocoManip-Marl: the pelvis estimator is saved beside the skrl checkpoints, not in them
-    if resume_path and hasattr(env_cfg, "estimator"):
-        env_cfg.estimator.checkpoint_path = estimator_checkpoint_for(resume_path)
+    # LocoManip-Marl: the pelvis estimator (and curriculum state) is saved beside the skrl checkpoints, not in them
+    warm_start = resume_path or (retrieve_file_path(args_cli.init_policies) if args_cli.init_policies else None)
+    if warm_start and hasattr(env_cfg, "estimator"):
+        env_cfg.estimator.checkpoint_path = estimator_checkpoint_for(warm_start)
 
     # set the IO descriptors export flag if requested
     if isinstance(env_cfg, ManagerBasedRLEnvCfg):
@@ -269,6 +297,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if resume_path:
         print(f"[INFO] Loading model checkpoint from: {resume_path}")
         runner.agent.load(resume_path)
+    elif args_cli.init_policies:
+        load_policies_only(runner.agent, retrieve_file_path(args_cli.init_policies))
     project_log_std_after_updates(runner.agent, agent_cfg["models"]["policy"])
 
     # run training

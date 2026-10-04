@@ -187,20 +187,22 @@ class ArmTargetsCommand(CommandTerm):
     (pelvis x, y and yaw; standing pelvis height above the scanned ground; no
     roll or pitch) and that world pose is kept.
 
-    **Curriculum.** Each env has a level. Each table is sorted by difficulty:
-    the larger of the distance and the rotation from the default pose, each
-    normalised by its maximum. Spread level k (0..spread_levels) draws from the
-    easiest first_level_fraction ** (1 - k / spread_levels) of it, a geometric
-    spacing, so goals start in front of the robot and every level widens the
-    region until the last is the whole standing workspace. The next
-    drop_levels levels use the whole table and lower both targets by a shared
-    random drop up to max_height_drop * k / drop_levels, which the legs must
-    crouch for.
+    **Curriculum: two axes per env.** Each table is sorted by difficulty: the
+    larger of the distance and the rotation from the default pose, each
+    normalised by its maximum. The *spread* level k (0..spread_levels) draws
+    from the easiest first_level_fraction ** (1 - k / spread_levels) of it, a
+    geometric spacing, so goals start in front of the robot and widen to the
+    whole standing workspace. The *drop* level j (0..drop_levels) lowers both
+    targets by a shared random drop in [0, max_height_drop * j / drop_levels]:
+    targets below where the arms reach standing. Nothing tells the legs to
+    crouch; lowering the pelvis is just what makes those targets reachable.
 
-    A level moves on the env's last level_window arm goals, across episodes:
-    up at >= promote_rate reached, down below demote_rate, and the window
-    restarts at each move. A fall during an arm goal moves it down at the end
-    of the episode (update_levels, from the arm_target_levels curriculum term).
+    Both move on the env's last level_window arm goals, across episodes: a
+    promotion at >= promote_rate reached raises one axis, alternating and drop
+    first, so low targets appear early while the spread is still easy; a
+    demotion below demote_rate undoes the most recent promotion. The window
+    restarts at each move. A fall during an arm goal demotes at the end of the
+    episode (update_levels, from the arm_target_levels curriculum term).
 
     **What the policies see.** believed_b: the targets in the pelvis frame.
     Exact at the event (on the robot: the operator's pelvis-frame command);
@@ -229,7 +231,6 @@ class ArmTargetsCommand(CommandTerm):
         self.scanner: RayCaster = env.scene.sensors[cfg.height_scanner_name]
         self.num_arms = len(cfg.body_names)
         self.body_ids = [self.robot.find_bodies(name)[0][0] for name in cfg.body_names]
-        self.max_level = cfg.spread_levels + cfg.drop_levels
         shape = (self.num_envs, self.num_arms, 7)
         zeros = lambda: torch.zeros(self.num_envs, device=self.device)  # noqa: E731
 
@@ -250,8 +251,11 @@ class ArmTargetsCommand(CommandTerm):
         self._errors_cache: tuple[torch.Tensor, torch.Tensor] | None = None
         self._errors_step = -1
 
-        # -- curriculum: level, and the env's recent arm-goal outcomes (1 reached, 0 missed)
-        self.level = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # -- curriculum: two levels, and the env's recent arm-goal outcomes (1 reached, 0 missed)
+        self.spread_level = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.drop_level = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._promote_drop_next = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        self._last_promoted_drop = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.outcomes = torch.zeros(self.num_envs, cfg.level_window, device=self.device)
         self.outcome_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
@@ -383,11 +387,18 @@ class ArmTargetsCommand(CommandTerm):
     Curriculum.
     """
 
+    @property
+    def level(self) -> torch.Tensor:
+        """spread_level + drop_level: one number for logs."""
+        return self.spread_level + self.drop_level
+
     def update_levels(self, env_ids: Sequence[int], fell: torch.Tensor):
-        """At episode end: one level down if the robot fell during an arm goal. Restarts its outcome window."""
-        down = fell & self.arm_mode[env_ids]
-        self.level[env_ids] = (self.level[env_ids] - down.long()).clamp(min=0)
-        self.outcome_count[env_ids] = torch.where(down, 0, self.outcome_count[env_ids])
+        """At episode end: a fall during an arm goal is a demotion. Restarts the env's outcome window."""
+        env_ids = torch.as_tensor(env_ids, device=self.device)
+        down = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        down[env_ids] = fell & self.arm_mode[env_ids]
+        self._move_levels(torch.zeros_like(down), down)
+        self.outcome_count = torch.where(down, 0, self.outcome_count)
 
     def _record_outcomes(self, reached: torch.Tensor, missed: torch.Tensor):
         """Push this step's ended arm goals into each env's window; move levels on full windows."""
@@ -402,20 +413,56 @@ class ArmTargetsCommand(CommandTerm):
         rate = self.outcomes.mean(dim=1)
         up = judged & (rate >= self.cfg.promote_rate)
         down = judged & (rate < self.cfg.demote_rate)
-        self.level = (self.level + up.long() - down.long()).clamp(0, self.max_level)
+        self._move_levels(up, down)
         self.outcome_count = torch.where(up | down, 0, self.outcome_count)
+
+    def _move_levels(self, up: torch.Tensor, down: torch.Tensor):
+        """Promotions alternate drop / spread (drop first); a demotion undoes the most recent promotion."""
+        can_drop = self.drop_level < self.cfg.drop_levels
+        can_spread = self.spread_level < self.cfg.spread_levels
+        raise_drop = up & can_drop & (self._promote_drop_next | ~can_spread)
+        raise_spread = up & can_spread & ~raise_drop
+        self.drop_level += raise_drop.long()
+        self.spread_level += raise_spread.long()
+        self._promote_drop_next = torch.where(raise_drop, False, torch.where(raise_spread, True, self._promote_drop_next))
+        self._last_promoted_drop = torch.where(raise_drop, True, torch.where(raise_spread, False, self._last_promoted_drop))
+
+        lower_drop = down & (self.drop_level > 0) & (self._last_promoted_drop | (self.spread_level == 0))
+        lower_spread = down & (self.spread_level > 0) & ~lower_drop
+        self.drop_level -= lower_drop.long()
+        self.spread_level -= lower_spread.long()
+        # the next promotion re-raises what was just lowered; the one before it becomes the last promoted
+        self._promote_drop_next = torch.where(lower_drop, True, torch.where(lower_spread, False, self._promote_drop_next))
+        self._last_promoted_drop = torch.where(
+            lower_drop, False, torch.where(lower_spread, True, self._last_promoted_drop)
+        )
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         """Env-side curriculum state, saved with the estimator so a resumed or played run keeps its levels."""
-        return {"level": self.level.clone()}
+        return {
+            "spread_level": self.spread_level.clone(),
+            "drop_level": self.drop_level.clone(),
+            "promote_drop_next": self._promote_drop_next.clone(),
+            "last_promoted_drop": self._last_promoted_drop.clone(),
+        }
 
     def load_state_dict(self, state: dict[str, torch.Tensor]):
-        level = state["level"].to(self.device)
-        if len(level) == self.num_envs:
-            self.level[:] = level
+        if "level" in state:
+            # single-level runs (before the two axes): levels above spread_levels were drops
+            level = state["level"].to(self.device)
+            saved = {
+                "spread_level": level.clamp(max=self.cfg.spread_levels),
+                "drop_level": (level - self.cfg.spread_levels).clamp(min=0),
+            }
         else:
-            # a different env count (e.g. play.py): draw from the saved levels
-            self.level[:] = level[torch.randint(0, len(level), (self.num_envs,), device=self.device)]
+            saved = {k: v.to(self.device) for k, v in state.items()}
+        n = len(saved["spread_level"])
+        pick = slice(None) if n == self.num_envs else torch.randint(0, n, (self.num_envs,), device=self.device)
+        self.spread_level[:] = saved["spread_level"][pick].clamp(0, self.cfg.spread_levels)
+        self.drop_level[:] = saved["drop_level"][pick].clamp(0, self.cfg.drop_levels)
+        if "promote_drop_next" in saved:
+            self._promote_drop_next[:] = saved["promote_drop_next"][pick]
+            self._last_promoted_drop[:] = saved["last_promoted_drop"][pick]
 
     """
     Table construction.
@@ -578,8 +625,7 @@ class ArmTargetsCommand(CommandTerm):
         if len(arm_ids) == 0:
             return
         m = len(arm_ids)
-        level = self.level[arm_ids]
-        spread_level = level.clamp(max=self.cfg.spread_levels)
+        spread_level = self.spread_level[arm_ids]
         at_default = torch.rand(m, device=self.device) < self.cfg.rel_default_envs
         targets_s = torch.empty(m, self.num_arms, 7, device=self.device)
         for arm in range(self.num_arms):
@@ -588,7 +634,7 @@ class ArmTargetsCommand(CommandTerm):
             pose = self._tables[arm][idx]
             pose[at_default] = self.rest_pose_b[arm]
             targets_s[:, arm] = pose
-        drop_level = (level - self.cfg.spread_levels).clamp(min=0).float()
+        drop_level = self.drop_level[arm_ids].float()
         max_drop = self.cfg.max_height_drop * drop_level / max(self.cfg.drop_levels, 1)
         self.height_drop[arm_ids] = torch.rand(m, device=self.device) * max_drop
         targets_s[..., 2] -= self.height_drop[arm_ids].unsqueeze(1)
@@ -681,10 +727,11 @@ class ArmTargetsCommandCfg(CommandTermCfg):
 
     # -- curriculum
     spread_levels: int = 10
-    """Levels 0..spread_levels widen the region; the last one is the whole standing table."""
+    """Spread levels 0..spread_levels widen the region; the last one is the whole standing table."""
     first_level_fraction: float = 0.005
     """Share of each table (easiest first) that level 0 draws from; levels grow geometrically to 1."""
     drop_levels: int = 5
+    """Drop levels 0..drop_levels lower the targets by up to max_height_drop * level / drop_levels."""
     max_height_drop: float = 0.25
     level_window: int = 5
     """Arm goals per judgement: the level moves on the env's last level_window outcomes."""

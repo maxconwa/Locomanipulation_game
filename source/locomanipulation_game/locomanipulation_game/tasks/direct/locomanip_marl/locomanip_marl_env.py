@@ -82,6 +82,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
         group_dims = self.observation_manager.group_obs_dim
         self.cfg.observation_spaces = {agent: group_dims[agent][0] for agent in self.cfg.possible_agents}
         self.cfg.state_space = group_dims["critic"][0]
+        if self.cfg.state_includes_agent_obs:
+            self.cfg.state_space += sum(group_dims[agent][0] for agent in self.cfg.possible_agents)
         self.cfg.action_spaces = {
             agent: self.action_manager.get_term(term).action_dim for agent, term in self.cfg.agent_action_terms.items()
         }
@@ -160,6 +162,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
     def _get_states(self) -> torch.Tensor:
         # computed with the agents' groups in _get_observations, which step()
         # and reset() always call before state()
+        if self.cfg.state_includes_agent_obs:
+            return torch.cat([self._obs_buf[agent] for agent in self.cfg.possible_agents] + [self._obs_buf["critic"]], dim=1)
         return self._obs_buf["critic"]
 
     def _reset_idx(self, env_ids: Sequence[int]):
