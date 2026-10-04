@@ -288,6 +288,12 @@ class LegsRewardsCfg(LowerRewardsCfg):
     of 2.0 for xy.
     """
 
+    # Heading held through arm goals (see mdp.yaw_rate_l2_during_arm_goal); on
+    # top of track_ang_vel_z, which already asks for zero yaw then.
+    arm_goal_yaw_rate = RewTerm(
+        func=mdp.yaw_rate_l2_during_arm_goal, weight=-1.0, params={"arm_command_name": ARM_COMMAND}
+    )
+
     def __post_init__(self):
         self.action_rate.func = mdp.action_term_rate_l2
         self.action_rate.params = {"action_name": AGENT_ACTION_TERMS["legs"]}
@@ -333,6 +339,11 @@ class ArmsRewardsCfg:
 
     # --- shared survival: the legs' alive bonus (the fall penalty is the env's termination_penalty) ---
     alive = RewTerm(func=mdp.is_alive, weight=0.15)
+
+    # --- don't turn the robot while reaching (mdp.yaw_rate_l2_during_arm_goal) ---
+    arm_goal_yaw_rate = RewTerm(
+        func=mdp.yaw_rate_l2_during_arm_goal, weight=-2.0, params={"arm_command_name": ARM_COMMAND}
+    )
 
     # --- effort and smoothness (arm joints only), the legs' weights ---
     torques = RewTerm(

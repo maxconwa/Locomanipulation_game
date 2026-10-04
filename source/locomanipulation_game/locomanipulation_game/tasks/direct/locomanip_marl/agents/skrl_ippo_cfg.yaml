@@ -73,10 +73,12 @@ agent:
   value_clip: 0.2
   # Per agent. The arms' 0.01 kept their std at ~0.76 (0.38 rad per joint at
   # scale 0.5) for 2000+ updates (run 4): too noisy to hold both wrists within
-  # 5 cm, so arm goals were rarely reached and the curriculum never left level 0.
+  # 5 cm. At 0.002 with the higher learning rate their std crept back up from
+  # 0.15 to 0.20 (run 6). 0 like the IBR adversary: the arms' dense tracking
+  # reward keeps it from collapsing, and train.py bounds it to [0.05, 1.0].
   entropy_loss_scale:
     legs: 0.01
-    arms: 0.002
+    arms: 0.0
   value_loss_scale: 1.0
   kl_threshold: 0.0
   time_limit_bootstrap: True  # rsl_rl bootstraps time-outs too

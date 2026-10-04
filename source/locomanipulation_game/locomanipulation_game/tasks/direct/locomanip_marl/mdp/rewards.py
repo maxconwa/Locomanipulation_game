@@ -137,3 +137,16 @@ def stand_still_navigation(
     """
     navigating = ~env.command_manager.get_term(arm_command_name).arm_mode
     return stand_still(env, asset_cfg, command_name) * navigating
+
+
+def yaw_rate_l2_during_arm_goal(env: ManagerBasedRLEnv, arm_command_name: str) -> torch.Tensor:
+    """Squared pelvis yaw rate while an arm goal holds the velocity command at zero.
+
+    Run 6 measured ~0.5 rad/s mean |yaw rate| during arm goals: the robot
+    turned or wobbled while reaching (likely the arms' reaction torque), so the
+    world-fixed targets kept moving in the pelvis frame and the arms stalled
+    at ~11 cm. track_ang_vel_z already pays the legs for zero yaw; this term
+    also charges the arms, whose motion causes it.
+    """
+    yaw_rate = env.scene["robot"].data.root_ang_vel_b[:, 2]
+    return torch.square(yaw_rate) * env.command_manager.get_term(arm_command_name).arm_mode
