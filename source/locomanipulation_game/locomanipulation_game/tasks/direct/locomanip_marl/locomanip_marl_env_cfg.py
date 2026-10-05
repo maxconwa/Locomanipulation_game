@@ -91,6 +91,8 @@ GOAL_BONUS = 5.0          # paid once per reached goal
 # the arms' tracking, and at 0.1 that was ~11% of the legs' reward.
 LEGS_SHARE_OF_ARMS = 0.5
 ARMS_SHARE_OF_LEGS = 0.1
+# Legs gait shaping during arm goals, as a fraction of its IBR weight (see LegsRewardsCfg).
+ARM_GOAL_SHAPING_SCALE = {"lin_vel_z": 0.0, "ang_vel_xy": 0.5, "hip_pos": 0.2}
 
 
 @configclass
@@ -293,9 +295,16 @@ class LegsRewardsCfg(LowerRewardsCfg):
     action_rate and self_collision would otherwise see the arms; base_height
     and stand_still apply during navigation only, so nothing holds the legs
     at standing height during an arm goal and a crouch can emerge when low
-    targets reward it. track_ang_vel_z is
-    weighted up: yaw tracking earned 0.48 of its 1.0 in run 5, against 1.65
-    of 2.0 for xy.
+    targets reward it. track_ang_vel_z is weighted up: yaw tracking earned
+    0.48 of its 1.0 in run 5, against 1.65 of 2.0 for xy.
+
+    During arm goals (ARM_GOAL_SHAPING_SCALE) lin_vel_z is off, ang_vel_xy
+    halved and hip_pos at 0.2: run 9 measured them as the gait shaping that
+    resists the crouch. Kept: torques, dof_pos_limits, feet_contact_forces,
+    contact_no_vel, self_collision and the smoothness terms protect the
+    hardware, and in a deep crouch they mostly charged falls and hard drops;
+    the zero-command velocity terms and arm_goal_yaw_rate ask for standing
+    still without turning, which a crouch shouldn't need to break.
     """
 
     # Heading held through arm goals (see mdp.yaw_rate_l2_during_arm_goal); on
@@ -318,6 +327,18 @@ class LegsRewardsCfg(LowerRewardsCfg):
         self.stand_still.func = mdp.stand_still_navigation
         self.stand_still.params = {**self.stand_still.params, "arm_command_name": ARM_COMMAND}
         self.track_ang_vel_z.weight = 1.5
+        for name, func in (
+            ("lin_vel_z", mdp.lin_vel_z_l2_modal),
+            ("ang_vel_xy", mdp.ang_vel_xy_l2_modal),
+            ("hip_pos", mdp.joint_deviation_l2_modal),
+        ):
+            term = getattr(self, name)
+            term.func = func
+            term.params = {
+                **term.params,
+                "arm_command_name": ARM_COMMAND,
+                "arm_goal_scale": ARM_GOAL_SHAPING_SCALE[name],
+            }
 
 
 def _arm_tracking_terms(arm: int) -> dict[str, RewTerm]:
@@ -460,9 +481,14 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     # Per-agent floor on the summed step reward, like PositiveRewardRLEnv.
     # None disables it.
     reward_clip_min: dict[str, float | None] = {"legs": 0.0, "arms": 0.0}
+    # Whether the floor also applies during arm goals. Not for the legs: going
+    # down into a crouch measured -2.0/s (run 9), which the floor made 0, so
+    # the whole descent read as lost income.
+    reward_clip_during_arm_goals: dict[str, bool] = {"legs": False, "arms": True}
     # Added after the clip on terminating (not timed-out) steps, so the floor
-    # can't cancel it. The legs keep IBR's zero (ALMI has no terminal penalty).
-    termination_penalty: dict[str, float] = {"legs": 0.0, "arms": -5.0}
+    # can't cancel it. The legs' -5 (IBR and ALMI had 0) prices the falls the
+    # freer crouch allows: run 9 fell 1.2-2.2 times per env-minute.
+    termination_penalty: dict[str, float] = {"legs": -5.0, "arms": -5.0}
 
     def __post_init__(self):
         # Contacts every physics step (the phase-contact and swing-height terms

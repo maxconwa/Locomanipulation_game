@@ -14,7 +14,9 @@ from typing import TYPE_CHECKING
 from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 
-from locomanipulation_game.tasks.manager_based.locomanipulation_game.mdp.rewards import stand_still
+from isaaclab.envs.mdp.rewards import ang_vel_xy_l2, lin_vel_z_l2
+
+from locomanipulation_game.tasks.manager_based.locomanipulation_game.mdp.rewards import joint_deviation_l2, stand_still
 
 from .commands import ground_height
 
@@ -152,3 +154,38 @@ def yaw_rate_l2_during_arm_goal(env: ManagerBasedRLEnv, arm_command_name: str) -
     """
     yaw_rate = env.scene["robot"].data.root_ang_vel_b[:, 2]
     return torch.square(yaw_rate) * env.command_manager.get_term(arm_command_name).arm_mode
+
+
+# ---------------------------------------------------------------------------
+# Gait shaping that resists a crouch, scaled down during arm goals only.
+# Run 9's per-term breakdown (scripts/skrl/eval_crouch.py) measured these while
+# the pelvis was going down: lin_vel_z -0.57/s, ang_vel_xy -0.96/s, and in a
+# deep crouch hip_pos -0.57/s against -0.05 standing. Walking keeps the IBR
+# weights; scale 1 during navigation, arm_goal_scale during an arm goal.
+# ---------------------------------------------------------------------------
+
+
+def _arm_goal_scale(env: ManagerBasedRLEnv, arm_command_name: str, arm_goal_scale: float) -> torch.Tensor:
+    arm_mode = env.command_manager.get_term(arm_command_name).arm_mode
+    return torch.where(arm_mode, arm_goal_scale, 1.0)
+
+
+def lin_vel_z_l2_modal(
+    env: ManagerBasedRLEnv, arm_command_name: str, arm_goal_scale: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """lin_vel_z_l2, scaled during arm goals: vertical pelvis velocity is what a crouch is."""
+    return lin_vel_z_l2(env, asset_cfg) * _arm_goal_scale(env, arm_command_name, arm_goal_scale)
+
+
+def ang_vel_xy_l2_modal(
+    env: ManagerBasedRLEnv, arm_command_name: str, arm_goal_scale: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """ang_vel_xy_l2, scaled during arm goals: a squat descent pitches the pelvis."""
+    return ang_vel_xy_l2(env, asset_cfg) * _arm_goal_scale(env, arm_command_name, arm_goal_scale)
+
+
+def joint_deviation_l2_modal(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, arm_command_name: str, arm_goal_scale: float
+) -> torch.Tensor:
+    """joint_deviation_l2, scaled during arm goals (hip_pos: the hip roll/yaw a wide squat needs)."""
+    return joint_deviation_l2(env, asset_cfg) * _arm_goal_scale(env, arm_command_name, arm_goal_scale)

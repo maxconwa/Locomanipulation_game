@@ -147,7 +147,11 @@ class LocoManipMarlEnv(DirectMARLEnv):
                 self._raise_nan(agent, manager)
             floor = self.cfg.reward_clip_min[agent]
             if floor is not None:
-                reward = torch.clamp(reward, min=floor)
+                clipped = torch.clamp(reward, min=floor)
+                if self.cfg.reward_clip_during_arm_goals[agent]:
+                    reward = clipped
+                else:
+                    reward = torch.where(self._arm_command.arm_mode, reward, clipped)
             rewards[agent] = reward + self.cfg.termination_penalty[agent] * terminated
         return rewards
 
