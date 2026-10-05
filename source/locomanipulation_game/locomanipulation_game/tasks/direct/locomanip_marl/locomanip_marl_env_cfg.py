@@ -92,6 +92,10 @@ GOAL_BONUS = 5.0          # paid once per reached goal
 LEGS_SHARE_OF_ARMS = 0.5
 ARMS_SHARE_OF_LEGS = 0.1
 # Legs gait shaping during arm goals, as a fraction of its IBR weight (see LegsRewardsCfg).
+# Run 10 trained with these: falls doubled early on (the legs' std climbed
+# 0.58 -> 0.70 with the damping relaxed) but it converged stable, at 0.07-0.13
+# falls per env-minute. The legs' std is now capped at 0.6 (skrl config,
+# log_std_bounds) against that early excursion.
 ARM_GOAL_SHAPING_SCALE = {"lin_vel_z": 0.0, "ang_vel_xy": 0.5, "hip_pos": 0.2}
 
 

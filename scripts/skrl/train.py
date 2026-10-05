@@ -140,8 +140,11 @@ else:
     algorithm = agent_cfg_entry_point.split("_cfg")[0].split("skrl_")[-1].lower()
 
 
-def project_log_std_after_updates(agent, policy_cfg: dict):
+def project_log_std_after_updates(agent, policy_cfg: dict, per_agent: dict | None = None):
     """Keep each multi-agent policy's log_std *parameter* inside [min_log_std, max_log_std].
+
+    per_agent ({uid: [min, max]}, the agent config's log_std_bounds) narrows the
+    bounds for one agent: skrl's model instantiator has one pair for all.
 
     skrl's GaussianMixin clamps log_std only in the forward pass. A parameter
     pushed past max_log_std (the entropy bonus does this) then gets zero
@@ -155,13 +158,16 @@ def project_log_std_after_updates(agent, policy_cfg: dict):
 
     if not hasattr(agent, "policies") or not policy_cfg.get("clip_log_std", True):
         return
-    low, high = policy_cfg["min_log_std"], policy_cfg["max_log_std"]
+    bounds = {uid: (policy_cfg["min_log_std"], policy_cfg["max_log_std"]) for uid in agent.policies}
+    for uid, (low, high) in (per_agent or {}).items():
+        bounds[uid] = (max(low, bounds[uid][0]), min(high, bounds[uid][1]))
+    print(f"[INFO] log_std bounds per agent: {bounds}")
 
     def project(uid):
         parameter = getattr(agent.policies[uid], "log_std_parameter", None)
         if parameter is not None:
             with torch.no_grad():
-                parameter.clamp_(low, high)
+                parameter.clamp_(*bounds[uid])
 
     for uid in agent.policies:
         project(uid)
@@ -299,7 +305,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner.agent.load(resume_path)
     elif args_cli.init_policies:
         load_policies_only(runner.agent, retrieve_file_path(args_cli.init_policies))
-    project_log_std_after_updates(runner.agent, agent_cfg["models"]["policy"])
+    project_log_std_after_updates(runner.agent, agent_cfg["models"]["policy"], agent_cfg.get("log_std_bounds"))
 
     # run training
     runner.run()

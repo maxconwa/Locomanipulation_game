@@ -197,6 +197,12 @@ class ArmTargetsCommand(CommandTerm):
     targets below where the arms reach standing. Nothing tells the legs to
     crouch; lowering the pelvis is just what makes those targets reachable.
 
+    A lowered goal (drop > low_target_min_drop) draws each arm's target from
+    the lower low_target_quantile of the level's region by height, so the arms
+    are already near the bottom of their reach and the drop is left to the
+    legs (run 10: with targets drawn from the whole region the arms covered
+    about two thirds of every drop, crouch slope 0.33).
+
     Both move on the env's last level_window arm goals, across episodes: a
     promotion at >= promote_rate reached raises one axis, alternating and drop
     first, so low targets appear early while the spread is still easy; a
@@ -219,7 +225,10 @@ class ArmTargetsCommand(CommandTerm):
     **Metrics**, per episode, split by mode: goal_position_error /
     goal_orientation_error (mean over arm-goal steps), rest_position_error
     (mean over navigation steps), command_drift / estimator_drift, and the
-    goals reached and missed.
+    goals reached and missed. Crouch: target_drop and pelvis_drop (mean over
+    arm-goal steps, m below standing) and crouch_slope, the regression slope
+    of pelvis drop on target drop over the logged episodes (what
+    scripts/skrl/eval_crouch.py measures, live during training).
     """
 
     cfg: ArmTargetsCommandCfg
@@ -278,6 +287,23 @@ class ArmTargetsCommand(CommandTerm):
             sorted_table, counts = self._sort_by_difficulty(table, default_pose)
             self._tables.append(sorted_table)
             self._level_counts.append(counts)
+        # per arm, per spread level: indices of that level's region in its lower height quantile
+        self._low_index: list[torch.Tensor] = []
+        self._low_counts: list[torch.Tensor] = []
+        for table, counts in zip(self._tables, self._level_counts):
+            rows = []
+            for count in counts.tolist():
+                z = table[:count, 2]
+                rows.append(torch.nonzero(z <= torch.quantile(z, self.cfg.low_target_quantile)).flatten())
+            padded = torch.zeros(len(rows), max(len(r) for r in rows), dtype=torch.long, device=self.device)
+            for level, row in enumerate(rows):
+                padded[level, : len(row)] = row
+            self._low_index.append(padded)
+            self._low_counts.append(torch.tensor([len(r) for r in rows], device=self.device))
+        # crouch: per-episode sums over arm-goal steps of target drop (t) and pelvis drop (p)
+        self._crouch_n, self._crouch_t, self._crouch_p, self._crouch_tt, self._crouch_tp = (
+            zeros(), zeros(), zeros(), zeros(), zeros()
+        )
         # (num_arms, 7): the arms-forward default, also the navigation rest pose
         self.rest_pose_b = torch.stack(default_poses)
 
@@ -373,7 +399,16 @@ class ArmTargetsCommand(CommandTerm):
         _add_weighted_mean(extras, "goal_position_error", self._goal_pos_err[ids], self._goal_steps[ids])
         _add_weighted_mean(extras, "goal_orientation_error", self._goal_rot_err[ids], self._goal_steps[ids])
         _add_weighted_mean(extras, "rest_position_error", self._rest_pos_err[ids], self._rest_steps[ids])
-        for buffer in (self._goal_steps, self._goal_pos_err, self._goal_rot_err, self._rest_steps, self._rest_pos_err):
+        _add_weighted_mean(extras, "target_drop", self._crouch_t[ids], self._crouch_n[ids])
+        _add_weighted_mean(extras, "pelvis_drop", self._crouch_p[ids], self._crouch_n[ids])
+        n = self._crouch_n[ids].sum()
+        if n.item() > 1:
+            t, p = self._crouch_t[ids].sum(), self._crouch_p[ids].sum()
+            var = self._crouch_tt[ids].sum() - t * t / n
+            if var.item() > 1e-6 * n.item():
+                extras["crouch_slope"] = ((self._crouch_tp[ids].sum() - t * p / n) / var).item()
+        for buffer in (self._goal_steps, self._goal_pos_err, self._goal_rot_err, self._rest_steps, self._rest_pos_err,
+                       self._crouch_n, self._crouch_t, self._crouch_p, self._crouch_tt, self._crouch_tp):
             buffer[ids] = 0.0
         self.invalidate_errors()
         self._at_reset = True
@@ -579,6 +614,14 @@ class ArmTargetsCommand(CommandTerm):
         self._goal_rot_err += rot_error.mean(dim=1) * arm
         self._rest_steps += 1.0 - arm
         self._rest_pos_err += pos_error.mean(dim=1) * (1.0 - arm)
+        ground = ground_height(self.scanner)
+        counted = arm * torch.isfinite(ground).float()
+        pelvis_drop = torch.nan_to_num(self.cfg.standing_height - (self.robot.data.root_pos_w[:, 2] - ground), nan=0.0)
+        self._crouch_n += counted
+        self._crouch_t += self.height_drop * counted
+        self._crouch_p += pelvis_drop * counted
+        self._crouch_tt += self.height_drop.square() * counted
+        self._crouch_tp += self.height_drop * pelvis_drop * counted
 
         root_pos, root_quat = self.robot.data.root_pos_w, self.robot.data.root_quat_w
         believed_w = _apply(root_pos, root_quat, self.believed_b)
@@ -627,17 +670,24 @@ class ArmTargetsCommand(CommandTerm):
         m = len(arm_ids)
         spread_level = self.spread_level[arm_ids]
         at_default = torch.rand(m, device=self.device) < self.cfg.rel_default_envs
+        drop_level = self.drop_level[arm_ids].float()
+        max_drop = self.cfg.max_height_drop * drop_level / max(self.cfg.drop_levels, 1)
+        drop = torch.rand(m, device=self.device) * max_drop
+        self.height_drop[arm_ids] = drop
+        # a lowered goal starts from the low part of the region: the arms can't take the drop alone
+        low = (drop > self.cfg.low_target_min_drop) if self.cfg.low_targets_when_lowered else torch.zeros_like(at_default)
         targets_s = torch.empty(m, self.num_arms, 7, device=self.device)
         for arm in range(self.num_arms):
             count = self._level_counts[arm][spread_level]
             idx = (torch.rand(m, device=self.device) * count).long()
+            if low.any():
+                level = spread_level[low]
+                pick = (torch.rand(len(level), device=self.device) * self._low_counts[arm][level]).long()
+                idx[low] = self._low_index[arm][level, pick]
             pose = self._tables[arm][idx]
             pose[at_default] = self.rest_pose_b[arm]
             targets_s[:, arm] = pose
-        drop_level = self.drop_level[arm_ids].float()
-        max_drop = self.cfg.max_height_drop * drop_level / max(self.cfg.drop_levels, 1)
-        self.height_drop[arm_ids] = torch.rand(m, device=self.device) * max_drop
-        targets_s[..., 2] -= self.height_drop[arm_ids].unsqueeze(1)
+        targets_s[..., 2] -= drop.unsqueeze(1)
 
         origin, quat = self.standing_frame_w()
         if self._at_reset:
@@ -733,6 +783,10 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     drop_levels: int = 5
     """Drop levels 0..drop_levels lower the targets by up to max_height_drop * level / drop_levels."""
     max_height_drop: float = 0.25
+    low_targets_when_lowered: bool = True
+    """Draw a lowered goal's targets from the low part of the level's region (see the class docstring)."""
+    low_target_quantile: float = 0.5
+    low_target_min_drop: float = 0.02
     level_window: int = 5
     """Arm goals per judgement: the level moves on the env's last level_window outcomes."""
     promote_rate: float = 0.8

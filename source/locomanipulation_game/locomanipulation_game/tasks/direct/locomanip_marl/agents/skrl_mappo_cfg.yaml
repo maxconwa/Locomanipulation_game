@@ -36,6 +36,15 @@ models:
     output: ONE
 
 
+# Per-agent [min, max] log std, applied by scripts/skrl/train.py after every
+# update (the model block above has one pair for both). Legs std <= 0.6:
+# run 10 started at 0.58 and climbed to 0.70 within 1.6k updates once its
+# damping terms were relaxed, with falls going 13% -> 28%; it settled back
+# near 0.6 by the end.
+log_std_bounds:
+  legs: [-3.0, -0.51]   # std 0.05 .. 0.6
+  arms: [-3.0, 0.0]     # std 0.05 .. 1.0
+
 # https://skrl.readthedocs.io/en/latest/api/memories/random.html
 memory:
   class: RandomMemory
