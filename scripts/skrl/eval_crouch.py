@@ -12,9 +12,10 @@ Writes to <run>/eval_crouch/<checkpoint>/ (or --out):
     posture.png               knee / hip / ankle / pelvis pitch vs target drop
     outcomes.png              goals reached (%) and falls per env-minute, per pair
     reach_by_height.png       goals reached and pelvis drop by how high the lower target is above the ground
-    timeline.png             one robot through a run of goals at the --focus pair
+    timeline.png              one robot through a run of goals at the --focus pair
     rewards_by_crouch.md/.png every legs and arms reward term, by how low the pelvis is and how it moves
     crouch.mp4                (--video) that robot on camera, goal frames visible
+    crouch_stills.png, stills (--video) its deepest crouches and the moments before its falls
     samples.npz               the raw samples behind the plots
 
 Use many envs for the numbers and few for anything you watch: with more than
@@ -145,7 +146,8 @@ def evaluate(spread: int, drop: int, focus: bool) -> dict:
     samples = {k: [] for k in ("target_drop", "pelvis_drop", "knee", "hip_pitch", "ankle_pitch", "pelvis_pitch", "pos_err", "rot_err",
                                "pelvis_vz", "target_height", "rew_legs", "rew_arms")}
     goals = {k: [] for k in ("height", "reached", "needs_crouch")}  # one entry per goal that ended
-    timeline = {k: [] for k in ("target_drop", "pelvis_drop", "knee", "pos_err", "reached", "fell")}
+    falls = {k: [] for k in ("tilt_x", "tilt_y", "pelvis_drop", "target_height", "needs_crouch", "episode_time")}  # one per fall
+    timeline = {k: [] for k in ("target_drop", "target_height", "pelvis_drop", "knee", "pos_err", "reached", "fell")}
     frames = []
     video_steps = int(args.video_seconds / base.step_dt) if (focus and args.video) else 0
     for step in range(args.steps):
@@ -154,6 +156,9 @@ def evaluate(spread: int, drop: int, focus: bool) -> dict:
         missed0 = arm.metrics["goals_missed"].clone()
         # the goal a step ends is replaced within that step: read its targets first
         height0, needs_crouch0 = arm.lowest_target_height.clone(), arm.needs_crouch.clone()
+        # and the robot's last state before a fall: the step resets a fallen env
+        gravity0, pelvis_drop0 = robot.data.projected_gravity_b.clone(), pelvis_state()[0]
+        episode_time0 = base.episode_length_buf.clone().float() * base.step_dt
         obs, _, terminated, _, _ = base.step(act(obs, states))
         states = base.state()
         reached = (arm.metrics["goals_reached"] - reached0).clamp(min=0)
@@ -167,6 +172,15 @@ def evaluate(spread: int, drop: int, focus: bool) -> dict:
             goals["reached"].append(reached[ended] > 0)
             goals["needs_crouch"].append(needs_crouch0[ended])
         totals["falls"] += terminated["legs"].float().sum().item()
+        fell = terminated["legs"]
+        if fell.any():
+            # gravity in the pelvis frame: +x when pitched nose-down (toppling forward), +y when tipped left
+            falls["tilt_x"].append(gravity0[fell, 0])
+            falls["tilt_y"].append(gravity0[fell, 1])
+            falls["pelvis_drop"].append(pelvis_drop0[fell])
+            falls["target_height"].append(height0[fell])
+            falls["needs_crouch"].append(needs_crouch0[fell])
+            falls["episode_time"].append(episode_time0[fell])
         pos_err, rot_err = arm.errors()
         pelvis_drop, valid = pelvis_state()
 
@@ -186,6 +200,7 @@ def evaluate(spread: int, drop: int, focus: bool) -> dict:
             samples["rew_arms"].append(base.reward_managers["arms"]._step_reward[ok].clone())
         if focus:
             timeline["target_drop"].append(arm.height_drop[0].item())
+            timeline["target_height"].append(arm.lowest_target_height[0].item())
             timeline["pelvis_drop"].append(pelvis_drop[0].item())
             timeline["knee"].append(robot.data.joint_pos[0, joint_ids["knee"]].mean().item())
             timeline["pos_err"].append(pos_err[0].mean().item())
@@ -201,6 +216,7 @@ def evaluate(spread: int, drop: int, focus: bool) -> dict:
     to_np = lambda xs: torch.cat(xs).float().cpu().numpy()  # noqa: E731
     data = {k: to_np(v) for k, v in samples.items()}
     data.update({f"goal_{k}": to_np(v) if v else np.zeros(0) for k, v in goals.items()})
+    data.update({f"fall_{k}": to_np(v) if v else np.zeros(0) for k, v in falls.items()})
     minutes = args.num_envs * args.steps * base.step_dt / 60.0
     finished = totals["reached"] + totals["missed"]
     cmd, act_drop = data["target_drop"], data["pelvis_drop"]
@@ -288,7 +304,7 @@ lim = 100 * (BINS[-1])
 ax.plot([0, lim], [0, lim], color=REF, linewidth=1.0, zorder=1)
 ax.text(lim * 0.97, lim * 0.97, "pelvis drops as far\nas the targets", color=INK_2, fontsize=8, ha="right", va="top")
 summary = {}
-for s in spreads:
+for k, s in enumerate(spreads):
     x, y = pooled(s, "pelvis_drop")
     c, m, lo, hi = binned(x, y)
     slope, icpt = fit(x, y)
@@ -297,7 +313,8 @@ for s in spreads:
     ax.plot(100 * c, 100 * m, color=color_of[s], linewidth=1.5, marker="o", markersize=6,
             markeredgecolor=SURFACE, markeredgewidth=1.5, label=f"spread level {s}", zorder=3)
     if len(c):
-        ax.annotate(f"slope {slope:.2f}", (100 * c[-1], 100 * m[-1]), xytext=(6, 0), textcoords="offset points",
+        # stacked by spread, so lines that end together don't print over each other
+        ax.annotate(f"slope {slope:.2f}", (100 * c[-1], 100 * m[-1]), xytext=(6, 7 - 14 * k), textcoords="offset points",
                     color=INK, fontsize=9, va="center")
 best = max(summary.values(), key=lambda v: v[0] if not np.isnan(v[0]) else -1)[0]
 ax.set_title(f"The pelvis follows lowered targets {best:.2f} cm per cm" if not np.isnan(best) else "Pelvis drop vs target drop")
@@ -428,6 +445,47 @@ if focus_result is not None:
         fps = int(round(1.0 / base.step_dt))
         imageio.mimwrite(os.path.join(OUT, "crouch.mp4"), focus_result["frames"], fps=fps, quality=8)
 
+        # stills: the deepest crouch moments (at least 1 s apart), and the moment before each fall
+        n = len(focus_result["frames"])
+        depth = tl["pelvis_drop"][:n]
+        falls_at = np.nonzero(tl["fell"][:n])[0]
+        # a squat, not a fall: no frame in the 2 s before a fall (a fall can start as a sideways split a second
+        # earlier), nor deeper than the legs can fold (0.415 m with the feet flat at the hard knee and ankle
+        # limits; a little slack for the scanned ground)
+        squatting = depth < 0.45
+        for i in falls_at:
+            squatting[max(i - int(2.0 / base.step_dt), 0): i + 1] = False
+        picks = []
+        for i in np.argsort(-np.where(squatting, depth, -np.inf)):
+            if not squatting[i]:
+                break
+            if len(picks) == 6:
+                break
+            if all(abs(i - j) >= int(1.0 / base.step_dt) for j, _ in picks):
+                picks.append((int(i), "deepest"))
+        picks += [(max(int(i) - int(0.3 / base.step_dt), 0), "before a fall") for i in falls_at[:3]]
+        picks.sort()
+        stills_dir = os.path.join(OUT, "stills")
+        os.makedirs(stills_dir, exist_ok=True)
+        for i, kind in picks:
+            imageio.imwrite(os.path.join(stills_dir, f"t{i * base.step_dt:05.2f}s_{kind.replace(' ', '_')}.png"),
+                            focus_result["frames"][i])
+        cols = 3
+        rows = (len(picks) + cols - 1) // cols
+        fig, axes = plt.subplots(rows, cols, figsize=(5.2 * cols, 3.2 * rows), squeeze=False)
+        for ax in axes.flat:
+            ax.axis("off")
+        for ax, (i, kind) in zip(axes.flat, picks):
+            ax.imshow(focus_result["frames"][i])
+            ax.set_title(f"t = {i * base.step_dt:.1f} s, pelvis {100 * depth[i]:.0f} cm down,"
+                         f" target {tl['target_height'][i]:.2f} m up" + (" (before a fall)" if kind != "deepest" else ""),
+                         fontsize=9, color="#e34948" if kind != "deepest" else INK)
+        fig.suptitle(f"One robot at spread {FOCUS[0]}, drop {FOCUS[1]}: its deepest crouches", x=0.01, ha="left",
+                     fontweight="bold", color=INK)
+        fig.tight_layout()
+        fig.savefig(os.path.join(OUT, "crouch_stills.png"), dpi=110)
+        plt.close(fig)
+
 # 5. rewards by crouch depth and motion: every term, per second
 BUCKETS = [("standing (< 3 cm)", -1.0, 0.03), ("shallow (3-8 cm)", 0.03, 0.08), ("mid (8-13 cm)", 0.08, 0.13),
            ("deep (13-25 cm)", 0.13, 0.25), ("very deep (> 25 cm)", 0.25, 2.0)]
@@ -513,6 +571,25 @@ for r in results:
 worst_falls = max(r["falls_per_min"] for r in results)
 lines += ["", f"- Falls: worst pair {worst_falls:.2f} per env-minute"
           + (" (**unstable**: a robot falls every couple of minutes or sooner)" if worst_falls > 0.5 else " (stable)") + "."]
+fall = {k: np.concatenate([r["data"][f"fall_{k}"] for r in results]) for k in
+        ("tilt_x", "tilt_y", "pelvis_drop", "target_height", "needs_crouch", "episode_time")}
+lines += ["", "## Falls: which way, and when", ""]
+if len(fall["tilt_x"]):
+    forward = (np.abs(fall["tilt_x"]) >= np.abs(fall["tilt_y"])) & (fall["tilt_x"] > 0)
+    backward = (np.abs(fall["tilt_x"]) >= np.abs(fall["tilt_y"])) & (fall["tilt_x"] <= 0)
+    sideways = ~(forward | backward)
+    lines += [
+        f"- {len(fall['tilt_x'])} falls over {sum(args.num_envs * args.steps for _ in results) * base.step_dt / 60:.0f}"
+        f" env-minutes. Direction (the pelvis tilt the step before): forward {pct(forward.mean())},"
+        f" backward {pct(backward.mean())}, sideways {pct(sideways.mean())}.",
+        f"- {pct(fall['needs_crouch'].mean())} happened during goals that need a crouch; the pelvis was on average"
+        f" {100 * fall['pelvis_drop'].mean():.1f} cm down, the lower target {fall['target_height'].mean():.2f} m above the ground.",
+        f"- {pct((fall['episode_time'] < 1.0).mean())} came within 1 s of an episode start (a reset to standing),"
+        f" {pct(((fall['episode_time'] >= 1.0) & (fall['pelvis_drop'] >= 0.2)).mean())} later from a crouch deeper than 20 cm,"
+        f" {pct(((fall['episode_time'] >= 1.0) & (fall['pelvis_drop'] < 0.2)).mean())} later from higher.",
+    ]
+else:
+    lines.append("- No falls.")
 lines += ["", "## Goals below the standing reach", "",
           f"No arm pose reaches a wrist target below {STANDING_REACH:.2f} m above the ground standing (the lowest pose in"
           " the target table), so reaching one takes a crouch. All pairs pooled, by the lower target's height:", "",
@@ -542,7 +619,7 @@ lines.append(
     f" of the time; knee max {all_knee.max():.2f} rad (soft limit {soft_limits['knee'][1]:.2f})."
 )
 lines += ["", "Figures: `crouch_response.png`, `posture.png`, `outcomes.png`, `reach_by_height.png`, `timeline.png`"
-          + (", video `crouch.mp4`." if focus_result and focus_result["frames"] else ".")]
+          + (", video `crouch.mp4`, stills `crouch_stills.png` and `stills/`." if focus_result and focus_result["frames"] else ".")]
 report = "\n".join(lines)
 with open(os.path.join(OUT, "report.md"), "w") as f:
     f.write(report + "\n")
