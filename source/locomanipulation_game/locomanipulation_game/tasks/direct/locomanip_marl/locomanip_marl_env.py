@@ -40,6 +40,7 @@ from isaaclab.managers import (
     RewardManager,
     TerminationManager,
 )
+from isaaclab.utils.math import quat_apply_inverse
 
 from .locomanip_marl_env_cfg import ARM_COMMAND, LocoManipMarlEnvCfg
 from .odometry import EstimatorTrainer, motion_to_transform, pelvis_motion
@@ -176,6 +177,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
         # scene reset (it reads how far the robot got), managers after.
         self.curriculum_manager.compute(env_ids=env_ids)
         super()._reset_idx(env_ids)  # scene, reset events, episode_length_buf
+        self._refresh_sensors_after_reset(env_ids)
         self._fresh[env_ids] = True
 
         log = {}
@@ -300,6 +302,28 @@ class LocoManipMarlEnv(DirectMARLEnv):
     """
     Helpers.
     """
+
+    def _refresh_sensors_after_reset(self, env_ids: Sequence[int]):
+        """Make the IMU read the reset state, not the robot's last pose before the reset.
+
+        DirectMARLEnv.step resets envs without updating the kinematics, so the
+        IMU's rigid-body view kept the old pose and velocity until the next
+        physics step: the first observation of an episode showed the previous
+        episode's (often fallen) orientation and a lin_acc of (old velocity) /
+        dt, 100-250 m/s^2 against a running std of ~18. The legs answered with
+        knee actions near -300 (clipped at 10): run 12, agent_57600, drop level
+        10, 20% of episodes after a fall fell again within 1 s, 12% after a
+        time-out. Imu.reset also zeroes its previous velocity, so even a fresh
+        first reading is (reset velocity) / dt; it is set to the accelerometer
+        at rest, gravity only, and the next reading differences from the reset
+        velocity.
+        """
+        self.scene.write_data_to_sim()
+        self.sim.forward()
+        imu = self.scene["imu"]
+        data = imu.data  # recomputes the reset envs from the refreshed view and stores their velocity
+        data.lin_acc_b[env_ids] = quat_apply_inverse(data.quat_w[env_ids], imu._gravity_bias_w[env_ids])
+        data.ang_acc_b[env_ids] = 0.0
 
     def _set_soft_joint_limits(self):
         """Soft limits at cfg.soft_joint_pos_limit_factors of the hard range, for the joints it names.
