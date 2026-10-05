@@ -12,6 +12,7 @@ Writes to <run>/eval_crouch/<checkpoint>/ (or --out):
     posture.png               knee / hip / ankle / pelvis pitch vs target drop
     outcomes.png              goals reached (%) and falls per env-minute, per pair
     timeline.png              one robot through a run of goals at the --focus pair
+    rewards_by_crouch.md/.png every legs and arms reward term, by how low the pelvis is and how it moves
     crouch.mp4                (--video) that robot on camera, goal frames visible
     samples.npz               the raw samples behind the plots
 
@@ -138,7 +139,8 @@ def evaluate(spread: int, drop: int, focus: bool) -> dict:
     obs, _ = base.reset()
     states = base.state()
     totals = dict(reached=0.0, missed=0.0, falls=0.0)
-    samples = {k: [] for k in ("target_drop", "pelvis_drop", "knee", "hip_pitch", "ankle_pitch", "pelvis_pitch", "pos_err", "rot_err")}
+    samples = {k: [] for k in ("target_drop", "pelvis_drop", "knee", "hip_pitch", "ankle_pitch", "pelvis_pitch", "pos_err", "rot_err",
+                               "pelvis_vz", "rew_legs", "rew_arms")}
     timeline = {k: [] for k in ("target_drop", "pelvis_drop", "knee", "pos_err", "reached", "fell")}
     frames = []
     video_steps = int(args.video_seconds / base.step_dt) if (focus and args.video) else 0
@@ -165,6 +167,10 @@ def evaluate(spread: int, drop: int, focus: bool) -> dict:
             samples["pelvis_pitch"].append(euler_xyz_from_quat(robot.data.root_quat_w[ok])[1])
             samples["pos_err"].append(pos_err[ok].mean(dim=1))
             samples["rot_err"].append(rot_err[ok].mean(dim=1))
+            samples["pelvis_vz"].append(robot.data.root_lin_vel_w[ok][:, 2])
+            # each term's weighted reward this step, per second (RewardManager._step_reward)
+            samples["rew_legs"].append(base.reward_managers["legs"]._step_reward[ok].clone())
+            samples["rew_arms"].append(base.reward_managers["arms"]._step_reward[ok].clone())
         if focus:
             timeline["target_drop"].append(arm.height_drop[0].item())
             timeline["pelvis_drop"].append(pelvis_drop[0].item())
@@ -364,6 +370,52 @@ if focus_result is not None:
 
         fps = int(round(1.0 / base.step_dt))
         imageio.mimwrite(os.path.join(OUT, "crouch.mp4"), focus_result["frames"], fps=fps, quality=8)
+
+# 5. rewards by crouch depth and motion: every term, per second
+BUCKETS = [("standing (< 3 cm)", -1.0, 0.03), ("shallow (3-8 cm)", 0.03, 0.08), ("mid (8-13 cm)", 0.08, 0.13),
+           ("deep (> 13 cm)", 0.13, 1.0)]
+pool = lambda key: np.concatenate([r["data"][key] for r in results])  # noqa: E731
+p_drop, p_vz = pool("pelvis_drop"), pool("pelvis_vz")
+masks = [(name, (p_drop >= lo) & (p_drop < hi)) for name, lo, hi in BUCKETS]
+masks += [("lowering (v_z < -0.1)", p_vz < -0.1), ("holding (|v_z| < 0.05)", np.abs(p_vz) < 0.05), ("rising (v_z > 0.1)", p_vz > 0.1)]
+reward_lines = ["# Rewards during a crouch", "",
+                "Each term's weighted reward per second (what the reward manager adds, before the per-agent clip),"
+                " averaged over samples grouped by how far the pelvis is below standing height, and by its vertical"
+                " velocity. Arm goals only, all pairs pooled.", ""]
+deltas = {}
+for agent in ("legs", "arms"):
+    names = base.reward_managers[agent].active_terms
+    rew = pool(f"rew_{agent}")
+    header = "| term | " + " | ".join(n for n, _ in masks) + " |"
+    reward_lines += [f"## {agent}", "", header, "|---" * (len(masks) + 1) + "|",
+                     "| samples | " + " | ".join(f"{int(m.sum())}" for _, m in masks) + " |"]
+    stand, deep = masks[0][1], masks[3][1]
+    order = sorted(range(len(names)), key=lambda i: (rew[deep, i].mean() - rew[stand, i].mean()) if deep.any() and stand.any() else 0)
+    for i in order:
+        cells = [f"{rew[m, i].mean():+.3f}" if m.any() else "-" for _, m in masks]
+        reward_lines.append(f"| {names[i]} | " + " | ".join(cells) + " |")
+    totals = [f"**{rew[m].sum(axis=1).mean():+.3f}**" if m.any() else "-" for _, m in masks]
+    reward_lines += ["| **total** | " + " | ".join(totals) + " |", ""]
+    if deep.any() and stand.any():
+        deltas[agent] = {names[i]: rew[deep, i].mean() - rew[stand, i].mean() for i in range(len(names))}
+with open(os.path.join(OUT, "rewards_by_crouch.md"), "w") as f:
+    f.write("\n".join(reward_lines) + "\n")
+if "legs" in deltas:
+    # what a deep crouch gains or costs the legs, term by term: diverging blue (gain) / red (cost)
+    items = sorted(deltas["legs"].items(), key=lambda kv: kv[1])
+    items = [kv for kv in items if abs(kv[1]) >= 0.005]
+    fig, ax = plt.subplots(figsize=(8, 0.32 * len(items) + 1.4))
+    ys = np.arange(len(items))
+    ax.barh(ys, [v for _, v in items], height=0.6, color=["#2a78d6" if v > 0 else "#e34948" for _, v in items])
+    ax.set_yticks(ys, [k for k, _ in items])
+    ax.axvline(0, color=REF, linewidth=1.0)
+    ax.grid(axis="y", visible=False)
+    ax.set_xlabel("reward per second: deep crouch (> 13 cm) minus standing (< 3 cm)")
+    ax.set_title("What a deep crouch gains (blue) or costs (red) the legs")
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT, "rewards_by_crouch.png"), dpi=150)
+    plt.close(fig)
+print("\n".join(reward_lines))
 
 np.savez_compressed(
     os.path.join(OUT, "samples.npz"),
