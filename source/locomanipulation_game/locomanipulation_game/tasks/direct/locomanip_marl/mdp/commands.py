@@ -198,10 +198,20 @@ class ArmTargetsCommand(CommandTerm):
     crouch; lowering the pelvis is just what makes those targets reachable.
 
     A lowered goal (drop > low_target_min_drop) draws each arm's target from
-    the lower low_target_quantile of the level's region by height, so the arms
-    are already near the bottom of their reach and the drop is left to the
-    legs (run 10: with targets drawn from the whole region the arms covered
-    about two thirds of every drop, crouch slope 0.33).
+    the lower low_target_quantile of the level's region by height, beside or
+    in front of the pelvis (x >= low_target_min_x), so the arms are already
+    near the bottom of their reach and the drop is left to the legs (run 10:
+    with targets drawn from the whole region the arms covered about two thirds
+    of every drop, crouch slope 0.33; run 11, the lower half: the lowest
+    target still 0.63 m above the ground, slope 0.5). With the bottom 10% and
+    a 0.5 m drop the deepest targets sit about 0.4 m above the ground, which
+    takes a full squat (feet flat, the pelvis at most 0.40 m down at the
+    knee and ankle-pitch soft limits, with the hips behind the ankles) and a
+    forward lean.
+
+    needs_crouch marks a goal with a target below the lowest wrist height of
+    the standing table (lowest_target_height, above the ground at the event):
+    no arm pose reaches it standing. The crouch_goals_* metrics count those.
 
     Both move on the env's last level_window arm goals, across episodes: a
     promotion at >= promote_rate reached raises one axis, alternating and drop
@@ -225,10 +235,12 @@ class ArmTargetsCommand(CommandTerm):
     **Metrics**, per episode, split by mode: goal_position_error /
     goal_orientation_error (mean over arm-goal steps), rest_position_error
     (mean over navigation steps), command_drift / estimator_drift, and the
-    goals reached and missed. Crouch: target_drop and pelvis_drop (mean over
-    arm-goal steps, m below standing) and crouch_slope, the regression slope
-    of pelvis drop on target drop over the logged episodes (what
-    scripts/skrl/eval_crouch.py measures, live during training).
+    goals reached and missed, of them those that needed a crouch
+    (crouch_goals_*). Crouch: target_drop and pelvis_drop (mean over arm-goal
+    steps, m below standing), target_height (the lower target above the
+    ground) and crouch_slope, the regression slope of pelvis drop on target
+    drop over the logged episodes (what scripts/skrl/eval_crouch.py measures,
+    live during training).
     """
 
     cfg: ArmTargetsCommandCfg
@@ -252,6 +264,8 @@ class ArmTargetsCommand(CommandTerm):
         self.believed_b[..., 3] = 1.0
         self.shadow_b[..., 3] = 1.0
         self.height_drop = zeros()
+        self.lowest_target_height = zeros()  # lower wrist target above the ground, at the event
+        self.needs_crouch = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.use_estimate = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.estimate_prob = 0.0  # set by the env
         self.hold_time = zeros()
@@ -273,6 +287,8 @@ class ArmTargetsCommand(CommandTerm):
         self.metrics["estimator_drift"] = zeros()
         self.metrics["goals_reached"] = zeros()
         self.metrics["goals_missed"] = zeros()
+        self.metrics["crouch_goals_reached"] = zeros()
+        self.metrics["crouch_goals_missed"] = zeros()
         # per-episode sums for the mode-split metrics, logged as weighted means by reset()
         self._goal_steps, self._goal_pos_err, self._goal_rot_err = zeros(), zeros(), zeros()
         self._rest_steps, self._rest_pos_err = zeros(), zeros()
@@ -287,22 +303,28 @@ class ArmTargetsCommand(CommandTerm):
             sorted_table, counts = self._sort_by_difficulty(table, default_pose)
             self._tables.append(sorted_table)
             self._level_counts.append(counts)
-        # per arm, per spread level: indices of that level's region in its lower height quantile
+        # per arm, per spread level: indices of that level's region in its lower height quantile, not
+        # behind the pelvis (a squat moves the hips back); the quantile alone if that leaves none
         self._low_index: list[torch.Tensor] = []
         self._low_counts: list[torch.Tensor] = []
         for table, counts in zip(self._tables, self._level_counts):
             rows = []
             for count in counts.tolist():
                 z = table[:count, 2]
-                rows.append(torch.nonzero(z <= torch.quantile(z, self.cfg.low_target_quantile)).flatten())
+                low = z <= torch.quantile(z, self.cfg.low_target_quantile)
+                in_front = low & (table[:count, 0] >= self.cfg.low_target_min_x)
+                rows.append(torch.nonzero(in_front if in_front.any() else low).flatten())
             padded = torch.zeros(len(rows), max(len(r) for r in rows), dtype=torch.long, device=self.device)
             for level, row in enumerate(rows):
                 padded[level, : len(row)] = row
             self._low_index.append(padded)
             self._low_counts.append(torch.tensor([len(r) for r in rows], device=self.device))
-        # crouch: per-episode sums over arm-goal steps of target drop (t) and pelvis drop (p)
-        self._crouch_n, self._crouch_t, self._crouch_p, self._crouch_tt, self._crouch_tp = (
-            zeros(), zeros(), zeros(), zeros(), zeros()
+        # (num_arms,): the lowest wrist height each arm reaches standing, pelvis frame
+        self._standing_min_z = torch.stack([table[:, 2].min() for table in self._tables])
+        # crouch: per-episode sums over arm-goal steps of target drop (t), pelvis drop (p) and
+        # lowest target height (h)
+        self._crouch_n, self._crouch_t, self._crouch_p, self._crouch_tt, self._crouch_tp, self._crouch_h = (
+            zeros(), zeros(), zeros(), zeros(), zeros(), zeros()
         )
         # (num_arms, 7): the arms-forward default, also the navigation rest pose
         self.rest_pose_b = torch.stack(default_poses)
@@ -401,6 +423,7 @@ class ArmTargetsCommand(CommandTerm):
         _add_weighted_mean(extras, "rest_position_error", self._rest_pos_err[ids], self._rest_steps[ids])
         _add_weighted_mean(extras, "target_drop", self._crouch_t[ids], self._crouch_n[ids])
         _add_weighted_mean(extras, "pelvis_drop", self._crouch_p[ids], self._crouch_n[ids])
+        _add_weighted_mean(extras, "target_height", self._crouch_h[ids], self._crouch_n[ids])
         n = self._crouch_n[ids].sum()
         if n.item() > 1:
             t, p = self._crouch_t[ids].sum(), self._crouch_p[ids].sum()
@@ -408,7 +431,8 @@ class ArmTargetsCommand(CommandTerm):
             if var.item() > 1e-6 * n.item():
                 extras["crouch_slope"] = ((self._crouch_tp[ids].sum() - t * p / n) / var).item()
         for buffer in (self._goal_steps, self._goal_pos_err, self._goal_rot_err, self._rest_steps, self._rest_pos_err,
-                       self._crouch_n, self._crouch_t, self._crouch_p, self._crouch_tt, self._crouch_tp):
+                       self._crouch_n, self._crouch_t, self._crouch_p, self._crouch_tt, self._crouch_tp,
+                       self._crouch_h):
             buffer[ids] = 0.0
         self.invalidate_errors()
         self._at_reset = True
@@ -622,6 +646,7 @@ class ArmTargetsCommand(CommandTerm):
         self._crouch_p += pelvis_drop * counted
         self._crouch_tt += self.height_drop.square() * counted
         self._crouch_tp += self.height_drop * pelvis_drop * counted
+        self._crouch_h += self.lowest_target_height * counted
 
         root_pos, root_quat = self.robot.data.root_pos_w, self.robot.data.root_quat_w
         believed_w = _apply(root_pos, root_quat, self.believed_b)
@@ -640,6 +665,8 @@ class ArmTargetsCommand(CommandTerm):
         self.ended_goal_count += ended.sum()
         self.metrics["goals_reached"] += self.just_reached.float()
         self.metrics["goals_missed"] += timed_out.float()
+        self.metrics["crouch_goals_reached"] += (self.just_reached & self.needs_crouch).float()
+        self.metrics["crouch_goals_missed"] += (timed_out & self.needs_crouch).float()
         # before the resample below, so the next goal is drawn at the new level
         self._record_outcomes(self.just_reached, timed_out)
         # CommandTerm.compute counts time_left down next and resamples every env at <= 0
@@ -653,6 +680,8 @@ class ArmTargetsCommand(CommandTerm):
         self.arm_mode[env_ids] = arm_goal
         self.hold_time[env_ids] = 0.0
         self.height_drop[env_ids] = 0.0
+        self.lowest_target_height[env_ids] = 0.0
+        self.needs_crouch[env_ids] = False
         self.use_estimate[env_ids] = torch.rand(n, device=self.device) < self.estimate_prob
 
         # -- navigation: rest pose in the pelvis frame, a fresh velocity command
@@ -688,6 +717,9 @@ class ArmTargetsCommand(CommandTerm):
             pose[at_default] = self.rest_pose_b[arm]
             targets_s[:, arm] = pose
         targets_s[..., 2] -= drop.unsqueeze(1)
+        # the standing frame's origin is standing_height above the ground
+        self.lowest_target_height[arm_ids] = targets_s[..., 2].min(dim=1)[0] + self.cfg.standing_height
+        self.needs_crouch[arm_ids] = (targets_s[..., 2] < self._standing_min_z).any(dim=1)
 
         origin, quat = self.standing_frame_w()
         if self._at_reset:
@@ -780,12 +812,16 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     """Spread levels 0..spread_levels widen the region; the last one is the whole standing table."""
     first_level_fraction: float = 0.005
     """Share of each table (easiest first) that level 0 draws from; levels grow geometrically to 1."""
-    drop_levels: int = 5
-    """Drop levels 0..drop_levels lower the targets by up to max_height_drop * level / drop_levels."""
-    max_height_drop: float = 0.25
+    drop_levels: int = 10
+    """Drop levels 0..drop_levels lower the targets by up to max_height_drop * level / drop_levels.
+
+    5 cm per level, as in runs 9-11 (5 levels, 0.25 m), so a resumed run's levels keep their depth."""
+    max_height_drop: float = 0.5
     low_targets_when_lowered: bool = True
     """Draw a lowered goal's targets from the low part of the level's region (see the class docstring)."""
-    low_target_quantile: float = 0.5
+    low_target_quantile: float = 0.1
+    low_target_min_x: float = -0.1
+    """A lowered goal's targets are at least this far forward of the pelvis (x, standing pelvis frame)."""
     low_target_min_drop: float = 0.02
     level_window: int = 5
     """Arm goals per judgement: the level moves on the env's last level_window outcomes."""

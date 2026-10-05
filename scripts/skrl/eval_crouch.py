@@ -11,7 +11,8 @@ Writes to <run>/eval_crouch/<checkpoint>/ (or --out):
     crouch_response.png       target drop vs pelvis drop, per spread level
     posture.png               knee / hip / ankle / pelvis pitch vs target drop
     outcomes.png              goals reached (%) and falls per env-minute, per pair
-    timeline.png              one robot through a run of goals at the --focus pair
+    reach_by_height.png       goals reached and pelvis drop by how high the lower target is above the ground
+    timeline.png             one robot through a run of goals at the --focus pair
     rewards_by_crouch.md/.png every legs and arms reward term, by how low the pelvis is and how it moves
     crouch.mp4                (--video) that robot on camera, goal frames visible
     samples.npz               the raw samples behind the plots
@@ -22,9 +23,9 @@ Use many envs for the numbers and few for anything you watch: with more than
     # numbers and plots
     python scripts/skrl/eval_crouch.py --checkpoint <run>/checkpoints/agent_<N>.pt
     # a video of one robot (headless, needs cameras), into its own folder
-    python scripts/skrl/eval_crouch.py --checkpoint ... --video --num_envs 16 --grid 4:5 --out <folder>
+    python scripts/skrl/eval_crouch.py --checkpoint ... --video --num_envs 16 --grid 4:10 --out <folder>
     # live in the Isaac Sim window, real time
-    python scripts/skrl/eval_crouch.py --checkpoint ... --gui --num_envs 16 --grid 4:5 --steps 3000
+    python scripts/skrl/eval_crouch.py --checkpoint ... --gui --num_envs 16 --grid 4:10 --steps 3000
 """
 
 import argparse
@@ -40,7 +41,7 @@ parser.add_argument("--task", default="LocoManip-Marl-Stand-Direct-v0")
 parser.add_argument("--algorithm", default="mappo", help="skrl config the checkpoint was trained with: ippo or mappo.")
 parser.add_argument("--num_envs", type=int, default=512)
 parser.add_argument("--steps", type=int, default=1500, help="Policy steps per (spread, drop) pair; 50 per second.")
-parser.add_argument("--grid", default="4:0,4:1,4:2,4:3,4:4,4:5,8:0,8:2,8:4,8:5", help="spread:drop level pairs to hold.")
+parser.add_argument("--grid", default="4:0,4:2,4:4,4:5,4:6,4:8,4:10,8:0,8:5,8:10", help="spread:drop level pairs to hold.")
 parser.add_argument("--focus", default=None, help="spread:drop pair for the timeline and video; default: the grid's deepest drop.")
 parser.add_argument("--out", default=None, help="Output folder; default <run>/eval_crouch/<checkpoint name>.")
 parser.add_argument("--video", action="store_true", help="Record crouch.mp4 of env 0 at the focus pair (enables cameras).")
@@ -114,6 +115,8 @@ JOINTS = {
 }
 joint_ids = {name: robot.find_joints(names, preserve_order=True)[0] for name, names in JOINTS.items()}
 soft_limits = {name: robot.data.soft_joint_pos_limits[0, ids].mean(dim=0).tolist() for name, ids in joint_ids.items()}
+# the lowest wrist target reachable standing, above the ground: below it a goal needs a crouch
+STANDING_REACH = arm._standing_min_z.min().item() + env_cfg.commands.arm_targets.standing_height
 
 runner = Runner(env, agent_cfg)
 runner.agent.load(args.checkpoint)
@@ -140,7 +143,8 @@ def evaluate(spread: int, drop: int, focus: bool) -> dict:
     states = base.state()
     totals = dict(reached=0.0, missed=0.0, falls=0.0)
     samples = {k: [] for k in ("target_drop", "pelvis_drop", "knee", "hip_pitch", "ankle_pitch", "pelvis_pitch", "pos_err", "rot_err",
-                               "pelvis_vz", "rew_legs", "rew_arms")}
+                               "pelvis_vz", "target_height", "rew_legs", "rew_arms")}
+    goals = {k: [] for k in ("height", "reached", "needs_crouch")}  # one entry per goal that ended
     timeline = {k: [] for k in ("target_drop", "pelvis_drop", "knee", "pos_err", "reached", "fell")}
     frames = []
     video_steps = int(args.video_seconds / base.step_dt) if (focus and args.video) else 0
@@ -148,12 +152,20 @@ def evaluate(spread: int, drop: int, focus: bool) -> dict:
         start = time.time()
         reached0 = arm.metrics["goals_reached"].clone()
         missed0 = arm.metrics["goals_missed"].clone()
+        # the goal a step ends is replaced within that step: read its targets first
+        height0, needs_crouch0 = arm.lowest_target_height.clone(), arm.needs_crouch.clone()
         obs, _, terminated, _, _ = base.step(act(obs, states))
         states = base.state()
         reached = (arm.metrics["goals_reached"] - reached0).clamp(min=0)
         # per-episode counters; a reset zeroes them, so clamp that step's difference
+        missed = (arm.metrics["goals_missed"] - missed0).clamp(min=0)
         totals["reached"] += reached.sum().item()
-        totals["missed"] += (arm.metrics["goals_missed"] - missed0).clamp(min=0).sum().item()
+        totals["missed"] += missed.sum().item()
+        ended = (reached > 0) | (missed > 0)
+        if step >= 100 and ended.any():
+            goals["height"].append(height0[ended])
+            goals["reached"].append(reached[ended] > 0)
+            goals["needs_crouch"].append(needs_crouch0[ended])
         totals["falls"] += terminated["legs"].float().sum().item()
         pos_err, rot_err = arm.errors()
         pelvis_drop, valid = pelvis_state()
@@ -168,6 +180,7 @@ def evaluate(spread: int, drop: int, focus: bool) -> dict:
             samples["pos_err"].append(pos_err[ok].mean(dim=1))
             samples["rot_err"].append(rot_err[ok].mean(dim=1))
             samples["pelvis_vz"].append(robot.data.root_lin_vel_w[ok][:, 2])
+            samples["target_height"].append(arm.lowest_target_height[ok])
             # each term's weighted reward this step, per second (RewardManager._step_reward)
             samples["rew_legs"].append(base.reward_managers["legs"]._step_reward[ok].clone())
             samples["rew_arms"].append(base.reward_managers["arms"]._step_reward[ok].clone())
@@ -187,6 +200,7 @@ def evaluate(spread: int, drop: int, focus: bool) -> dict:
 
     to_np = lambda xs: torch.cat(xs).float().cpu().numpy()  # noqa: E731
     data = {k: to_np(v) for k, v in samples.items()}
+    data.update({f"goal_{k}": to_np(v) if v else np.zeros(0) for k, v in goals.items()})
     minutes = args.num_envs * args.steps * base.step_dt / 60.0
     finished = totals["reached"] + totals["missed"]
     cmd, act_drop = data["target_drop"], data["pelvis_drop"]
@@ -199,8 +213,13 @@ def evaluate(spread: int, drop: int, focus: bool) -> dict:
         reached_per_min=totals["reached"] / minutes, falls_per_min=totals["falls"] / minutes,
         timeline={k: np.array(v) for k, v in timeline.items()} if focus else None, frames=frames,
     )
+    needs_crouch = data["goal_needs_crouch"] > 0
+    result["crouch_goals"] = int(needs_crouch.sum())
+    result["crouch_success"] = float(data["goal_reached"][needs_crouch].mean()) if needs_crouch.any() else float("nan")
     print(
-        f"EVAL {spread:3d}:{drop:<3d} | success {100 * result['success']:5.1f}% | falls/env-min {result['falls_per_min']:.2f} |"
+        f"EVAL {spread:3d}:{drop:<3d} | success {100 * result['success']:5.1f}%"
+        f" (needing a crouch {100 * result['crouch_success']:5.1f}% of {result['crouch_goals']}) |"
+        f" falls/env-min {result['falls_per_min']:.2f} |"
         f" target drop {100 * cmd.mean():4.1f} cm -> pelvis drop {100 * act_drop.mean():4.1f} cm, slope {slope:5.2f} |"
         f" knee {data['knee'].mean():.2f} rad | err {100 * data['pos_err'].mean():.1f} cm {data['rot_err'].mean():.2f} rad"
     )
@@ -230,11 +249,11 @@ plt.rcParams.update({
     "axes.edgecolor": GRID, "axes.labelcolor": INK_2, "axes.titlecolor": INK, "text.color": INK,
     "xtick.color": INK_2, "ytick.color": INK_2, "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.8,
     "axes.spines.top": False, "axes.spines.right": False, "font.size": 10, "axes.titlesize": 11,
-    "axes.titleweight": "bold", "axes.titlelocation": "left", "legend.frameon": False,
+    "axes.titleweight": "bold", "axes.titlelocation": "left", "legend.frameon": False, "axes.axisbelow": True,
 })
 spreads = sorted({r["spread"] for r in results})
 color_of = {s: SERIES[i % len(SERIES)] for i, s in enumerate(spreads)}  # color follows the spread, not its rank
-BINS = np.arange(0.0, 0.26, 0.02)
+BINS = np.arange(0.0, env_cfg.commands.arm_targets.max_height_drop + 0.011, 0.02)
 
 
 def binned(x, y):
@@ -336,6 +355,44 @@ fig.tight_layout()
 fig.savefig(os.path.join(OUT, "outcomes.png"), dpi=150)
 plt.close(fig)
 
+# 3b. by target height above the ground, all pairs pooled: is a goal that needs a crouch reached?
+HEIGHT_EDGES = [np.inf, STANDING_REACH, 0.75, 0.60, 0.45, -np.inf]  # descending: lower targets to the right
+height_labels = [f">= {STANDING_REACH:.2f} m\n(standing reach)"] + [
+    f"{lo:.2f}-{hi:.2f} m" for hi, lo in zip(HEIGHT_EDGES[1:-2], HEIGHT_EDGES[2:-1])
+] + [f"< {HEIGHT_EDGES[-2]:.2f} m"]
+g_height = np.concatenate([r["data"]["goal_height"] for r in results])
+g_reached = np.concatenate([r["data"]["goal_reached"] for r in results])
+s_height = np.concatenate([r["data"]["target_height"] for r in results])
+s_drop = np.concatenate([r["data"]["pelvis_drop"] for r in results])
+s_err = np.concatenate([r["data"]["pos_err"] for r in results])
+by_height = []
+for hi, lo, label in zip(HEIGHT_EDGES[:-1], HEIGHT_EDGES[1:], height_labels):
+    g, s = (g_height < hi) & (g_height >= lo), (s_height < hi) & (s_height >= lo)
+    by_height.append(dict(
+        label=label, goals=int(g.sum()), success=float(g_reached[g].mean()) if g.any() else float("nan"),
+        pelvis_drop=float(s_drop[s].mean()) if s.any() else float("nan"),
+        pos_err=float(s_err[s].mean()) if s.any() else float("nan"),
+    ))
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.0))
+xs = np.arange(len(by_height))
+ax1.bar(xs, [100 * b["success"] for b in by_height], width=0.55, color=SERIES[0])
+for x, b in zip(xs, by_height):
+    if b["goals"]:
+        ax1.text(x, 100 * b["success"] + 1.5, f"{100 * b['success']:.0f}%\nn={b['goals']}", ha="center", fontsize=8, color=INK_2)
+ax1.set_ylim(0, 110)
+ax1.set_title("Arm goals reached (%)")
+ax2.bar(xs, [100 * b["pelvis_drop"] for b in by_height], width=0.55, color=SERIES[0])
+ax2.set_title("Pelvis drop below standing (cm)")
+for ax in (ax1, ax2):
+    ax.set_xticks(xs, [b["label"] for b in by_height], fontsize=8)
+    ax.set_xlabel("lower wrist target above the ground")
+    ax.grid(axis="x", visible=False)
+fig.suptitle("Targets below the standing reach can only be reached by crouching", x=0.01, ha="left",
+             fontweight="bold", color=INK)
+fig.tight_layout()
+fig.savefig(os.path.join(OUT, "reach_by_height.png"), dpi=150)
+plt.close(fig)
+
 # 4. timeline of one robot at the focus pair: shared time axis, one measure per panel
 focus_result = next((r for r in results if (r["spread"], r["drop"]) == FOCUS), None)
 if focus_result is not None:
@@ -373,7 +430,7 @@ if focus_result is not None:
 
 # 5. rewards by crouch depth and motion: every term, per second
 BUCKETS = [("standing (< 3 cm)", -1.0, 0.03), ("shallow (3-8 cm)", 0.03, 0.08), ("mid (8-13 cm)", 0.08, 0.13),
-           ("deep (> 13 cm)", 0.13, 1.0)]
+           ("deep (13-25 cm)", 0.13, 0.25), ("very deep (> 25 cm)", 0.25, 2.0)]
 pool = lambda key: np.concatenate([r["data"][key] for r in results])  # noqa: E731
 p_drop, p_vz = pool("pelvis_drop"), pool("pelvis_vz")
 masks = [(name, (p_drop >= lo) & (p_drop < hi)) for name, lo, hi in BUCKETS]
@@ -410,7 +467,7 @@ if "legs" in deltas:
     ax.set_yticks(ys, [k for k, _ in items])
     ax.axvline(0, color=REF, linewidth=1.0)
     ax.grid(axis="y", visible=False)
-    ax.set_xlabel("reward per second: deep crouch (> 13 cm) minus standing (< 3 cm)")
+    ax.set_xlabel("reward per second: deep crouch (13-25 cm) minus standing (< 3 cm)")
     ax.set_title("What a deep crouch gains (blue) or costs (red) the legs")
     fig.tight_layout()
     fig.savefig(os.path.join(OUT, "rewards_by_crouch.png"), dpi=150)
@@ -445,15 +502,29 @@ for s in spreads:
         f" of the extra drop and the arms reach for the rest."
     )
 lines += ["", "## Can the robot do the task, and does it stay up?", "",
-          "| spread:drop | goals reached | falls / env-min | wrist error | rotation error |", "|---|---|---|---|---|"]
+          "| spread:drop | goals reached | needing a crouch: reached (goals) | falls / env-min | wrist error | rotation error |",
+          "|---|---|---|---|---|---|"]
 for r in results:
+    crouch = f"{pct(r['crouch_success'])} ({r['crouch_goals']})" if r["crouch_goals"] else "-"
     lines.append(
-        f"| {r['spread']}:{r['drop']} | {pct(r['success'])} | {r['falls_per_min']:.2f} |"
+        f"| {r['spread']}:{r['drop']} | {pct(r['success'])} | {crouch} | {r['falls_per_min']:.2f} |"
         f" {100 * r['data']['pos_err'].mean():.1f} cm | {r['data']['rot_err'].mean():.2f} rad |"
     )
 worst_falls = max(r["falls_per_min"] for r in results)
 lines += ["", f"- Falls: worst pair {worst_falls:.2f} per env-minute"
           + (" (**unstable**: a robot falls every couple of minutes or sooner)" if worst_falls > 0.5 else " (stable)") + "."]
+lines += ["", "## Goals below the standing reach", "",
+          f"No arm pose reaches a wrist target below {STANDING_REACH:.2f} m above the ground standing (the lowest pose in"
+          " the target table), so reaching one takes a crouch. All pairs pooled, by the lower target's height:", "",
+          "| lower target above the ground | goals | reached | pelvis drop | wrist error |", "|---|---|---|---|---|"]
+for b in by_height:
+    lines.append(
+        f"| {b['label'].replace(chr(10), ' ')} | {b['goals']} | {pct(b['success']) if b['goals'] else '-'} |"
+        f" {100 * b['pelvis_drop']:.1f} cm | {100 * b['pos_err']:.1f} cm |"
+    )
+all_drop = np.concatenate([r["data"]["pelvis_drop"] for r in results])
+lines += ["", f"- Deepest crouch: pelvis drop {100 * np.percentile(all_drop, 95):.1f} cm at the 95th percentile,"
+          f" {100 * all_drop.max():.1f} cm at most (pelvis {STANDING_PELVIS_HEIGHT - all_drop.max():.2f} m above the ground)."]
 lines += ["", "## How the legs do it", ""]
 for s in spreads:
     rs = sorted((r for r in results if r["spread"] == s), key=lambda r: r["drop"])
@@ -470,7 +541,7 @@ lines.append(
     f"- Joint headroom: ankle pitch within 0.1 rad of its soft limit {pct(np.mean(np.min(np.abs(all_ankle[:, None] - np.array(soft_limits['ankle_pitch'])[None]), axis=1) < 0.1))}"
     f" of the time; knee max {all_knee.max():.2f} rad (soft limit {soft_limits['knee'][1]:.2f})."
 )
-lines += ["", "Figures: `crouch_response.png`, `posture.png`, `outcomes.png`, `timeline.png`"
+lines += ["", "Figures: `crouch_response.png`, `posture.png`, `outcomes.png`, `reach_by_height.png`, `timeline.png`"
           + (", video `crouch.mp4`." if focus_result and focus_result["frames"] else ".")]
 report = "\n".join(lines)
 with open(os.path.join(OUT, "report.md"), "w") as f:

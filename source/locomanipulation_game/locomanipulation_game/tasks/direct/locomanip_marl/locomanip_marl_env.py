@@ -50,6 +50,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
 
     def __init__(self, cfg: LocoManipMarlEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
+        self._set_soft_joint_limits()
 
         # Managers resolve physics handles, so they come after super() has
         # started the sim. Same order as ManagerBasedRLEnv.load_managers:
@@ -299,6 +300,23 @@ class LocoManipMarlEnv(DirectMARLEnv):
     """
     Helpers.
     """
+
+    def _set_soft_joint_limits(self):
+        """Soft limits at cfg.soft_joint_pos_limit_factors of the hard range, for the joints it names.
+
+        Same formula as Articulation (mean +- factor * half range), which applies
+        the asset's single factor to every joint. Before the managers: the arm
+        target table and joint_pos_limits read these.
+        """
+        robot = self.scene["robot"]
+        for pattern, factor in self.cfg.soft_joint_pos_limit_factors.items():
+            ids, names = robot.find_joints(pattern)
+            hard = robot.data.joint_pos_limits[:, ids]
+            mean, half_range = hard.mean(dim=-1), 0.5 * (hard[..., 1] - hard[..., 0])
+            robot.data.soft_joint_pos_limits[:, ids, 0] = mean - factor * half_range
+            robot.data.soft_joint_pos_limits[:, ids, 1] = mean + factor * half_range
+            limits = [[round(v, 3) for v in pair] for pair in robot.data.soft_joint_pos_limits[0, ids].tolist()]
+            print(f"[INFO] Soft joint limits at {factor} of the hard range: {dict(zip(names, limits))}")
 
     def _raise_nan(self, agent: str, manager: RewardManager):
         step_reward = manager._step_reward

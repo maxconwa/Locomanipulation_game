@@ -493,6 +493,12 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     # can't cancel it. The legs' -5 (IBR and ALMI had 0) prices the falls the
     # freer crouch allows: run 9 fell 1.2-2.2 times per env-minute.
     termination_penalty: dict[str, float] = {"legs": -5.0, "arms": -5.0}
+    # Per-joint soft limit factors over the asset's 0.9, applied once at init
+    # (nothing here rewrites joint limits later). The knee (hard -0.12..2.19)
+    # and ankle pitch (hard -0.90..0.52, the CL_Assets URDF, MJCF and USD
+    # agree) bound a feet-flat squat: the pelvis goes 0.376 m down at 0.9,
+    # 0.395 m at 0.95, so at 0.9 dof_pos_limits charges the deepest squat.
+    soft_joint_pos_limit_factors: dict[str, float] = {".*_knee_joint": 0.95, ".*_ankle_pitch_joint": 0.95}
 
     def __post_init__(self):
         # Contacts every physics step (the phase-contact and swing-height terms
