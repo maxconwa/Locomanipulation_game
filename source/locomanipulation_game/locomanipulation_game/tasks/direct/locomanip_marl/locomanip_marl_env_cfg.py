@@ -497,10 +497,14 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     # Per-agent floor on the summed step reward, like PositiveRewardRLEnv.
     # None disables it.
     reward_clip_min: dict[str, float | None] = {"legs": 0.0, "arms": 0.0}
-    # Whether the floor also applies during arm goals. Not for the legs: going
-    # down into a crouch measured -2.0/s (run 9), which the floor made 0, so
-    # the whole descent read as lost income.
-    reward_clip_during_arm_goals: dict[str, bool] = {"legs": False, "arms": True}
+    # Whether the floor also applies during arm goals. Yes for both: the legs'
+    # reward should never be negative, which is what the floor is for (user,
+    # 2026-10-05). Runs 10-13 had it off for the legs during arm goals (going
+    # down into a crouch measured -2.0/s in run 9, and the floor hid that
+    # cost); flat run D then showed the price: early on the legs netted about
+    # -0.3/s alive, falling cost about as much as living, and they never
+    # learned to stand.
+    reward_clip_during_arm_goals: dict[str, bool] = {"legs": True, "arms": True}
     # Added after the clip on terminating (not timed-out) steps, so the floor
     # can't cancel it. The legs' -5 (IBR and ALMI had 0) prices the falls the
     # freer crouch allows: run 9 fell 1.2-2.2 times per env-minute.
@@ -620,9 +624,9 @@ class LocoManipMarlFlatCurriculumEnvCfg(LocoManipMarlEnvCfg):
         )
         self.observations.legs.actions.func = mdp.applied_action
         self.observations.arms.actions.func = mdp.applied_action
-        # Staying up must pay. The legs' reward is floored at 0 while walking but not during arm goals
-        # (a crouch shouldn't read as free), so early on, flailing and not yet tracking, their net reward
-        # per second alive was negative (flat run D: -0.3/s), the -5 fall cost about as much as living,
-        # and after 13.8k steps every episode still fell within ~1.5 s (run C, walk-only, stood by 4k).
-        # A constant alive reward only moves the stay-up-vs-fall trade (a 20 s episode is worth +20).
+        # Staying up must pay. Flat run D (legs' reward then not floored during arm goals) netted about
+        # -0.3/s alive early on, so the -5 fall cost about as much as living, and after 13.8k steps every
+        # episode still fell within ~1.5 s (run C, walk-only, stood by 4k). With the floor now on in both
+        # modes, this keeps a margin for living: a constant alive reward only moves the stay-up-vs-fall
+        # trade (a 20 s episode is worth +20).
         self.rewards.legs.alive.weight = 1.0
