@@ -13,9 +13,16 @@ a more user-friendly way.
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import faulthandler
+import signal
 import sys
 
 from isaaclab.app import AppLauncher
+
+# `kill -USR1 <pid>` prints every thread's Python stack to stderr (the run's log). Flat run A hung
+# at step 22.5k (GPU and one worker thread at 100%, main thread in a futex wait, SIGTERM ignored)
+# with no way to see where.
+faulthandler.register(signal.SIGUSR1, all_threads=True)
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with skrl.")
