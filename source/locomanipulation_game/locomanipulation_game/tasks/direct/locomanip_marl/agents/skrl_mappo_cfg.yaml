@@ -91,7 +91,15 @@ agent:
     arms: 0.0
   value_loss_scale: 1.0
   kl_threshold: 0.0
-  time_limit_bootstrap: True  # rsl_rl bootstraps time-outs too
+  # rsl_rl bootstraps time-outs too. Not the arms: flat run A's arms value scaler ran away from the
+  # start (mean 6e9 at step 4.8k, 1.5e16 at 19.2k, then nan and a hung PhysX). At a time-out skrl
+  # adds gamma * V(next state) to the reward, V un-normalised through the scaler that is trained on
+  # those returns: once the critic's normalised output pinned at the scaler's +5 clip, every update
+  # raised the scaler and so the next bootstrap. The arms' own rewards in walk-only are tiny and
+  # flat (no arm goals), so nothing anchored the scale; the legs' scaler stayed at mean ~6, std ~4.
+  time_limit_bootstrap:
+    legs: True
+    arms: False
   rewards_shaper_scale: 1.0
   experiment:
     directory: "locomanip_marl"

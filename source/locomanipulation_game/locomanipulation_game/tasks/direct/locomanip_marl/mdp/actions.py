@@ -1,17 +1,17 @@
-"""Joint-position actions with bounded, rate-limited targets.
+"""Joint-position actions with bounded, optionally rate-limited targets.
 
-Run 12's videos showed the squat and the arm moves happening too fast to be
-safe (pelvis drops over 0.8 m/s, joints at hardware speed), and the policy
-commanding targets far past the joint stops (knee actions of -300 against a
-clip of 10). This term keeps the plain JointPositionAction mapping (target =
-action * scale + offset) and then, once per policy step:
+Run 12's policy commanded targets far past the joint stops (knee actions of
+-300 against a clip of 10). This term keeps the plain JointPositionAction
+mapping (target = action * scale + offset) and then, once per policy step:
 
   1. bounds each target to [hard lower - target_margin, hard upper + target_margin]:
      the margin lets the PD controller push against a limit (holding a deep
      squat needs the knee target ~0.37 rad past the knee angle), but no further;
-  2. limits how far each target may move from the last applied one: max_rate
-     (rad/s) during arm goals and settle segments, max_rate_navigation while
-     walking, per env from the arm command's mode.
+  2. if max_rate is set, limits how far each target may move from the last
+     applied one: max_rate (rad/s) during arm goals and settle segments,
+     max_rate_navigation while walking, per env from the arm command's mode.
+     Flat run A had rate caps (arms 1.0-1.5 rad/s, knee and hip pitch 1.2 during
+     arm goals) for slower, safer moves; the user reverted them for the restart.
 
 The policy sees what was applied (applied_actions, in action units, through
 mdp.applied_action), and beyond_bounds (also in action units) is what the
@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import torch
 from collections.abc import Sequence
-from dataclasses import MISSING
 from typing import TYPE_CHECKING
 
 import isaaclab.utils.string as string_utils
@@ -43,19 +42,16 @@ class RateLimitedJointPositionAction(JointPositionAction):
         hard = self._asset.data.joint_pos_limits[:, self._joint_ids]
         self._lower = hard[..., 0] - cfg.target_margin
         self._upper = hard[..., 1] + cfg.target_margin
-        self._rate = self._per_joint(cfg.max_rate)
+        self._rate = self._per_joint(cfg.max_rate) if cfg.max_rate else None
         self._rate_navigation = self._per_joint(cfg.max_rate_navigation) if cfg.max_rate_navigation else self._rate
         self._applied = self._asset.data.joint_pos[:, self._joint_ids].clone()
         self._beyond = torch.zeros_like(self._raw_actions)
-        print(
-            f"[INFO] {type(self).__name__}: targets within the hard limits +- {cfg.target_margin} rad; rate caps"
-            f" (rad/s, arm goals and settle) {dict(zip(self._joint_names, self._rate.tolist()))}"
-            + (
-                f"; walking {dict(zip(self._joint_names, self._rate_navigation.tolist()))}"
-                if cfg.max_rate_navigation
-                else ""
-            )
-        )
+        caps = "no rate caps"
+        if self._rate is not None:
+            caps = f"rate caps (rad/s, arm goals and settle) {dict(zip(self._joint_names, self._rate.tolist()))}"
+            if cfg.max_rate_navigation:
+                caps += f"; walking {dict(zip(self._joint_names, self._rate_navigation.tolist()))}"
+        print(f"[INFO] {type(self).__name__}: targets within the hard limits +- {cfg.target_margin} rad; {caps}")
 
     def _per_joint(self, rates: dict[str, float]) -> torch.Tensor:
         index_list, _, value_list = string_utils.resolve_matching_names_values(rates, self._joint_names)
@@ -81,6 +77,10 @@ class RateLimitedJointPositionAction(JointPositionAction):
         target = self._raw_actions * self._scale + self._offset
         bounded = torch.maximum(torch.minimum(target, self._upper), self._lower)
         self._beyond = (target - bounded).abs() / abs(self._scale)
+        if self._rate is None:
+            self._applied = bounded
+            self._processed_actions = self._applied
+            return
         rate = self._rate.expand_as(bounded)
         if self.cfg.max_rate_navigation:
             arm = self._env.command_manager.get_term(self.cfg.mode_command_name)
@@ -102,9 +102,9 @@ class RateLimitedJointPositionAction(JointPositionAction):
 class RateLimitedJointPositionActionCfg(JointPositionActionCfg):
     class_type: type = RateLimitedJointPositionAction
 
-    max_rate: dict[str, float] = MISSING
+    max_rate: dict[str, float] | None = None
     """rad/s per joint (regex keys, every joint covered): the cap during arm goals and settle segments,
-    or always when max_rate_navigation is None."""
+    or always when max_rate_navigation is None. None: no rate limit, bounds only."""
     max_rate_navigation: dict[str, float] | None = None
     """rad/s per joint while walking (not in an arm goal or a settle)."""
     mode_command_name: str = "arm_targets"

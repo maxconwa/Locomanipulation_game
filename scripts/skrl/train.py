@@ -187,6 +187,104 @@ def project_log_std_after_updates(agent, policy_cfg: dict, per_agent: dict | Non
     agent.update = update_and_project
 
 
+def guard_updates(
+    agent, log_dir: str, value_loss_alarm: float = 5.0, value_scale_alarm: float = 1.0e4, max_dumps: int = 3
+):
+    """Check every multi-agent update for divergence; on one, save the update's batch and say why.
+
+    Flat run A: the arms' value loss went 0.57 -> 26 -> nan in two updates
+    (twice, at the same point), then nan actions hung PhysX. The rewards were
+    bounded throughout, so the cause is inside the update. Before each update
+    this records the rollout memory's ranges and the preprocessors' smallest
+    variances; after it, it checks the parameters. A non-finite parameter, a
+    value scaler whose std passed value_scale_alarm, or a value-loss spike
+    (above value_loss_alarm and 20x the median of the agent's last 50 updates;
+    a fresh critic starts high) prints both and saves the memory and the
+    pre-update weights to <log_dir>/divergence_<uid>_<n>.pt (the first
+    max_dumps, ~150 MB each at 4096 envs). The first two then stop the run.
+    """
+    import torch
+
+    if not hasattr(agent, "memories"):
+        return
+    from collections import deque
+
+    update = agent.update
+    alarms = {"count": 0}
+    recent = {uid: deque(maxlen=50) for uid in agent.memories}
+
+    def ranges(uid):
+        memory = agent.memories[uid]
+        out = {}
+        for name in ("observations", "states", "actions", "rewards", "log_prob", "values"):
+            t = memory.get_tensor_by_name(name)
+            finite = torch.isfinite(t)
+            tf = t[finite] if finite.any() else torch.zeros(1, device=t.device)
+            out[name] = (tf.min().item(), tf.max().item(), int((~finite).sum()))
+        for name in ("observation", "state", "value"):
+            pre = getattr(agent, f"_{name}_preprocessor")[uid]
+            if hasattr(pre, "running_variance"):
+                var = pre.running_variance
+                out[f"{name} scaler"] = (var.min().item(), var.max().item(), int((var < 1e-8).sum()))
+        return out
+
+    def update_and_check(*, timestep, timesteps, uid):
+        before = ranges(uid)
+        weights = {
+            "policy": {k: v.detach().clone() for k, v in agent.policies[uid].state_dict().items()},
+            "value": {k: v.detach().clone() for k, v in agent.values[uid].state_dict().items()},
+        }
+        update(timestep=timestep, timesteps=timesteps, uid=uid)
+        finite = all(
+            torch.isfinite(p).all() for model in (agent.policies[uid], agent.values[uid]) for p in model.parameters()
+        )
+        losses = agent.tracking_data.get(f"Loss / Value loss ({uid})", [])
+        value_loss = losses[-1] if losses else 0.0
+        scaler = agent._value_preprocessor[uid]
+        # a return scale this large is a feedback loop, not a task (flat run A: 6e9 by step 4.8k)
+        runaway = hasattr(scaler, "running_variance") and scaler.running_variance.max().item() > value_scale_alarm**2
+        finite = finite and not runaway
+        history = recent[uid]
+        spike = (
+            len(history) == history.maxlen
+            and value_loss > value_loss_alarm
+            and value_loss > 20.0 * sorted(history)[len(history) // 2]
+        )
+        history.append(value_loss)
+        if finite and not spike:
+            return
+        alarms["count"] += 1
+        if alarms["count"] > max_dumps and finite:
+            return
+        path = os.path.join(log_dir, f"divergence_{uid}_{alarms['count']}.pt")
+        memory = agent.memories[uid]
+        torch.save(
+            {
+                "timestep": timestep,
+                "value_loss": value_loss,
+                "ranges_before": before,
+                "weights_before": weights,
+                "memory": {n: memory.get_tensor_by_name(n).detach().cpu() for n in memory.get_tensor_names()},
+            },
+            path,
+        )
+        print(
+            f"[DIVERGENCE] agent {uid} at timestep {timestep}: value loss {value_loss:.4g}, finite params {finite},"
+            f" value scaler std {scaler.running_variance.max().sqrt().item():.4g}"
+        )
+        for name, (low, high, bad) in before.items():
+            print(f"[DIVERGENCE]   {name:18s} min {low:.4g}  max {high:.4g}  non-finite / tiny-variance {bad}")
+        print(f"[DIVERGENCE]   saved the update's memory and the weights before it to {path}")
+        sys.stdout.flush()
+        if not finite:
+            raise RuntimeError(
+                f"agent {uid}: non-finite parameters or a runaway value scale after the update at timestep {timestep};"
+                f" see {path}"
+            )
+
+    agent.update = update_and_check
+
+
 def load_policies_only(agent, path: str):
     """Load each agent's policy and observation preprocessor from a multi-agent skrl checkpoint.
 
@@ -313,6 +411,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     elif args_cli.init_policies:
         load_policies_only(runner.agent, retrieve_file_path(args_cli.init_policies))
     project_log_std_after_updates(runner.agent, agent_cfg["models"]["policy"], agent_cfg.get("log_std_bounds"))
+    guard_updates(runner.agent, log_dir)
 
     # run training
     runner.run()

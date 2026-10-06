@@ -126,6 +126,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
     def _pre_physics_step(self, actions: dict[str, torch.Tensor]) -> None:
         self.actions = actions
         joint_action = torch.cat([actions[agent] for agent in self.cfg.possible_agents], dim=1)
+        if not torch.isfinite(joint_action).all():
+            # a NaN joint target hangs the PhysX solver (flat run A, twice: GPU at 100%, no error)
+            bad = {agent: int((~torch.isfinite(actions[agent])).any(dim=1).sum()) for agent in self.cfg.possible_agents}
+            raise RuntimeError(f"Non-finite actions at step {self.common_step_counter}, envs per agent: {bad}")
         self.action_manager.process_action(joint_action.clamp(-self.cfg.clip_actions, self.cfg.clip_actions))
 
     def _apply_action(self) -> None:

@@ -126,7 +126,9 @@ wrist_ids = robot.find_bodies(arm.cfg.body_names, preserve_order=True)[0]
 def caps(term_name: str, navigation: bool) -> dict[str, float]:
     """The applied-target rate cap (rad/s) per joint name of an action term, in one mode."""
     term = base.action_manager.get_term(term_name)
-    rates = term._rate_navigation if navigation else term._rate
+    rates = getattr(term, "_rate_navigation" if navigation else "_rate", None)
+    if rates is None:  # no rate caps on this term
+        return {name: float("inf") for name in term._joint_names}
     return dict(zip(term._joint_names, rates.tolist()))
 
 
@@ -318,9 +320,12 @@ for k, (label, color) in enumerate((("walking", SERIES[0]), ("arm goal", SERIES[
 for k, (mode, color) in enumerate((("walking", SERIES[0]), ("arm goal / settle", SERIES[1]))):
     for x, g in zip(xs, groups):
         c = group_cap[mode][g]
+        if not np.isfinite(c):
+            continue
         ax1.plot([x + (k - 0.5) * 0.36 - 0.17, x + (k - 0.5) * 0.36 + 0.17], [c, c], color=INK, linewidth=1.2)
 ax1.set_xticks(xs, groups, fontsize=8, rotation=20)
-ax1.set_title("Joint speed, 99th percentile (rad/s); black ticks: target-rate caps")
+ax1.set_title("Joint speed, 99th percentile (rad/s)" + ("; black ticks: target-rate caps" if any(
+    np.isfinite(c) for m in group_cap.values() for c in m.values()) else ""))
 ax1.legend(fontsize=8, loc="upper right")
 ax1.grid(axis="x", visible=False)
 labels = [r["mode"] for r in speed_rows]
@@ -421,9 +426,10 @@ for r in speed_rows:
         f" {r['pelvis'][0]:.2f} / {r['pelvis'][1]:.2f} / {r['pelvis'][2]:.2f} m/s | "
         + " | ".join(f"{r[g]:.1f}" for g in GROUPS) + " |"
     )
-lines.append("| target-rate cap, walking | | | | " + " | ".join(f"{group_cap['walking'][g]:.1f}" for g in GROUPS) + " |")
+cap_cell = lambda c: f"{c:.1f}" if np.isfinite(c) else "none"  # noqa: E731
+lines.append("| target-rate cap, walking | | | | " + " | ".join(cap_cell(group_cap["walking"][g]) for g in GROUPS) + " |")
 lines.append("| target-rate cap, arm goal / settle | | | | "
-             + " | ".join(f"{group_cap['arm goal / settle'][g]:.1f}" for g in GROUPS) + " |")
+             + " | ".join(cap_cell(group_cap["arm goal / settle"][g]) for g in GROUPS) + " |")
 lines += ["", "Joint speeds are measured, not commanded: the cap limits the target, and the PD response, steps"
           " and impacts can briefly exceed it."]
 lines += ["", "## Falls", ""]
