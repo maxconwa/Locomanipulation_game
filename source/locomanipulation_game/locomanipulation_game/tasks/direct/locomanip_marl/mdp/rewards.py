@@ -39,6 +39,20 @@ def action_term_rate_l2(env: ManagerBasedRLEnv, action_name: str) -> torch.Tenso
     return torch.sum(torch.square(a - prev), dim=1)
 
 
+def action_beyond_clip(env, agent: str, clip: float) -> torch.Tensor:
+    """Sum over the agent's raw policy actions of how far each is beyond the clip the env applies.
+
+    The env clamps actions to +-clip before the action manager sees them, so an
+    output of 15 and one of 400 command the same joint target and no other term
+    can tell them apart: nothing pulls a policy mean back once it drifts past
+    the clip. Run 12 (agent_57600) sent knee actions of -300..-400 in the first
+    steps of 10-15% of episodes at drop level 10, locking the knees straight.
+    Linear, so those outliers are charged hard but not enough to swamp the
+    critic. Reads the env's raw per-agent actions (LocoManipMarlEnv.actions).
+    """
+    return (env.actions[agent].abs() - clip).clamp(min=0.0).sum(dim=1)
+
+
 class self_contacts_involving(ManagerTermBase):
     """Number of self-contact pairs above `threshold` that include at least one of `own_links`.
 

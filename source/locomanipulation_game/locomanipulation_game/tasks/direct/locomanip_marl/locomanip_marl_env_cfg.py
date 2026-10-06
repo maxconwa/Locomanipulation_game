@@ -97,6 +97,7 @@ ARMS_SHARE_OF_LEGS = 0.1
 # falls per env-minute. The legs' std is now capped at 0.6 (skrl config,
 # log_std_bounds) against that early excursion.
 ARM_GOAL_SHAPING_SCALE = {"lin_vel_z": 0.0, "ang_vel_xy": 0.5, "hip_pos": 0.2}
+CLIP_ACTIONS = 10.0       # the env clamps every raw policy action to +-this (IBR's rsl_rl clip_actions)
 
 
 @configclass
@@ -316,6 +317,14 @@ class LegsRewardsCfg(LowerRewardsCfg):
     arm_goal_yaw_rate = RewTerm(
         func=mdp.yaw_rate_l2_during_arm_goal, weight=-1.0, params={"arm_command_name": ARM_COMMAND}
     )
+    # Raw leg actions past the clip (see mdp.action_beyond_clip). Per second:
+    # an action of 15 costs 0.1, 80 costs 1.4, 400 costs 7.8, against a legs
+    # total of ~+6. Run 12 at agent_100800: none in steady state (knee p99 6.6),
+    # but in an episode's first 0.5 s ankle pitch passes the clip 5-6% of steps
+    # and single actions reach ~100.
+    action_beyond_clip = RewTerm(
+        func=mdp.action_beyond_clip, weight=-0.02, params={"agent": "legs", "clip": CLIP_ACTIONS}
+    )
 
     def __post_init__(self):
         self.action_rate.func = mdp.action_term_rate_l2
@@ -481,7 +490,7 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     # the other agent saw and did (its last action is in its observation).
     state_includes_agent_obs: bool = True
     # Same as the IBR rounds' rsl_rl clip_actions.
-    clip_actions: float = 10.0
+    clip_actions: float = CLIP_ACTIONS
     # Per-agent floor on the summed step reward, like PositiveRewardRLEnv.
     # None disables it.
     reward_clip_min: dict[str, float | None] = {"legs": 0.0, "arms": 0.0}
