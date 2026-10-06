@@ -3,8 +3,8 @@
 Holds every env at one walking stage (no gate moves) with deterministic (mean) actions and the run's own
 estimator and target table:
 
-  --stage walk       navigation only, arms at the zero-joint-angle rest pose (curriculum stage 0)
-  --stage alternate  walking and arm goals 50/50 with settles between (stage 1), reach levels held at
+  --stage walk       navigation only, arms at the zero-joint-angle rest pose
+  --stage alternate  walking and arm goals 50/50 with settles between, reach levels held at
                      --levels spread:drop
 
 It measures velocity tracking by command type, falls (direction, when, in which mode), and the speeds
@@ -78,6 +78,9 @@ env_cfg.scene.num_envs = args.num_envs
 env_cfg.log_dir = RUN_DIR
 env_cfg.estimator.train = False
 env_cfg.estimator.checkpoint_path = estimator_checkpoint_for(args.checkpoint)
+# the stage is set by the arm-goal share alone (a run trained with the walking gate is evaluated the same way)
+env_cfg.commands.arm_targets.walk_gate = False
+env_cfg.commands.arm_targets.arm_goal_prob = 0.0 if args.stage == "walk" else 0.5
 if args.video or args.gui:
     if args.num_envs > 20:
         print(f"[eval_walk] WARNING: {args.num_envs} envs share tiles and overlap on camera; use --num_envs 16 to watch.")
@@ -98,9 +101,7 @@ arm = base.command_manager.get_term("arm_targets")
 vel = base.command_manager.get_term("base_velocity")
 robot = base.scene["robot"]
 scanner = base.scene.sensors["height_scanner"]
-if not arm.cfg.walk_gate:
-    raise SystemExit(f"[eval_walk] {args.task} has no walking gate; use eval_crouch.py for it.")
-# hold the stage and the reach levels: no gate or curriculum moves
+# hold the reach levels: no curriculum moves
 STAGE = 0 if args.stage == "walk" else 1
 spread, drop = (int(x) for x in args.levels.split(":"))
 
@@ -161,14 +162,12 @@ totals = dict(reached=0.0, missed=0.0, falls=0)
 video_steps = int(args.video_seconds / base.step_dt) if args.video else 0
 print(f"EVAL {args.checkpoint}  stage {args.stage}  envs {args.num_envs}  steps {args.steps}  out {OUT}")
 with torch.inference_mode():
-    arm.walk_stage[:] = STAGE
     arm.spread_level[:] = spread
     arm.drop_level[:] = drop
     obs, _ = base.reset()
     states = base.state()
     for step in range(args.steps):
         start = time.time()
-        arm.walk_stage[:] = STAGE
         # the mode a step runs in, and the robot before it (a fall resets the env within the step)
         mode0 = torch.where(arm.arm_mode, 2, torch.where(arm.settling, 1, 0))
         gravity0 = robot.data.projected_gravity_b.clone()

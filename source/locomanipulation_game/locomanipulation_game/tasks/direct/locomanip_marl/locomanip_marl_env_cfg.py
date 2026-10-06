@@ -548,18 +548,21 @@ class LocoManipMarlStandEnvCfg(LocoManipMarlEnvCfg):
 
 @configclass
 class LocoManipMarlFlatCurriculumEnvCfg(LocoManipMarlEnvCfg):
-    """Flat world, fresh policies: walk first, then alternate walking with crouch-reaching.
+    """Flat world, fresh policies: walking and crouch-reaching, 50/50 from the start.
 
     The target behaviour is walk -> stop -> crouch-reach -> stand -> walk on,
-    never walking and reaching at once. Per env (ArmTargetsCommand walk_gate):
-    stage 0 is navigation only, the arms holding the zero-joint-angle wrist
-    pose (rest_pose_b) as their end-effector command; once its navigation
-    segments are tracked (>= 80% of the commanded path, no fall, 4 of the
-    last 5) it alternates, each event an arm goal with probability 0.5 and
-    the reach curriculum (spread, then the 0.5 m drop) running as in the
-    stand task. A fall while walking sends it back to stage 0. Each mode
-    switch first settles: 0.75 s stopped before an arm goal, 1.5 s to stand
-    up before walking.
+    never walking and reaching at once. Each goal event is an arm goal with
+    probability 0.5, else navigation with the arms holding the
+    zero-joint-angle wrist pose (rest_pose_b) as their end-effector command;
+    the reach curriculum (spread, then the 0.5 m drop) runs as in the stand
+    task. Each mode switch first settles: 0.75 s stopped before an arm goal,
+    1.5 s to stand up before walking.
+
+    Flat run C used ArmTargetsCommand's walking gate instead (navigation only
+    until 4 of 5 segments covered 80% of their commanded path): it walked well
+    (2% falls, 0.19 m/s error) but covered 69% of the path on average, so only
+    1.3% of envs passed by step 65k, and the arms' std had collapsed to its
+    floor holding the rest pose. The user chose 50/50 from step 0 instead.
 
     Also, for this task only:
       * the flat generator (same tile layout as the terrain world, plane only),
@@ -594,10 +597,10 @@ class LocoManipMarlFlatCurriculumEnvCfg(LocoManipMarlEnvCfg):
         self.events.reset_joints.params = {
             **self.events.reset_joints.params, "position_range": (-0.05, 0.05), "velocity_range": (-0.1, 0.1)
         }
-        # walk first, then alternate
+        # walking and arm goals 50/50 from the start, settling at each switch
         arm = self.commands.arm_targets
-        arm.walk_gate = True
-        arm.alternate_arm_goal_prob = 0.5
+        arm.walk_gate = False
+        arm.arm_goal_prob = 0.5
         arm.settle_to_arm_s = 0.75
         arm.settle_to_nav_s = 1.5
         # bounded joint targets; the policies see the applied action
