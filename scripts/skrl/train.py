@@ -230,6 +230,9 @@ def guard_updates(
 
     def update_and_check(*, timestep, timesteps, uid):
         before = ranges(uid)
+        # the critic's predictions as stored in the rollout (un-normalised): the scale the advantages use
+        agent.track_data(f"Value / rollout min ({uid})", before["values"][0])
+        agent.track_data(f"Value / rollout max ({uid})", before["values"][1])
         weights = {
             "policy": {k: v.detach().clone() for k, v in agent.policies[uid].state_dict().items()},
             "value": {k: v.detach().clone() for k, v in agent.values[uid].state_dict().items()},
@@ -241,8 +244,12 @@ def guard_updates(
         losses = agent.tracking_data.get(f"Loss / Value loss ({uid})", [])
         value_loss = losses[-1] if losses else 0.0
         scaler = agent._value_preprocessor[uid]
-        # a return scale this large is a feedback loop, not a task (flat run A: 6e9 by step 4.8k)
-        runaway = hasattr(scaler, "running_variance") and scaler.running_variance.max().item() > value_scale_alarm**2
+        # a return scale this large is a feedback loop, not a task (flat run A: 6e9 by step 4.8k); without a
+        # value preprocessor, the critic's raw predictions in the rollout say the same
+        if hasattr(scaler, "running_variance"):
+            runaway = scaler.running_variance.max().item() > value_scale_alarm**2
+        else:
+            runaway = max(abs(before["values"][0]), abs(before["values"][1])) > value_scale_alarm
         finite = finite and not runaway
         history = recent[uid]
         spike = (
@@ -270,7 +277,8 @@ def guard_updates(
         )
         print(
             f"[DIVERGENCE] agent {uid} at timestep {timestep}: value loss {value_loss:.4g}, finite params {finite},"
-            f" value scaler std {scaler.running_variance.max().sqrt().item():.4g}"
+            + (f" value scaler std {scaler.running_variance.max().sqrt().item():.4g}" if hasattr(scaler, "running_variance")
+               else f" rollout values {before['values'][0]:.4g}..{before['values'][1]:.4g} (no value preprocessor)")
         )
         for name, (low, high, bad) in before.items():
             print(f"[DIVERGENCE]   {name:18s} min {low:.4g}  max {high:.4g}  non-finite / tiny-variance {bad}")
@@ -283,6 +291,23 @@ def guard_updates(
             )
 
     agent.update = update_and_check
+
+
+def drop_value_preprocessors(agent, uids) -> None:
+    """Train these agents' critics on raw returns: no value preprocessor (skrl's yaml can't say it per agent).
+
+    skrl's RunningStandardScaler for values is fitted on each update's returns
+    *and on the critic's own un-normalised predictions*. Flat run B, with the
+    arms' time-out bootstrap already off, still had the arms' value scale at
+    mean -99, std 354 by step 4.8k, for returns that can only lie in about
+    [-5, 13]: a poorly fitting critic widens the scale it is then measured in.
+    rsl_rl (the IBR runs) never normalises values. Call before loading a
+    checkpoint, so the dropped module is neither saved nor restored.
+    """
+    for uid in uids or []:
+        agent._value_preprocessor[uid] = agent._empty_preprocessor
+        agent.checkpoint_modules[uid].pop("value_preprocessor", None)
+        print(f"[INFO] {uid}: no value preprocessor, the critic learns raw returns")
 
 
 def load_policies_only(agent, path: str):
@@ -403,6 +428,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # configure and instantiate the skrl runner
     # https://skrl.readthedocs.io/en/latest/api/utils/runner.html
     runner = Runner(env, agent_cfg)
+    drop_value_preprocessors(runner.agent, agent_cfg.get("no_value_preprocessor"))
 
     # load checkpoint (if specified)
     if resume_path:

@@ -41,6 +41,10 @@ models:
 # run 10 started at 0.58 and climbed to 0.70 within 1.6k updates once its
 # damping terms were relaxed, with falls going 13% -> 28%; it settled back
 # near 0.6 by the end.
+# Critics trained on raw returns (scripts/skrl/train.py drop_value_preprocessors): the arms'.
+# skrl fits the value scaler to the critic's own predictions too; in flat run B it reached mean -99,
+# std 354 by step 4.8k for arms returns bounded to about [-5, 13]. The legs' stayed at ~3 / ~4.5.
+no_value_preprocessor: [arms]
 log_std_bounds:
   legs: [-3.0, -0.51]   # std 0.05 .. 0.6
   arms: [-3.0, 0.0]     # std 0.05 .. 1.0
