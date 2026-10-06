@@ -38,6 +38,7 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("--checkpoint", required=True, help="skrl agent checkpoint; its run's estimator and target table are used.")
+parser.add_argument("--true_odometry", action="store_true", help="Move arm commands by the true pelvis motion, not the estimate.")
 parser.add_argument("--task", default="LocoManip-Marl-Stand-Direct-v0")
 parser.add_argument("--algorithm", default="mappo", help="skrl config the checkpoint was trained with: ippo or mappo.")
 parser.add_argument("--num_envs", type=int, default=512)
@@ -83,6 +84,7 @@ env_cfg.log_dir = RUN_DIR  # its saved target table and estimator (with curricul
 env_cfg.commands.arm_targets.arm_goal_prob = 1.0
 env_cfg.commands.arm_targets.walk_gate = False  # the flat curriculum: arm goals only here too
 env_cfg.estimator.train = False
+env_cfg.estimator.use_estimate = not args.true_odometry
 env_cfg.estimator.checkpoint_path = estimator_checkpoint_for(args.checkpoint)
 if args.video or args.gui:
     if args.num_envs > 20:
