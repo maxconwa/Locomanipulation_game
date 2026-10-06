@@ -81,6 +81,7 @@ agent_cfg = load_cfg_from_registry(args.task, f"skrl_{args.algorithm}_cfg_entry_
 env_cfg.scene.num_envs = args.num_envs
 env_cfg.log_dir = RUN_DIR  # its saved target table and estimator (with curriculum state) are reused
 env_cfg.commands.arm_targets.arm_goal_prob = 1.0
+env_cfg.commands.arm_targets.walk_gate = False  # the flat curriculum: arm goals only here too
 env_cfg.estimator.train = False
 env_cfg.estimator.checkpoint_path = estimator_checkpoint_for(args.checkpoint)
 if args.video or args.gui:
@@ -116,6 +117,10 @@ JOINTS = {
 }
 joint_ids = {name: robot.find_joints(names, preserve_order=True)[0] for name, names in JOINTS.items()}
 soft_limits = {name: robot.data.soft_joint_pos_limits[0, ids].mean(dim=0).tolist() for name, ids in joint_ids.items()}
+# safety speeds (the user's limits: wrist <= 0.5 m/s, pelvis up/down <= 0.3 m/s)
+wrist_ids = robot.find_bodies(arm.cfg.body_names, preserve_order=True)[0]
+arm_joint_ids = robot.find_joints(".*_(shoulder|elbow|wrist)_.*joint")[0]
+pitch_joint_ids = sum(joint_ids.values(), [])
 # the lowest wrist target reachable standing, above the ground: below it a goal needs a crouch
 STANDING_REACH = arm._standing_min_z.min().item() + env_cfg.commands.arm_targets.standing_height
 
@@ -144,7 +149,7 @@ def evaluate(spread: int, drop: int, focus: bool) -> dict:
     states = base.state()
     totals = dict(reached=0.0, missed=0.0, falls=0.0)
     samples = {k: [] for k in ("target_drop", "pelvis_drop", "knee", "hip_pitch", "ankle_pitch", "pelvis_pitch", "pos_err", "rot_err",
-                               "pelvis_vz", "target_height", "rew_legs", "rew_arms")}
+                               "pelvis_vz", "target_height", "wrist_speed", "qd_arm", "qd_leg_pitch", "rew_legs", "rew_arms")}
     goals = {k: [] for k in ("height", "reached", "needs_crouch")}  # one entry per goal that ended
     falls = {k: [] for k in ("tilt_x", "tilt_y", "pelvis_drop", "target_height", "needs_crouch", "episode_time")}  # one per fall
     timeline = {k: [] for k in ("target_drop", "target_height", "pelvis_drop", "knee", "pos_err", "reached", "fell")}
@@ -195,6 +200,9 @@ def evaluate(spread: int, drop: int, focus: bool) -> dict:
             samples["rot_err"].append(rot_err[ok].mean(dim=1))
             samples["pelvis_vz"].append(robot.data.root_lin_vel_w[ok][:, 2])
             samples["target_height"].append(arm.lowest_target_height[ok])
+            samples["wrist_speed"].append(robot.data.body_lin_vel_w[ok][:, wrist_ids].norm(dim=-1).max(dim=1)[0])
+            samples["qd_arm"].append(robot.data.joint_vel[ok][:, arm_joint_ids].abs().max(dim=1)[0])
+            samples["qd_leg_pitch"].append(robot.data.joint_vel[ok][:, pitch_joint_ids].abs().max(dim=1)[0])
             # each term's weighted reward this step, per second (RewardManager._step_reward)
             samples["rew_legs"].append(base.reward_managers["legs"]._step_reward[ok].clone())
             samples["rew_arms"].append(base.reward_managers["arms"]._step_reward[ok].clone())
@@ -612,6 +620,13 @@ for s in spreads:
         f" {first['ankle_pitch'].mean():.2f} -> {last['ankle_pitch'].mean():.2f}, pelvis pitch"
         f" {first['pelvis_pitch'].mean():.2f} -> {last['pelvis_pitch'].mean():.2f} rad."
     )
+pooled_speed = {k: np.concatenate([r["data"][k] for r in results]) for k in ("wrist_speed", "pelvis_vz", "qd_arm", "qd_leg_pitch")}
+lines.append(
+    f"- Speeds (99th percentile, all pairs): wrist {np.percentile(pooled_speed['wrist_speed'], 99):.2f} m/s (safe <= 0.5),"
+    f" pelvis up/down {np.percentile(np.abs(pooled_speed['pelvis_vz']), 99):.2f} m/s (safe <= 0.3), fastest arm joint"
+    f" {np.percentile(pooled_speed['qd_arm'], 99):.1f} rad/s, fastest knee / hip / ankle pitch"
+    f" {np.percentile(pooled_speed['qd_leg_pitch'], 99):.1f} rad/s."
+)
 all_ankle = np.concatenate([r["data"]["ankle_pitch"] for r in results])
 all_knee = np.concatenate([r["data"]["knee"] for r in results])
 lines.append(
