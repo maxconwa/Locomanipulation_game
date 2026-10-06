@@ -620,3 +620,9 @@ class LocoManipMarlFlatCurriculumEnvCfg(LocoManipMarlEnvCfg):
         )
         self.observations.legs.actions.func = mdp.applied_action
         self.observations.arms.actions.func = mdp.applied_action
+        # Staying up must pay. The legs' reward is floored at 0 while walking but not during arm goals
+        # (a crouch shouldn't read as free), so early on, flailing and not yet tracking, their net reward
+        # per second alive was negative (flat run D: -0.3/s), the -5 fall cost about as much as living,
+        # and after 13.8k steps every episode still fell within ~1.5 s (run C, walk-only, stood by 4k).
+        # A constant alive reward only moves the stay-up-vs-fall trade (a 20 s episode is worth +20).
+        self.rewards.legs.alive.weight = 1.0
