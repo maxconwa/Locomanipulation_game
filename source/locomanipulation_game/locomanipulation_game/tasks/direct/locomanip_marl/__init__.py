@@ -47,3 +47,14 @@ gym.register(
         **_AGENT_CFGS,
     },
 )
+
+# The IK task with arm goals in front, spread evenly, low goals built in a feet-flat squat, and held until they end.
+gym.register(
+    id="LocoManip-Marl-Flat-IK2-Direct-v0",
+    entry_point=f"{__name__}.locomanip_marl_env:LocoManipMarlEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.locomanip_marl_env_cfg:LocoManipMarlFlatIK2EnvCfg",
+        **_AGENT_CFGS,
+    },
+)

@@ -33,9 +33,12 @@ from isaaclab.sensors import ContactSensor, RayCaster
 from isaaclab.utils import configclass
 from isaaclab.utils.math import (
     combine_frame_transforms,
+    euler_xyz_from_quat,
     quat_error_magnitude,
+    quat_from_euler_xyz,
     quat_unique,
     subtract_frame_transforms,
+    wrap_to_pi,
     yaw_quat,
 )
 
@@ -86,6 +89,34 @@ def _relative(pos_a, quat_a, pose_w):
         pose_w[..., 3:].reshape(-1, 4),
     )
     return torch.cat([pos, quat_unique(rot)], dim=-1).view(n, a, 7)
+
+
+def _balance_cells(table: torch.Tensor, cell: float, size: int, min_rows: int, generator: torch.Generator) -> torch.Tensor:
+    """table resampled so every occupied cell (a cube of side cell, by position) holds the same number of rows.
+
+    Random joint angles crowd the wrist onto the outstretched shell of the
+    workspace (run G's table: 29% of its targets in a band beside the
+    shoulder, 2.3% in front of the chest). Each cell keeps size // cells rows:
+    drawn without replacement where it has that many, all of them plus random
+    repeats where it has fewer. Cells with fewer than min_rows rows, slivers
+    at the edge of the workspace, are dropped.
+    """
+    keys = torch.floor(table[:, :3] / cell).long()
+    _, cell_of, counts = torch.unique(keys, dim=0, return_inverse=True, return_counts=True)
+    kept = counts >= min_rows
+    quota = max(size // max(int(kept.sum()), 1), 1)
+    # rows grouped by cell, in random order within it; rank = position inside its cell
+    noise = torch.rand(len(table), generator=generator, device=table.device, dtype=torch.float64)
+    order = torch.argsort(cell_of.double() + noise)
+    starts = torch.cumsum(counts, 0) - counts
+    rank = torch.arange(len(table), device=table.device) - starts[cell_of[order]]
+    rows = order[(rank < quota) & kept[cell_of[order]]]
+    short = torch.nonzero(kept & (counts < quota)).flatten()
+    if len(short) > 0:
+        cells = torch.repeat_interleave(short, quota - counts[short])
+        pick = (torch.rand(len(cells), generator=generator, device=table.device) * counts[cells]).long()
+        rows = torch.cat([rows, order[starts[cells] + pick]])
+    return table[rows]
 
 
 def _add_weighted_mean(extras: dict, key: str, total: torch.Tensor, count: torch.Tensor):
@@ -227,6 +258,33 @@ class ArmTargetsCommand(CommandTerm):
     the standing table (lowest_target_height, above the ground at the event):
     no arm pose reaches it standing. The crouch_goals_* metrics count those.
 
+    **Squat tables (squat_tables).** Lowering standing targets has two
+    faults: the drop draws most goals at high drop levels, so the high and
+    wide workspace stops being trained (run G at drop 10: 96% of goals
+    lowered, 3% of targets above 1.2 m), and a lowered target was never
+    checked against a crouching body. With squat_tables the drop only
+    extends the bottom of the range. An arm goal is a low goal with
+    probability low_goal_prob, else a standing goal from the standing table,
+    whose top never moves. Low goals come from tables built in feet-flat
+    squats, one per drop level j, j / drop_levels of the way down in pelvis
+    drop to the deepest squat (knee and ankle pitch squat_limit_margin
+    inside their soft limits, the pelvis leaning squat_pelvis_pitch): random
+    arm poses with the legs squatting, rejected on any arm contact (legs,
+    torso, ground), kept below the standing table's low_target_quantile
+    height, recorded in the standing frame. Both wrists of a low goal come
+    from the same depth, so one pelvis height reaches both; an env draws a
+    depth from 0 up to its drop level, uniformly (depth 0: the bottom of the
+    standing reach). height_drop is then the pelvis drop the goal was built
+    at. min_target_x drops targets behind the body and balance_cell spreads
+    every table evenly over the space it covers, in both kinds of table.
+    judge_axes_separately moves spread on standing goals only and drop on
+    low goals only.
+
+    **Goal timing.** resample_on_reach (default) replaces a reached goal at
+    once. Off, a goal lasts its whole timer: it is reached once, when first
+    held inside the tolerances for reach_hold_s (the bonus is paid then), and
+    the tracking terms keep paying for holding still on target.
+
     Both move on the env's last level_window arm goals, across episodes: a
     promotion at >= promote_rate reached raises one axis, alternating and drop
     first, so low targets appear early while the spread is still easy; a
@@ -303,6 +361,8 @@ class ArmTargetsCommand(CommandTerm):
         self.estimate_prob = 0.0  # set by the env
         self.hold_time = zeros()
         self.just_reached = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.goal_reached = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)  # this goal, once
+        self.goal_low = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)  # from a squat table
         self._at_reset = False
         self._errors_cache: tuple[torch.Tensor, torch.Tensor] | None = None
         self._errors_step = -1
@@ -317,6 +377,8 @@ class ArmTargetsCommand(CommandTerm):
         # each arm goal's closest approach (mean of both wrists' position error, m) and the window of them
         self.goal_best_error = torch.full((self.num_envs,), float("inf"), device=self.device)
         self.error_outcomes = torch.zeros(self.num_envs, cfg.level_window, device=self.device)
+        # judge_axes_separately: outcomes/outcome_count hold standing goals, error_outcomes/low_outcome_count low ones
+        self.low_outcome_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._best_err_sum, self._best_err_n = zeros(), zeros()
 
         # -- walking gate: stage 0 walks only, stage 1 alternates; recent judged navigation segments
@@ -344,7 +406,12 @@ class ArmTargetsCommand(CommandTerm):
         self.ended_goal_drift_sum = torch.zeros((), device=self.device)
         self.ended_goal_count = torch.zeros((), device=self.device)
 
-        raw_tables, default_poses = self._load_or_build_tables(env)
+        if cfg.judge_axes_separately and (not cfg.squat_tables or cfg.drop_promote_error is None):
+            raise ValueError("judge_axes_separately needs squat_tables and drop_promote_error.")
+        if cfg.squat_tables and not cfg.foot_body_names:
+            raise ValueError("squat_tables needs foot_body_names.")
+        data = self._load_or_build_tables(env)
+        raw_tables, default_poses = data["tables"], data["default_poses"]
         self._tables: list[torch.Tensor] = []
         self._level_counts: list[torch.Tensor] = []
         for table, default_pose in zip(raw_tables, default_poses):
@@ -376,6 +443,8 @@ class ArmTargetsCommand(CommandTerm):
         )
         # (num_arms, 7): the arms-forward default, also the navigation rest pose
         self.rest_pose_b = torch.stack(default_poses)
+        if cfg.squat_tables:
+            self._setup_squat_tables(data["squat"])
 
     def __str__(self) -> str:
         msg = "ArmTargetsCommand:\n"
@@ -387,6 +456,11 @@ class ArmTargetsCommand(CommandTerm):
         msg += f"\tLevels: {self.cfg.spread_levels + 1} spread + {self.cfg.drop_levels} drop\n"
         for arm, counts in enumerate(self._level_counts):
             msg += f"\tTargets per spread level ({self.cfg.body_names[arm]}): {counts.tolist()}\n"
+        if self.cfg.squat_tables:
+            msg += f"\tLow goals: {self.cfg.low_goal_prob:.0%}, squat depths (pelvis drop, m): "
+            msg += f"{[round(v, 3) for v in self._squat_drops.tolist()]}\n"
+            for arm, counts in enumerate(self._squat_counts):
+                msg += f"\tLow targets per depth, all spread ({self.cfg.body_names[arm]}): {counts[:, -1].tolist()}\n"
         return msg
 
     """
@@ -505,7 +579,14 @@ class ArmTargetsCommand(CommandTerm):
         env_ids = torch.as_tensor(env_ids, device=self.device)
         down = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         down[env_ids] = fell & self.arm_mode[env_ids]
-        if self.cfg.drop_promote_error is None:
+        if self.cfg.judge_axes_separately:
+            # a fall during a low goal costs a drop level, during a standing goal a spread level
+            low = down & self.goal_low
+            self.drop_level -= (low & (self.drop_level > 0)).long()
+            self.spread_level -= (down & ~low & (self.spread_level > 0)).long()
+            self.low_outcome_count = torch.where(low, 0, self.low_outcome_count)
+            down = down & ~low  # the spread window restarts only after a standing goal's fall, below
+        elif self.cfg.drop_promote_error is None:
             self._move_levels(torch.zeros_like(down), down)
         else:
             # a fall while reaching: one drop level back if there is one, else one spread level
@@ -523,6 +604,9 @@ class ArmTargetsCommand(CommandTerm):
     def _record_outcomes(self, reached: torch.Tensor, missed: torch.Tensor):
         """Push this step's ended arm goals into each env's window; move levels on full windows."""
         ended = reached | missed
+        if self.cfg.judge_axes_separately:
+            self._record_split_outcomes(ended & ~self.goal_low, reached, ended & self.goal_low)
+            return
         slot = self.outcome_count % self.cfg.level_window
         current = self.outcomes.gather(1, slot.unsqueeze(1)).squeeze(1)
         value = torch.where(ended, reached.float(), current)
@@ -551,6 +635,36 @@ class ArmTargetsCommand(CommandTerm):
         self.spread_level += up_spread.long() - down_spread.long()
         moved = up_drop | down_drop | up_spread | down_spread
         self.outcome_count = torch.where(moved, 0, self.outcome_count)
+
+    def _record_split_outcomes(self, standing_ended: torch.Tensor, reached: torch.Tensor, low_ended: torch.Tensor):
+        """judge_axes_separately: standing goals' reach outcomes move spread, low goals' closest approach moves drop.
+
+        Each axis has its own window of the env's last level_window goals of
+        its kind, restarted when that axis moves.
+        """
+        cfg, window = self.cfg, self.cfg.level_window
+        slot = (self.outcome_count % window).unsqueeze(1)
+        value = torch.where(standing_ended, reached.float(), self.outcomes.gather(1, slot).squeeze(1))
+        self.outcomes.scatter_(1, slot, value.unsqueeze(1))
+        self.outcome_count += standing_ended.long()
+        slot = (self.low_outcome_count % window).unsqueeze(1)
+        value = torch.where(low_ended, self.goal_best_error.clamp(max=10.0), self.error_outcomes.gather(1, slot).squeeze(1))
+        self.error_outcomes.scatter_(1, slot, value.unsqueeze(1))
+        self.low_outcome_count += low_ended.long()
+
+        judged = standing_ended & (self.outcome_count >= window)
+        rate = self.outcomes.mean(dim=1)
+        up_spread = judged & (rate >= cfg.promote_rate) & (self.spread_level < cfg.spread_levels)
+        down_spread = judged & (rate < cfg.demote_rate) & (self.spread_level > 0)
+        judged = low_ended & (self.low_outcome_count >= window)
+        error = self.error_outcomes.mean(dim=1)
+        demote_error = cfg.drop_demote_error if cfg.drop_demote_error is not None else 1.5 * cfg.drop_promote_error
+        up_drop = judged & (error <= cfg.drop_promote_error) & (self.drop_level < cfg.drop_levels)
+        down_drop = judged & (error > demote_error) & (self.drop_level > 0)
+        self.spread_level += up_spread.long() - down_spread.long()
+        self.drop_level += up_drop.long() - down_drop.long()
+        self.outcome_count = torch.where(up_spread | down_spread, 0, self.outcome_count)
+        self.low_outcome_count = torch.where(up_drop | down_drop, 0, self.low_outcome_count)
 
     def _move_levels(self, up: torch.Tensor, down: torch.Tensor):
         """Promotions alternate drop / spread (drop first); a demotion undoes the most recent promotion."""
@@ -641,27 +755,84 @@ class ArmTargetsCommand(CommandTerm):
     Table construction.
     """
 
-    def _load_or_build_tables(self, env: ManagerBasedEnv) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    def _table_settings(self) -> dict:
+        """The cfg fields a saved table depends on; a file saved with others is rebuilt, not loaded."""
+        cfg = self.cfg
+        settings = {"body_names": list(cfg.body_names)}
+        if cfg.min_target_x is not None or cfg.balance_cell is not None or cfg.squat_tables:
+            settings.update(
+                min_target_x=cfg.min_target_x, balance_cell=cfg.balance_cell, balance_min_rows=cfg.balance_min_rows,
+                table_size=cfg.table_size, build_size=cfg.build_size, squat_tables=cfg.squat_tables,
+            )
+        if cfg.squat_tables:
+            settings.update(
+                drop_levels=cfg.drop_levels, low_target_quantile=cfg.low_target_quantile,
+                squat_table_size=cfg.squat_table_size, squat_build_size=cfg.squat_build_size,
+                squat_limit_margin=cfg.squat_limit_margin, squat_pelvis_pitch=cfg.squat_pelvis_pitch,
+            )
+        return settings
+
+    def _load_or_build_tables(self, env: ManagerBasedEnv) -> dict:
+        """{"tables", "default_poses"} per arm, plus "squat" with squat_tables.
+
+        Loaded from <log_dir>/<table_file> when it was saved with the same
+        settings, else built and saved there.
+        """
         log_dir = getattr(env.cfg, "log_dir", None)
         path = os.path.join(log_dir, self.cfg.table_file) if log_dir else None
+        settings = self._table_settings()
         if path and os.path.isfile(path):
             saved = torch.load(path, map_location=self.device)
-            if saved.get("body_names") == list(self.cfg.body_names):
+            # files from before the settings were saved hold plain tables
+            if saved.get("settings", {"body_names": saved.get("body_names")}) == settings:
                 print(f"[INFO] ArmTargetsCommand: loaded the target tables from {path}")
-                return saved["tables"], saved["default_poses"]
+                return saved
+            print(f"[INFO] ArmTargetsCommand: {path} was built with other settings; rebuilding.")
+        generator = torch.Generator(device=self.device).manual_seed(0)
+        root_state = self.robot.data.default_root_state.clone()
+        root_state[:, :3] += env.scene.env_origins
+        default_q = self.robot.data.default_joint_pos.clone()
         tables, default_poses = [], []
         for arm in range(self.num_arms):
-            table, default_pose = self._build_table(env, arm)
+            size = self.cfg.build_size or self.cfg.table_size
+            table, default_pose = self._build_table(env, arm, default_q, root_state, None, size)
+            table = self._filter_and_balance(table, self.cfg.table_size, generator)
+            print(
+                f"[INFO] ArmTargetsCommand({self.cfg.body_names[arm]}): {len(table)} standing targets after"
+                f" filtering and balancing. Default pose (pelvis frame): {[round(v, 3) for v in default_pose.tolist()]}"
+            )
             tables.append(table)
             default_poses.append(default_pose)
+        data = {"settings": settings, "body_names": list(self.cfg.body_names), "tables": tables,
+                "default_poses": default_poses}
+        if self.cfg.squat_tables:
+            data["squat"] = self._build_squat_tables(env, tables, root_state, generator)
+        # leave the robot where the env's reset expects it
+        self._step_state(env, default_q, root_state)
         if path:
             os.makedirs(log_dir, exist_ok=True)
-            torch.save(
-                {"body_names": list(self.cfg.body_names), "tables": tables, "default_poses": default_poses}, path
-            )
-        return tables, default_poses
+            torch.save(data, path)
+        return data
 
-    def _build_table(self, env: ManagerBasedEnv, arm: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _filter_and_balance(self, table: torch.Tensor, size: int, generator: torch.Generator) -> torch.Tensor:
+        """Drops targets behind min_target_x, then balances (balance_cell) or truncates to size rows."""
+        if self.cfg.min_target_x is not None:
+            table = table[table[:, 0] >= self.cfg.min_target_x]
+        if self.cfg.balance_cell is None:
+            return table[:size]
+        return _balance_cells(table, self.cfg.balance_cell, size, self.cfg.balance_min_rows, generator)
+
+    def _build_table(
+        self, env: ManagerBasedEnv, arm: int, base_q: torch.Tensor, root_state: torch.Tensor,
+        frame: tuple[torch.Tensor, torch.Tensor] | None, size: int, keep=None, label: str = "standing",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """size collision-free wrist poses of one arm at random joint angles, the rest of the robot at base_q.
+
+        Poses are in frame (pelvis frame when None). keep(poses) -> bool mask
+        further filters the samples. Returns (table, the pose at the arm's
+        default angles). Standing, that pose must read collision-free: the
+        check that the contact test works.
+        """
         robot = self.robot
         body_idx = self.body_ids[arm]
         joint_ids, _ = robot.find_joints(self.cfg.joint_names[arm], preserve_order=True)
@@ -671,62 +842,179 @@ class ArmTargetsCommand(CommandTerm):
         limits = robot.data.soft_joint_pos_limits[0, joint_ids]
         low, high = limits[:, 0], limits[:, 1]
 
-        root_state = robot.data.default_root_state.clone()
-        root_state[:, :3] += env.scene.env_origins
-        default_q = robot.data.default_joint_pos.clone()
-        zero_qd = torch.zeros_like(robot.data.default_joint_vel)
-
         # the default pose: curriculum centre, rest pose, rel_default_envs
         # target, and a check that the contact test passes where nothing touches
-        default_pose, default_ok = self._reach(env, body_idx, default_q, zero_qd, root_state, sensor, check_ids)
-        if not default_ok.all():
+        default_pose, default_ok = self._reach(env, body_idx, base_q, root_state, frame, sensor, check_ids)
+        if frame is None and not default_ok.all():
             raise RuntimeError(
                 f"{self.cfg.body_names[arm]}: the default pose reads as a collision in "
                 f"{int((~default_ok).sum())} envs; the contact test is broken."
             )
 
-        poses, total, tried = [], 0, 0
+        poses, total, free, tried = [], 0, 0, 0
         for _ in range(self.cfg.max_build_batches):
-            q = default_q.clone()
+            q = base_q.clone()
             q[:, joint_ids] = low + (high - low) * torch.rand(self.num_envs, len(joint_ids), device=self.device)
-            pose_b, ok = self._reach(env, body_idx, q, zero_qd, root_state, sensor, check_ids)
-            poses.append(pose_b[ok])
+            pose, ok = self._reach(env, body_idx, q, root_state, frame, sensor, check_ids)
+            free += int(ok.sum())
+            if keep is not None:
+                ok &= keep(pose)
+            poses.append(pose[ok])
             total += int(ok.sum())
             tried += self.num_envs
-            if total >= self.cfg.table_size:
+            if total >= size:
                 break
-
-        # leave the robot where the env's reset expects it
-        self._reach(env, body_idx, default_q, zero_qd, root_state, sensor, check_ids)
-
-        table = torch.cat(poses)[: self.cfg.table_size]
+        table = torch.cat(poses)[:size]
         print(
-            f"[INFO] ArmTargetsCommand({self.cfg.body_names[arm]}): {len(table)} targets,"
-            f" {100.0 * total / tried:.1f}% of {tried} random arm poses collision-free."
-            f" Default pose (pelvis frame): {[round(v, 3) for v in default_pose[0].tolist()]}"
+            f"[INFO] ArmTargetsCommand({self.cfg.body_names[arm]}, {label}): {len(table)} targets kept,"
+            f" {100.0 * free / tried:.1f}% of {tried} random arm poses collision-free"
+            + ("." if keep is None else f", {100.0 * total / tried:.1f}% also kept.")
         )
         return table, default_pose[0].clone()
 
-    def _reach(self, env, body_idx, q, qd, root_state, sensor, check_ids) -> tuple[torch.Tensor, torch.Tensor]:
-        """Puts every env in joint state q, steps once, returns (body pose in pelvis frame, collision-free)."""
+    def _step_state(self, env: ManagerBasedEnv, q: torch.Tensor, root_state: torch.Tensor):
+        """Every env at rest in joint state q with its root at root_state, then one physics step."""
         robot = self.robot
         robot.write_root_pose_to_sim(root_state[:, :7])
         robot.write_root_velocity_to_sim(torch.zeros_like(root_state[:, 7:]))
-        robot.write_joint_state_to_sim(q, qd)
+        robot.write_joint_state_to_sim(q, torch.zeros_like(q))
         robot.set_joint_position_target(q)
         env.scene.write_data_to_sim()
         env.sim.step(render=False)
         env.scene.update(dt=env.physics_dt)
 
+    def _reach(self, env, body_idx, q, root_state, frame, sensor, check_ids) -> tuple[torch.Tensor, torch.Tensor]:
+        """Puts every env in joint state q, steps once, returns (body pose in frame or the pelvis frame, collision-free)."""
+        self._step_state(env, q, root_state)
+        robot = self.robot
+        frame_pos, frame_quat = (robot.data.root_pos_w, robot.data.root_quat_w) if frame is None else frame
         pos_b, quat_b = subtract_frame_transforms(
-            robot.data.root_pos_w,
-            robot.data.root_quat_w,
-            robot.data.body_pos_w[:, body_idx],
-            robot.data.body_quat_w[:, body_idx],
+            frame_pos, frame_quat, robot.data.body_pos_w[:, body_idx], robot.data.body_quat_w[:, body_idx]
         )
         peak_force = sensor.data.net_forces_w[:, check_ids].norm(dim=-1).max(dim=1)[0]
         ok = peak_force < self.cfg.collision_force_threshold
         return torch.cat([pos_b, quat_unique(quat_b)], dim=-1), ok
+
+    def _squat_posture(
+        self, env: ManagerBasedEnv, s: torch.Tensor, base_root: torch.Tensor, foot_home: torch.Tensor,
+        foot_pitch_home: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """A feet-flat squat per env at depth parameter s in [0, 1]: (joint state, root state, worst sole error in m).
+
+        The hip, knee and ankle pitch joints move linearly from their defaults
+        (s = 0) to the deepest squat (s = 1, _squat_deep). The root is pitched so
+        each sole stays flat and moved so each sole stays where it stands: the
+        pelvis lowers, goes back and leans forward, as it must on flat ground.
+        """
+        robot = self.robot
+        default = robot.data.default_joint_pos
+        q = default.clone()
+        for ids, deep in zip(self._squat_joint_ids, self._squat_deep):
+            q[:, ids] = default[:, ids] + s.unsqueeze(1) * (deep - default[:, ids])
+        # flat soles: the pelvis pitch cancels what the leg's pitch joints add to their standing sum
+        pitch = -sum(q[:, ids[0]] - default[:, ids[0]] for ids in self._squat_joint_ids)
+        zeros = torch.zeros_like(pitch)
+        root = base_root.clone()
+        for _ in range(3):
+            root[:, 3:7] = quat_from_euler_xyz(zeros, pitch, zeros)
+            self._step_state(env, q, root)
+            feet = robot.data.body_pos_w[:, self._foot_ids]
+            _, foot_pitch, _ = euler_xyz_from_quat(robot.data.body_quat_w[:, self._foot_ids[0]])
+            error = (foot_home - feet).norm(dim=-1).max(dim=1)[0]
+            pitch = pitch - wrap_to_pi(foot_pitch - foot_pitch_home)
+            root[:, :3] += (foot_home - feet).mean(dim=1)
+        return q, root, error
+
+    def _build_squat_tables(
+        self, env: ManagerBasedEnv, standing: list[torch.Tensor], base_root: torch.Tensor, generator: torch.Generator
+    ) -> dict:
+        """Per drop level j (0..drop_levels), per arm: targets reachable collision-free in a squat j / drop_levels deep.
+
+        The depths are evenly spaced in pelvis drop, from standing (j = 0) to
+        the deepest squat. A low target sits below the standing table's
+        low_target_quantile height (standing frame z) and, with min_target_x,
+        that far forward of the standing pelvis; it is recorded in the standing
+        frame, the frame an arm goal is anchored in. Arm contact with anything,
+        the legs, torso and ground included, rejects a sample.
+        """
+        robot, cfg = self.robot, self.cfg
+        self._squat_joint_ids = [robot.find_joints(name)[0] for name in cfg.squat_joint_names]
+        self._foot_ids = [robot.find_bodies(name)[0][0] for name in cfg.foot_body_names]
+        hip, knee, ankle = self._squat_joint_ids
+        soft = robot.data.soft_joint_pos_limits[0]
+        default = robot.data.default_joint_pos[0]
+        knee_deep = soft[knee, 1] - cfg.squat_limit_margin
+        ankle_deep = soft[ankle, 0] + cfg.squat_limit_margin
+        # flat soles keep hip + knee + ankle pitch at their standing sum minus the pelvis pitch
+        hip_deep = default[hip] + default[knee] + default[ankle] - cfg.squat_pelvis_pitch - knee_deep - ankle_deep
+        self._squat_deep = [hip_deep, knee_deep, ankle_deep]
+
+        default_q = robot.data.default_joint_pos.clone()
+        self._step_state(env, default_q, base_root)
+        foot_home = robot.data.body_pos_w[:, self._foot_ids].clone()
+        _, foot_pitch_home, _ = euler_xyz_from_quat(robot.data.body_quat_w[:, self._foot_ids[0]])
+        frame = (base_root[:, :3], base_root[:, 3:7])  # the standing pelvis: the standing frame at an event
+
+        # pelvis drop along the squat, one depth parameter per env, then the parameter of each even depth
+        s = torch.linspace(0.0, 1.0, self.num_envs, device=self.device)
+        _, root, error = self._squat_posture(env, s, base_root, foot_home, foot_pitch_home)
+        drop = base_root[:, 2] - root[:, 2]
+        if error.max() > 0.005 or not bool((drop[1:] >= drop[:-1] - 1e-4).all()):
+            raise RuntimeError(f"Squat placement failed: sole error {error.max():.4f} m, drop not monotone in depth.")
+        depths = cfg.drop_levels + 1
+        wanted = drop[-1] * torch.arange(depths, device=self.device) / max(cfg.drop_levels, 1)
+        hi = torch.searchsorted(drop.contiguous(), wanted).clamp(1, len(drop) - 1)
+        lo = hi - 1
+        w = ((wanted - drop[lo]) / (drop[hi] - drop[lo]).clamp(min=1e-9)).clamp(0.0, 1.0)
+        s_depth = s[lo] + w * (s[hi] - s[lo])
+
+        low_z = [torch.quantile(table[:, 2], cfg.low_target_quantile) for table in standing]
+        tables = [[] for _ in range(self.num_arms)]
+        rests = [[] for _ in range(self.num_arms)]
+        drops, postures = [], []
+        for j in range(depths):
+            q, root, error = self._squat_posture(env, s_depth[j].expand(self.num_envs), base_root, foot_home, foot_pitch_home)
+            if error.max() > 0.005:
+                raise RuntimeError(f"Squat depth {j}: sole error {error.max():.4f} m.")
+            drops.append(float(base_root[0, 2] - root[0, 2]))
+            _, pelvis_pitch, _ = euler_xyz_from_quat(root[:1, 3:7])
+            postures.append({
+                "pelvis_drop": drops[-1],
+                "pelvis_back": float(base_root[0, 0] - root[0, 0]),
+                "pelvis_pitch": float(wrap_to_pi(pelvis_pitch)[0]),
+                "hip_pitch": float(q[0, hip[0]]), "knee": float(q[0, knee[0]]), "ankle_pitch": float(q[0, ankle[0]]),
+            })
+            print(f"[INFO] ArmTargetsCommand: squat depth {j}: {postures[-1]}")
+            for arm in range(self.num_arms):
+                z_max, x_min = low_z[arm], cfg.min_target_x
+
+                def keep(pose, z_max=z_max, x_min=x_min):
+                    low = pose[:, 2] < z_max
+                    return low if x_min is None else low & (pose[:, 0] >= x_min)
+
+                table, rest = self._build_table(
+                    env, arm, q, root, frame, cfg.squat_build_size, keep=keep, label=f"squat depth {j}"
+                )
+                table = self._filter_and_balance(table, cfg.squat_table_size, generator)
+                if len(table) == 0:
+                    raise RuntimeError(f"{cfg.body_names[arm]}: no low targets at squat depth {j}.")
+                tables[arm].append(table)
+                rests[arm].append(rest)
+        return {"drops": drops, "tables": tables, "rest": rests, "postures": postures}
+
+    def _setup_squat_tables(self, squat: dict):
+        """Each depth's table sorted by difficulty from that depth's rest pose, padded into one tensor per arm."""
+        self._squat_drops = torch.tensor(squat["drops"], device=self.device)
+        self.squat_postures = squat["postures"]
+        self._squat_tables: list[torch.Tensor] = []
+        self._squat_counts: list[torch.Tensor] = []  # (depths, spread_levels + 1) per arm
+        for arm in range(self.num_arms):
+            ordered = [self._sort_by_difficulty(t, r) for t, r in zip(squat["tables"][arm], squat["rest"][arm])]
+            padded = torch.zeros(len(ordered), max(len(t) for t, _ in ordered), 7, device=self.device)
+            for j, (table, _) in enumerate(ordered):
+                padded[j, : len(table)] = table
+            self._squat_tables.append(padded)
+            self._squat_counts.append(torch.stack([counts for _, counts in ordered]))
 
     def _sort_by_difficulty(self, table: torch.Tensor, default_pose: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Table sorted easiest first, and how many entries each spread level may draw from (geometric)."""
@@ -773,9 +1061,19 @@ class ArmTargetsCommand(CommandTerm):
         within = (pos_error < self.cfg.reach_pos_tol).all(dim=1) & (rot_error < self.cfg.reach_rot_tol).all(dim=1)
         step_dt = self._env.step_dt
         self.hold_time = torch.where(within & self.arm_mode, self.hold_time + step_dt, torch.zeros_like(self.hold_time))
-        self.just_reached = self.hold_time >= self.cfg.reach_hold_s
-        timed_out = (self.time_left - step_dt <= 0.0) & ~self.just_reached & self.arm_mode
-        ended = self.just_reached | timed_out
+        held = self.hold_time >= self.cfg.reach_hold_s
+        if self.cfg.resample_on_reach:
+            self.just_reached = held
+            timed_out = (self.time_left - step_dt <= 0.0) & ~self.just_reached & self.arm_mode
+            ended = self.just_reached | timed_out
+            reached_at_end = self.just_reached
+        else:
+            # the goal stays until its timer runs out: reached once, when first held; judged when it ends
+            self.just_reached = held & ~self.goal_reached & self.arm_mode
+            self.goal_reached |= self.just_reached
+            ended = (self.time_left - step_dt <= 0.0) & self.arm_mode
+            timed_out = ended & ~self.goal_reached
+            reached_at_end = ended & self.goal_reached
         self.ended_goal_drift_sum += (shadow_drift * ended).sum()
         self.ended_goal_count += ended.sum()
         self.metrics["goals_reached"] += self.just_reached.float()
@@ -787,9 +1085,10 @@ class ArmTargetsCommand(CommandTerm):
         self._best_err_sum += torch.where(ended, self.goal_best_error.clamp(max=10.0), 0.0)
         self._best_err_n += ended.float()
         # before the resample below, so the next goal is drawn at the new level
-        self._record_outcomes(self.just_reached, timed_out)
+        self._record_outcomes(reached_at_end, timed_out)
         # CommandTerm.compute counts time_left down next and resamples every env at <= 0
-        self.time_left[self.just_reached] = 0.0
+        if self.cfg.resample_on_reach:
+            self.time_left[self.just_reached] = 0.0
 
     def _resample_command(self, env_ids: Sequence[int]):
         self.invalidate_errors()
@@ -818,6 +1117,8 @@ class ArmTargetsCommand(CommandTerm):
 
         self.arm_mode[env_ids] = arm_goal
         self.goal_best_error[env_ids] = float("inf")
+        self.goal_reached[env_ids] = False
+        self.goal_low[env_ids] = False
         self.hold_time[env_ids] = 0.0
         self.height_drop[env_ids] = 0.0
         self.lowest_target_height[env_ids] = 0.0
@@ -847,24 +1148,39 @@ class ArmTargetsCommand(CommandTerm):
         m = len(arm_ids)
         spread_level = self.spread_level[arm_ids]
         at_default = torch.rand(m, device=self.device) < self.cfg.rel_default_envs
-        drop_level = self.drop_level[arm_ids].float()
-        max_drop = self.cfg.max_height_drop * drop_level / max(self.cfg.drop_levels, 1)
-        drop = torch.rand(m, device=self.device) * max_drop
+        if self.cfg.squat_tables:
+            # a low goal from the table of a squat depth up to the env's drop level, else a standing goal; the
+            # squat tables are in the standing frame already, so nothing is shifted
+            low = torch.rand(m, device=self.device) < self.cfg.low_goal_prob
+            depth = (torch.rand(m, device=self.device) * (self.drop_level[arm_ids] + 1)).long()
+            depth = depth.clamp(max=self.cfg.drop_levels)
+            at_default &= ~low
+            drop = torch.where(low, self._squat_drops[depth], 0.0)
+        else:
+            drop_level = self.drop_level[arm_ids].float()
+            max_drop = self.cfg.max_height_drop * drop_level / max(self.cfg.drop_levels, 1)
+            drop = torch.rand(m, device=self.device) * max_drop
+            # a lowered goal starts from the low part of the region: the arms can't take the drop alone
+            low = (drop > self.cfg.low_target_min_drop) if self.cfg.low_targets_when_lowered else torch.zeros_like(at_default)
         self.height_drop[arm_ids] = drop
-        # a lowered goal starts from the low part of the region: the arms can't take the drop alone
-        low = (drop > self.cfg.low_target_min_drop) if self.cfg.low_targets_when_lowered else torch.zeros_like(at_default)
+        self.goal_low[arm_ids] = low
         targets_s = torch.empty(m, self.num_arms, 7, device=self.device)
         for arm in range(self.num_arms):
             count = self._level_counts[arm][spread_level]
             idx = (torch.rand(m, device=self.device) * count).long()
-            if low.any():
+            if low.any() and not self.cfg.squat_tables:
                 level = spread_level[low]
                 pick = (torch.rand(len(level), device=self.device) * self._low_counts[arm][level]).long()
                 idx[low] = self._low_index[arm][level, pick]
             pose = self._tables[arm][idx]
+            if low.any() and self.cfg.squat_tables:
+                d, level = depth[low], spread_level[low]
+                pick = (torch.rand(len(d), device=self.device) * self._squat_counts[arm][d, level]).long()
+                pose[low] = self._squat_tables[arm][d, pick]
             pose[at_default] = self.rest_pose_b[arm]
             targets_s[:, arm] = pose
-        targets_s[..., 2] -= drop.unsqueeze(1)
+        if not self.cfg.squat_tables:
+            targets_s[..., 2] -= drop.unsqueeze(1)
         # the standing frame's origin is standing_height above the ground
         self.lowest_target_height[arm_ids] = targets_s[..., 2].min(dim=1)[0] + self.cfg.standing_height
         self.needs_crouch[arm_ids] = (targets_s[..., 2] < self._standing_min_z).any(dim=1)
@@ -998,6 +1314,40 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     """Zero-velocity settle before an arm goal that follows navigation (s); 0 disables."""
     settle_to_nav_s: float = 0.0
     """Zero-velocity settle before navigation that follows an arm goal (s): time to stand up; 0 disables."""
+
+    # -- goal timing
+    resample_on_reach: bool = True
+    """True: a reached goal is replaced at once. False: it stays until its timer runs out, so holding still on
+    target keeps earning; it counts as reached (and pays the bonus) once, when first held for reach_hold_s."""
+
+    # -- the workspace (see "Squat tables" in the class docstring); all off by default
+    min_target_x: float | None = None
+    """m: table targets less than this far forward of the pelvis (standing frame x) are dropped."""
+    balance_cell: float | None = None
+    """m: resample each table so every occupied cell of this size holds the same number of targets."""
+    balance_min_rows: int = 4
+    """Cells with fewer targets than this before balancing (slivers at the workspace edge) are dropped."""
+    build_size: int | None = None
+    """Collision-free targets to collect per arm before filtering and balancing (None: table_size)."""
+    squat_tables: bool = False
+    """Low goals from tables built with the legs in feet-flat squats, one per drop level (see the docstring)."""
+    low_goal_prob: float = 0.5
+    """With squat_tables: the share of arm goals drawn from the low tables; the rest come from the standing one."""
+    squat_table_size: int = 50_000
+    """Targets per arm per squat depth, after filtering and balancing."""
+    squat_build_size: int = 60_000
+    """Low (below the standing low_target_quantile height) collision-free targets to collect per arm and depth."""
+    squat_joint_names: tuple[str, str, str] = (".*_hip_pitch_joint", ".*_knee_joint", ".*_ankle_pitch_joint")
+    """The pitch joints the squat bends: hip, knee, ankle, each matching both legs (left first)."""
+    foot_body_names: list[str] | None = None
+    """Bodies held where they stand while squatting (the soles stay flat on the ground)."""
+    squat_limit_margin: float = 0.05
+    """rad: the deepest squat stays this far inside the knee and ankle-pitch soft limits."""
+    squat_pelvis_pitch: float = 0.15
+    """rad: forward lean of the pelvis at the deepest squat (run G's crouch leaned 0.15 at 27 cm down)."""
+    judge_axes_separately: bool = False
+    """With squat_tables: spread moves on the reach rate of standing goals only, drop on the closest approach of
+    low goals only (drop_promote_error / drop_demote_error), so neither axis climbs on the other's goals."""
 
     goal_pose_visualizer_cfg: VisualizationMarkersCfg = _frame_marker("/Visuals/Command/arm_goal_pose", 0.1)
     believed_pose_visualizer_cfg: VisualizationMarkersCfg = _frame_marker("/Visuals/Command/arm_believed_pose", 0.06)

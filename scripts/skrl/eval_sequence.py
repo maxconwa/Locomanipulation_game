@@ -8,7 +8,8 @@ stopped before an arm goal, 1.5 s to stand up before walking).
 
   walk:S         navigation for S seconds at --walk_speed m/s straight ahead, arms at the zero pose
   stand_reach    an arm goal from the reach table at --spread, not lowered
-  crouch_reach   an arm goal from the low, in-front part of the table, lowered by --crouch_drop m
+  crouch_reach   an arm goal from the low, in-front part of the table, lowered by --crouch_drop m; with squat
+                 tables, a low goal from the squat depth closest to --crouch_drop m of pelvis drop
 
 Writes to <run>/eval_sequence/<checkpoint>/ (or --out): sequence.mp4 (with --video), timeline.png
 (phase-shaded: pelvis height, wrist error, commanded vs actual speed), stills.png (one frame per
@@ -53,7 +54,7 @@ from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry  # noqa: E402
 
 import locomanipulation_game.tasks  # noqa: E402, F401
 from locomanipulation_game.assets.h1_2 import STANDING_PELVIS_HEIGHT  # noqa: E402
-from locomanipulation_game.tasks.direct.locomanip_marl.mdp.commands import _relative, ground_height  # noqa: E402
+from locomanipulation_game.tasks.direct.locomanip_marl.mdp.commands import _apply, _relative, ground_height  # noqa: E402
 from locomanipulation_game.tasks.direct.locomanip_marl.odometry import estimator_checkpoint_for  # noqa: E402
 
 SCHEDULE = []
@@ -116,6 +117,30 @@ def apply_drop(env_ids: torch.Tensor, drop: float):
     arm.lowest_target_height[env_ids] -= extra
 
 
+def apply_squat_goal(env_ids: torch.Tensor, drop: float):
+    """Replace the just-drawn arm goals of env_ids with low targets from the squat depth closest to `drop`."""
+    j = int(torch.argmin((arm._squat_drops - drop).abs()))
+    level = arm.spread_level[env_ids]
+    targets = torch.empty(len(env_ids), arm.num_arms, 7, device=base.device)
+    for a in range(arm.num_arms):
+        pick = (torch.rand(len(env_ids), device=base.device) * arm._squat_counts[a][j, level]).long()
+        targets[:, a] = arm._squat_tables[a][j, pick]
+    origin, quat = arm.standing_frame_w()
+    arm.anchor_w[env_ids] = _apply(origin[env_ids], quat[env_ids], targets)
+    arm.believed_b[env_ids] = _relative(robot.data.root_pos_w[env_ids], robot.data.root_quat_w[env_ids], arm.anchor_w[env_ids])
+    arm.shadow_b[env_ids] = arm.believed_b[env_ids]
+    arm.height_drop[env_ids] = arm._squat_drops[j]
+    arm.goal_low[env_ids] = True
+    arm.lowest_target_height[env_ids] = targets[..., 2].min(dim=1)[0] + arm.cfg.standing_height
+    arm.needs_crouch[env_ids] = (targets[..., 2] < arm._standing_min_z).any(dim=1)
+
+
+SQUAT = arm.cfg.squat_tables
+if SQUAT:
+    # every drawn goal is a standing one, settle ends included; a crouch reach's is replaced by a squat-table goal
+    arm.cfg.low_goal_prob = 0.0
+
+
 def scheduled_resample(env_ids):
     env_ids = torch.as_tensor(env_ids, device=base.device)
     settling = arm.settling[env_ids].clone()
@@ -148,7 +173,7 @@ def scheduled_resample(env_ids):
             seconds = torch.tensor([SCHEDULE[int(phase[i])][1] for i in now_walking.tolist()], device=base.device)
             arm.time_left[now_walking] = seconds
         if kind == "crouch_reach" and len(now_reaching):
-            apply_drop(now_reaching, args.crouch_drop)
+            (apply_squat_goal if SQUAT else apply_drop)(now_reaching, args.crouch_drop)
     cfg.low_target_min_drop = 0.02
 
 

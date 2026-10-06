@@ -43,6 +43,7 @@ from locomanipulation_game.assets.h1_2 import (
     ARM_LINK_NAMES,
     COLLISION_LINK_NAMES,
     FINGER_LINK_NAMES,
+    FOOT_LINK_NAMES,
     LOWER_JOINT_NAMES,
     LOWER_LINK_NAMES,
     PELVIS_LINK_NAME,
@@ -678,3 +679,46 @@ class LocoManipMarlFlatIKEnvCfg(LocoManipMarlFlatCurriculumEnvCfg):
         )
         self.commands.arm_targets.drop_promote_error = 0.12
         self.commands.arm_targets.drop_demote_error = 0.18
+
+
+@configclass
+class LocoManipMarlFlatIK2EnvCfg(LocoManipMarlFlatIKEnvCfg):
+    """The IK task with the arm goals redrawn: in front, evenly spread, low goals built in a real squat, held.
+
+    Run G (the IK task) crouched and walked, but its sampler starved the
+    standing workspace: at drop level 10, 96% of goals were lowered standing
+    targets from the bottom 10% of the table, so 3% of targets were above
+    1.2 m and the wide standing reach regressed (spread 8, no drop: 36%
+    reached, 1.18 falls/env-min). The arms also darted from goal to goal:
+    each was replaced 0.2 s after it was reached. Changes, all in the arm
+    command (mdp.ArmTargetsCommand):
+
+      * no targets less than 0.1 m forward of the pelvis (47% of the table
+        was behind it);
+      * every table balanced over 10 cm cells (random joint angles put 29% of
+        targets in the outstretched band beside the shoulder, 2.3% in front
+        of the chest);
+      * half the arm goals from the whole standing table at every drop level,
+        half from squat tables: targets reachable collision-free with the legs
+        in a feet-flat squat at that depth, both wrists from one depth;
+      * goals last 4 s and stay after they are reached (held 1 s inside 5 cm /
+        0.35 rad), so staying on target keeps paying;
+      * spread moves on standing goals, drop on low goals.
+
+    Observation and action sizes are the IK task's: legs 96, arms 124.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        arm = self.commands.arm_targets
+        arm.table_file = "arm_target_tables_v2.pt"
+        arm.min_target_x = 0.1
+        arm.balance_cell = 0.1
+        arm.build_size = 300_000
+        arm.squat_tables = True
+        arm.foot_body_names = FOOT_LINK_NAMES
+        arm.low_goal_prob = 0.5
+        arm.judge_axes_separately = True
+        arm.resample_on_reach = False
+        arm.reach_hold_s = 1.0
+        arm.resampling_time_range = (4.0, 4.0)
