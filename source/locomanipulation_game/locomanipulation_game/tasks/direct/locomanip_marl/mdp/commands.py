@@ -314,6 +314,10 @@ class ArmTargetsCommand(CommandTerm):
         self._last_promoted_drop = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.outcomes = torch.zeros(self.num_envs, cfg.level_window, device=self.device)
         self.outcome_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # each arm goal's closest approach (mean of both wrists' position error, m) and the window of them
+        self.goal_best_error = torch.full((self.num_envs,), float("inf"), device=self.device)
+        self.error_outcomes = torch.zeros(self.num_envs, cfg.level_window, device=self.device)
+        self._best_err_sum, self._best_err_n = zeros(), zeros()
 
         # -- walking gate: stage 0 walks only, stage 1 alternates; recent judged navigation segments
         self.walk_stage = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -468,6 +472,7 @@ class ArmTargetsCommand(CommandTerm):
         _add_weighted_mean(extras, "target_drop", self._crouch_t[ids], self._crouch_n[ids])
         _add_weighted_mean(extras, "pelvis_drop", self._crouch_p[ids], self._crouch_n[ids])
         _add_weighted_mean(extras, "target_height", self._crouch_h[ids], self._crouch_n[ids])
+        _add_weighted_mean(extras, "goal_best_error", self._best_err_sum[ids], self._best_err_n[ids])
         n = self._crouch_n[ids].sum()
         if n.item() > 1:
             t, p = self._crouch_t[ids].sum(), self._crouch_p[ids].sum()
@@ -476,7 +481,7 @@ class ArmTargetsCommand(CommandTerm):
                 extras["crouch_slope"] = ((self._crouch_tp[ids].sum() - t * p / n) / var).item()
         for buffer in (self._goal_steps, self._goal_pos_err, self._goal_rot_err, self._rest_steps, self._rest_pos_err,
                        self._crouch_n, self._crouch_t, self._crouch_p, self._crouch_tt, self._crouch_tp,
-                       self._crouch_h):
+                       self._crouch_h, self._best_err_sum, self._best_err_n):
             buffer[ids] = 0.0
         self.invalidate_errors()
         self._at_reset = True
@@ -500,7 +505,14 @@ class ArmTargetsCommand(CommandTerm):
         env_ids = torch.as_tensor(env_ids, device=self.device)
         down = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         down[env_ids] = fell & self.arm_mode[env_ids]
-        self._move_levels(torch.zeros_like(down), down)
+        if self.cfg.drop_promote_error is None:
+            self._move_levels(torch.zeros_like(down), down)
+        else:
+            # a fall while reaching: one drop level back if there is one, else one spread level
+            lower_drop = down & (self.drop_level > 0)
+            lower_spread = down & ~lower_drop & (self.spread_level > 0)
+            self.drop_level -= lower_drop.long()
+            self.spread_level -= lower_spread.long()
         self.outcome_count = torch.where(down, 0, self.outcome_count)
         if self.cfg.walk_gate:
             # the episode's last navigation segment: judged now (the reset's resample skips it); a fall
@@ -515,14 +527,30 @@ class ArmTargetsCommand(CommandTerm):
         current = self.outcomes.gather(1, slot.unsqueeze(1)).squeeze(1)
         value = torch.where(ended, reached.float(), current)
         self.outcomes.scatter_(1, slot.unsqueeze(1), value.unsqueeze(1))
+        current_err = self.error_outcomes.gather(1, slot.unsqueeze(1)).squeeze(1)
+        err_value = torch.where(ended, self.goal_best_error.clamp(max=10.0), current_err)
+        self.error_outcomes.scatter_(1, slot.unsqueeze(1), err_value.unsqueeze(1))
         self.outcome_count += ended.long()
 
         judged = ended & (self.outcome_count >= self.cfg.level_window)
         rate = self.outcomes.mean(dim=1)
-        up = judged & (rate >= self.cfg.promote_rate)
-        down = judged & (rate < self.cfg.demote_rate)
-        self._move_levels(up, down)
-        self.outcome_count = torch.where(up | down, 0, self.outcome_count)
+        if self.cfg.drop_promote_error is None:
+            up = judged & (rate >= self.cfg.promote_rate)
+            down = judged & (rate < self.cfg.demote_rate)
+            self._move_levels(up, down)
+            self.outcome_count = torch.where(up | down, 0, self.outcome_count)
+            return
+        # independent axes: spread on the reach rate, drop on how close the wrists got
+        error = self.error_outcomes.mean(dim=1)
+        demote_error = self.cfg.drop_demote_error if self.cfg.drop_demote_error is not None else 1.5 * self.cfg.drop_promote_error
+        up_drop = judged & (error <= self.cfg.drop_promote_error) & (self.drop_level < self.cfg.drop_levels)
+        down_drop = judged & (error > demote_error) & (self.drop_level > 0)
+        up_spread = judged & (rate >= self.cfg.promote_rate) & (self.spread_level < self.cfg.spread_levels)
+        down_spread = judged & (rate < self.cfg.demote_rate) & (self.spread_level > 0)
+        self.drop_level += up_drop.long() - down_drop.long()
+        self.spread_level += up_spread.long() - down_spread.long()
+        moved = up_drop | down_drop | up_spread | down_spread
+        self.outcome_count = torch.where(moved, 0, self.outcome_count)
 
     def _move_levels(self, up: torch.Tensor, down: torch.Tensor):
         """Promotions alternate drop / spread (drop first); a demotion undoes the most recent promotion."""
@@ -579,6 +607,7 @@ class ArmTargetsCommand(CommandTerm):
             "drop_level": self.drop_level.clone(),
             "promote_drop_next": self._promote_drop_next.clone(),
             "last_promoted_drop": self._last_promoted_drop.clone(),
+            "error_outcomes": self.error_outcomes.clone(),
             "walk_stage": self.walk_stage.clone(),
             "nav_outcomes": self.nav_outcomes.clone(),
             "nav_outcome_count": self.nav_outcome_count.clone(),
@@ -601,6 +630,8 @@ class ArmTargetsCommand(CommandTerm):
         if "promote_drop_next" in saved:
             self._promote_drop_next[:] = saved["promote_drop_next"][pick]
             self._last_promoted_drop[:] = saved["last_promoted_drop"][pick]
+        if "error_outcomes" in saved and saved["error_outcomes"].shape[1] == self.cfg.level_window:
+            self.error_outcomes[:] = saved["error_outcomes"][pick]
         if "walk_stage" in saved and saved["nav_outcomes"].shape[1] == self.cfg.gate_window:
             self.walk_stage[:] = saved["walk_stage"][pick]
             self.nav_outcomes[:] = saved["nav_outcomes"][pick]
@@ -751,6 +782,10 @@ class ArmTargetsCommand(CommandTerm):
         self.metrics["goals_missed"] += timed_out.float()
         self.metrics["crouch_goals_reached"] += (self.just_reached & self.needs_crouch).float()
         self.metrics["crouch_goals_missed"] += (timed_out & self.needs_crouch).float()
+        best = torch.minimum(self.goal_best_error, pos_error.mean(dim=1))
+        self.goal_best_error = torch.where(self.arm_mode, best, self.goal_best_error)
+        self._best_err_sum += torch.where(ended, self.goal_best_error.clamp(max=10.0), 0.0)
+        self._best_err_n += ended.float()
         # before the resample below, so the next goal is drawn at the new level
         self._record_outcomes(self.just_reached, timed_out)
         # CommandTerm.compute counts time_left down next and resamples every env at <= 0
@@ -782,6 +817,7 @@ class ArmTargetsCommand(CommandTerm):
         velocity.seg_tracked[env_ids] = 0.0
 
         self.arm_mode[env_ids] = arm_goal
+        self.goal_best_error[env_ids] = float("inf")
         self.hold_time[env_ids] = 0.0
         self.height_drop[env_ids] = 0.0
         self.lowest_target_height[env_ids] = 0.0
@@ -939,6 +975,12 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     """Arm goals per judgement: the level moves on the env's last level_window outcomes."""
     promote_rate: float = 0.8
     demote_rate: float = 0.4
+    drop_promote_error: float | None = None
+    """m. None: both axes move together on the reach rate (alternating, drop first). Set: the axes move
+    independently, spread on the reach rate and drop when the mean closest approach over the window
+    (both wrists' mean position error) is at most this, so lowered targets don't wait on 5 cm precision."""
+    drop_demote_error: float | None = None
+    """m: the drop axis moves back above this mean closest approach (default 1.5 x drop_promote_error)."""
 
     # -- walking gate and settle (see the class docstring); off by default
     walk_gate: bool = False

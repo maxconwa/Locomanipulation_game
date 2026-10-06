@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import torch
 from collections.abc import Sequence
+from dataclasses import MISSING
 from typing import TYPE_CHECKING
 
 import isaaclab.utils.string as string_utils
@@ -31,7 +32,12 @@ from isaaclab.utils import configclass
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
-__all__ = ["RateLimitedJointPositionAction", "RateLimitedJointPositionActionCfg"]
+__all__ = [
+    "IKResidualArmAction",
+    "IKResidualArmActionCfg",
+    "RateLimitedJointPositionAction",
+    "RateLimitedJointPositionActionCfg",
+]
 
 
 class RateLimitedJointPositionAction(JointPositionAction):
@@ -111,3 +117,129 @@ class RateLimitedJointPositionActionCfg(JointPositionActionCfg):
     """The ArmTargetsCommand whose arm_mode / settling pick the cap."""
     target_margin: float = 0.4
     """rad past each hard joint limit a target may go."""
+
+
+class IKResidualArmAction(JointPositionAction):
+    """Arm joint targets from one differential-IK step toward the arm command, plus the policy's residual.
+
+    Each policy step, for each arm, a damped-least-squares step (Isaac Lab's
+    DifferentialIKController) moves the arm's joint targets from the current
+    joint angles toward the command the policies see (ArmTargetsCommand's
+    believed pose, pelvis frame), with the wrist Jacobian rotated into the
+    pelvis frame. The policy's action, times scale, is added in joint space,
+    and each target is bounded to [hard lower - target_margin, hard upper +
+    target_margin]. The IK step is capped at max_ik_step rad per joint per
+    policy step.
+
+    Run F's arms, learning the whole map from joint angles and a target to
+    joint targets, stopped at ~12 cm and reached ~15% of goals (5 cm / 0.35
+    rad), so its reach curriculum never moved. The IK step gets near a
+    target from the start; the policy learns what IK can't: gravity sag,
+    self-collision, joint limits, the moving pelvis. A target the arms can't
+    reach (a lowered goal) leaves an error that only the legs can close.
+
+    applied_actions (the residual, action units) is what mdp.applied_action
+    observes; beyond_bounds as in RateLimitedJointPositionAction.
+    """
+
+    cfg: IKResidualArmActionCfg
+
+    def __init__(self, cfg: IKResidualArmActionCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
+
+        robot = self._asset
+        hard = robot.data.joint_pos_limits[:, self._joint_ids]
+        self._lower = hard[..., 0] - cfg.target_margin
+        self._upper = hard[..., 1] + cfg.target_margin
+        self._arm_cols, self._jac_cols, self._jac_body, self._body_ids, self._ik = [], [], [], [], []
+        names = list(self._joint_names)
+        for body, arm_joints in zip(cfg.body_names, cfg.arm_joint_names):
+            cols = [names.index(j) for j in arm_joints]  # columns in this term's action
+            joint_ids, _ = robot.find_joints(arm_joints, preserve_order=True)
+            body_id = robot.find_bodies(body)[0][0]
+            fixed = robot.is_fixed_base
+            self._arm_cols.append(cols)
+            # PhysX Jacobians: a floating base adds 6 leading columns; a fixed one drops the root link
+            self._jac_cols.append([j + (0 if fixed else 6) for j in joint_ids])
+            self._jac_body.append(body_id - 1 if fixed else body_id)
+            self._body_ids.append(body_id)
+            self._ik.append(DifferentialIKController(
+                DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="dls",
+                                            ik_params={"lambda_val": cfg.ik_damping}),
+                num_envs=self.num_envs, device=self.device,
+            ))
+        self._applied = robot.data.joint_pos[:, self._joint_ids].clone()
+        self._beyond = torch.zeros_like(self._raw_actions)
+        self.ik_targets = self._applied.clone()  # the IK command alone, before the residual
+        print(f"[INFO] {type(self).__name__}: IK on {cfg.body_names}, damping {cfg.ik_damping}, step cap"
+              f" {cfg.max_ik_step} rad, residual scale {cfg.scale}, bounds +- {cfg.target_margin} rad past the limits")
+
+    @property
+    def applied_actions(self) -> torch.Tensor:
+        return self._raw_actions
+
+    @property
+    def beyond_bounds(self) -> torch.Tensor:
+        return self._beyond
+
+    def process_actions(self, actions: torch.Tensor):
+        from isaaclab.utils.math import matrix_from_quat, quat_inv, subtract_frame_transforms
+
+        self._raw_actions[:] = actions
+        robot = self._asset
+        command = self._env.command_manager.get_term(self.cfg.command_name).believed_b  # (N, arms, 7), wxyz
+        root_pos, root_quat = robot.data.root_pos_w, robot.data.root_quat_w
+        to_root = matrix_from_quat(quat_inv(root_quat))
+        jacobians = robot.root_physx_view.get_jacobians()
+        q = robot.data.joint_pos[:, self._joint_ids]
+        # integrate: step from the previous IK command (holds against gravity sag); else from the measured angles
+        ik = self.ik_targets.clone() if self.cfg.ik_integrate else q.clone()
+        for arm, (cols, jac_cols, jac_body, body) in enumerate(zip(self._arm_cols, self._jac_cols, self._jac_body, self._body_ids)):
+            ee_pos, ee_quat = subtract_frame_transforms(
+                root_pos, root_quat, robot.data.body_pos_w[:, body], robot.data.body_quat_w[:, body]
+            )
+            jac = jacobians[:, jac_body][:, :, jac_cols]  # (N, 6, arm joints), world frame
+            jac = torch.cat([torch.bmm(to_root, jac[:, :3]), torch.bmm(to_root, jac[:, 3:])], dim=1)
+            self._ik[arm].set_command(command[:, arm])
+            q_arm = q[:, cols]
+            step = self.cfg.ik_gain * (self._ik[arm].compute(ee_pos, ee_quat, jac, q_arm) - q_arm)
+            ik[:, cols] = ik[:, cols] + step.clamp(-self.cfg.max_ik_step, self.cfg.max_ik_step)
+        self.ik_targets = torch.maximum(torch.minimum(ik, self._upper), self._lower)  # bounded, so no windup past them
+        target = ik + self._raw_actions * self._scale
+        bounded = torch.maximum(torch.minimum(target, self._upper), self._lower)
+        self._beyond = (target - bounded).abs() / abs(self._scale)
+        self._applied = bounded
+        self._processed_actions = bounded
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        super().reset(env_ids)
+        ids = slice(None) if env_ids is None else env_ids
+        self._applied[ids] = self._asset.data.joint_pos[ids][:, self._joint_ids]
+        self.ik_targets[ids] = self._applied[ids]
+        self._beyond[ids] = 0.0
+
+
+@configclass
+class IKResidualArmActionCfg(JointPositionActionCfg):
+    """Joint names must cover both arms' joints; scale is the residual's rad per action unit."""
+
+    class_type: type = IKResidualArmAction
+
+    body_names: list[str] = MISSING
+    """One end-effector body per arm, in the order of the arm command's bodies."""
+    arm_joint_names: list[list[str]] = MISSING
+    """Per arm, its joints, in kinematic order."""
+    command_name: str = "arm_targets"
+    ik_damping: float = 0.05
+    """Damped-least-squares lambda (Isaac Lab's default is 0.01; more damping near singular poses)."""
+    max_ik_step: float = 0.1
+    """rad per joint per policy step: the IK step's cap, not a speed limit on the residual. Pure IK (residual 0,
+    run F's legs), easiest goals: 0.05 reached 6% (9.5 cm closest: too small a step to hold the arm up against
+    gravity, PD torque being stiffness x step), 0.1 reached 72% (2.8 cm), 0.2 reached 69% (2.6 cm)."""
+    ik_integrate: bool = False
+    """Step from the previous IK command instead of the measured joint angles, so the command can stay ahead
+    of a sagging arm. Tested and worse: 6-7% of the easiest goals reached and more falls (gain 0.3-0.5)."""
+    ik_gain: float = 1.0
+    """Share of the IK step taken per policy step."""
+    target_margin: float = 0.4

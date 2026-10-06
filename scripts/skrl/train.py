@@ -321,10 +321,21 @@ def load_policies_only(agent, path: str):
 
     modules = torch.load(path, map_location=agent.device, weights_only=False)
     for uid in agent.possible_agents:
-        for name in ("policy", "observation_preprocessor"):
-            module = agent.checkpoint_modules[uid].get(name)
-            if module is not None and name in modules.get(uid, {}):
-                module.load_state_dict(modules[uid][name])
+        saved = modules.get(uid, {})
+        own = {name: agent.checkpoint_modules[uid].get(name) for name in ("policy", "observation_preprocessor")}
+        # an agent whose observations or actions changed size starts fresh (e.g. the IK task's arms)
+        fits = all(
+            module is None or name not in saved or all(
+                saved[name][k].shape == v.shape for k, v in module.state_dict().items() if k in saved[name]
+            )
+            for name, module in own.items()
+        )
+        if not fits:
+            print(f"[INFO] Warm start: {uid} changed shape since {path}; it starts fresh")
+            continue
+        for name, module in own.items():
+            if module is not None and name in saved:
+                module.load_state_dict(saved[name])
                 print(f"[INFO] Warm start: {uid}/{name} from {path}")
 
 

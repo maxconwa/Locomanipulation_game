@@ -630,3 +630,51 @@ class LocoManipMarlFlatCurriculumEnvCfg(LocoManipMarlEnvCfg):
         # modes, this keeps a margin for living: a constant alive reward only moves the stay-up-vs-fall
         # trade (a 20 s episode is worth +20).
         self.rewards.legs.alive.weight = 1.0
+
+
+@configclass
+class LocoManipMarlFlatIKEnvCfg(LocoManipMarlFlatCurriculumEnvCfg):
+    """The flat curriculum with arms that can see their error and reach through IK.
+
+    Run F walked well but its arms stopped at ~12 cm and reached ~15% of goals
+    (5 cm / 0.35 rad), so no env ever left reach level 0 and the targets were
+    never lowered: no crouch. Three changes, on top of run F's setup:
+
+      * the arms observe their wrist poses and each wrist's error to the
+        command, in the pelvis frame (before, only the critic had them);
+      * the arm action is one damped-least-squares IK step toward the command
+        plus the policy's residual (mdp.IKResidualArmAction, 0.2 rad per unit);
+      * the reach curriculum's axes move independently: spread on the reach
+        rate as before, drop when the mean closest approach over the last 5
+        goals is <= 12 cm (back above 18 cm), so lowered targets don't wait on
+        5 cm precision; a lowered target the arms can't reach leaves an error
+        only the legs can close.
+
+    Observation sizes: legs 96 (unchanged), arms 98 + 14 + 12 = 124.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.actions.arm_pos = mdp.IKResidualArmActionCfg(
+            asset_name="robot",
+            joint_names=ARM_JOINT_NAMES,
+            scale=0.2,
+            use_default_offset=False,
+            preserve_order=True,
+            body_names=[LEFT_EE_BODY, RIGHT_EE_BODY],
+            arm_joint_names=[LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES],
+            command_name=ARM_COMMAND,
+        )
+        # appended after the existing arm terms (the manager reads the group's attributes in order)
+        self.observations.arms.wrist_poses = ObsTerm(
+            func=mdp.body_pose_in_root_xyzw,
+            params={"asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_BODY, RIGHT_EE_BODY], preserve_order=True)},
+            noise=Unoise(n_min=-0.005, n_max=0.005),
+        )
+        self.observations.arms.wrist_errors = ObsTerm(
+            func=mdp.arm_target_error_in_root,
+            params={"command_name": ARM_COMMAND},
+            noise=Unoise(n_min=-0.005, n_max=0.005),
+        )
+        self.commands.arm_targets.drop_promote_error = 0.12
+        self.commands.arm_targets.drop_demote_error = 0.18

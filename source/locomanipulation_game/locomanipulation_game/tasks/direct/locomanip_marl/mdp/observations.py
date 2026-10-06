@@ -88,3 +88,27 @@ def applied_action(env: ManagerBasedRLEnv, action_name: str) -> torch.Tensor:
     """
     term = env.action_manager.get_term(action_name)
     return term.applied_actions if hasattr(term, "applied_actions") else term.raw_actions
+
+
+def arm_target_error_in_root(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """Per arm, the wrist's error to the command it acts on: (dx, dy, dz, rx, ry, rz) in the pelvis frame.
+
+    Position: believed target minus wrist position. Rotation: the axis-angle
+    rotation that takes the wrist to the believed target orientation. The
+    actor's own wrist poses were missing from its observations (only the
+    critic had them), so the arm policy had to learn its forward kinematics to
+    know how far off it was. Shape (num_envs, 6 * arms).
+    """
+    from isaaclab.utils.math import compute_pose_error
+
+    term: ArmTargetsCommand = env.command_manager.get_term(command_name)
+    robot = term.robot
+    errors = []
+    for arm, body_id in enumerate(term.body_ids):
+        pos_b, quat_b = subtract_frame_transforms(
+            robot.data.root_pos_w, robot.data.root_quat_w, robot.data.body_pos_w[:, body_id], robot.data.body_quat_w[:, body_id]
+        )
+        target = term.believed_b[:, arm]
+        pos_err, rot_err = compute_pose_error(pos_b, quat_b, target[:, :3], target[:, 3:], rot_error_type="axis_angle")
+        errors.append(torch.cat([pos_err, rot_err], dim=-1))
+    return torch.cat(errors, dim=-1)
