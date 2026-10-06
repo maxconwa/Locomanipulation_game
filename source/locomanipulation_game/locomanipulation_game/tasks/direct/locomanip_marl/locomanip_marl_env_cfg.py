@@ -25,6 +25,8 @@ torso_joint belongs to neither agent: its actuator holds it at default, as in
 the IBR rounds.
 """
 
+import math
+
 from isaaclab.envs import DirectMARLEnvCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -53,6 +55,7 @@ from locomanipulation_game.tasks.manager_based.locomanipulation_game.common.rewa
 from locomanipulation_game.tasks.manager_based.locomanipulation_game.common.scenes import (
     SELF_CONTACT_LINK_NAMES,
     SELF_CONTACT_SENSOR_NAMES,
+    TERRAINS_FLAT_CFG,
     CurriculumCfg,
     TerrainSceneCfg,
 )
@@ -541,3 +544,97 @@ class LocoManipMarlStandEnvCfg(LocoManipMarlEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.commands.arm_targets.arm_goal_prob = 1.0
+
+
+# Joint-target speed caps for the flat curriculum (rad/s; mdp.RateLimitedJointPositionAction).
+# Conservative, from the user: wrist <= ~0.5 m/s, pelvis up/down <= ~0.3 m/s, legs
+# faster only when stepping. Run 12's squat moved the pelvis ~0.27 m per rad of
+# knee, so knee and hip pitch at 1.2 rad/s give ~0.3 m/s. Walking keeps 8 rad/s,
+# under the 9-23 rad/s hardware limits, until the gait's joint speeds are measured.
+ARM_RATE = {".*_shoulder_.*_joint": 1.0, ".*_elbow_joint": 1.5, ".*_wrist_.*_joint": 1.5}
+LEG_RATE_ARM_GOAL = {
+    ".*_knee_joint": 1.2,
+    ".*_hip_pitch_joint": 1.2,
+    ".*_ankle_pitch_joint": 1.0,
+    ".*_hip_(roll|yaw)_joint": 3.0,
+    ".*_ankle_roll_joint": 3.0,
+}
+LEG_RATE_WALKING = {".*": 8.0}
+
+
+@configclass
+class LocoManipMarlFlatCurriculumEnvCfg(LocoManipMarlEnvCfg):
+    """Flat world, fresh policies: walk first, then alternate walking with crouch-reaching.
+
+    The target behaviour is walk -> stop -> crouch-reach -> stand -> walk on,
+    never walking and reaching at once. Per env (ArmTargetsCommand walk_gate):
+    stage 0 is navigation only, the arms holding the zero-joint-angle wrist
+    pose (rest_pose_b) as their end-effector command; once its navigation
+    segments are tracked (>= 80% of the commanded path, no fall, 4 of the
+    last 5) it alternates, each event an arm goal with probability 0.5 and
+    the reach curriculum (spread, then the 0.5 m drop) running as in the
+    stand task. A fall while walking sends it back to stage 0. Each mode
+    switch first settles: 0.75 s stopped before an arm goal, 1.5 s to stand
+    up before walking.
+
+    Also, for this task only:
+      * the flat generator (same tile layout as the terrain world, plane only),
+        no terrain curriculum;
+      * joint targets bounded to the hard limits +- 0.4 rad and rate-limited
+        (ARM_RATE, LEG_RATE_*): slower, safer moves than runs 1-13;
+      * the policies observe the applied action, not the raw one;
+      * the IMU updates every physics step: at the policy rate its finite
+        difference divided by the physics dt and read lin_acc 4x too large;
+      * calmer resets: run 12 had ~2/3 of its falls in an episode's first second.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        # flat world
+        self.scene.terrain.terrain_generator = TERRAINS_FLAT_CFG
+        self.curriculum.terrain_levels = None
+        # IMU at the physics rate (the base class sets the policy rate)
+        self.scene.imu.update_period = self.sim.dt
+        # calmer resets: on the ground, near still, joints near default
+        self.events.reset_base.params = {
+            **self.events.reset_base.params,
+            "pose_range": {
+                "x": (-0.5, 0.5), "y": (-0.5, 0.5), "z": (0.0, 0.02),
+                "roll": (-0.05, 0.05), "pitch": (-0.05, 0.05), "yaw": (-math.pi, math.pi),
+            },
+            "velocity_range": {
+                "x": (-0.1, 0.1), "y": (-0.1, 0.1), "z": (-0.05, 0.05),
+                "roll": (-0.1, 0.1), "pitch": (-0.1, 0.1), "yaw": (-0.1, 0.1),
+            },
+        }
+        self.events.reset_joints.params = {
+            **self.events.reset_joints.params, "position_range": (-0.05, 0.05), "velocity_range": (-0.1, 0.1)
+        }
+        # walk first, then alternate
+        arm = self.commands.arm_targets
+        arm.walk_gate = True
+        arm.alternate_arm_goal_prob = 0.5
+        arm.settle_to_arm_s = 0.75
+        arm.settle_to_nav_s = 1.5
+        # bounded, rate-limited joint targets; the policies see the applied action
+        self.actions.joint_pos = mdp.RateLimitedJointPositionActionCfg(
+            asset_name="robot",
+            joint_names=LOWER_JOINT_NAMES,
+            scale=0.25,
+            use_default_offset=True,
+            preserve_order=True,
+            max_rate=LEG_RATE_ARM_GOAL,
+            max_rate_navigation=LEG_RATE_WALKING,
+            mode_command_name=ARM_COMMAND,
+        )
+        self.actions.arm_pos = mdp.RateLimitedJointPositionActionCfg(
+            asset_name="robot",
+            joint_names=ARM_JOINT_NAMES,
+            scale=0.5,
+            use_default_offset=True,
+            preserve_order=True,
+            max_rate=ARM_RATE,
+            mode_command_name=ARM_COMMAND,
+        )
+        self.observations.legs.actions.func = mdp.applied_action
+        self.observations.arms.actions.func = mdp.applied_action

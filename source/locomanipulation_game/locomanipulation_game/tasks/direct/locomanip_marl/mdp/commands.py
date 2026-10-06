@@ -113,6 +113,12 @@ class ModalVelocityCommand(UniformVelocityCommand):
         asked for, and the part of it the base covered along the commanded
         direction (capped at the commanded speed). The terrain curriculum
         (terrain_levels_tracking) reads these before the reset zeroes them.
+
+    The command is also zero while ArmTargetsCommand has the env settling
+    between modes, and settle steps count in neither mode's metrics.
+    seg_commanded / seg_tracked are the same two paths summed over the current
+    navigation segment only; ArmTargetsCommand reads them for its walking gate
+    and zeroes them at each goal event.
     """
 
     cfg: ModalVelocityCommandCfg
@@ -124,26 +130,34 @@ class ModalVelocityCommand(UniformVelocityCommand):
         self.metrics["tracked_path"] = zeros()
         self._nav_steps, self._nav_err_xy, self._nav_err_yaw = zeros(), zeros(), zeros()
         self._arm_steps, self._arm_yaw_rate = zeros(), zeros()
+        self.seg_commanded, self.seg_tracked = zeros(), zeros()
 
     def _arm_mode(self) -> torch.Tensor:
         return self._env.command_manager.get_term(self.cfg.arm_command_name).arm_mode
 
+    def _settling(self) -> torch.Tensor:
+        return self._env.command_manager.get_term(self.cfg.arm_command_name).settling
+
     def _update_command(self):
         super()._update_command()
-        self.vel_command_b[self._arm_mode()] = 0.0
+        self.vel_command_b[self._arm_mode() | self._settling()] = 0.0
 
     def _update_metrics(self):
         super()._update_metrics()
         dt = self._env.step_dt
         arm = self._arm_mode().float()
-        nav = 1.0 - arm
+        nav = (1.0 - arm) * (~self._settling()).float()
         cmd_xy = self.vel_command_b[:, :2]
         vel_xy = self.robot.data.root_lin_vel_b[:, :2]
         yaw_rate = self.robot.data.root_ang_vel_b[:, 2]
         speed = torch.norm(cmd_xy, dim=-1)
         along = (vel_xy * cmd_xy).sum(dim=-1) / speed.clamp(min=1e-6)
-        self.metrics["commanded_path"] += speed * dt * nav
-        self.metrics["tracked_path"] += torch.minimum(along.clamp(min=0.0), speed) * dt * nav
+        commanded = speed * dt * nav
+        tracked = torch.minimum(along.clamp(min=0.0), speed) * dt * nav
+        self.metrics["commanded_path"] += commanded
+        self.metrics["tracked_path"] += tracked
+        self.seg_commanded += commanded
+        self.seg_tracked += tracked
         self._nav_steps += nav
         self._nav_err_xy += torch.norm(cmd_xy - vel_xy, dim=-1) * nav
         self._nav_err_yaw += torch.abs(self.vel_command_b[:, 2] - yaw_rate) * nav
@@ -220,6 +234,25 @@ class ArmTargetsCommand(CommandTerm):
     restarts at each move. A fall during an arm goal demotes at the end of the
     episode (update_levels, from the arm_target_levels curriculum term).
 
+    **Walking gate (walk_gate).** Off by default (arm goals with probability
+    arm_goal_prob, as above). On: each env starts in walk_stage 0, navigation
+    only with the arms at the rest pose, and is promoted to stage 1, where
+    each event is an arm goal with probability alternate_arm_goal_prob, once
+    its last gate_window judged navigation segments were tracked: a segment
+    with at least gate_min_path m commanded is judged at its end, a success
+    if it covered gate_track_ratio of that path along the commanded direction
+    (ModalVelocityCommand.seg_*) without a fall. Promotion at >=
+    gate_promote_rate of the window; demotion back to stage 0 below
+    gate_demote_rate, or at once on a fall while walking or settling. The
+    reach levels are kept through demotions.
+
+    **Settle.** When an event switches mode (navigation -> arm goal or back)
+    and settle_to_arm_s / settle_to_nav_s is > 0, the env first gets a settle
+    segment of that length: velocity zero, arms at the rest pose, arm_mode
+    False (so the navigation-only legs terms, base_height and stand_still,
+    pull the pelvis back up after a crouch). The drawn mode starts when it
+    ends; an arm goal's targets are anchored only then.
+
     **What the policies see.** believed_b: the targets in the pelvis frame.
     Exact at the event (on the robot: the operator's pelvis-frame command);
     then each step apply_pelvis_motion() moves it by the pelvis motion the
@@ -282,6 +315,14 @@ class ArmTargetsCommand(CommandTerm):
         self.outcomes = torch.zeros(self.num_envs, cfg.level_window, device=self.device)
         self.outcome_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
+        # -- walking gate: stage 0 walks only, stage 1 alternates; recent judged navigation segments
+        self.walk_stage = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.nav_outcomes = torch.zeros(self.num_envs, cfg.gate_window, device=self.device)
+        self.nav_outcome_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # -- settle between modes: the mode drawn when the settle began, applied when it ends
+        self.settling = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.pending_arm = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
         # -- metrics. CommandTerm.reset logs their mean over the reset envs, then zeroes them.
         self.metrics["command_drift"] = zeros()
         self.metrics["estimator_drift"] = zeros()
@@ -289,6 +330,9 @@ class ArmTargetsCommand(CommandTerm):
         self.metrics["goals_missed"] = zeros()
         self.metrics["crouch_goals_reached"] = zeros()
         self.metrics["crouch_goals_missed"] = zeros()
+        self.metrics["nav_segments_judged"] = zeros()
+        self.metrics["nav_segments_tracked"] = zeros()
+        self.metrics["settle_steps"] = zeros()
         # per-episode sums for the mode-split metrics, logged as weighted means by reset()
         self._goal_steps, self._goal_pos_err, self._goal_rot_err = zeros(), zeros(), zeros()
         self._rest_steps, self._rest_pos_err = zeros(), zeros()
@@ -458,6 +502,11 @@ class ArmTargetsCommand(CommandTerm):
         down[env_ids] = fell & self.arm_mode[env_ids]
         self._move_levels(torch.zeros_like(down), down)
         self.outcome_count = torch.where(down, 0, self.outcome_count)
+        if self.cfg.walk_gate:
+            # the episode's last navigation segment: judged now (the reset's resample skips it); a fall
+            # while walking or settling fails it whatever its path, and demotes an alternating env
+            walking = ~self.arm_mode[env_ids]
+            self._judge_nav_segments(env_ids[walking], fell[walking])
 
     def _record_outcomes(self, reached: torch.Tensor, missed: torch.Tensor):
         """Push this step's ended arm goals into each env's window; move levels on full windows."""
@@ -496,6 +545,33 @@ class ArmTargetsCommand(CommandTerm):
             lower_drop, False, torch.where(lower_spread, True, self._last_promoted_drop)
         )
 
+    def _judge_nav_segments(self, env_ids: torch.Tensor, fell: torch.Tensor | None = None):
+        """Score the navigation segments that just ended in env_ids, move walk_stage, zero the segment paths."""
+        if len(env_ids) == 0:
+            return
+        velocity = self._env.command_manager.get_term(self.cfg.velocity_command_name)
+        fell = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device) if fell is None else fell
+        commanded, tracked = velocity.seg_commanded[env_ids], velocity.seg_tracked[env_ids]
+        # a settle segment has no commanded path: judged only when it ends in a fall
+        judged = (commanded >= self.cfg.gate_min_path) | fell
+        success = ~fell & (tracked >= self.cfg.gate_track_ratio * commanded)
+        ids, ok = env_ids[judged], success[judged].float()
+        self.metrics["nav_segments_judged"][ids] += 1.0
+        self.metrics["nav_segments_tracked"][ids] += ok
+        slot = self.nav_outcome_count[ids] % self.cfg.gate_window
+        self.nav_outcomes[ids, slot] = ok
+        self.nav_outcome_count[ids] += 1
+        full = self.nav_outcome_count[ids] >= self.cfg.gate_window
+        rate = self.nav_outcomes[ids].mean(dim=1)
+        stage = self.walk_stage[ids]
+        up = full & (stage == 0) & (rate >= self.cfg.gate_promote_rate)
+        down = (stage == 1) & ((full & (rate < self.cfg.gate_demote_rate)) | fell[judged])
+        self.walk_stage[ids[up]] = 1
+        self.walk_stage[ids[down]] = 0
+        self.nav_outcome_count[ids[up | down]] = 0  # the window restarts at each move
+        velocity.seg_commanded[env_ids] = 0.0
+        velocity.seg_tracked[env_ids] = 0.0
+
     def state_dict(self) -> dict[str, torch.Tensor]:
         """Env-side curriculum state, saved with the estimator so a resumed or played run keeps its levels."""
         return {
@@ -503,6 +579,9 @@ class ArmTargetsCommand(CommandTerm):
             "drop_level": self.drop_level.clone(),
             "promote_drop_next": self._promote_drop_next.clone(),
             "last_promoted_drop": self._last_promoted_drop.clone(),
+            "walk_stage": self.walk_stage.clone(),
+            "nav_outcomes": self.nav_outcomes.clone(),
+            "nav_outcome_count": self.nav_outcome_count.clone(),
         }
 
     def load_state_dict(self, state: dict[str, torch.Tensor]):
@@ -522,6 +601,10 @@ class ArmTargetsCommand(CommandTerm):
         if "promote_drop_next" in saved:
             self._promote_drop_next[:] = saved["promote_drop_next"][pick]
             self._last_promoted_drop[:] = saved["last_promoted_drop"][pick]
+        if "walk_stage" in saved and saved["nav_outcomes"].shape[1] == self.cfg.gate_window:
+            self.walk_stage[:] = saved["walk_stage"][pick]
+            self.nav_outcomes[:] = saved["nav_outcomes"][pick]
+            self.nav_outcome_count[:] = saved["nav_outcome_count"][pick]
 
     """
     Table construction.
@@ -632,6 +715,7 @@ class ArmTargetsCommand(CommandTerm):
 
     def _update_metrics(self):
         pos_error, rot_error = self.errors()
+        self.metrics["settle_steps"] += self.settling.float()
         arm = self.arm_mode.float()
         self._goal_steps += arm
         self._goal_pos_err += pos_error.mean(dim=1) * arm
@@ -676,7 +760,27 @@ class ArmTargetsCommand(CommandTerm):
         self.invalidate_errors()
         env_ids = torch.as_tensor(env_ids, device=self.device)
         n = len(env_ids)
-        arm_goal = torch.rand(n, device=self.device) < self.cfg.arm_goal_prob
+        velocity = self._env.command_manager.get_term(self.cfg.velocity_command_name)
+        was_arm, was_settling = self.arm_mode[env_ids].clone(), self.settling[env_ids].clone()
+        if self.cfg.walk_gate:
+            if not self._at_reset:
+                # navigation segments that ran out their timer; a reset's were judged at the episode end
+                walked = ~was_arm & ~was_settling
+                self._judge_nav_segments(env_ids[walked])
+            prob = torch.where(self.walk_stage[env_ids] > 0, self.cfg.alternate_arm_goal_prob, 0.0)
+        else:
+            prob = torch.full((n,), self.cfg.arm_goal_prob, device=self.device)
+        arm_goal = torch.rand(n, device=self.device) < prob
+        # a settle ends in the mode drawn when it began; a mode switch first settles
+        arm_goal = torch.where(was_settling, self.pending_arm[env_ids], arm_goal)
+        settle_s = torch.where(arm_goal, self.cfg.settle_to_arm_s, self.cfg.settle_to_nav_s)
+        settle = ~was_settling & (arm_goal != was_arm) & (settle_s > 0.0) & (not self._at_reset)
+        self.settling[env_ids] = settle
+        self.pending_arm[env_ids] = arm_goal
+        arm_goal = arm_goal & ~settle
+        velocity.seg_commanded[env_ids] = 0.0
+        velocity.seg_tracked[env_ids] = 0.0
+
         self.arm_mode[env_ids] = arm_goal
         self.hold_time[env_ids] = 0.0
         self.height_drop[env_ids] = 0.0
@@ -684,13 +788,21 @@ class ArmTargetsCommand(CommandTerm):
         self.needs_crouch[env_ids] = False
         self.use_estimate[env_ids] = torch.rand(n, device=self.device) < self.estimate_prob
 
+        # -- settle: stop, arms at the rest pose, for the switch's settle time
+        settle_ids = env_ids[settle]
+        if len(settle_ids) > 0:
+            self.believed_b[settle_ids] = self.rest_pose_b
+            self.shadow_b[settle_ids] = self.rest_pose_b
+            self.time_left[settle_ids] = settle_s[settle]
+            velocity.vel_command_b[settle_ids] = 0.0
+
         # -- navigation: rest pose in the pelvis frame, a fresh velocity command
-        nav_ids = env_ids[~arm_goal]
+        nav_ids = env_ids[~arm_goal & ~settle]
         if len(nav_ids) > 0:
             self.believed_b[nav_ids] = self.rest_pose_b
             self.shadow_b[nav_ids] = self.rest_pose_b
             self.time_left[nav_ids] = torch.empty(len(nav_ids), device=self.device).uniform_(*self.cfg.nav_time_range)
-            self._env.command_manager.get_term(self.cfg.velocity_command_name)._resample(nav_ids)
+            velocity._resample(nav_ids)
 
         # -- arm goal: table targets, anchored in the world now
         arm_ids = env_ids[arm_goal]
@@ -732,7 +844,7 @@ class ArmTargetsCommand(CommandTerm):
         )
         self.shadow_b[arm_ids] = self.believed_b[arm_ids]
         # stand still for it: zero now rather than at the velocity term's next update
-        self._env.command_manager.get_term(self.cfg.velocity_command_name).vel_command_b[arm_ids] = 0.0
+        velocity.vel_command_b[arm_ids] = 0.0
 
     def _update_command(self):
         pass
@@ -827,6 +939,23 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     """Arm goals per judgement: the level moves on the env's last level_window outcomes."""
     promote_rate: float = 0.8
     demote_rate: float = 0.4
+
+    # -- walking gate and settle (see the class docstring); off by default
+    walk_gate: bool = False
+    """Per-env stages: walk only until navigation is tracked, then alternate. arm_goal_prob is then unused."""
+    alternate_arm_goal_prob: float = 0.5
+    """Arm-goal probability per event once an env alternates (walk_stage 1)."""
+    gate_window: int = 5
+    gate_promote_rate: float = 0.8
+    gate_demote_rate: float = 0.4
+    gate_min_path: float = 1.0
+    """m: a navigation segment that commanded less is not judged."""
+    gate_track_ratio: float = 0.8
+    """A judged segment succeeds when it covered this share of its commanded path, without a fall."""
+    settle_to_arm_s: float = 0.0
+    """Zero-velocity settle before an arm goal that follows navigation (s); 0 disables."""
+    settle_to_nav_s: float = 0.0
+    """Zero-velocity settle before navigation that follows an arm goal (s): time to stand up; 0 disables."""
 
     goal_pose_visualizer_cfg: VisualizationMarkersCfg = _frame_marker("/Visuals/Command/arm_goal_pose", 0.1)
     believed_pose_visualizer_cfg: VisualizationMarkersCfg = _frame_marker("/Visuals/Command/arm_believed_pose", 0.06)

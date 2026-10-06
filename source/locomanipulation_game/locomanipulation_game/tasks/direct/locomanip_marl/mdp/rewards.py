@@ -49,8 +49,16 @@ def action_beyond_clip(env, agent: str, clip: float) -> torch.Tensor:
     steps of 10-15% of episodes at drop level 10, locking the knees straight.
     Linear, so those outliers are charged hard but not enough to swamp the
     critic. Reads the env's raw per-agent actions (LocoManipMarlEnv.actions).
+
+    With a bounded action term (mdp.RateLimitedJointPositionAction) the charge
+    also covers what its per-joint target bounds cut off inside the clip
+    (beyond_bounds, action units): the whole way past each joint's bound.
     """
-    return (env.actions[agent].abs() - clip).clamp(min=0.0).sum(dim=1)
+    excess = (env.actions[agent].abs() - clip).clamp(min=0.0).sum(dim=1)
+    term = env.action_manager.get_term(env.cfg.agent_action_terms[agent])
+    if hasattr(term, "beyond_bounds"):
+        excess = excess + term.beyond_bounds.sum(dim=1)
+    return excess
 
 
 class self_contacts_involving(ManagerTermBase):

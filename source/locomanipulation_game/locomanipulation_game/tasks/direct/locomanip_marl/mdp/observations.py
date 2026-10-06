@@ -77,3 +77,14 @@ def body_pose_in_root_xyzw(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) ->
         )
         poses.append(torch.cat([pos_b, _wxyz_to_xyzw(quat_unique(quat_b))], dim=-1))
     return torch.cat(poses, dim=-1)
+
+
+def applied_action(env: ManagerBasedRLEnv, action_name: str) -> torch.Tensor:
+    """The agent's last action as applied: after the action term's bounds and rate limit, in action units.
+
+    For a bounded, rate-limited term (mdp.RateLimitedJointPositionAction) the
+    raw action and the applied one differ; the policy acts on the applied one.
+    Any other term: its raw action, like mdp.last_action.
+    """
+    term = env.action_manager.get_term(action_name)
+    return term.applied_actions if hasattr(term, "applied_actions") else term.raw_actions

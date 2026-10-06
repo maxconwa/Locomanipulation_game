@@ -14,11 +14,15 @@ def arm_target_levels(env: ManagerBasedRLEnv, env_ids: Sequence[int], command_na
     """At episode end, a fall during an arm goal is a demotion (ArmTargetsCommand.update_levels).
 
     The rest of the arm curriculum moves at goal events, inside the command.
-    Logs the mean spread and drop levels.
+    Logs the mean spread and drop levels and, with the walking gate on, the
+    share of envs that alternate (walk_stage 1).
     """
     term = env.command_manager.get_term(command_name)
     term.update_levels(env_ids, fell=env.termination_manager.terminated[env_ids])
-    return {"spread": torch.mean(term.spread_level.float()), "drop": torch.mean(term.drop_level.float())}
+    levels = {"spread": torch.mean(term.spread_level.float()), "drop": torch.mean(term.drop_level.float())}
+    if term.cfg.walk_gate:
+        levels["walk_stage"] = torch.mean(term.walk_stage.float())
+    return levels
 
 
 def terrain_levels_tracking(

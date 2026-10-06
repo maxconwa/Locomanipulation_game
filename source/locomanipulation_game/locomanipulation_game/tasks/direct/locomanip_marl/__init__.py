@@ -25,3 +25,14 @@ gym.register(
     disable_env_checker=True,
     kwargs={"env_cfg_entry_point": f"{__name__}.locomanip_marl_env_cfg:LocoManipMarlStandEnvCfg", **_AGENT_CFGS},
 )
+
+# Flat world, fresh policies: walk first, then alternate walking with crouch-reaching.
+gym.register(
+    id="LocoManip-Marl-Flat-Curriculum-Direct-v0",
+    entry_point=f"{__name__}.locomanip_marl_env:LocoManipMarlEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.locomanip_marl_env_cfg:LocoManipMarlFlatCurriculumEnvCfg",
+        **_AGENT_CFGS,
+    },
+)
