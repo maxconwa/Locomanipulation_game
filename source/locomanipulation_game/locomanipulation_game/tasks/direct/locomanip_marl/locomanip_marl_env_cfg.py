@@ -50,6 +50,7 @@ from locomanipulation_game.tasks.manager_based.locomanipulation_game.legs_r0_env
     EventCfg,
     TerminationsCfg,
 )
+from locomanipulation_game.tasks.manager_based.locomanipulation_game.mdp.rewards import GAIT_PERIOD
 
 from . import mdp
 from .golem_safety import GOLEM_TARGET_CLIP, GolemEstopCfg
@@ -79,7 +80,7 @@ LEGS_SHARE_OF_ARMS = 0.5
 ARMS_SHARE_OF_LEGS = 0.1
 # The legs' gait shaping during arm goals, as a share of its weight: these terms resist a crouch.
 ARM_GOAL_SHAPING_SCALE = {"lin_vel_z": 0.0, "ang_vel_xy": 0.5, "hip_pos": 0.2}
-TRACKING_STD = 0.25       # velocity tracking kernel: standing still under a turn command earns little
+TRACKING_STD = 0.25       # velocity tracking kernel width, on the gait-cycle mean velocity
 CLIP_ACTIONS = 10.0       # the env clamps every raw policy action to +-this
 TORQUE_HEADROOM = 0.85    # targets ask for at most this share of a joint's effort limit (the e-stop trips at 0.9)
 
@@ -247,6 +248,7 @@ class LegsRewardsCfg(LowerRewardsCfg):
     action_rate and self_collision count the legs only; base_height and stand_still apply during navigation only,
     so a crouch can emerge during arm goals, and the gait shaping that resists a crouch is scaled down then
     (ARM_GOAL_SHAPING_SCALE). feet_swing_clearance replaces feet_swing_height, which a dragging foot never pays.
+    Velocity tracking scores the gait-cycle mean velocity, so stepping in place to turn doesn't pay for its sway.
     """
 
     feet_swing_height = None
@@ -273,8 +275,11 @@ class LegsRewardsCfg(LowerRewardsCfg):
     def __post_init__(self):
         self.alive.weight = 1.0
         self.track_ang_vel_z.weight = 1.5
-        self.track_lin_vel_xy.params["std"] = TRACKING_STD
-        self.track_ang_vel_z.params["std"] = TRACKING_STD
+        # scored on the pelvis velocity averaged over one gait cycle (mdp.track_velocity_avg_exp)
+        for term, component in ((self.track_lin_vel_xy, "lin_xy"), (self.track_ang_vel_z, "ang_z")):
+            term.func = mdp.track_velocity_avg_exp
+            term.params = {"command_name": "base_velocity", "std": TRACKING_STD, "component": component,
+                           "window_s": GAIT_PERIOD}
         self.action_rate.func = mdp.action_term_rate_l2
         self.action_rate.params = {"action_name": AGENT_ACTION_TERMS["legs"]}
         self.self_collision.func = mdp.self_contacts_involving

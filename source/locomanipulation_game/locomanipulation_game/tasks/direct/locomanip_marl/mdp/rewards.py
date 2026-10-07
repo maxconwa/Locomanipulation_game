@@ -82,6 +82,42 @@ class self_contacts_involving(ManagerTermBase):
         return count
 
 
+class track_velocity_avg_exp(ManagerTermBase):
+    """exp(-err^2 / std^2) of the velocity command against the pelvis velocity averaged over the last window_s.
+
+    component "lin_xy": (vx, vy) in the pelvis frame; "ang_z": the yaw rate. A step sways and twists the pelvis
+    within the gait cycle, so on the instantaneous velocity standing still under a small command pays about as
+    much as following it. Averaged over one gait cycle, only the motion the command asks for counts.
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self._window = max(int(round(cfg.params["window_s"] / env.step_dt)), 1)
+        dims = 2 if cfg.params["component"] == "lin_xy" else 1
+        self._samples = torch.zeros(env.num_envs, self._window, dims, device=env.device)
+        self._count = torch.zeros(env.num_envs, device=env.device)
+        self._slot = 0
+
+    def reset(self, env_ids=None):
+        ids = slice(None) if env_ids is None else env_ids
+        self._samples[ids] = 0.0
+        self._count[ids] = 0.0
+
+    def __call__(
+        self, env: ManagerBasedRLEnv, command_name: str, std: float, component: str, window_s: float
+    ) -> torch.Tensor:
+        data = env.scene["robot"].data
+        if component == "lin_xy":
+            velocity, command = data.root_lin_vel_b[:, :2], env.command_manager.get_command(command_name)[:, :2]
+        else:
+            velocity, command = data.root_ang_vel_b[:, 2:3], env.command_manager.get_command(command_name)[:, 2:3]
+        self._samples[:, self._slot] = velocity
+        self._slot = (self._slot + 1) % self._window
+        self._count = torch.clamp(self._count + 1.0, max=self._window)
+        mean = self._samples.sum(dim=1) / self._count.unsqueeze(1)
+        return torch.exp(-torch.sum(torch.square(command - mean), dim=1) / std**2)
+
+
 def arm_target_pos_exp(env: ManagerBasedRLEnv, command_name: str, arm: int, std: float) -> torch.Tensor:
     """exp(-d^2 / std^2) on one arm's wrist position error."""
     pos_error, _ = env.command_manager.get_term(command_name).errors()
