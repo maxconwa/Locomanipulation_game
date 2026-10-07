@@ -941,3 +941,28 @@ class LocoManipMarlFlatGolem6EnvCfg(LocoManipMarlFlatGolem5EnvCfg):
         super().__post_init__()
         self.commands.base_velocity.pure_turn_prob = 0.2
         self.commands.base_velocity.pure_lateral_prob = 0.1
+
+
+@configclass
+class LocoManipMarlFlatGolem7EnvCfg(LocoManipMarlFlatGolem6EnvCfg):
+    """The Golem6 task with the robot's mass matching the URDF and RoboCasa's model.
+
+    The URDF's head_camera_link, imu_link, livox_link and logo_link are frames on torso_link with no inertial;
+    the USD import gave each 1 kg (two of them 0.68 m above the torso origin), so the Isaac robot weighs 71.9 kg
+    against RoboCasa's 67.5 kg, and with add_torso_mass (-2..+4 kg) every training robot was heavier than RoboCasa's.
+    Here those four links weigh 0.01 kg each, so training spans 65.9-71.9 kg.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.events.massless_frames = EventTerm(
+            func=mdp.randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg(
+                    "robot", body_names=["head_camera_link", "imu_link", "livox_link", "logo_link"]
+                ),
+                "mass_distribution_params": (0.01, 0.01),
+                "operation": "abs",
+            },
+        )
