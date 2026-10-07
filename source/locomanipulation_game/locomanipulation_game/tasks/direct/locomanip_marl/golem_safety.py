@@ -11,8 +11,8 @@ The sim enforces the same URDF limits physically, so a policy trained without th
 (run I: 1-62 torque, 4-15 position and 0.1-0.4 velocity trips per robot-minute).
 
 GolemEstopMonitor applies those thresholds tightened by a margin (GolemEstopCfg) to every physics substep, for the
-golem_estop termination. Torque is the PD demand before the effort clip (computed_torque): the motor follows it up
-to its peak, which can exceed the URDF value (GOLEM raised its elbow limits after seeing that).
+golem_estop termination. Torque is the motor's PD demand at the current state, before the effort clip: the motor
+follows it up to its peak, which can exceed the URDF value (GOLEM raised its elbow limits after seeing that).
 
 The table is copied from GOLEM (core/joint_limits.py and config/relax_safety_split.yaml at commit 462c479), so
 training needs no GOLEM checkout; scripts/skrl/audit_golem_estop.py compares it against the live files.
@@ -116,11 +116,12 @@ class GolemEstopMonitor:
             self.flags[cause] |= hit
 
     def _motor_torque(self) -> torch.Tensor:
-        """The PD demand with the motor's own damping: computed_torque less any randomized passive damping, which
-        the simulator folds into the drive (Golem3) but the motor doesn't produce."""
-        data = self.robot.data
-        extra = (data.joint_damping - data.default_joint_damping)[:, self.joint_ids]
-        return data.computed_torque[:, self.joint_ids] + extra * data.joint_vel[:, self.joint_ids]
+        """The motor's PD demand at the current state: stiffness (target - q) - damping qd, with the motor's own
+        damping. computed_torque would lag a substep (it is computed before the step, from the state before it)
+        and folds in any randomized passive damping (Golem3), which the motor doesn't produce."""
+        data, ids = self.robot.data, self.joint_ids
+        error = data.joint_pos_target[:, ids] - data.joint_pos[:, ids]
+        return data.joint_stiffness[:, ids] * error - data.default_joint_damping[:, ids] * data.joint_vel[:, ids]
 
     def tripped(self) -> torch.Tensor:
         return self.flags["velocity"] | self.flags["position"] | self.flags["torque"]

@@ -145,7 +145,7 @@ def update(dt):
     mi = mode_index()
     substeps.add_(torch.bincount(mi, minlength=len(MODES)).float())
     data = robot.data
-    q, dq, tau = data.joint_pos[:, ids], data.joint_vel[:, ids].abs(), data.computed_torque[:, ids].abs()
+    q, dq, tau = data.joint_pos[:, ids], data.joint_vel[:, ids].abs(), ex._motor_torque().abs()
     dq_ratio_max.copy_(torch.maximum(dq_ratio_max, (dq / ex.dq_max).max(dim=0).values))
     tau_ratio_max.copy_(torch.maximum(tau_ratio_max, (tau[~skip] / ex.tau_max).max(dim=0).values if (~skip).any() else tau_ratio_max))
     q_room_min.copy_(torch.minimum(q_room_min, torch.minimum(q - ex.q_low, ex.q_high - q).min(dim=0).values))
