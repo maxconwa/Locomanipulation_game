@@ -16,7 +16,12 @@ from isaaclab.sensors import ContactSensor
 
 from isaaclab.envs.mdp.rewards import ang_vel_xy_l2, lin_vel_z_l2
 
-from locomanipulation_game.tasks.manager_based.locomanipulation_game.mdp.rewards import joint_deviation_l2, stand_still
+from locomanipulation_game.tasks.manager_based.locomanipulation_game.mdp.rewards import (
+    STANCE_THRESHOLD,
+    joint_deviation_l2,
+    leg_phase,
+    stand_still,
+)
 
 from .commands import ground_height
 
@@ -211,3 +216,34 @@ def joint_deviation_l2_modal(
 ) -> torch.Tensor:
     """joint_deviation_l2, scaled during arm goals (hip_pos: the hip roll/yaw a wide squat needs)."""
     return joint_deviation_l2(env, asset_cfg) * _arm_goal_scale(env, arm_command_name, arm_goal_scale)
+
+
+def feet_swing_clearance(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    rest_height: float,
+    lift_height: float,
+    command_name: str = "base_velocity",
+    terrain_sensor_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """How far each foot in its swing phase is below a swing reference, summed over the feet (m).
+
+    The gait clock (leg_phase, which the legs observe) puts each foot in swing for phase >= STANCE_THRESHOLD
+    while a walk is commanded; the reference there rises from rest_height to rest_height + lift_height and
+    back, rest_height + lift_height * sin(pi * s) over the swing's progress s in [0, 1]. A foot pays only for
+    being below it, in contact or not. feet_swing_height charges a foot only while it is off the ground, so a
+    foot that drags through its swing is never charged: runs up to M walked lifting the ankle about 1 cm.
+    Standing and arm goals have no swing phase, so they cost nothing here.
+
+    asset_cfg's bodies are the feet in leg_phase's order (left, right).
+    """
+    asset = env.scene[asset_cfg.name]
+    foot_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+    if terrain_sensor_cfg is not None:
+        foot_z = foot_z - ground_height(env.scene.sensors[terrain_sensor_cfg.name]).unsqueeze(1)
+    phase = leg_phase(env, command_name)
+    swing = phase >= STANCE_THRESHOLD
+    progress = ((phase - STANCE_THRESHOLD) / (1.0 - STANCE_THRESHOLD)).clamp(0.0, 1.0)
+    reference = rest_height + lift_height * torch.sin(torch.pi * progress)
+    return torch.sum((reference - foot_z).clamp(min=0.0) * swing, dim=1)
+

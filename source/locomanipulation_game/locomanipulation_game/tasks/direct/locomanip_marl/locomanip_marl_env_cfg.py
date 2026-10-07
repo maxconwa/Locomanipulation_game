@@ -893,3 +893,33 @@ class LocoManipMarlFlatGolem4EnvCfg(LocoManipMarlFlatGolem3EnvCfg):
         for term in (self.rewards.legs.track_lin_vel_xy, self.rewards.legs.track_ang_vel_z,
                      self.rewards.arms.legs_track_lin_vel_xy, self.rewards.arms.legs_track_ang_vel_z):
             term.params["std"] = 0.25
+
+
+@configclass
+class LocoManipMarlFlatGolem5EnvCfg(LocoManipMarlFlatGolem4EnvCfg):
+    """The Golem4 task with a swing-height term that a dragging foot can't escape.
+
+    Every run up to M walks with a shuffle: in Isaac and in GOLEM's MuJoCo test alike, the ankle rises about
+    1 cm while walking (standing height 0.045 m, walking peak 0.055 m) and the feet stay loaded through most
+    of their swing. feet_swing_height charges a foot only while it is off the ground, so dragging it costs
+    nothing and a small lift costs more than none; its total was -0.0002 per second at the end of run M.
+    Here it is replaced by feet_swing_clearance: during a commanded walk, each foot in its swing phase of
+    the gait clock pays for being below a reference that rises 5.5 cm above its standing height and back
+    (peak 0.10 m, against the old target's 0.08). At weight -10 a full shuffle costs about 0.5 per second
+    of walking; a step that follows the reference costs nothing.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.legs.feet_swing_height = None
+        self.rewards.legs.feet_swing_clearance = RewTerm(
+            func=mdp.feet_swing_clearance,
+            weight=-10.0,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names=FOOT_LINK_NAMES, preserve_order=True),
+                "rest_height": 0.045,
+                "lift_height": 0.055,
+                "command_name": "base_velocity",
+                "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
+            },
+        )
