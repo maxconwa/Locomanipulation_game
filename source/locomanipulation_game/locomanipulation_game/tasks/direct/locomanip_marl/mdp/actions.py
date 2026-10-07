@@ -13,9 +13,15 @@ mapping (target = action * scale + offset) and then, once per policy step:
      Flat run A had rate caps (arms 1.0-1.5 rad/s, knee and hip pitch 1.2 during
      arm goals) for slower, safer moves; the user reverted them for the restart.
 
+With torque_headroom set, both terms also keep each target where the PD
+torque it asks for at the measured state, stiffness (target - q) - damping qd,
+is within torque_headroom of the joint's effort limit (torque_bounds). GOLEM's
+safety layer e-stops on measured torque at the limit, and a target far from
+the joint asks for more than the motor may give.
+
 The policy sees what was applied (applied_actions, in action units, through
 mdp.applied_action), and beyond_bounds (also in action units) is what the
-bound cut off, for the legs' action_beyond_clip penalty.
+position bound cut off, for the legs' action_beyond_clip penalty.
 """
 
 from __future__ import annotations
@@ -39,6 +45,16 @@ __all__ = [
     "RateLimitedJointPositionAction",
     "RateLimitedJointPositionActionCfg",
 ]
+
+
+def torque_bounds(asset, joint_ids, headroom: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per joint, the targets whose PD torque at the measured state, stiffness (target - q) - damping qd, stays
+    within headroom x the effort limit: [q + (-h tau + kd qd) / kp, q + (h tau + kd qd) / kp]."""
+    data = asset.data
+    q, qd = data.joint_pos[:, joint_ids], data.joint_vel[:, joint_ids]
+    kp, kd = data.joint_stiffness[:, joint_ids], data.joint_damping[:, joint_ids]
+    tau = headroom * data.joint_effort_limits[:, joint_ids]
+    return q + (kd * qd - tau) / kp, q + (kd * qd + tau) / kp
 
 
 class RateLimitedJointPositionAction(JointPositionAction):
@@ -84,6 +100,9 @@ class RateLimitedJointPositionAction(JointPositionAction):
         target = self._raw_actions * self._scale + self._offset
         bounded = torch.maximum(torch.minimum(target, self._upper), self._lower)
         self._beyond = (target - bounded).abs() / abs(self._scale)
+        if self.cfg.torque_headroom is not None:
+            low, high = torque_bounds(self._asset, self._joint_ids, self.cfg.torque_headroom)
+            bounded = torch.maximum(torch.minimum(bounded, high), low)
         if self._rate is None:
             self._applied = bounded
             self._processed_actions = self._applied
@@ -118,6 +137,9 @@ class RateLimitedJointPositionActionCfg(JointPositionActionCfg):
     """The ArmTargetsCommand whose arm_mode / settling pick the cap."""
     target_margin: float = 0.4
     """rad past each hard joint limit a target may go."""
+    torque_headroom: float | None = None
+    """Keep the PD torque each target asks for at the measured state within this share of the effort limit
+    (torque_bounds); None: no torque bound."""
 
 
 class IKResidualArmAction(JointPositionAction):
@@ -223,6 +245,9 @@ class IKResidualArmAction(JointPositionAction):
         target = ik + self._residual * self._scale
         bounded = torch.maximum(torch.minimum(target, self._upper), self._lower)
         self._beyond = (target - bounded).abs() / abs(self._scale)
+        if self.cfg.torque_headroom is not None:
+            low, high = torque_bounds(robot, self._joint_ids, self.cfg.torque_headroom)
+            bounded = torch.maximum(torch.minimum(bounded, high), low)
         self._applied = bounded
         self._processed_actions = bounded
 
@@ -259,4 +284,6 @@ class IKResidualArmActionCfg(JointPositionActionCfg):
     """Share of the IK step taken per policy step."""
     residual_cutoff_hz: float | None = None
     """Low-pass the residual at this cut-off (one-pole, per policy step) before adding it; None: unfiltered."""
+    torque_headroom: float | None = None
+    """As RateLimitedJointPositionActionCfg.torque_headroom."""
     target_margin: float = 0.4

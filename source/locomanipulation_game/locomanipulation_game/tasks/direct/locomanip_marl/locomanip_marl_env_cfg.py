@@ -797,3 +797,25 @@ class LocoManipMarlFlatGolemEnvCfg(LocoManipMarlFlatIK3EnvCfg):
         self.terminations.golem_estop = DoneTerm(func=mdp.golem_estop)
         self.actions.joint_pos.target_margin = -GOLEM_TARGET_CLIP
         self.actions.arm_pos.target_margin = -GOLEM_TARGET_CLIP
+
+
+@configclass
+class LocoManipMarlFlatGolem2EnvCfg(LocoManipMarlFlatGolemEnvCfg):
+    """The Golem task with each joint target also bounded by torque: the PD torque it asks for at the measured
+    state stays within 85% of the joint's effort limit (mdp.actions.torque_bounds).
+
+    Run I under the Golem task tripped GOLEM's e-stops 28.5 times per robot-minute, 80% of them on torque:
+    shoulder yaw asked for up to 4.4x its 18 Nm through the arms' residual, and the IK step plus residual can
+    put a target 0.3 rad or more from the joint. Run J, trained against the e-stop termination alone, cut the
+    per-step trip rate by ~40% in 15k steps, but every e-stop during an arm goal cost a reach level and both
+    levels fell from ~6 / ~8 to 0. With the bound, run I trips 15 times per robot-minute instead of 28.5 (torque
+    7 / 3 in settles / arm goals instead of 61 / 35); the rest, mostly ankle pitch at its stop in deep squats,
+    is left to the termination. Keeping targets 0.03 rad inside the limits instead of GOLEM's 0.001 changed
+    nothing (15.25): loads, not targets, put those joints on their stops. 0.85 sits below the termination's
+    0.9; the deploy controller applies the same bound at the measured state.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.actions.joint_pos.torque_headroom = 0.85
+        self.actions.arm_pos.torque_headroom = 0.85
