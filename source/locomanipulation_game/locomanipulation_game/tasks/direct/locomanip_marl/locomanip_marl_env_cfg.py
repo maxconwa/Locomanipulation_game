@@ -491,6 +491,9 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     estimator: PelvisEstimatorCfg = PelvisEstimatorCfg()
     # GOLEM's safety-layer e-stops, checked at every physics substep (golem_safety.py); None: not checked
     golem_estop: GolemEstopCfg | None = None
+    # Joint targets reach the robot this many physics substeps late, drawn per env and episode from [lo, hi]
+    # (5 ms each): the deploy loop's latency. The agents observe their actions undelayed. None: no delay.
+    action_delay_substeps: tuple[int, int] | None = None
 
     # agent -> the action term it drives (see AGENT_ACTION_TERMS)
     agent_action_terms: dict[str, str] = AGENT_ACTION_TERMS
@@ -851,3 +854,42 @@ class LocoManipMarlFlatGolem3EnvCfg(LocoManipMarlFlatGolem2EnvCfg):
             func=mdp.randomize_joint_parameters, mode="startup",
             params={"asset_cfg": joints, "armature_distribution_params": (0.01, 0.12), "operation": "abs"},
         )
+
+
+@configclass
+class LocoManipMarlFlatGolem4EnvCfg(LocoManipMarlFlatGolem3EnvCfg):
+    """The Golem3 task with GOLEM's RoboCasa joint dynamics, the deploy loop's latency, sharper velocity tracking
+    and wider e-stop margins on the joints behind RoboCasa's e-stops.
+
+    GOLEM's sim-to-sim test (tests/locomanipulation_game/sim2sim_walk.py: the deploy controller on RoboCasa's
+    compiled MuJoCo scene, without ROS) found, for run M on a fixed walking schedule:
+    - RoboCasa's passive joint damping (10 on every joint) is what stops backward walking: path covered 0.02 with
+      it, 1.17 without, against Isaac's 1.05-1.10 at nominal joints; contact stiffness, floor friction, the
+      friction cone, the PD integration, the timestep and 10-20 ms of delay barely change it. In Isaac the same
+      damping and armature 0.1 cut backward walking to 0.37 (run M saw damping only up to 10, rarely there).
+      Here every robot gets damping uniform in [8, 12] and armature in [0.08, 0.12], around RoboCasa's.
+    - Sideways steps and turning in place are not learned even in Isaac (path covered about 0): with the
+      tracking kernel's std at 0.5, standing still under a 0.25 m/s sideways command earns 78% of the tracking
+      reward (53% for a 0.4 rad/s turn). At std 0.25 it earns 37% (8%).
+    - 20 ms of target delay added a fall and 12 e-stop onsets in MuJoCo (Isaac: 10-20 ms multiplied falls plus
+      e-stops by 9-20). Here targets land 0-4 substeps (0-20 ms) late, drawn per episode.
+    - Ankle pitch reached its position e-stop 9 times in deep MuJoCo squats, and ankle roll and knee extension
+      caused most of RoboCasa's e-stops: their margins go from 0.02 to 0.05 rad (the knee's only at the
+      extension limit, so the squat keeps its depth).
+
+    Observation and action sizes are unchanged, so Golem3 checkpoints load. The deploy settings are Golem2's.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.events.passive_damping.params["damping_distribution_params"] = (8.0, 12.0)
+        self.events.joint_armature.params["armature_distribution_params"] = (0.08, 0.12)
+        self.action_delay_substeps = (0, 4)
+        self.golem_estop = GolemEstopCfg(joint_position_margins={
+            ".*_ankle_roll_joint": (0.05, 0.05),
+            ".*_ankle_pitch_joint": (0.05, 0.05),
+            ".*_knee_joint": (0.05, 0.02),
+        })
+        for term in (self.rewards.legs.track_lin_vel_xy, self.rewards.legs.track_ang_vel_z,
+                     self.rewards.arms.legs_track_lin_vel_xy, self.rewards.arms.legs_track_ang_vel_z):
+            term.params["std"] = 0.25

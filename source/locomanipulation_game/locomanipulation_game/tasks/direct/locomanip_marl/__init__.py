@@ -98,3 +98,13 @@ gym.register(
         **_AGENT_CFGS,
     },
 )
+
+gym.register(
+    id="LocoManip-Marl-Flat-Golem4-Direct-v0",
+    entry_point=f"{__name__}.locomanip_marl_env:LocoManipMarlEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.locomanip_marl_env_cfg:LocoManipMarlFlatGolem4EnvCfg",
+        **_AGENT_CFGS,
+    },
+)

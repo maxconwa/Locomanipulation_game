@@ -20,6 +20,8 @@ training needs no GOLEM checkout; scripts/skrl/audit_golem_estop.py compares it 
 
 from __future__ import annotations
 
+import re
+
 import torch
 
 from isaaclab.utils import configclass
@@ -76,6 +78,8 @@ class GolemEstopCfg:
     """Trip at this fraction of GOLEM's torque e-stop."""
     position_margin: float = 0.02
     """Trip this far (rad) inside GOLEM's position e-stop."""
+    joint_position_margins: dict[str, tuple[float, float]] = {}
+    """Per-joint overrides of position_margin: joint-name regex -> (margin at the lower limit, at the upper)."""
 
 
 class GolemEstopMonitor:
@@ -87,15 +91,23 @@ class GolemEstopMonitor:
         self.joint_ids = robot.find_joints(GOLEM_JOINT_NAMES, preserve_order=True)[0]
         table = torch.tensor([row[1:] for row in GOLEM_LIMITS], device=device)
         low, high, vel, tau, _, q_off, vel_ratio, tau_ratio = table.T
-        self.q_low = low + q_off + cfg.position_margin
-        self.q_high = high - q_off - cfg.position_margin
+        margin_low = torch.full_like(low, cfg.position_margin)
+        margin_high = torch.full_like(high, cfg.position_margin)
+        for pattern, (m_low, m_high) in cfg.joint_position_margins.items():
+            hits = [i for i, n in enumerate(GOLEM_JOINT_NAMES) if re.fullmatch(pattern, n)]
+            if not hits:
+                raise ValueError(f"joint_position_margins: {pattern!r} matches no GOLEM joint")
+            margin_low[hits], margin_high[hits] = m_low, m_high
+        self.q_low = low + q_off + margin_low
+        self.q_high = high - q_off - margin_high
         self.dq_max = vel * vel_ratio * cfg.velocity_margin
         self.tau_max = tau * tau_ratio * cfg.torque_margin
         self.flags = {c: torch.zeros(num_envs, dtype=torch.bool, device=device) for c in CAUSES}
         self.joint_hits = {c: torch.zeros(len(GOLEM_LIMITS), device=device) for c in CAUSES}
         self._skip_torque = torch.ones(num_envs, dtype=torch.bool, device=device)
         print(f"[INFO] GolemEstopMonitor ({GOLEM_PRESET}, velocity x{cfg.velocity_margin}, torque x{cfg.torque_margin},"
-              f" position {cfg.position_margin} rad inside): " + ", ".join(
+              f" position {cfg.position_margin} rad inside"
+              f"{f', {cfg.joint_position_margins}' if cfg.joint_position_margins else ''}): " + ", ".join(
                   f"{n} q [{lo:.3f}, {hi:.3f}] dq {dq:.1f} tau {t:.1f}" for n, lo, hi, dq, t in zip(
                       GOLEM_JOINT_NAMES, self.q_low.tolist(), self.q_high.tolist(), self.dq_max.tolist(), self.tau_max.tolist())))
 

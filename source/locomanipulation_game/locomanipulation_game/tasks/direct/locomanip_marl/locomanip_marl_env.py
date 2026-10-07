@@ -82,6 +82,16 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._golem_log: dict[str, torch.Tensor] = {}
         if self.cfg.golem_estop is not None:
             self._golem_monitor = GolemEstopMonitor(self.scene["robot"], self.cfg.golem_estop, self.num_envs, self.device)
+        # the deploy loop's latency (cfg.action_delay_substeps): per env, the substeps a new target waits
+        self._delay = None
+        if self.cfg.action_delay_substeps is not None:
+            lo, hi = self.cfg.action_delay_substeps
+            if not 0 <= lo <= hi <= self.cfg.decimation:
+                raise ValueError(f"action_delay_substeps {self.cfg.action_delay_substeps} must lie in [0, decimation]")
+            robot = self.scene["robot"]
+            self._delay = torch.randint(lo, hi + 1, (self.num_envs,), device=self.device)
+            self._delayed_target = robot.data.joint_pos.clone()   # what the robot holds until the new target lands
+            self._substep = 0
 
         # _pre_physics_step concatenates the agents' actions in possible_agents order
         expected_terms = [self.cfg.agent_action_terms[agent] for agent in self.cfg.possible_agents]
@@ -154,12 +164,23 @@ class LocoManipMarlEnv(DirectMARLEnv):
             bad = {agent: int((~torch.isfinite(actions[agent])).any(dim=1).sum()) for agent in self.cfg.possible_agents}
             raise RuntimeError(f"Non-finite actions at step {self.common_step_counter}, envs per agent: {bad}")
         self.action_manager.process_action(joint_action.clamp(-self.cfg.clip_actions, self.cfg.clip_actions))
+        if self._delay is not None:
+            self._substep = 0
 
     def _apply_action(self) -> None:
         if self._golem_monitor is not None:
             # once per physics substep: the state the previous substep left
             self._golem_monitor.update()
         self.action_manager.apply_action()
+        if self._delay is not None:
+            # the targets just written are this step's; envs still inside their delay keep the last step's
+            robot = self.scene["robot"]
+            new = robot.data.joint_pos_target.clone()
+            late = self._delay > self._substep
+            robot.set_joint_position_target(torch.where(late.unsqueeze(1), self._delayed_target, new))
+            self._substep += 1
+            if self._substep == self.cfg.decimation:
+                self._delayed_target = new
 
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         self.termination_manager.compute()
@@ -212,6 +233,12 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._fresh[env_ids] = True
         if self._golem_monitor is not None:
             self._golem_monitor.reset(env_ids)
+        if self._delay is not None:
+            lo, hi = self.cfg.action_delay_substeps
+            ids = torch.as_tensor(env_ids, device=self.device)
+            self._delay[ids] = torch.randint(lo, hi + 1, (len(ids),), device=self.device)
+            # a fresh episode starts from a hold at its reset pose, as the deploy node's pre-pose ends
+            self._delayed_target[ids] = self.scene["robot"].data.joint_pos[ids]
 
         log = {}
         log.update(self.observation_manager.reset(env_ids))
