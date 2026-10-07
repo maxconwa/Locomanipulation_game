@@ -923,3 +923,21 @@ class LocoManipMarlFlatGolem5EnvCfg(LocoManipMarlFlatGolem4EnvCfg):
                 "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
             },
         )
+
+
+@configclass
+class LocoManipMarlFlatGolem6EnvCfg(LocoManipMarlFlatGolem5EnvCfg):
+    """The Golem5 task with turns in place and sideways walks drawn on purpose.
+
+    Velocity commands are uniform over forward, sideways and yaw, so a turn with almost no linear velocity
+    (|v| < 0.1 m/s, |yaw rate| > 0.25 rad/s) is 1.7% of commands and a near-pure sideways walk 1.4%. Run O at
+    agent_52800 walks forward and backward at 85-90% of the command in Isaac, but on a 0.4 rad/s turn in place
+    it stands still (0.01 rad/s, both feet loaded) and on 0.25 m/s sideways it reaches 0.01-0.09 m/s, though
+    turning in place would earn about 1.2 more per second of track_ang_vel_z. Here 20% of the moving commands
+    are replaced by a turn in place (|yaw rate| 0.2-0.5 rad/s) and 10% by a sideways walk (|vy| 0.15-0.3 m/s).
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.base_velocity.pure_turn_prob = 0.2
+        self.commands.base_velocity.pure_lateral_prob = 0.1

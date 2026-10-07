@@ -150,6 +150,11 @@ class ModalVelocityCommand(UniformVelocityCommand):
     seg_commanded / seg_tracked are the same two paths summed over the current
     navigation segment only; ArmTargetsCommand reads them for its walking gate
     and zeroes them at each goal event.
+
+    A resampled moving command is replaced, with probability pure_turn_prob, by
+    a turn in place (zero linear velocity, |yaw rate| in pure_turn_speed, either
+    sign), and with probability pure_lateral_prob by a sideways walk (zero
+    forward and yaw, |vy| in pure_lateral_speed). Standing commands are kept.
     """
 
     cfg: ModalVelocityCommandCfg
@@ -168,6 +173,22 @@ class ModalVelocityCommand(UniformVelocityCommand):
 
     def _settling(self) -> torch.Tensor:
         return self._env.command_manager.get_term(self.cfg.arm_command_name).settling
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        super()._resample_command(env_ids)
+        if self.cfg.pure_turn_prob <= 0.0 and self.cfg.pure_lateral_prob <= 0.0:
+            return
+        ids = torch.as_tensor(env_ids, device=self.device)
+        ids = ids[~self.is_standing_env[ids]]
+        u = torch.rand(len(ids), device=self.device)
+        turn = ids[u < self.cfg.pure_turn_prob]
+        lateral = ids[(u >= self.cfg.pure_turn_prob) & (u < self.cfg.pure_turn_prob + self.cfg.pure_lateral_prob)]
+        for sub, axis, speed in ((turn, 2, self.cfg.pure_turn_speed), (lateral, 1, self.cfg.pure_lateral_speed)):
+            if len(sub) == 0:
+                continue
+            sign = torch.where(torch.rand(len(sub), device=self.device) < 0.5, -1.0, 1.0)
+            self.vel_command_b[sub] = 0.0
+            self.vel_command_b[sub, axis] = sign * torch.empty(len(sub), device=self.device).uniform_(*speed)
 
     def _update_command(self):
         super()._update_command()
@@ -211,6 +232,10 @@ class ModalVelocityCommand(UniformVelocityCommand):
 class ModalVelocityCommandCfg(UniformVelocityCommandCfg):
     class_type: type = ModalVelocityCommand
     arm_command_name: str = MISSING
+    pure_turn_prob: float = 0.0
+    pure_turn_speed: tuple[float, float] = (0.2, 0.5)       # rad/s
+    pure_lateral_prob: float = 0.0
+    pure_lateral_speed: tuple[float, float] = (0.15, 0.3)   # m/s
 
 
 class ArmTargetsCommand(CommandTerm):
