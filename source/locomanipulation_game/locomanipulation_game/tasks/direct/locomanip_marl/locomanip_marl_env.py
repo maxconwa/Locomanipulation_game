@@ -14,9 +14,10 @@ onto the per-agent dicts:
 
 It also runs the pelvis odometry (odometry.py). After every step it estimates
 how the pelvis moved from the `odometry` observation group's history window
-(which ends at the step's end) and the action, moves the arm command by that
-(ArmTargetsCommand.apply_pelvis_motion), and fits the estimator to the true
-motion. The estimator's file also carries the env-side state a resume or
+(which ends at the step's end) and the action, or with estimator.odometry
+"legs" from the attitude and a planted foot (_leg_odometry), moves the arm
+command by that (ArmTargetsCommand.apply_pelvis_motion), and fits the
+estimator to the true motion. The estimator's file also carries the env-side state a resume or
 play.py needs: the arm and terrain curriculum levels and the drift gate.
 
 _get_observations does, in order: odometry -> commands (events re-anchor arm
@@ -40,7 +41,7 @@ from isaaclab.managers import (
     RewardManager,
     TerminationManager,
 )
-from isaaclab.utils.math import quat_apply_inverse
+from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_inv, quat_mul
 
 from .locomanip_marl_env_cfg import ARM_COMMAND, LocoManipMarlEnvCfg
 from .odometry import EstimatorTrainer, motion_to_transform, pelvis_motion
@@ -111,6 +112,18 @@ class LocoManipMarlEnv(DirectMARLEnv):
         # running mean of the estimate's drift at the end of an arm goal; starts closed
         self._goal_drift_ema = torch.tensor(1.0, device=self.device)
         self._estimator_log: dict[str, torch.Tensor] = {}
+        if self.cfg.estimator.odometry == "legs":
+            feet = self.cfg.estimator.foot_body_names
+            if not feet:
+                raise ValueError('estimator.odometry "legs" needs estimator.foot_body_names.')
+            self._contact_sensor = self.scene.sensors[self.cfg.estimator.contact_sensor_name]
+            if self._contact_sensor.cfg.history_length < self.cfg.decimation:
+                raise ValueError("Leg odometry needs the contact history to cover a policy step's physics substeps.")
+            self._foot_ids = self._robot.find_bodies(feet, preserve_order=True)[0]
+            self._foot_sensor_ids = self._contact_sensor.find_bodies(feet, preserve_order=True)[0]
+            self._prev_feet_in_pelvis = self._feet_in_pelvis()
+        elif self.cfg.estimator.odometry != "learned":
+            raise ValueError(f'estimator.odometry must be "learned" or "legs", not {self.cfg.estimator.odometry!r}.')
         if self.cfg.estimator.checkpoint_path:
             model_loaded, env_state = self.estimator.load(self.cfg.estimator.checkpoint_path)
             print(f"[INFO] Pelvis estimator file: {self.cfg.estimator.checkpoint_path} (model loaded: {model_loaded})")
@@ -220,14 +233,19 @@ class LocoManipMarlEnv(DirectMARLEnv):
         root_pos = self._robot.data.root_pos_w.clone()
         root_quat = self._robot.data.root_quat_w.clone()
         cfg = self.cfg.estimator
+        legs = cfg.odometry == "legs"
+        feet_in_pelvis = self._feet_in_pelvis() if legs else None
 
         if self._have_prev:
             valid = ~self._fresh
             inputs = torch.cat([odometry_obs, self.action_manager.action], dim=1)
             true_motion = pelvis_motion(self._prev_root_pos, self._prev_root_quat, root_pos, root_quat, self.step_dt)
-            estimated_motion = self.estimator.model(inputs)
+            with torch.no_grad():  # the commands don't carry the estimator's graph from step to step
+                estimated = motion_to_transform(self.estimator.model(inputs), self.step_dt)
+            if legs:
+                estimated = self._leg_odometry(feet_in_pelvis, root_quat, estimated, true_motion, valid)
             self._arm_command.apply_pelvis_motion(
-                estimated=motion_to_transform(estimated_motion, self.step_dt),
+                estimated=estimated,
                 true=motion_to_transform(true_motion, self.step_dt),
                 env_mask=valid,
             )
@@ -242,6 +260,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
 
         self._have_prev = True
         self._prev_root_pos, self._prev_root_quat = root_pos, root_quat
+        if legs:
+            self._prev_feet_in_pelvis = feet_in_pelvis
         self._fresh[:] = False
 
         # Quality gate: the estimate's drift over whole arm goals (shadow command),
@@ -269,6 +289,64 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._estimator_log["Estimator/estimate_prob"] = prob
         self._estimator_log["Estimator/goal_drift"] = self._goal_drift_ema
         self._estimator_log["Estimator/gate_open"] = gate_open
+
+    def _feet_in_pelvis(self) -> torch.Tensor:
+        """Each foot's ankle-roll origin in the pelvis frame, (N, F, 3): on the robot, forward kinematics of the
+        joint encoders."""
+        feet = self._robot.data.body_pos_w[:, self._foot_ids] - self._robot.data.root_pos_w.unsqueeze(1)
+        n, f = feet.shape[:2]
+        quat = self._robot.data.root_quat_w.unsqueeze(1).expand(n, f, 4).reshape(-1, 4)
+        return quat_apply_inverse(quat, feet.reshape(-1, 3)).view(n, f, 3)
+
+    def _leg_odometry(
+        self,
+        feet_in_pelvis: torch.Tensor,
+        root_quat: torch.Tensor,
+        fallback: tuple[torch.Tensor, torch.Tensor],
+        true_motion: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """This step's pelvis motion, (delta_pos, delta_quat) in the previous pelvis frame: the rotation from the
+        attitude, the translation from a planted foot.
+
+        The rotation dR is the change in pelvis orientation: in sim the true
+        one, on the robot the IMU's attitude estimate carried through the waist
+        joint (roll and pitch held by gravity, yaw drifting with the gyro
+        bias). A planted foot's ankle point stays put in the world, so with
+        p(t) its position in the pelvis frame the pelvis moved by
+        p(t-1) - dR p(t). A foot counts as planted if its contact force stayed
+        above stance_force at every physics substep of the step; with both
+        planted the two are averaged, weighted by that force. Envs with
+        neither keep the learned estimate's translation.
+
+        Not the whole foot pose (P(t-1)^-1 o P(t), P the pelvis pose in the
+        foot frame): loaded feet rock on their sole edges, 0.006 rad per step
+        at the median during run H's arm goals, and the pelvis a metre above
+        turns that into millimetres per step. Over 4 s goals (run H's
+        agent_91200, spread 4 / drop 10) a target drifted 7.1 cm that way at
+        the median, 3.7 cm with the learned estimator, 0.9 cm this way.
+        """
+        n, f = feet_in_pelvis.shape[:2]
+        delta_quat = quat_mul(quat_inv(self._prev_root_quat), root_quat)
+        turned = quat_apply(delta_quat.unsqueeze(1).expand(n, f, 4).reshape(-1, 4), feet_in_pelvis.reshape(-1, 3))
+        delta_pos = self._prev_feet_in_pelvis - turned.view(n, f, 3)  # (N, F, 3), one estimate per foot
+
+        # lowest contact force of each foot over the step's substeps (history slot 0 is the latest)
+        forces = self._contact_sensor.data.net_forces_w_history[:, : self.cfg.decimation, self._foot_sensor_ids]
+        load = forces.norm(dim=-1).min(dim=1).values  # (N, F)
+        weight = torch.where(load > self.cfg.estimator.stance_force, load, torch.zeros_like(load))
+        total = weight.sum(dim=1, keepdim=True)
+        stance = total.squeeze(1) > 0
+        leg_pos = ((weight / total.clamp(min=1e-6)).unsqueeze(-1) * delta_pos).sum(dim=1)
+
+        # how often it applies during arm goals, and its per-step error there (m/s, like the estimator's)
+        arm = valid & self._arm_command.arm_mode
+        used = arm & stance
+        lin_error = torch.norm(leg_pos / self.step_dt - true_motion[:, :3], dim=-1)
+        self._estimator_log["Estimator/legs_stance"] = used.sum() / arm.sum().clamp(min=1)
+        self._estimator_log["Estimator/legs_lin_vel_error"] = (lin_error * used).sum() / used.sum().clamp(min=1)
+
+        return torch.where(stance.unsqueeze(-1), leg_pos, fallback[0]), delta_quat
 
     def _save_estimator(self):
         directory = os.path.join(self.cfg.log_dir, "estimator")

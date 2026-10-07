@@ -13,6 +13,12 @@ pelvis pose, so every step yields a labelled sample. The env keeps the last
 buffer_steps steps and fits the estimator every train_every steps; skrl never
 sees it. The env saves it beside the skrl checkpoints (estimator/ in the run
 directory) and play.py loads it from there.
+
+With odometry "legs" the arm commands follow the attitude and a planted
+foot's kinematics instead (LocoManipMarlEnv._leg_odometry), and this
+estimator only covers the steps where no foot stayed planted. Integrated over
+a 4 s held goal its small per-step errors (run H: 0.03 m/s, 0.03 rad/s)
+moved the command 10-15 cm.
 """
 
 from __future__ import annotations
@@ -170,6 +176,15 @@ def estimator_checkpoint_for(agent_checkpoint: str) -> str | None:
 class PelvisEstimatorCfg:
     use_estimate: bool = True
     """False: arm commands always follow the true pelvis motion (the ground-truth ablation)."""
+    odometry: str = "learned"
+    """Where the estimate comes from: "learned" (the MLP below) or "legs" (rotation from the attitude, translation
+    from a planted foot's kinematics, the MLP's where no foot stayed planted; LocoManipMarlEnv._leg_odometry)."""
+    foot_body_names: list[str] | None = None
+    """odometry "legs": the feet, as robot bodies and contact-sensor bodies."""
+    contact_sensor_name: str = "contact_forces"
+    stance_force: float = 50.0
+    """odometry "legs": a foot counts as planted over a step if its contact force stayed above this (N) at every
+    physics substep. Standing, each foot of the H1-2 carries ~350 N."""
     train: bool = True
     checkpoint_path: str | None = None
     """Estimator to start from (train.py / play.py fill this from an skrl checkpoint)."""

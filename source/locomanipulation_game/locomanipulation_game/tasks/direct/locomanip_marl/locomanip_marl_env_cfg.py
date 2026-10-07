@@ -722,3 +722,31 @@ class LocoManipMarlFlatIK2EnvCfg(LocoManipMarlFlatIKEnvCfg):
         arm.resample_on_reach = False
         arm.reach_hold_s = 1.0
         arm.resampling_time_range = (4.0, 4.0)
+
+
+@configclass
+class LocoManipMarlFlatIK3EnvCfg(LocoManipMarlFlatIK2EnvCfg):
+    """The IK2 task with arm commands moved by leg kinematics instead of the learned estimator.
+
+    Run H (IK2) held each goal for 4 s, and over that time the learned
+    estimator's small per-step errors (0.03 m/s, 0.03 rad/s) moved the arm
+    command 10-15 cm off its world point. With the command moved by the true
+    pelvis motion instead, run H's agent_91200 reached 94% of goals at
+    spread 4 / drop 10 (86% on the estimate) and 64% at 8 / 5 (49%).
+
+    Here the attitude gives the rotation and a planted foot the translation
+    (LocoManipMarlEnv._leg_odometry): the ankle's position in the pelvis frame
+    is forward kinematics of the joint encoders, and while the foot stays put
+    its change is the pelvis's motion. Passively, on run H's agent_91200 at
+    spread 4 / drop 10, a target drifted 0.9 cm over a 4 s goal this way (90th
+    percentile 2.8 cm), against 3.7 cm (5.6 cm) with the learned estimator.
+    During arm goals a foot is planted on 99.5% of steps; the learned
+    estimator still trains and covers the rest.
+
+    Observation and action sizes are the IK task's: legs 96, arms 124.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.estimator.odometry = "legs"
+        self.estimator.foot_body_names = FOOT_LINK_NAMES
