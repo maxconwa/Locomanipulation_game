@@ -726,7 +726,7 @@ class LocoManipMarlFlatIK2EnvCfg(LocoManipMarlFlatIKEnvCfg):
 
 @configclass
 class LocoManipMarlFlatIK3EnvCfg(LocoManipMarlFlatIK2EnvCfg):
-    """The IK2 task with arm commands moved by leg kinematics instead of the learned estimator.
+    """The IK2 task with arm commands moved by leg kinematics, and the arms' residual low-passed.
 
     Run H (IK2) held each goal for 4 s, and over that time the learned
     estimator's small per-step errors (0.03 m/s, 0.03 rad/s) moved the arm
@@ -741,7 +741,16 @@ class LocoManipMarlFlatIK3EnvCfg(LocoManipMarlFlatIK2EnvCfg):
     spread 4 / drop 10, a target drifted 0.9 cm over a 4 s goal this way (90th
     percentile 2.8 cm), against 3.7 cm (5.6 cm) with the learned estimator.
     During arm goals a foot is planted on 99.5% of steps; the learned
-    estimator still trains and covers the rest.
+    estimator still trains and covers the rest. With the estimate this close,
+    arm goals follow it from the start (no teacher-forcing warmup or ramp);
+    the drift gate still holds it back while its drift over whole goals is
+    above 5 cm.
+
+    The arms' residual is low-passed at 3 Hz (mdp.IKResidualArmAction): while
+    holding a goal, run H's residual chattered at ~12 Hz, every arm joint
+    reversing 21-30 times a second (0.4-0.9 rad/s at the median, wrist
+    0.32 m/s); with the residual off, IK alone reversed 5-10 times (wrist
+    0.10 m/s) but sagged to a 3.7 cm error instead of 1.9 cm.
 
     Observation and action sizes are the IK task's: legs 96, arms 124.
     """
@@ -750,3 +759,6 @@ class LocoManipMarlFlatIK3EnvCfg(LocoManipMarlFlatIK2EnvCfg):
         super().__post_init__()
         self.estimator.odometry = "legs"
         self.estimator.foot_body_names = FOOT_LINK_NAMES
+        self.estimator.warmup_steps = 0
+        self.estimator.ramp_steps = 0
+        self.actions.arm_pos.residual_cutoff_hz = 3.0

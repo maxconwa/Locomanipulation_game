@@ -20,6 +20,7 @@ bound cut off, for the legs' action_beyond_clip penalty.
 
 from __future__ import annotations
 
+import math
 import torch
 from collections.abc import Sequence
 from dataclasses import MISSING
@@ -138,6 +139,11 @@ class IKResidualArmAction(JointPositionAction):
     self-collision, joint limits, the moving pelvis. A target the arms can't
     reach (a lowered goal) leaves an error that only the legs can close.
 
+    With residual_cutoff_hz set, the residual is low-passed first (one-pole,
+    per policy step) and the policy observes the filtered residual. Run H's
+    residual chattered at ~12 Hz while holding a goal: every arm joint
+    reversed 21-30 times a second, against 5-10 with the residual off.
+
     applied_actions (the residual, action units) is what mdp.applied_action
     observes; beyond_bounds as in RateLimitedJointPositionAction.
     """
@@ -172,12 +178,18 @@ class IKResidualArmAction(JointPositionAction):
         self._applied = robot.data.joint_pos[:, self._joint_ids].clone()
         self._beyond = torch.zeros_like(self._raw_actions)
         self.ik_targets = self._applied.clone()  # the IK command alone, before the residual
+        # one-pole low-pass of the residual: weight of the new action per policy step (1: no filter)
+        self._filter_alpha = 1.0
+        if cfg.residual_cutoff_hz is not None:
+            self._filter_alpha = 1.0 - math.exp(-2.0 * math.pi * cfg.residual_cutoff_hz * env.step_dt)
+        self._residual = torch.zeros_like(self._raw_actions)  # the filtered residual, action units
         print(f"[INFO] {type(self).__name__}: IK on {cfg.body_names}, damping {cfg.ik_damping}, step cap"
-              f" {cfg.max_ik_step} rad, residual scale {cfg.scale}, bounds +- {cfg.target_margin} rad past the limits")
+              f" {cfg.max_ik_step} rad, residual scale {cfg.scale}, bounds +- {cfg.target_margin} rad past the limits,"
+              f" residual low-pass {cfg.residual_cutoff_hz} Hz (alpha {self._filter_alpha:.3f})")
 
     @property
     def applied_actions(self) -> torch.Tensor:
-        return self._raw_actions
+        return self._residual
 
     @property
     def beyond_bounds(self) -> torch.Tensor:
@@ -187,6 +199,8 @@ class IKResidualArmAction(JointPositionAction):
         from isaaclab.utils.math import matrix_from_quat, quat_inv, subtract_frame_transforms
 
         self._raw_actions[:] = actions
+        # detached: outside skrl's no_grad (eval scripts) the recursion would chain the policy's graph across steps
+        self._residual = self._residual + self._filter_alpha * (actions.detach() - self._residual)
         robot = self._asset
         command = self._env.command_manager.get_term(self.cfg.command_name).believed_b  # (N, arms, 7), wxyz
         root_pos, root_quat = robot.data.root_pos_w, robot.data.root_quat_w
@@ -206,7 +220,7 @@ class IKResidualArmAction(JointPositionAction):
             step = self.cfg.ik_gain * (self._ik[arm].compute(ee_pos, ee_quat, jac, q_arm) - q_arm)
             ik[:, cols] = ik[:, cols] + step.clamp(-self.cfg.max_ik_step, self.cfg.max_ik_step)
         self.ik_targets = torch.maximum(torch.minimum(ik, self._upper), self._lower)  # bounded, so no windup past them
-        target = ik + self._raw_actions * self._scale
+        target = ik + self._residual * self._scale
         bounded = torch.maximum(torch.minimum(target, self._upper), self._lower)
         self._beyond = (target - bounded).abs() / abs(self._scale)
         self._applied = bounded
@@ -217,6 +231,7 @@ class IKResidualArmAction(JointPositionAction):
         ids = slice(None) if env_ids is None else env_ids
         self._applied[ids] = self._asset.data.joint_pos[ids][:, self._joint_ids]
         self.ik_targets[ids] = self._applied[ids]
+        self._residual[ids] = 0.0
         self._beyond[ids] = 0.0
 
 
@@ -242,4 +257,6 @@ class IKResidualArmActionCfg(JointPositionActionCfg):
     of a sagging arm. Tested and worse: 6-7% of the easiest goals reached and more falls (gain 0.3-0.5)."""
     ik_gain: float = 1.0
     """Share of the IK step taken per policy step."""
+    residual_cutoff_hz: float | None = None
+    """Low-pass the residual at this cut-off (one-pole, per policy step) before adding it; None: unfiltered."""
     target_margin: float = 0.4
