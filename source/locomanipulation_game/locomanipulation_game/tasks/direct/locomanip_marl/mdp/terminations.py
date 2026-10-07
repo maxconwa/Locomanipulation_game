@@ -1,0 +1,25 @@
+"""Terminations for the two-agent task."""
+
+from __future__ import annotations
+
+import torch
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..locomanip_marl_env import LocoManipMarlEnv
+
+__all__ = ["golem_estop"]
+
+
+def golem_estop(env: LocoManipMarlEnv) -> torch.Tensor:
+    """GOLEM's safety layer would have e-stopped the robot during this policy step (golem_safety.py).
+
+    The env's monitor has checked every physics substep but the last; this checks the last, keeps the step's
+    log, and clears the flags for the next step.
+    """
+    monitor = env._golem_monitor
+    monitor.update()
+    tripped = monitor.tripped().clone()
+    env._golem_log = monitor.log()
+    monitor.clear()
+    return tripped

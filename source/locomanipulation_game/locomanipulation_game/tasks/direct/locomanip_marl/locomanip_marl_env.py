@@ -20,6 +20,10 @@ command by that (ArmTargetsCommand.apply_pelvis_motion), and fits the
 estimator to the true motion. The estimator's file also carries the env-side state a resume or
 play.py needs: the arm and terrain curriculum levels and the drift gate.
 
+With cfg.golem_estop set, GolemEstopMonitor (golem_safety.py) checks GOLEM's
+safety-layer e-stops at every physics substep (from _apply_action, and once
+more in the golem_estop termination) and the episode ends on a trip.
+
 _get_observations does, in order: odometry -> commands (events re-anchor arm
 goals, overriding the odometry update) -> the agents' groups. Unlike
 ManagerBasedRLEnv, the command manager updates after interval events, not
@@ -43,6 +47,7 @@ from isaaclab.managers import (
 )
 from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_inv, quat_mul
 
+from .golem_safety import GolemEstopMonitor
 from .locomanip_marl_env_cfg import ARM_COMMAND, LocoManipMarlEnvCfg
 from .odometry import EstimatorTrainer, motion_to_transform, pelvis_motion
 
@@ -72,6 +77,11 @@ class LocoManipMarlEnv(DirectMARLEnv):
             print(f"[INFO] Reward Manager ({agent}): ", manager)
         self.curriculum_manager = CurriculumManager(self.cfg.curriculum, self)
         print("[INFO] Curriculum Manager: ", self.curriculum_manager)
+        # read by the golem_estop termination, which needs it from the first step
+        self._golem_monitor = None
+        self._golem_log: dict[str, torch.Tensor] = {}
+        if self.cfg.golem_estop is not None:
+            self._golem_monitor = GolemEstopMonitor(self.scene["robot"], self.cfg.golem_estop, self.num_envs, self.device)
 
         # _pre_physics_step concatenates the agents' actions in possible_agents order
         expected_terms = [self.cfg.agent_action_terms[agent] for agent in self.cfg.possible_agents]
@@ -146,6 +156,9 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self.action_manager.process_action(joint_action.clamp(-self.cfg.clip_actions, self.cfg.clip_actions))
 
     def _apply_action(self) -> None:
+        if self._golem_monitor is not None:
+            # once per physics substep: the state the previous substep left
+            self._golem_monitor.update()
         self.action_manager.apply_action()
 
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -180,6 +193,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
         groups = list(self.cfg.possible_agents) + ["critic"]
         self._obs_buf = {g: self.observation_manager.compute_group(g, update_history=True) for g in groups}
         self.extras.setdefault("log", {}).update(self._estimator_log)
+        self.extras["log"].update(self._golem_log)
         return {agent: self._obs_buf[agent] for agent in self.cfg.possible_agents}
 
     def _get_states(self) -> torch.Tensor:
@@ -196,6 +210,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
         super()._reset_idx(env_ids)  # scene, reset events, episode_length_buf
         self._refresh_sensors_after_reset(env_ids)
         self._fresh[env_ids] = True
+        if self._golem_monitor is not None:
+            self._golem_monitor.reset(env_ids)
 
         log = {}
         log.update(self.observation_manager.reset(env_ids))

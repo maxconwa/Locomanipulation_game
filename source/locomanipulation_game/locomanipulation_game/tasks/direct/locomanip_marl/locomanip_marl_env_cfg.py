@@ -33,6 +33,7 @@ from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
@@ -67,6 +68,7 @@ from locomanipulation_game.tasks.manager_based.locomanipulation_game.legs_r0_env
 )
 
 from . import mdp
+from .golem_safety import GOLEM_TARGET_CLIP, GolemEstopCfg
 from .odometry import PelvisEstimatorCfg
 
 LEFT_ARM_JOINT_NAMES = ARM_JOINT_NAMES[:7]
@@ -486,6 +488,8 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     curriculum: MarlCurriculumCfg = MarlCurriculumCfg()
     # pelvis odometry that keeps the arm command on its world point
     estimator: PelvisEstimatorCfg = PelvisEstimatorCfg()
+    # GOLEM's safety-layer e-stops, checked at every physics substep (golem_safety.py); None: not checked
+    golem_estop: GolemEstopCfg | None = None
 
     # agent -> the action term it drives (see AGENT_ACTION_TERMS)
     agent_action_terms: dict[str, str] = AGENT_ACTION_TERMS
@@ -762,3 +766,34 @@ class LocoManipMarlFlatIK3EnvCfg(LocoManipMarlFlatIK2EnvCfg):
         self.estimator.warmup_steps = 0
         self.estimator.ramp_steps = 0
         self.actions.arm_pos.residual_cutoff_hz = 3.0
+
+
+@configclass
+class LocoManipMarlFlatGolemEnvCfg(LocoManipMarlFlatIK3EnvCfg):
+    """The IK3 task under GOLEM's safety layer: targets clipped as it clips them, and its e-stops end the episode.
+
+    GOLEM's h12_safety_layer (relax_safety_split, the preset the real launch uses) clips position targets to the
+    URDF range shrunk by 0.001 rad and e-stops the robot when a joint reaches its position limit, its velocity limit
+    or its torque limit (golem_safety.py has the table). The sim has the same limits as hard physical stops, so
+    run I worked right at them: under GOLEM it would trip 1-62 times per robot-minute on torque (shoulder yaw,
+    elbows, ankle pitch), 4-15 on position (ankle roll and pitch, shoulder yaw, elbows) and 0.1-0.4 on velocity
+    (knees, shoulder pitch), and 19% of its walking ankle-roll targets and ~20% of its arm-goal wrist-pitch
+    targets lay outside GOLEM's clip.
+
+    Here both action terms bound their targets to GOLEM's clip (hard limits shrunk by 0.001; the sim's shoulder
+    roll limit is already the stricter one), and the golem_estop termination ends the episode like a fall (the
+    -5 termination penalty, a level down for an arm goal) when any joint crosses GOLEM's e-stop tightened by
+    GolemEstopCfg's margin: 90% of the velocity and torque thresholds, 0.02 rad inside the position ones.
+
+    A squat needs no target past the knee limit: holding it takes extension torque, so the knee target sits below
+    the knee angle (run I's knee targets left GOLEM's clip on 0.01% of steps).
+
+    Observation and action sizes are the IK task's (legs 96, arms 124), so IK3 checkpoints load.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.golem_estop = GolemEstopCfg()
+        self.terminations.golem_estop = DoneTerm(func=mdp.golem_estop)
+        self.actions.joint_pos.target_margin = -GOLEM_TARGET_CLIP
+        self.actions.arm_pos.target_margin = -GOLEM_TARGET_CLIP
