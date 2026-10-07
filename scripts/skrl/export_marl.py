@@ -25,7 +25,7 @@ import yaml
 parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", required=True)
 parser.add_argument("--out", required=True)
-parser.add_argument("--task", default="LocoManip-Marl-Flat-Golem-Direct-v0", help="Recorded in export.yaml.")
+parser.add_argument("--task", default="LocoManip-Marl-Direct-v0", help="Recorded in export.yaml.")
 parser.add_argument("--clip_actions", type=float, default=10.0, help="The env's cfg.clip_actions.")
 args = parser.parse_args()
 

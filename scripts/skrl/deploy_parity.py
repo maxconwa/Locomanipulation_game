@@ -27,7 +27,7 @@ parser.add_argument("--export", required=True, help="Folder with legs.pt, arms.p
 parser.add_argument("--config", default=None, help="Deploy yaml; default: the export folder's only *.yaml besides export.yaml.")
 parser.add_argument("--deploy_pkg", required=True)
 parser.add_argument("--urdf", default="/home/max/GOLEM/CL_Assets/ros_assets/h1_2_magpie.urdf")
-parser.add_argument("--task", default="LocoManip-Marl-Flat-Golem2-Direct-v0")
+parser.add_argument("--task", default="LocoManip-Marl-Direct-v0")
 parser.add_argument("--num_envs", type=int, default=4)
 parser.add_argument("--steps", type=int, default=600)
 parser.add_argument("--arm_goal_prob", type=float, default=None, help="Share of events that are arm goals; default: the task's.")
@@ -89,8 +89,8 @@ if args.arm_goal_prob is not None:
     env_cfg.commands.arm_targets.arm_goal_prob = args.arm_goal_prob
 for group in ("legs", "arms"):
     getattr(env_cfg.observations, group).enable_corruption = False
-if getattr(env_cfg.terminations, "golem_estop", None) is not None:
-    env_cfg.terminations.golem_estop = None  # parity is about the computation; keep episodes running
+env_cfg.terminations.golem_estop = None  # parity is about the computation; keep episodes running
+env_cfg.action_delay_substeps = (0, 0)  # the targets the env applies are the step's own
 agent_cfg["trainer"]["close_environment_at_exit"] = False
 agent_cfg["agent"]["experiment"]["write_interval"] = 0
 agent_cfg["agent"]["experiment"]["checkpoint_interval"] = 0
@@ -133,7 +133,7 @@ def sync(i: int = 0):
     ctrl.steps = int(base.episode_length_buf[i])
     ctrl.legs_last = legs_term.applied_actions[i].double().cpu().numpy().copy()
     ctrl.arms_last = arms_term.applied_actions[i].double().cpu().numpy().copy()
-    ctrl.residual = arms_term._residual[i].double().cpu().numpy().copy() if hasattr(arms_term, "_residual") else ctrl.arms_last.copy()
+    ctrl.residual = arms_term._residual[i].double().cpu().numpy().copy()
 
 
 def compare(prefix, terms, deploy, trained):

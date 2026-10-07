@@ -8,8 +8,8 @@ force) and commander.jsonl (the schedule's events, falls). GOLEM's scorer then c
     python scripts/skrl/eval_sim2sim_walk.py --checkpoint <run>/checkpoints/agent_<N>.pt --out <dir> --headless
     python3 ~/GOLEM/tests/locomanipulation_game/sim2sim_walk.py --score <dir>/env* --out <dir>/scored
 
---passive_damping and --armature set every motor joint's added passive damping and armature (the Golem3 events,
-held at one value) - e.g. 10 and 0.1, RoboCasa's.
+--passive_damping and --armature hold every motor joint's added passive damping and armature at one value; the
+defaults are RoboCasa's, which the task randomizes around (the Isaac asset alone: 0 and 0.01).
 """
 
 import argparse
@@ -24,13 +24,13 @@ DEFAULT_SCHEDULE = ("stand:2,walk:8:0.5:0:0,stand:2,walk:6:-0.4:0:0,stand:2,walk
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("--checkpoint", required=True)
-parser.add_argument("--task", default="LocoManip-Marl-Flat-Golem3-Direct-v0")
+parser.add_argument("--task", default="LocoManip-Marl-Direct-v0")
 parser.add_argument("--algorithm", default="mappo")
 parser.add_argument("--schedule", default=DEFAULT_SCHEDULE, help="stand:S | walk:S:vx:vy:wz items (reach items are skipped)")
 parser.add_argument("--num_envs", type=int, default=8)
 parser.add_argument("--seed", type=int, default=7)
-parser.add_argument("--passive_damping", type=float, default=0.0)
-parser.add_argument("--armature", type=float, default=0.01)
+parser.add_argument("--passive_damping", type=float, default=10.0)
+parser.add_argument("--armature", type=float, default=0.1)
 parser.add_argument("--out", required=True)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -70,18 +70,14 @@ env_cfg.log_dir = RUN_DIR
 env_cfg.estimator.train = False
 env_cfg.estimator.checkpoint_path = estimator_checkpoint_for(args.checkpoint)
 env_cfg.episode_length_s = float(starts[-1]) + 30.0
-env_cfg.commands.arm_targets.walk_gate = False
 env_cfg.commands.arm_targets.arm_goal_prob = 0.0
 env_cfg.events.push_robot = None
 env_cfg.events.reset_joints.params["position_range"] = (0.0, 0.0)
 env_cfg.events.reset_joints.params["velocity_range"] = (0.0, 0.0)
 env_cfg.events.reset_base.params["pose_range"] = {"x": (0.0, 0.0), "y": (0.0, 0.0), "yaw": (0.0, 0.0)}
 env_cfg.events.reset_base.params["velocity_range"] = {}
-if hasattr(env_cfg.events, "passive_damping"):
-    env_cfg.events.passive_damping.params["damping_distribution_params"] = (args.passive_damping, args.passive_damping)
-    env_cfg.events.joint_armature.params["armature_distribution_params"] = (args.armature, args.armature)
-elif args.passive_damping or args.armature != 0.01:
-    raise SystemExit(f"{args.task} has no joint damping/armature events; use a Golem3 task")
+env_cfg.events.passive_damping.params["damping_distribution_params"] = (args.passive_damping, args.passive_damping)
+env_cfg.events.joint_armature.params["armature_distribution_params"] = (args.armature, args.armature)
 agent_cfg["trainer"]["close_environment_at_exit"] = False
 agent_cfg["agent"]["experiment"]["write_interval"] = 0
 agent_cfg["agent"]["experiment"]["checkpoint_interval"] = 0
@@ -94,8 +90,6 @@ robot = base.scene["robot"]
 contacts = base.scene.sensors["contact_forces"]
 arm._record_outcomes = lambda reached, missed: None
 arm.update_levels = lambda env_ids, fell: None
-if hasattr(arm, "_judge_nav_segments"):
-    arm._judge_nav_segments = lambda env_ids, fell=None: None
 runner = Runner(env, agent_cfg)
 runner.agent.load(args.checkpoint)
 runner.agent.enable_training_mode(False, apply_to_models=True)

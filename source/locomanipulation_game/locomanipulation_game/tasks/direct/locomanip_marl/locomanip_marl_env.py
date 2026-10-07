@@ -1,33 +1,16 @@
-"""DirectMARLEnv that runs Isaac Lab's managers inside, so the IBR mdp terms work unchanged.
+"""DirectMARLEnv that runs Isaac Lab's managers inside, so manager-based mdp terms work unchanged.
 
-DirectMARLEnv owns the step loop, the scene and the event manager. The mdp
-functions the IBR rounds use read `env.command_manager`, `env.action_manager`
-and `env.termination_manager`, and every manager only needs `scene`, `sim`,
-`num_envs`, `device` and `max_episode_length_s` from its env, which a
-DirectMARLEnv has. So this class builds those managers itself and maps them
-onto the per-agent dicts:
+DirectMARLEnv owns the step loop, the scene and the event manager; this class builds the other managers and maps
+them onto the per-agent dicts:
 
-    actions:      agent -> its ActionManager term (concatenated, legs first)
-    observations: agent -> its ObservationManager group; `critic` -> env state
-    rewards:      agent -> its own RewardManager
+    actions:      one ActionManager, the agents' terms concatenated in possible_agents order
+    observations: agent -> its observation group; the env state is both agents' groups plus `critic`
+    rewards:      agent -> its own RewardManager, floored at 0, plus termination_penalty on terminating steps
     dones:        one TerminationManager, shared (one body, one episode)
 
-It also runs the pelvis odometry (odometry.py). After every step it estimates
-how the pelvis moved from the `odometry` observation group's history window
-(which ends at the step's end) and the action, or with estimator.odometry
-"legs" from the attitude and a planted foot (_leg_odometry), moves the arm
-command by that (ArmTargetsCommand.apply_pelvis_motion), and fits the
-estimator to the true motion. The estimator's file also carries the env-side state a resume or
-play.py needs: the arm and terrain curriculum levels and the drift gate.
-
-With cfg.golem_estop set, GolemEstopMonitor (golem_safety.py) checks GOLEM's
-safety-layer e-stops at every physics substep (from _apply_action, and once
-more in the golem_estop termination) and the episode ends on a trip.
-
-_get_observations does, in order: odometry -> commands (events re-anchor arm
-goals, overriding the odometry update) -> the agents' groups. Unlike
-ManagerBasedRLEnv, the command manager updates after interval events, not
-before.
+After every step it moves the arm command by the pelvis motion from leg odometry (_leg_odometry), with the learned
+estimator (odometry.py) where no foot stayed planted, and fits that estimator to the true motion. GolemEstopMonitor
+(golem_safety.py) checks GOLEM's e-stops at every physics substep, and joint targets land action_delay_substeps late.
 """
 
 from __future__ import annotations
@@ -59,9 +42,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
         super().__init__(cfg, render_mode, **kwargs)
         self._set_soft_joint_limits()
 
-        # Managers resolve physics handles, so they come after super() has
-        # started the sim. Same order as ManagerBasedRLEnv.load_managers:
-        # observations read commands and actions, rewards read terminations.
+        # After super() has started the sim, in ManagerBasedRLEnv.load_managers' order: observations read commands
+        # and actions, rewards read terminations.
         self.command_manager = CommandManager(self.cfg.commands, self)
         print("[INFO] Command Manager: ", self.command_manager)
         self.action_manager = ActionManager(self.cfg.actions, self)
@@ -77,36 +59,18 @@ class LocoManipMarlEnv(DirectMARLEnv):
             print(f"[INFO] Reward Manager ({agent}): ", manager)
         self.curriculum_manager = CurriculumManager(self.cfg.curriculum, self)
         print("[INFO] Curriculum Manager: ", self.curriculum_manager)
-        # read by the golem_estop termination, which needs it from the first step
-        self._golem_monitor = None
-        self._golem_log: dict[str, torch.Tensor] = {}
-        if self.cfg.golem_estop is not None:
-            self._golem_monitor = GolemEstopMonitor(self.scene["robot"], self.cfg.golem_estop, self.num_envs, self.device)
-        # the deploy loop's latency (cfg.action_delay_substeps): per env, the substeps a new target waits
-        self._delay = None
-        if self.cfg.action_delay_substeps is not None:
-            lo, hi = self.cfg.action_delay_substeps
-            if not 0 <= lo <= hi <= self.cfg.decimation:
-                raise ValueError(f"action_delay_substeps {self.cfg.action_delay_substeps} must lie in [0, decimation]")
-            robot = self.scene["robot"]
-            self._delay = torch.randint(lo, hi + 1, (self.num_envs,), device=self.device)
-            self._delayed_target = robot.data.joint_pos.clone()   # what the robot holds until the new target lands
-            self._substep = 0
+        self._robot = self.scene["robot"]
+        self.golem_monitor = GolemEstopMonitor(self._robot, self.cfg.golem_estop, self.num_envs, self.device)
+        self.golem_log: dict[str, torch.Tensor] = {}
+        # the deploy loop's latency: per env, the substeps a new target waits; until then the robot holds the last
+        lo, hi = self.cfg.action_delay_substeps
+        self._delay = torch.randint(lo, hi + 1, (self.num_envs,), device=self.device)
+        self._delayed_target = self._robot.data.joint_pos.clone()
+        self._substep = 0
 
-        # _pre_physics_step concatenates the agents' actions in possible_agents order
-        expected_terms = [self.cfg.agent_action_terms[agent] for agent in self.cfg.possible_agents]
-        if self.action_manager.active_terms != expected_terms:
-            raise ValueError(
-                f"Action terms {self.action_manager.active_terms} must be {expected_terms}:"
-                " one per agent, in possible_agents order."
-            )
-
-        # Spaces come from the managers, not from hand-counted cfg values.
         group_dims = self.observation_manager.group_obs_dim
         self.cfg.observation_spaces = {agent: group_dims[agent][0] for agent in self.cfg.possible_agents}
-        self.cfg.state_space = group_dims["critic"][0]
-        if self.cfg.state_includes_agent_obs:
-            self.cfg.state_space += sum(group_dims[agent][0] for agent in self.cfg.possible_agents)
+        self.cfg.state_space = group_dims["critic"][0] + sum(group_dims[agent][0] for agent in self.cfg.possible_agents)
         self.cfg.action_spaces = {
             agent: self.action_manager.get_term(term).action_dim for agent, term in self.cfg.agent_action_terms.items()
         }
@@ -118,10 +82,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
 
         # -- pelvis odometry
         self._arm_command = self.command_manager.get_term(ARM_COMMAND)
-        self._robot = self.scene["robot"]
-        odometry_dim = group_dims["odometry"][0]
         self.estimator = EstimatorTrainer(
-            self.cfg.estimator, odometry_dim + self.action_manager.total_action_dim, self.num_envs, self.device
+            self.cfg.estimator, group_dims["odometry"][0] + self.action_manager.total_action_dim, self.num_envs, self.device
         )
         print(f"[INFO] Pelvis estimator: {self.estimator.model}")
         self._have_prev = False
@@ -132,23 +94,14 @@ class LocoManipMarlEnv(DirectMARLEnv):
         # running mean of the estimate's drift at the end of an arm goal; starts closed
         self._goal_drift_ema = torch.tensor(1.0, device=self.device)
         self._estimator_log: dict[str, torch.Tensor] = {}
-        if self.cfg.estimator.odometry == "legs":
-            feet = self.cfg.estimator.foot_body_names
-            if not feet:
-                raise ValueError('estimator.odometry "legs" needs estimator.foot_body_names.')
-            self._contact_sensor = self.scene.sensors[self.cfg.estimator.contact_sensor_name]
-            if self._contact_sensor.cfg.history_length < self.cfg.decimation:
-                raise ValueError("Leg odometry needs the contact history to cover a policy step's physics substeps.")
-            self._foot_ids = self._robot.find_bodies(feet, preserve_order=True)[0]
-            self._foot_sensor_ids = self._contact_sensor.find_bodies(feet, preserve_order=True)[0]
-            self._prev_feet_in_pelvis = self._feet_in_pelvis()
-        elif self.cfg.estimator.odometry != "learned":
-            raise ValueError(f'estimator.odometry must be "learned" or "legs", not {self.cfg.estimator.odometry!r}.')
+        feet = self.cfg.estimator.foot_body_names
+        self._contact_sensor = self.scene.sensors[self.cfg.estimator.contact_sensor_name]
+        self._foot_ids = self._robot.find_bodies(feet, preserve_order=True)[0]
+        self._foot_sensor_ids = self._contact_sensor.find_bodies(feet, preserve_order=True)[0]
+        self._prev_feet_in_pelvis = self._feet_in_pelvis()
         if self.cfg.estimator.checkpoint_path:
-            model_loaded, env_state = self.estimator.load(self.cfg.estimator.checkpoint_path)
-            print(f"[INFO] Pelvis estimator file: {self.cfg.estimator.checkpoint_path} (model loaded: {model_loaded})")
-            if env_state is not None:
-                self._load_env_state(env_state, restore_gate=model_loaded)
+            print(f"[INFO] Pelvis estimator file: {self.cfg.estimator.checkpoint_path}")
+            self._load_env_state(self.estimator.load(self.cfg.estimator.checkpoint_path))
 
         self._obs_buf: dict[str, torch.Tensor] = {}
 
@@ -160,27 +113,22 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self.actions = actions
         joint_action = torch.cat([actions[agent] for agent in self.cfg.possible_agents], dim=1)
         if not torch.isfinite(joint_action).all():
-            # a NaN joint target hangs the PhysX solver (flat run A, twice: GPU at 100%, no error)
-            bad = {agent: int((~torch.isfinite(actions[agent])).any(dim=1).sum()) for agent in self.cfg.possible_agents}
-            raise RuntimeError(f"Non-finite actions at step {self.common_step_counter}, envs per agent: {bad}")
+            # a NaN joint target hangs the PhysX solver
+            raise RuntimeError(f"Non-finite actions at step {self.common_step_counter}")
         self.action_manager.process_action(joint_action.clamp(-self.cfg.clip_actions, self.cfg.clip_actions))
-        if self._delay is not None:
-            self._substep = 0
+        self._substep = 0
 
     def _apply_action(self) -> None:
-        if self._golem_monitor is not None:
-            # once per physics substep: the state the previous substep left
-            self._golem_monitor.update()
+        # once per physics substep: the state the previous substep left
+        self.golem_monitor.update()
         self.action_manager.apply_action()
-        if self._delay is not None:
-            # the targets just written are this step's; envs still inside their delay keep the last step's
-            robot = self.scene["robot"]
-            new = robot.data.joint_pos_target.clone()
-            late = self._delay > self._substep
-            robot.set_joint_position_target(torch.where(late.unsqueeze(1), self._delayed_target, new))
-            self._substep += 1
-            if self._substep == self.cfg.decimation:
-                self._delayed_target = new
+        # the targets just written are this step's; envs still inside their delay keep the last step's
+        new = self._robot.data.joint_pos_target.clone()
+        late = self._delay > self._substep
+        self._robot.set_joint_position_target(torch.where(late.unsqueeze(1), self._delayed_target, new))
+        self._substep += 1
+        if self._substep == self.cfg.decimation:
+            self._delayed_target = new
 
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         self.termination_manager.compute()
@@ -197,15 +145,9 @@ class LocoManipMarlEnv(DirectMARLEnv):
         for agent, manager in self.reward_managers.items():
             reward = manager.compute(dt=self.step_dt)
             if torch.isnan(reward).any():
-                self._raise_nan(agent, manager)
-            floor = self.cfg.reward_clip_min[agent]
-            if floor is not None:
-                clipped = torch.clamp(reward, min=floor)
-                if self.cfg.reward_clip_during_arm_goals[agent]:
-                    reward = clipped
-                else:
-                    reward = torch.where(self._arm_command.arm_mode, reward, clipped)
-            rewards[agent] = reward + self.cfg.termination_penalty[agent] * terminated
+                bad = torch.isnan(manager._step_reward).any(dim=0).nonzero(as_tuple=True)[0].tolist()
+                raise RuntimeError(f"NaN in {agent} reward terms {[manager._term_names[i] for i in bad]}")
+            rewards[agent] = torch.clamp(reward, min=0.0) + self.cfg.termination_penalty * terminated
         return rewards
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
@@ -214,31 +156,25 @@ class LocoManipMarlEnv(DirectMARLEnv):
         groups = list(self.cfg.possible_agents) + ["critic"]
         self._obs_buf = {g: self.observation_manager.compute_group(g, update_history=True) for g in groups}
         self.extras.setdefault("log", {}).update(self._estimator_log)
-        self.extras["log"].update(self._golem_log)
+        self.extras["log"].update(self.golem_log)
         return {agent: self._obs_buf[agent] for agent in self.cfg.possible_agents}
 
     def _get_states(self) -> torch.Tensor:
-        # computed with the agents' groups in _get_observations, which step()
-        # and reset() always call before state()
-        if self.cfg.state_includes_agent_obs:
-            return torch.cat([self._obs_buf[agent] for agent in self.cfg.possible_agents] + [self._obs_buf["critic"]], dim=1)
-        return self._obs_buf["critic"]
+        # computed in _get_observations, which step() and reset() call before state()
+        return torch.cat([self._obs_buf[agent] for agent in self.cfg.possible_agents] + [self._obs_buf["critic"]], dim=1)
 
     def _reset_idx(self, env_ids: Sequence[int]):
-        # Same order as ManagerBasedRLEnv._reset_idx: curriculum before the
-        # scene reset (it reads how far the robot got), managers after.
+        # ManagerBasedRLEnv._reset_idx's order: curriculum before the scene reset, managers after
         self.curriculum_manager.compute(env_ids=env_ids)
         super()._reset_idx(env_ids)  # scene, reset events, episode_length_buf
         self._refresh_sensors_after_reset(env_ids)
         self._fresh[env_ids] = True
-        if self._golem_monitor is not None:
-            self._golem_monitor.reset(env_ids)
-        if self._delay is not None:
-            lo, hi = self.cfg.action_delay_substeps
-            ids = torch.as_tensor(env_ids, device=self.device)
-            self._delay[ids] = torch.randint(lo, hi + 1, (len(ids),), device=self.device)
-            # a fresh episode starts from a hold at its reset pose, as the deploy node's pre-pose ends
-            self._delayed_target[ids] = self.scene["robot"].data.joint_pos[ids]
+        self.golem_monitor.reset(env_ids)
+        lo, hi = self.cfg.action_delay_substeps
+        ids = torch.as_tensor(env_ids, device=self.device)
+        self._delay[ids] = torch.randint(lo, hi + 1, (len(ids),), device=self.device)
+        # a fresh episode starts from a hold at its reset pose, as the deploy node's pre-pose ends
+        self._delayed_target[ids] = self._robot.data.joint_pos[ids]
 
         log = {}
         log.update(self.observation_manager.reset(env_ids))
@@ -261,54 +197,43 @@ class LocoManipMarlEnv(DirectMARLEnv):
     """
 
     def _update_odometry(self):
-        """Estimate this step's pelvis motion, move the arm commands by it, and fit the estimator.
+        """Move the arm commands by this step's pelvis motion, fit the estimator, and set the arm command's
+        estimate_prob: while training, arm goals follow the estimate only while its drift over whole goals is under
+        drift_gate.
 
-        Arm goals follow the estimate with probability estimate_prob: 0 during
-        warmup, then ramping to 1, but only while the estimate's drift over a
-        whole arm goal (Estimator/goal_drift) is under drift_gate. A worse
-        estimate would hand the arms targets they can't reach.
-
-        Runs after resets: reset envs are skipped (their previous sample is
-        from the old episode) and get a fresh, exact command from the command
-        manager anyway.
+        Runs after resets: reset envs are skipped (their previous sample is from the old episode) and get an exact
+        command from the command manager anyway.
         """
         odometry_obs = self.observation_manager.compute_group("odometry", update_history=True)
         root_pos = self._robot.data.root_pos_w.clone()
         root_quat = self._robot.data.root_quat_w.clone()
         cfg = self.cfg.estimator
-        legs = cfg.odometry == "legs"
-        feet_in_pelvis = self._feet_in_pelvis() if legs else None
+        feet_in_pelvis = self._feet_in_pelvis()
 
         if self._have_prev:
             valid = ~self._fresh
             inputs = torch.cat([odometry_obs, self.action_manager.action], dim=1)
             true_motion = pelvis_motion(self._prev_root_pos, self._prev_root_quat, root_pos, root_quat, self.step_dt)
             with torch.no_grad():  # the commands don't carry the estimator's graph from step to step
-                estimated = motion_to_transform(self.estimator.model(inputs), self.step_dt)
-            if legs:
-                estimated = self._leg_odometry(feet_in_pelvis, root_quat, estimated, true_motion, valid)
+                learned = motion_to_transform(self.estimator.model(inputs), self.step_dt)
+            estimated = self._leg_odometry(feet_in_pelvis, root_quat, learned, true_motion, valid)
             self._arm_command.apply_pelvis_motion(
-                estimated=estimated,
-                true=motion_to_transform(true_motion, self.step_dt),
-                env_mask=valid,
+                estimated=estimated, true=motion_to_transform(true_motion, self.step_dt), env_mask=valid
             )
-
             if cfg.train:
                 self.estimator.add(inputs, true_motion, valid)
                 if self.common_step_counter % cfg.train_every == 0:
                     stats = self.estimator.train()
                     self._estimator_log.update({f"Estimator/{k}": v for k, v in stats.items()})
-                if cfg.save_every > 0 and self.common_step_counter % cfg.save_every == 0 and self.cfg.log_dir:
+                if self.common_step_counter % cfg.save_every == 0 and self.cfg.log_dir:
                     self._save_estimator()
 
         self._have_prev = True
         self._prev_root_pos, self._prev_root_quat = root_pos, root_quat
-        if legs:
-            self._prev_feet_in_pelvis = feet_in_pelvis
+        self._prev_feet_in_pelvis = feet_in_pelvis
         self._fresh[:] = False
 
-        # Quality gate: the estimate's drift over whole arm goals (shadow command),
-        # one EMA sample per ended goal. No GPU sync: everything stays a tensor.
+        # the drift gate: one EMA sample of the estimate's drift (shadow command) per ended arm goal
         arm = self._arm_command
         count = arm.ended_goal_count
         mean_drift = arm.ended_goal_drift_sum / count.clamp(min=1.0)
@@ -319,23 +244,13 @@ class LocoManipMarlEnv(DirectMARLEnv):
         arm.ended_goal_drift_sum.zero_()
         arm.ended_goal_count.zero_()
         gate_open = (self._goal_drift_ema < cfg.drift_gate).float()
-
-        # teacher forcing: the share of new arm goals whose command follows the estimate
-        if not cfg.use_estimate:
-            prob = torch.tensor(0.0, device=self.device)
-        elif not cfg.train:
-            prob = torch.tensor(1.0, device=self.device)
-        else:
-            ramp = min(max((self.common_step_counter - cfg.warmup_steps) / max(cfg.ramp_steps, 1), 0.0), 1.0)
-            prob = ramp * gate_open
-        arm.estimate_prob = prob
-        self._estimator_log["Estimator/estimate_prob"] = prob
+        arm.estimate_prob = gate_open if cfg.train else torch.tensor(1.0, device=self.device)
+        self._estimator_log["Estimator/estimate_prob"] = arm.estimate_prob
         self._estimator_log["Estimator/goal_drift"] = self._goal_drift_ema
         self._estimator_log["Estimator/gate_open"] = gate_open
 
     def _feet_in_pelvis(self) -> torch.Tensor:
-        """Each foot's ankle-roll origin in the pelvis frame, (N, F, 3): on the robot, forward kinematics of the
-        joint encoders."""
+        """Each foot's ankle-roll origin in the pelvis frame, (N, F, 3): on the robot, forward kinematics."""
         feet = self._robot.data.body_pos_w[:, self._foot_ids] - self._robot.data.root_pos_w.unsqueeze(1)
         n, f = feet.shape[:2]
         quat = self._robot.data.root_quat_w.unsqueeze(1).expand(n, f, 4).reshape(-1, 4)
@@ -349,25 +264,13 @@ class LocoManipMarlEnv(DirectMARLEnv):
         true_motion: torch.Tensor,
         valid: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """This step's pelvis motion, (delta_pos, delta_quat) in the previous pelvis frame: the rotation from the
-        attitude, the translation from a planted foot.
+        """This step's pelvis motion, (delta_pos, delta_quat) in the previous pelvis frame.
 
-        The rotation dR is the change in pelvis orientation: in sim the true
-        one, on the robot the IMU's attitude estimate carried through the waist
-        joint (roll and pitch held by gravity, yaw drifting with the gyro
-        bias). A planted foot's ankle point stays put in the world, so with
-        p(t) its position in the pelvis frame the pelvis moved by
-        p(t-1) - dR p(t). A foot counts as planted if its contact force stayed
-        above stance_force at every physics substep of the step; with both
-        planted the two are averaged, weighted by that force. Envs with
-        neither keep the learned estimate's translation.
-
-        Not the whole foot pose (P(t-1)^-1 o P(t), P the pelvis pose in the
-        foot frame): loaded feet rock on their sole edges, 0.006 rad per step
-        at the median during run H's arm goals, and the pelvis a metre above
-        turns that into millimetres per step. Over 4 s goals (run H's
-        agent_91200, spread 4 / drop 10) a target drifted 7.1 cm that way at
-        the median, 3.7 cm with the learned estimator, 0.9 cm this way.
+        The rotation dR is the change in pelvis orientation (on the robot, the IMU's attitude through the waist
+        joint). A planted foot's ankle stays put in the world, so with p(t) its position in the pelvis frame the
+        pelvis moved by p(t-1) - dR p(t). A foot counts as planted if its contact force stayed above stance_force at
+        every physics substep; with both planted the two are averaged, weighted by that force. Envs with neither
+        keep the learned estimate's translation.
         """
         n, f = feet_in_pelvis.shape[:2]
         delta_quat = quat_mul(quat_inv(self._prev_root_quat), root_quat)
@@ -382,7 +285,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
         stance = total.squeeze(1) > 0
         leg_pos = ((weight / total.clamp(min=1e-6)).unsqueeze(-1) * delta_pos).sum(dim=1)
 
-        # how often it applies during arm goals, and its per-step error there (m/s, like the estimator's)
+        # how often it applies during arm goals, and its per-step error there (m/s)
         arm = valid & self._arm_command.arm_mode
         used = arm & stance
         lin_error = torch.norm(leg_pos / self.step_dt - true_motion[:, :3], dim=-1)
@@ -393,21 +296,18 @@ class LocoManipMarlEnv(DirectMARLEnv):
 
     def _save_estimator(self):
         directory = os.path.join(self.cfg.log_dir, "estimator")
-        env_state = self._env_state()
-        self.estimator.save(os.path.join(directory, f"estimator_{self.common_step_counter}.pt"), env_state)
-        self.estimator.save(os.path.join(directory, "estimator_latest.pt"), env_state)
-
-    def _env_state(self) -> dict:
         terrain = self.scene.terrain
-        return {
+        env_state = {
             "arm_targets": self._arm_command.state_dict(),
             "terrain_levels": terrain.terrain_levels.clone(),
             "terrain_types": terrain.terrain_types.clone(),
             "goal_drift_ema": self._goal_drift_ema.clone(),
         }
+        self.estimator.save(os.path.join(directory, f"estimator_{self.common_step_counter}.pt"), env_state)
+        self.estimator.save(os.path.join(directory, "estimator_latest.pt"), env_state)
 
-    def _load_env_state(self, state: dict, restore_gate: bool):
-        """Curriculum levels (and, with a matching estimator, the drift gate) saved by _save_estimator."""
+    def _load_env_state(self, state: dict):
+        """Curriculum levels, terrain tiles and the drift gate saved by _save_estimator."""
         self._arm_command.load_state_dict(state["arm_targets"])
         terrain = self.scene.terrain
         levels = state["terrain_levels"].to(self.device)
@@ -417,11 +317,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
         else:
             terrain.terrain_levels[:] = levels[torch.randint(0, len(levels), (self.num_envs,), device=self.device)]
         terrain.env_origins[:] = terrain.terrain_origins[terrain.terrain_levels, terrain.terrain_types]
-        if restore_gate:
-            self._goal_drift_ema = state["goal_drift_ema"].to(self.device)
+        self._goal_drift_ema = state["goal_drift_ema"].to(self.device)
         print(
             f"[INFO] Restored curriculum: arm level mean {self._arm_command.level.float().mean().item():.2f},"
-            f" terrain level mean {terrain.terrain_levels.float().mean().item():.2f}"
+            f" drift gate {self._goal_drift_ema.item():.3f}"
         )
 
     """
@@ -431,17 +330,9 @@ class LocoManipMarlEnv(DirectMARLEnv):
     def _refresh_sensors_after_reset(self, env_ids: Sequence[int]):
         """Make the IMU read the reset state, not the robot's last pose before the reset.
 
-        DirectMARLEnv.step resets envs without updating the kinematics, so the
-        IMU's rigid-body view kept the old pose and velocity until the next
-        physics step: the first observation of an episode showed the previous
-        episode's (often fallen) orientation and a lin_acc of (old velocity) /
-        dt, 100-250 m/s^2 against a running std of ~18. The legs answered with
-        knee actions near -300 (clipped at 10): run 12, agent_57600, drop level
-        10, 20% of episodes after a fall fell again within 1 s, 12% after a
-        time-out. Imu.reset also zeroes its previous velocity, so even a fresh
-        first reading is (reset velocity) / dt; it is set to the accelerometer
-        at rest, gravity only, and the next reading differences from the reset
-        velocity.
+        DirectMARLEnv.step resets envs without updating the kinematics, so the IMU would show the previous
+        episode's orientation and a lin_acc of (old velocity) / dt in an episode's first observation. Imu.reset
+        also zeroes its previous velocity: the first reading is set to the accelerometer at rest, gravity only.
         """
         self.scene.write_data_to_sim()
         self.sim.forward()
@@ -451,12 +342,9 @@ class LocoManipMarlEnv(DirectMARLEnv):
         data.ang_acc_b[env_ids] = 0.0
 
     def _set_soft_joint_limits(self):
-        """Soft limits at cfg.soft_joint_pos_limit_factors of the hard range, for the joints it names.
-
-        Same formula as Articulation (mean +- factor * half range), which applies
-        the asset's single factor to every joint. Before the managers: the arm
-        target table and joint_pos_limits read these.
-        """
+        """Soft limits at cfg.soft_joint_pos_limit_factors of the hard range for the joints it names (Articulation's
+        formula, which applies the asset's single factor to every joint). Before the managers: the arm target tables
+        and joint_pos_limits read them."""
         robot = self.scene["robot"]
         for pattern, factor in self.cfg.soft_joint_pos_limit_factors.items():
             ids, names = robot.find_joints(pattern)
@@ -466,14 +354,3 @@ class LocoManipMarlEnv(DirectMARLEnv):
             robot.data.soft_joint_pos_limits[:, ids, 1] = mean + factor * half_range
             limits = [[round(v, 3) for v in pair] for pair in robot.data.soft_joint_pos_limits[0, ids].tolist()]
             print(f"[INFO] Soft joint limits at {factor} of the hard range: {dict(zip(names, limits))}")
-
-    def _raise_nan(self, agent: str, manager: RewardManager):
-        step_reward = manager._step_reward
-        nan_mask = torch.isnan(step_reward)
-        env_ids = nan_mask.any(dim=1).nonzero(as_tuple=True)[0]
-        bad_terms = [manager._term_names[i] for i in nan_mask.any(dim=0).nonzero(as_tuple=True)[0].tolist()]
-        root_pos = self.scene["robot"].data.root_pos_w[env_ids]
-        raise RuntimeError(
-            f"NaN in {agent} reward terms {bad_terms} at step {self.common_step_counter},"
-            f" envs {env_ids.tolist()[:8]}, root_pos_w {root_pos.tolist()[:8]}"
-        )

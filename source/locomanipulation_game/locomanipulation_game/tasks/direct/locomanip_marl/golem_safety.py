@@ -1,21 +1,11 @@
 """GOLEM's safety-layer e-stops, checked in the sim at every physics substep.
 
-On the robot, GOLEM's h12_safety_layer sits between the policy and rt/lowcmd. With the preset the real launch uses
-(relax_safety_split.yaml, from h1_bringup/launch/h1_real_controller.launch.py) it
-  - clips each position target into the URDF range shrunk by clip.position_offset (0.001 rad), and
-  - e-stops the robot when the measured state leaves the e-stop range, polled at 500 Hz:
-      position  q within estop.position_offset of a URDF limit (wrist pitch/yaw: 0.1 rad past it),
-      velocity  |dq| above the URDF velocity limit times estop.velocity_ratio (ankles 3x),
-      torque    |tau_est| above the URDF torque limit times estop.torque_ratio (elbows 1.2x, wrist pitch/yaw 2x).
-The sim enforces the same URDF limits physically, so a policy trained without this check works right at them
-(run I: 1-62 torque, 4-15 position and 0.1-0.4 velocity trips per robot-minute).
-
-GolemEstopMonitor applies those thresholds tightened by a margin (GolemEstopCfg) to every physics substep, for the
-golem_estop termination. Torque is the motor's PD demand at the current state, before the effort clip: the motor
-follows it up to its peak, which can exceed the URDF value (GOLEM raised its elbow limits after seeing that).
-
-The table is copied from GOLEM (core/joint_limits.py and config/relax_safety_split.yaml at commit 462c479), so
-training needs no GOLEM checkout; scripts/skrl/audit_golem_estop.py compares it against the live files.
+On the robot, GOLEM's h12_safety_layer (preset relax_safety_split, the one the real launch uses) clips each position
+target into the URDF range shrunk by 0.001 rad, and e-stops the robot when the measured state leaves the e-stop range,
+polled at 500 Hz: a joint within its position offset of a URDF limit, |dq| above the URDF velocity limit times its
+ratio, or |tau_est| above the URDF torque limit times its ratio. GolemEstopMonitor applies those thresholds,
+tightened by GolemEstopCfg's margins, for the golem_estop termination. Torque is the motor's PD demand at the current
+state. The table is copied from GOLEM (core/joint_limits.py and config/relax_safety_split.yaml at commit 462c479).
 """
 
 from __future__ import annotations
@@ -26,7 +16,6 @@ import torch
 
 from isaaclab.utils import configclass
 
-GOLEM_SAFETY_DIR = "/home/max/GOLEM/core_ws/src/h12_safety_layer"
 GOLEM_PRESET = "relax_safety_split"
 
 # (motor, URDF low, URDF high, URDF velocity, URDF torque, clip position_offset,
@@ -69,8 +58,8 @@ CAUSES = ("velocity", "position", "torque")
 
 @configclass
 class GolemEstopCfg:
-    """Sim thresholds: GOLEM's e-stops tightened by a margin for sim-to-real error (encoder noise, GOLEM's 500 Hz
-    polling against our 200 Hz physics, the torque estimate)."""
+    """Sim thresholds: GOLEM's e-stops tightened for sim-to-real error (encoder noise, GOLEM's 500 Hz polling
+    against the 200 Hz physics, the torque estimate)."""
 
     velocity_margin: float = 0.9
     """Trip at this fraction of GOLEM's velocity e-stop."""
@@ -128,9 +117,8 @@ class GolemEstopMonitor:
             self.flags[cause] |= hit
 
     def _motor_torque(self) -> torch.Tensor:
-        """The motor's PD demand at the current state: stiffness (target - q) - damping qd, with the motor's own
-        damping. computed_torque would lag a substep (it is computed before the step, from the state before it)
-        and folds in any randomized passive damping (Golem3), which the motor doesn't produce."""
+        """The motor's PD demand at the current state, with the motor's own damping (not the randomized passive part,
+        which the motor doesn't produce)."""
         data, ids = self.robot.data, self.joint_ids
         error = data.joint_pos_target[:, ids] - data.joint_pos[:, ids]
         return data.joint_stiffness[:, ids] * error - data.default_joint_damping[:, ids] * data.joint_vel[:, ids]

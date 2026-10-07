@@ -1,7 +1,4 @@
-"""MDP terms for the two-agent task.
-
-Everything the manager-based rounds use, plus the agent-aware terms here.
-"""
+"""MDP terms for the two-agent task: the manager-based game's terms plus the ones here."""
 
 from locomanipulation_game.tasks.manager_based.locomanipulation_game.mdp import *  # noqa: F401, F403
 

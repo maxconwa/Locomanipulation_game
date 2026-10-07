@@ -1,135 +1,54 @@
-# Template for Isaac Lab Projects
+# Locomanipulation game
 
-## Overview
+An Isaac Lab external project for the Unitree H1-2 with Magpie grippers.
 
-This project/repository serves as a template for building projects or extensions based on Isaac Lab.
-It allows you to develop in an isolated environment, outside of the core Isaac Lab repository.
+**This branch (`marl-direct`):** one robot and two MAPPO agents. The legs track a velocity command. The arms each
+track a wrist pose, and they crouch for low goals by squatting. The task targets deployment through GOLEM's safety
+layer into RoboCasa.
 
-**Key Features:**
+- `source/locomanipulation_game/locomanipulation_game/tasks/direct/locomanip_marl/`: the task, `LocoManip-Marl-Direct-v0`.
+  - `locomanip_marl_env_cfg.py`: everything configurable.
+  - `locomanip_marl_env.py`: a DirectMARLEnv that runs Isaac Lab's managers.
+  - `mdp/commands.py`: navigation or arm goals, and the reach curriculum.
+  - `odometry.py`: the pelvis-motion estimator.
+  - `golem_safety.py`: GOLEM's e-stops.
+- `tasks/manager_based/`: the legs-versus-adversary game (rsl_rl, `scripts/rsl_rl/`). The MARL task reuses its scene,
+  legs reward, events and mdp terms.
 
-- `Isolation` Work outside the core Isaac Lab repository, ensuring that your development efforts remain self-contained.
-- `Flexibility` This template is set up to allow your code to be run as an extension in Omniverse.
-
-**Keywords:** extension, template, isaaclab
-
-## Installation
-
-- Install Isaac Lab by following the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
-  We recommend using the conda or uv installation as it simplifies calling Python scripts from the terminal.
-
-- Clone or copy this project/repository separately from the Isaac Lab installation (i.e. outside the `IsaacLab` directory):
-
-- Using a python interpreter that has Isaac Lab installed, install the library in editable mode using:
-
-    ```bash
-    # use 'PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-    python -m pip install -e source/locomanipulation_game
-
-- Verify that the extension is correctly installed by:
-
-    - Listing the available tasks:
-
-        Note: It the task name changes, it may be necessary to update the search pattern `"Template-"`
-        (in the `scripts/list_envs.py` file) so that it can be listed.
-
-        ```bash
-        # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-        python scripts/list_envs.py
-        ```
-
-    - Running a task:
-
-        ```bash
-        # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-        python scripts/<RL_LIBRARY>/train.py --task=<TASK_NAME>
-        ```
-
-    - Running a task with dummy agents:
-
-        These include dummy agents that output zero or random agents. They are useful to ensure that the environments are configured correctly.
-
-        - Zero-action agent
-
-            ```bash
-            # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-            python scripts/zero_agent.py --task=<TASK_NAME>
-            ```
-        - Random-action agent
-
-            ```bash
-            # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-            python scripts/random_agent.py --task=<TASK_NAME>
-            ```
-
-### Set up IDE (Optional)
-
-To setup the IDE, please follow these instructions:
-
-- Run VSCode Tasks, by pressing `Ctrl+Shift+P`, selecting `Tasks: Run Task` and running the `setup_python_env` in the drop down menu.
-  When running this task, you will be prompted to add the absolute path to your Isaac Sim installation.
-
-If everything executes correctly, it should create a file .python.env in the `.vscode` directory.
-The file contains the python paths to all the extensions provided by Isaac Sim and Omniverse.
-This helps in indexing all the python modules for intelligent suggestions while writing code.
-
-### Setup as Omniverse Extension (Optional)
-
-We provide an example UI extension that will load upon enabling your extension defined in `source/locomanipulation_game/locomanipulation_game/ui_extension_example.py`.
-
-To enable your extension, follow these steps:
-
-1. **Add the search path of this project/repository** to the extension manager:
-    - Navigate to the extension manager using `Window` -> `Extensions`.
-    - Click on the **Hamburger Icon**, then go to `Settings`.
-    - In the `Extension Search Paths`, enter the absolute path to the `source` directory of this project/repository.
-    - If not already present, in the `Extension Search Paths`, enter the path that leads to Isaac Lab's extension directory directory (`IsaacLab/source`)
-    - Click on the **Hamburger Icon**, then click `Refresh`.
-
-2. **Search and enable your extension**:
-    - Find your extension under the `Third Party` category.
-    - Toggle it to enable your extension.
-
-## Code formatting
-
-We have a pre-commit template to automatically format your code.
-To install pre-commit:
+## Setup
 
 ```bash
-pip install pre-commit
+conda activate env_isaaclab
+python -m pip install -e source/locomanipulation_game
 ```
 
-Then you can run pre-commit with:
+## The MARL task
 
 ```bash
-pre-commit run --all-files
+# train (3800 updates = 91.2k steps); --checkpoint resumes, with the estimator and curriculum saved beside it
+python scripts/skrl/train.py --headless --max_iterations 3800 [--checkpoint <run>/checkpoints/agent_<N>.pt]
+python scripts/skrl/play.py --checkpoint <run>/checkpoints/agent_<N>.pt
+
+# deployment: networks + export.yaml, arm goals for the game commander, and parity with GOLEM's controller
+python scripts/skrl/export_marl.py --checkpoint <agent.pt> --out <GOLEM>/core_ws/src/locomotion_game_deploy/policies/marl_golem
+python scripts/skrl/export_arm_goals.py --checkpoint <agent.pt> --levels 4:10,7:10,10:10 --out <same dir> --headless
+python scripts/skrl/deploy_parity.py --checkpoint <agent.pt> --export <same dir> --deploy_pkg <GOLEM>/core_ws/src/locomotion_game_deploy --headless
+
+# GOLEM's walking sim-to-sim test, Isaac side (scored by GOLEM's tests/locomanipulation_game/sim2sim_walk.py --score)
+python scripts/skrl/eval_sim2sim_walk.py --checkpoint <agent.pt> --out <dir> --headless
 ```
 
-## Troubleshooting
+Runs are written to `logs/skrl/locomanip_marl/<time>_mappo_torch/`. Each run directory holds:
+- the skrl checkpoints;
+- `estimator/` (the pelvis estimator and curriculum state);
+- `arm_target_tables_v2.pt`: built on a run's first start, which takes a few minutes, then reused by every script
+  pointed at that run.
 
-### Pylance Missing Indexing of Extensions
+## The game
 
-In some VsCode versions, the indexing of part of the extensions is missing.
-In this case, add the path to your extension in `.vscode/settings.json` under the key `"python.analysis.extraPaths"`.
+Training rounds Legs-R0-v0 → Upper-Adv-Ri-v0 → Legs-Ri-v0, each against the frozen policy the previous round produced,
+in one process (`scripts/rsl_rl/game.py`; see its docstring). One round on its own:
 
-```json
-{
-    "python.analysis.extraPaths": [
-        "<path-to-ext-repo>/source/locomanipulation_game"
-    ]
-}
-```
-
-### Pylance Crash
-
-If you encounter a crash in `pylance`, it is probable that too many files are indexed and you run out of memory.
-A possible solution is to exclude some of omniverse packages that are not used in your project.
-To do so, modify `.vscode/settings.json` and comment out packages under the key `"python.analysis.extraPaths"`
-Some examples of packages that can likely be excluded are:
-
-```json
-"<path-to-isaac-sim>/extscache/omni.anim.*"         // Animation packages
-"<path-to-isaac-sim>/extscache/omni.kit.*"          // Kit UI tools
-"<path-to-isaac-sim>/extscache/omni.graph.*"        // Graph UI tools
-"<path-to-isaac-sim>/extscache/omni.services.*"     // Services tools
-...
+```bash
+python scripts/rsl_rl/train.py --task=Legs-R0-v0 --headless
 ```

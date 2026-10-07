@@ -2,7 +2,7 @@
 
 Builds the task's arm-goal command with the run's target tables, holds the reach curriculum at each requested
 spread:drop pair, and draws --goals goals per pair with the command's own sampler (ArmTargetsCommand.
-_resample_command): half standing goals from the whole table, half low goals built in a squat (IK2+). Each goal is
+_resample_command): half standing goals from the level's region, half low goals built in a squat. Each goal is
 saved in the standing frame (origin standing_height above the ground under the pelvis, yaw of the pelvis), which
 is the pelvis frame of a robot standing upright: the commander sends it as the pelvis-frame goal.
 
@@ -22,7 +22,7 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", required=True, help="Its run's target tables (and curriculum) are used.")
-parser.add_argument("--task", default="LocoManip-Marl-Flat-Golem-Direct-v0")
+parser.add_argument("--task", default="LocoManip-Marl-Direct-v0")
 parser.add_argument("--levels", default="4:10")
 parser.add_argument("--goals", type=int, default=2048)
 parser.add_argument("--num_envs", type=int, default=512)
