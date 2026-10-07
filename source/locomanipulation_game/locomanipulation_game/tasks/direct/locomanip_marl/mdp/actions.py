@@ -52,7 +52,8 @@ def torque_bounds(asset, joint_ids, headroom: float) -> tuple[torch.Tensor, torc
     within headroom x the effort limit: [q + (-h tau + kd qd) / kp, q + (h tau + kd qd) / kp]."""
     data = asset.data
     q, qd = data.joint_pos[:, joint_ids], data.joint_vel[:, joint_ids]
-    kp, kd = data.joint_stiffness[:, joint_ids], data.joint_damping[:, joint_ids]
+    # the motor's own damping: a randomized passive part (Golem3) is joint friction, not motor torque
+    kp, kd = data.joint_stiffness[:, joint_ids], data.default_joint_damping[:, joint_ids]
     tau = headroom * data.joint_effort_limits[:, joint_ids]
     return q + (kd * qd - tau) / kp, q + (kd * qd + tau) / kp
 

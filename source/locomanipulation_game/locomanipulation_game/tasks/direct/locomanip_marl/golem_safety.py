@@ -107,13 +107,20 @@ class GolemEstopMonitor:
             "position": (q < self.q_low) | (q > self.q_high),
             "velocity": data.joint_vel[:, self.joint_ids].abs() > self.dq_max,
             # computed_torque is from the last write before this state; stale right after a reset
-            "torque": (data.computed_torque[:, self.joint_ids].abs() > self.tau_max) & ~self._skip_torque.unsqueeze(1),
+            "torque": (self._motor_torque().abs() > self.tau_max) & ~self._skip_torque.unsqueeze(1),
         }
         self._skip_torque[:] = False
         for cause, joints in bad.items():
             hit = joints.any(dim=1)
             self.joint_hits[cause] += (joints & (hit & ~self.flags[cause]).unsqueeze(1)).float().sum(dim=0)
             self.flags[cause] |= hit
+
+    def _motor_torque(self) -> torch.Tensor:
+        """The PD demand with the motor's own damping: computed_torque less any randomized passive damping, which
+        the simulator folds into the drive (Golem3) but the motor doesn't produce."""
+        data = self.robot.data
+        extra = (data.joint_damping - data.default_joint_damping)[:, self.joint_ids]
+        return data.computed_torque[:, self.joint_ids] + extra * data.joint_vel[:, self.joint_ids]
 
     def tripped(self) -> torch.Tensor:
         return self.flags["velocity"] | self.flags["position"] | self.flags["torque"]

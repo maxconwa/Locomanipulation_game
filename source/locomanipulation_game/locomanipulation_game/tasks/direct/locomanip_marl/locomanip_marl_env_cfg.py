@@ -32,6 +32,7 @@ from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sim import SimulationCfg
@@ -819,3 +820,34 @@ class LocoManipMarlFlatGolem2EnvCfg(LocoManipMarlFlatGolemEnvCfg):
         super().__post_init__()
         self.actions.joint_pos.torque_headroom = 0.85
         self.actions.arm_pos.torque_headroom = 0.85
+
+
+BODY_JOINTS = [".*_hip_.*_joint", ".*_knee_joint", ".*_ankle_.*_joint", "torso_joint", ".*_shoulder_.*_joint",
+               ".*_elbow_joint", ".*_wrist_.*_joint"]
+"""The 27 motor joints (not the gripper hinges)."""
+
+
+@configclass
+class LocoManipMarlFlatGolem3EnvCfg(LocoManipMarlFlatGolem2EnvCfg):
+    """The Golem2 task with the joints' passive dynamics randomized per robot, toward GOLEM's MuJoCo model.
+
+    GOLEM's RoboCasa robot (CL_Assets robosuite_assets h1_2/robot.xml) gives every joint damping 10, armature
+    0.1 and frictionloss 0.2, on top of the PD the policy commands; our asset has armature 0.01 and only the
+    PD's damping (2-4). Run K at 14.4k steps, deployed through GOLEM into RoboCasa, lost its balance holding a
+    standing reach in open floor and tripped the ankle e-stops in all three games (14-56 s engaged); run I the
+    same (13-17 s). Here each robot gets, once at startup, extra passive damping uniform in [0, 10] N m s/rad
+    and an armature uniform in [0.01, 0.12] kg m^2 on all 27 motor joints. The extra damping is passive: the
+    torque bound and the e-stop monitor keep using the motor's own damping (default_joint_damping).
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        joints = SceneEntityCfg("robot", joint_names=BODY_JOINTS)
+        self.events.passive_damping = EventTerm(
+            func=mdp.randomize_actuator_gains, mode="startup",
+            params={"asset_cfg": joints, "damping_distribution_params": (0.0, 10.0), "operation": "add"},
+        )
+        self.events.joint_armature = EventTerm(
+            func=mdp.randomize_joint_parameters, mode="startup",
+            params={"asset_cfg": joints, "armature_distribution_params": (0.01, 0.12), "operation": "abs"},
+        )
