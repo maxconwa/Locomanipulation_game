@@ -175,7 +175,8 @@ with torch.no_grad():
                     goals.append(g)
                     cur[i] = g = None
                 if mode[i] and new[i]:
-                    cur[i] = g = {"low": bool(arm.goal_low[i]), "depth": float(arm.height_drop[i]), "pelvis_drop": 0.0,
+                    # the shallowest squat table's depth is 0 up to rounding (about -1e-7)
+                    cur[i] = g = {"low": bool(arm.goal_low[i]), "depth": max(float(arm.height_drop[i]), 0.0), "pelvis_drop": 0.0,
                                   "closest": 10.0, "err": [], "rot": [], "reached": False}
                 if g is not None:
                     g["pelvis_drop"] = max(g["pelvis_drop"], float(drop_now[i]))
