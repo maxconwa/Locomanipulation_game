@@ -4,6 +4,7 @@
 #   make all                                     every run in conditions.yaml without results, then the paper
 #   make eval    RUN=<run dir> LABEL=lambda1     Isaac Lab: full policy, legs blind, arms IK only (3 seeds)
 #   make sim2sim RUN=<run dir> LABEL=lambda1     MuJoCo: RoboCasa joint dynamics and the training plant's
+#   make curve   RUN=<run dir> LABEL=lambda1     every saved checkpoint on the unextended goals (learning curve)
 #   make paper                                   analysis -> figures (with the crouch render) -> page
 #   make smoke                                   pipeline self-test on a zero-action checkpoint (no run needed)
 #   make baselines                               GOLEM's arm IK on the goal grid (needs pinocchio + pink)
@@ -25,7 +26,7 @@ GUARD    ?= $(if $(wildcard $(HOME)/.claude/bin/resguard.sh),$(HOME)/.claude/bin
 
 DEVICE   ?= cuda:0
 
-.PHONY: all eval sim2sim paper analyze figures render page smoke baselines goals check-run
+.PHONY: all walk curve eval sim2sim paper analyze figures render page smoke baselines goals check-run
 
 # every run in conditions.yaml without current results: Isaac (full, legs blind, arms IK), MuJoCo; then make paper
 all:
@@ -59,6 +60,12 @@ figures:
 
 page:
 	$(PY) tools/build_page.py
+
+walk: check-run
+	$(GUARD) $(PY_ISAAC) tools/eval_walk.py --checkpoint $(CKPT) --label $(LABEL) --device $(DEVICE)
+
+curve: check-run
+	$(PY) tools/eval_curve.py --run $(RUN) --label $(LABEL) --device $(DEVICE)
 
 smoke:
 	$(PY) tools/smoke_checkpoint.py

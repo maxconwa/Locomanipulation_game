@@ -47,6 +47,7 @@ parser.add_argument("--batch", type=int, default=1600, help="envs per Isaac batc
 parser.add_argument("--physics", choices=["nominal", "train"], default="nominal")
 parser.add_argument("--odometry", choices=["learned", "true"], default="learned")
 parser.add_argument("--limit", type=int, default=0, help="evaluate only the first N goals (smoke test)")
+parser.add_argument("--ext0", action="store_true", help="only the goals without extension (learning curves)")
 parser.add_argument("--trace_bases", type=int, default=12, help="full traces for these many base goals, ext 0, seed 0")
 parser.add_argument("--task", default="LocoManip-Marl-Direct-v0")
 parser.add_argument("--out", default=None)
@@ -80,6 +81,8 @@ checkpoint = Path(args.checkpoint).resolve()
 run_dir = checkpoint.parent.parent
 seeds = [int(s) for s in args.seeds.split(",")]
 goals = C.read_goals(Path(args.goals))
+if args.ext0:
+    goals = [g for g in goals if g["ext"] == 0.0]
 if args.limit:
     goals = goals[: args.limit]
 suffix = "".join(s for s in (

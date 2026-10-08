@@ -1,0 +1,129 @@
+% Experiments section for main.tex, written 2026-10-08. Every number is a \reach{<condition>}{<quantity>} macro from
+% reach/tex/results_macros.tex, which `make -C reach paper` regenerates from the evaluation trials; a number that
+% does not exist yet prints a bold ??.
+%
+% Use: in the preamble    \input{reach/tex/results_macros.tex}
+%      in the body        replace the current \section{Experiments} ... (up to \section{Conclusion...}) with
+%                         \input{20261008-experiments_reach}
+% Sentences whose wording depends on a result still to come are marked % RESULT.
+% Conditions: l1, l0.5, l0 are the three lambda runs at 91.2k steps (conditions.yaml); /isaac, /isaac_legs_blind,
+% /isaac_arms_ik, /mujoco, /mujoco_isaacphys their evaluations; golem_ik/kinematic the IK reference. The preliminary
+% l0.5_52k (paper_yaw_91k at 52.8k steps) is reported on the result page, not here.
+
+\section{Experiments}
+\label{sec:experiments}
+
+We train $\pi_U$ and $\pi_L$ in Isaac Lab~\cite{mittal2025isaaclab} with the MAPPO implementation of
+SKRL~\cite{serrano2023skrl}, with 4096 environments and a 50\,Hz policy over a 200\,Hz physics step, for
+\wx{N environment steps} per run, one seed per $\lambda \in \{0, 0.5, 1\}$. All other settings are shared across
+runs. The evaluation below holds every network and normalizer fixed and freezes the depth curriculum.
+
+\subsection{Evaluation protocol}
+\label{sec:protocol}
+
+\textbf{Goals.} Every controller is scored on one fixed set of \reach{goals}{n} two-wrist goals. We draw
+\reach{goals}{bases} pairs of wrist poses from the standing-reachable tables of Sec.~\ref{sec:upper} and lower each
+pair by $d \in \{0, 0.1, \dots, \reach{goals}{depthmax}\}$\,m, the $z_{\mathrm{offset}}$ of training. To test reach away from
+the body as well as below it, each lowered pair is also pushed $e \in \{0, 0.1, 0.2\}$\,m outward in the ground
+plane, away from each shoulder. The lowest pose in the standing tables is \reach{goals}{standingfloor}\,cm above the
+ground; a goal whose lower wrist target lies below that height cannot be reached without the legs. Goals are placed
+in the standing frame at the moment they start and stay fixed in the world for 4\,s, as in training.
+
+\textbf{Trials.} A trial resets the robot with the training reset distribution, holds a zero velocity command for
+2\,s, then presents one goal. Policies act through their mean actions with observation noise on, and the learned
+pelvis estimator moves the goal they observe (Sec.~\ref{sec:estimator}). We run three seeds per goal in Isaac Lab
+with the training physics at its nominal values and pushes off.
+
+\textbf{Metrics.} A trial succeeds when both wrists stay within 5\,cm and 0.35\,rad of their true world-frame goals
+for 1\,s without a break, the criterion of the reach bonus. We report success with 95\% Wilson intervals, the wrist
+error over the last second of successful trials, and the pelvis height over that second. For balance we report the
+minimum signed distance of the centre of mass and of the divergent component of motion
+$\xi = c_{xy} + \dot c_{xy}/\omega$, $\omega = \sqrt{g/z_c}$, to the edge of the support polygon, the base tilt,
+planted-foot slip, and falls (tilt beyond 1\,rad). The operational floor of a controller is the lowest 0.1\,m band of
+lower target height from which every band above it has at least 80\% success on the goals without extension.
+
+\textbf{Controllers.} We compare the three $\lambda$ runs with three references. \emph{Blind legs} runs the
+$\lambda = 1$ networks but gives $\pi_L$ the observation it has while standing in navigation mode, without the
+wrist goals; its lower body balances and does not cooperate. \emph{IK arms} holds $\pi_U$'s residual at zero, so the
+arms follow the damped-least-squares step alone. \emph{GOLEM IK} is the upper-body controller of our lab's deployed
+stack, a quadratic-programming IK over the 14 arm joints with self-collision avoidance, solved on a standing robot
+whose pelvis cannot move.
+
+\subsection{Reach below the standing table}
+\label{sec:reach}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\textwidth]{reach/figures/fig_hero.pdf}
+  \caption{Reach of the $\lambda = 1$ policy with and without its legs' cooperation, on \reach{goals}{n} fixed
+    goals. Left: wrist targets reached in at least half of the trials, drawn over the H1-2 in side view, for the
+    policy with blind legs (blue) and the full policy (orange); the robot is shown at the end of a successful
+    reach of the lowest goal it reached, with the standing pose behind it. Centre: success against the height of
+    the lower wrist target. Right: pelvis height over the last second of each goal. Grey: targets below the
+    lowest standing-reachable pose. Bands are 95\% Wilson intervals (centre) and interquartile ranges (right).}
+  \label{fig:reach}
+\end{figure*}
+
+Of the goals whose lower target lies below the standing tables, the $\lambda = 1$ policy reached
+\reach{l1/isaac}{success_below}\% and the same networks with blind legs reached
+\reach{l1/isaac_legs_blind}{success_below}\%; GOLEM IK reached \reach{golem_ik/kinematic}{success_below}\% of
+the \reach{golem_ik/kinematic}{n_below} such goals and \reach{golem_ik/kinematic}{success_above}\% of those above
+(Fig.~\ref{fig:reach}). The operational floor was \reach{l1/isaac}{floor}\,cm above the ground for the full
+policy and \reach{l1/isaac_legs_blind}{floor}\,cm with blind legs. % RESULT: one sentence on the gap.
+For goals below the tables the full policy's pelvis dropped by a median of \reach{l1/isaac}{drop_below}\,cm,
+against \reach{l1/isaac_legs_blind}{drop_below}\,cm with blind legs, so the crouch tracks the goal height only
+when $\pi_L$ observes the goal. % RESULT: check the sign of this comparison before keeping "so".
+
+Table~\ref{tab:depth} gives success by lowering $d$ on the unextended goals. Reaching goals 0.1 and 0.2\,m beyond
+the standing tables ($e > 0$) requires leaning or stepping; the full policy reached
+\reach{l1/isaac}{success_d0.0}\% of all goals at $d = 0$, which includes them.
+
+\begin{table}[t]
+  \centering
+  \caption{Success (\%) by goal lowering $d$, standing-table goals without extension, three seeds per goal.}
+  \label{tab:depth}
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{lrrrrrr}
+    \toprule
+    $d$ (m) & 0 & 0.2 & 0.4 & 0.6 & 0.8 & 1.0 \\
+    \midrule
+    $\lambda = 1$            & \reach{l1/isaac}{success_e0_d0.0} & \reach{l1/isaac}{success_e0_d0.2} & \reach{l1/isaac}{success_e0_d0.4} & \reach{l1/isaac}{success_e0_d0.6} & \reach{l1/isaac}{success_e0_d0.8} & \reach{l1/isaac}{success_e0_d1.0} \\
+    $\lambda = 1$, blind legs & \reach{l1/isaac_legs_blind}{success_e0_d0.0} & \reach{l1/isaac_legs_blind}{success_e0_d0.2} & \reach{l1/isaac_legs_blind}{success_e0_d0.4} & \reach{l1/isaac_legs_blind}{success_e0_d0.6} & \reach{l1/isaac_legs_blind}{success_e0_d0.8} & \reach{l1/isaac_legs_blind}{success_e0_d1.0} \\
+    $\lambda = 1$, IK arms   & \reach{l1/isaac_arms_ik}{success_e0_d0.0} & \reach{l1/isaac_arms_ik}{success_e0_d0.2} & \reach{l1/isaac_arms_ik}{success_e0_d0.4} & \reach{l1/isaac_arms_ik}{success_e0_d0.6} & \reach{l1/isaac_arms_ik}{success_e0_d0.8} & \reach{l1/isaac_arms_ik}{success_e0_d1.0} \\
+    $\lambda = 0.5$          & \reach{l0.5/isaac}{success_e0_d0.0} & \reach{l0.5/isaac}{success_e0_d0.2} & \reach{l0.5/isaac}{success_e0_d0.4} & \reach{l0.5/isaac}{success_e0_d0.6} & \reach{l0.5/isaac}{success_e0_d0.8} & \reach{l0.5/isaac}{success_e0_d1.0} \\
+    $\lambda = 0$            & \reach{l0/isaac}{success_e0_d0.0} & \reach{l0/isaac}{success_e0_d0.2} & \reach{l0/isaac}{success_e0_d0.4} & \reach{l0/isaac}{success_e0_d0.6} & \reach{l0/isaac}{success_e0_d0.8} & \reach{l0/isaac}{success_e0_d1.0} \\
+    GOLEM IK (standing)      & \reach{golem_ik/kinematic}{success_e0_d0.0} & \reach{golem_ik/kinematic}{success_e0_d0.2} & \reach{golem_ik/kinematic}{success_e0_d0.4} & \reach{golem_ik/kinematic}{success_e0_d0.6} & \reach{golem_ik/kinematic}{success_e0_d0.8} & \reach{golem_ik/kinematic}{success_e0_d1.0} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Effect of reward sharing}
+\label{sec:sharing}
+
+Over all goals, $\lambda = 1$, $0.5$ and $0$ reached \reach{l1/isaac}{success}\%,
+\reach{l0.5/isaac}{success}\% and \reach{l0/isaac}{success}\%, with operational floors of
+\reach{l1/isaac}{floor}, \reach{l0.5/isaac}{floor} and \reach{l0/isaac}{floor}\,cm.
+% RESULT: if lambda = 0 also crouches, the crouch follows from the legs observing the goal and sharing changes how
+% far; if it does not, sharing is what produces it. State which, with the pelvis drop below the tables:
+For goals below the tables their median pelvis drops were \reach{l1/isaac}{drop_below},
+\reach{l0.5/isaac}{drop_below} and \reach{l0/isaac}{drop_below}\,cm.
+
+\subsection{Balance and accuracy}
+\label{sec:balance}
+
+At $d = 0.6$\,m the $\lambda = 1$ policy kept a median minimum CoM margin of \reach{l1/isaac}{com_d0.6}\,cm and
+fell in \reach{l1/isaac}{falls_d0.6}\% of trials; reached goals ended with a median wrist error of
+\reach{l1/isaac}{err_d0.6}\,cm and a wrist jitter of \reach{l1/isaac}{jitter_d0.6}\,mm over the last
+second, against \reach{l1/isaac}{err_d0.0}\,cm and \reach{l1/isaac}{jitter_d0.0}\,mm at $d = 0$.
+Across the whole grid the policy fell in \reach{l1/isaac}{falls}\% of trials.
+
+\subsection{Sim-to-sim transfer}
+\label{sec:sim2sim}
+
+We run the same goals in MuJoCo on the model of our lab's RoboCasa simulation, through a reimplementation of the
+policy loop that reproduces the training environment's observations to $10^{-5}$ and its joint targets to
+$2\times10^{-5}$\,rad from the same state, without retuning. With
+RoboCasa's joint damping, armature and friction the $\lambda = 1$ policy reached \reach{l1/mujoco}{success}\%
+of all goals and \reach{l1/mujoco}{success_below}\% of those below the tables, with
+\reach{l1/mujoco}{falls}\% falls; with those three joint parameters set to the training values it reached
+\reach{l1/mujoco_isaacphys}{success}\%. % RESULT: name the gap and its main cause.

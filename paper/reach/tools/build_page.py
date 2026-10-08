@@ -95,6 +95,8 @@ def eq(svgs, key, number):
 GALLERY = [
     ("fig_hero", "Hero, double column: the reached-target workspace over the H1-2 with and without the legs' "
                  "cooperation, success and pelvis height against the lower wrist target's height."),
+    ("fig_hero_final10", "The hero with a looser workspace: wrist targets within 10 cm at the goal's end in at least "
+                         "half of the trials."),
     ("fig_hero_depth", "The hero with goal lowering d on the right panels: the same base goals at every d."),
     ("fig_hero_col", "Single-column hero: workspace and success."),
     ("fig_filmstrip", "The robot every second of the deepest goal the hero policy reached, wrist targets marked."),
@@ -107,6 +109,11 @@ GALLERY = [
     ("error_vs_depth", "Wrist error of reached goals, and closest approach of all goals."),
     ("balance_vs_depth", "Balance: CoM and DCM margins, base tilt, wrist jitter, foot slip, falls."),
     ("sim2sim", "The hero policy in Isaac and in MuJoCo with RoboCasa's and with the training plant's joint dynamics."),
+    ("tradeoff", "Reach against walking: strict success below the standing table against the velocity-tracking "
+                 "error of the same checkpoint, one point per run (the two agents' tasks together)."),
+    ("walking", "Velocity-tracking error per command, one bar per run."),
+    ("learning_curve", "Strict success and curriculum depth level against environment transitions, every saved "
+                       "checkpoint of each run."),
     ("workspace_maps", "Per-wrist success over the sagittal plane, one map per condition."),
 ]
 

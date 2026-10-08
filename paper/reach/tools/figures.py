@@ -223,13 +223,22 @@ def pelvis_panel(D, ax, axis="height"):
 
 # ---------------------------------------------------------------- workspace and renders
 
-def wrist_points(key: str):
+CRITERIA = {"strict": "held within 5 cm and 0.35 rad for 1 s", "final10": "within 10 cm at the goal's end"}
+
+
+def wrist_points(key: str, criterion: str = "strict"):
+    """(x forward, height, reached) per wrist target; reached = that wrist's strict 1 s hold ("strict") or its
+    final position error under 10 cm ("final10")."""
     label, sim = key.split("/", 1)
     pts = []
     for r in csv.DictReader(open(C.RESULTS_DIR / label / sim / "trials.csv")):
         for pre in ("l", "r"):
-            pts.append((float(r[f"target_{pre}_x"]), float(r[f"target_{pre}_z"]) + C.STANDING_PELVIS_HEIGHT,
-                        float(r[f"success_{pre}"]) > 0.5))
+            if criterion == "strict":
+                ok = float(r[f"success_{pre}"]) > 0.5
+            else:
+                e = float(r[f"err_final_{pre}"]) if r[f"err_final_{pre}"] not in ("", "nan") else float("inf")
+                ok = e < 0.10
+            pts.append((float(r[f"target_{pre}_x"]), float(r[f"target_{pre}_z"]) + C.STANDING_PELVIS_HEIGHT, ok))
     return np.array(pts, dtype=float)
 
 
@@ -247,19 +256,28 @@ def success_field(pts, xs, zs, sigma=0.05, min_weight=2.0):
 
 
 def deepest_reached(D: Data):
-    """(goal row, traces.npz) of the lowest goal the hero reached among its traced seed-0 trials, or None."""
+    """(goal row, traces.npz, frame, kind) for the pose drawn over the workspace: the lowest goal the hero reached
+    among its traced seed-0 trials, at the step its 1 s hold completed ("reached"); if none was reached, the traced
+    trial with the deepest pelvis drop that stayed upright, at its closest approach ("closest"). None without traces."""
     if not D.hero:
         return None
     tr = C.RESULTS_DIR / D.hero / "isaac" / "traces.npz"
     if not tr.is_file():
         return None
-    names = set(np.load(tr).files)
-    best = None
-    for r in csv.DictReader(open(C.RESULTS_DIR / D.hero / "isaac" / "trials.csv")):
-        if r["success"] in ("1", "True") and r["seed"] == "0" and f"trace_{r['goal_id']}_state" in names:
-            if best is None or float(r["target_min_height"]) < float(best["target_min_height"]):
-                best = r
-    return (best, tr) if best else None
+    z = np.load(tr)
+    names = set(z.files)
+    rows = [r for r in csv.DictReader(open(C.RESULTS_DIR / D.hero / "isaac" / "trials.csv"))
+            if r["seed"] == "0" and f"trace_{r['goal_id']}_state" in names]
+    reached = [r for r in rows if r["success"] in ("1", "True")]
+    if reached:
+        r = min(reached, key=lambda r: float(r["target_min_height"]))
+        return r, tr, max(0, int(round(float(r["t_success"]) / C.POLICY_DT)) - 1), "reached"
+    upright = [r for r in rows if r["fell"] in ("0", "False")]
+    if not upright:
+        return None
+    r = max(upright, key=lambda r: float(r["pelvis_drop_last1s"]))
+    err = z[f"trace_{r['goal_id']}_err_mean"]
+    return r, tr, int(np.nanargmin(err)), "closest"
 
 
 def robot_layers(D: Data):
@@ -275,11 +293,11 @@ def robot_layers(D: Data):
     layers.append((img, mp, 0.30 if pick else 1.0))
     target = None
     if pick:
-        row, tr = pick
-        t = max(0, int(round(float(row["t_success"]) / C.POLICY_DT)) - 1)
+        row, tr, t, kind = pick
         (img2, mp2), = render_trace_frames(tr, row["goal_id"], [t], width=600, height=800)
         layers.append((img2, mp2, 1.0))
-        target = row
+        target = {**row, "pose_kind": kind, "pose_frame": t}
+        C.write_csv(FIG / "data" / "hero_pose.csv", [target])
     return layers, target
 
 
@@ -288,7 +306,7 @@ def extent_of(mp):
             mp["z_top"])
 
 
-def workspace_panel(D: Data, ax, layers, target):
+def workspace_panel(D: Data, ax, layers, target, criterion: str = "strict"):
     xs, zs = np.linspace(-0.3, 1.1, 141), np.linspace(0.0, 2.0, 201)
     ax.set_aspect("equal")
     shade_below_floor(D, ax, axis="y")
@@ -300,7 +318,7 @@ def workspace_panel(D: Data, ax, layers, target):
     for key, col in ((standing, BLUE), (crouch, lam_color(D.infos[crouch]["lambda"] or 1.0) if crouch else None)):
         if not key:
             continue
-        f = np.nan_to_num(success_field(wrist_points(key), xs, zs), nan=0.0)
+        f = np.nan_to_num(success_field(wrist_points(key, criterion), xs, zs), nan=0.0)
         ax.contourf(xs, zs, f, levels=[0.5, 1.01], colors=[col], alpha=0.28, zorder=2)
         ax.contour(xs, zs, f, levels=[0.5], colors=[col], linewidths=1.1, zorder=3)
         drawn.append((key, col))
@@ -322,23 +340,24 @@ def hero_legend(D, fig, ax_lines, drawn, y=0.995, ncol=4):
         handles.append(Patch(facecolor=col, alpha=0.3, edgecolor=col))
         labels.append(f"Reached by {D.name(key)}")
     handles.append(Line2D([], [], marker="x", ls="", color=INK, ms=5, mew=1.4))
-    labels.append("Targets of the pose shown")
+    labels.append("Wrist targets of the pose shown")
     fig.legend(handles, labels, loc="upper center", ncol=ncol, bbox_to_anchor=(0.5, y), handlelength=2.0,
                columnspacing=1.1)
 
 
-def fig_hero(D: Data, layers, target, axis="height"):
+def fig_hero(D: Data, layers, target, axis="height", criterion="strict"):
     fig = plt.figure(figsize=(DBL_W, 2.85))
     gs = fig.add_gridspec(1, 3, width_ratios=[1.12, 1.2, 1.2], wspace=0.36, left=0.06, right=0.995, bottom=0.14,
                           top=0.80)
     ax0, ax1, ax2 = (fig.add_subplot(gs[i]) for i in range(3))
-    drawn = workspace_panel(D, ax0, layers, target)
+    drawn = workspace_panel(D, ax0, layers, target, criterion)
     rows = success_panel(D, ax1, axis) + pelvis_panel(D, ax2, axis)
     for ax, letter in zip((ax0, ax1, ax2), "abc"):
         ax.text(-0.02, 1.03, f"({letter})", transform=ax.transAxes, fontsize=8, fontweight="bold", va="bottom",
                 ha="right")
     hero_legend(D, fig, ax1, drawn)
-    save(fig, "fig_hero" if axis == "height" else "fig_hero_depth", rows)
+    name = "fig_hero" if axis == "height" else "fig_hero_depth"
+    save(fig, name + ("" if criterion == "strict" else f"_{criterion}"), rows)
 
 
 def fig_hero_col(D: Data, layers, target):
@@ -359,9 +378,9 @@ def fig_filmstrip(D: Data):
     if not pick:
         return
     from render_robot import render_trace_frames
-    row, tr = pick
-    t_done = float(row["t_success"])
-    times = [0.0, 1.0, 2.0, min(t_done, 3.98), 3.98]
+    row, tr, t_pose, kind = pick
+    t_done = (t_pose + 1) * C.POLICY_DT
+    times = [0.0, 1.0, 2.0, round(min(t_done, 3.98), 2), 3.98]
     times = sorted(set(round(t, 2) for t in times))
     frames = render_trace_frames(tr, row["goal_id"], [int(round(t / C.POLICY_DT)) for t in times], width=480,
                                  height=640)
@@ -376,7 +395,8 @@ def fig_filmstrip(D: Data):
         ax.set_xlim(-0.35, 0.95)
         ax.set_ylim(0.0, 1.9)
         ax.set_aspect("equal")
-        ax.set_title(f"t = {t:.1f} s" + ("  (held 1 s)" if abs(t - t_done) < 1e-6 else ""), fontsize=7.2, pad=2)
+        tag = ("  (held 1 s)" if kind == "reached" else "  (closest)") if abs(t - t_done) < 1e-6 else ""
+        ax.set_title(f"t = {t:.1f} s" + tag, fontsize=7.2, pad=2)
         ax.set_xticks([0.0, 0.5])
     np.atleast_1d(axes)[0].set_ylabel("Height (m)")
     fig.supxlabel(f"Forward of the pelvis (m). {D.name(D.hero + '/isaac')}, goal {row['goal_id']}: lower target "
@@ -484,6 +504,89 @@ def sim2sim(D: Data):
     save(fig, "sim2sim", rows)
 
 
+def learning_curve(D: Data):
+    """Strict success (all goals, and below the standing table) and the mean curriculum level against environment
+    transitions, one line per run with curve data (results/curves/<label>.csv from eval_curve.py)."""
+    files = sorted((C.RESULTS_DIR / "curves").glob("*.csv"))
+    curves = {f.stem: read_csv(f) for f in files}
+    curves = {k: sorted(v, key=lambda r: r["transitions"]) for k, v in curves.items() if len(v) >= 2}
+    if not curves:
+        return
+    fig, axes = plt.subplots(1, 2, figsize=(DBL_W * 0.66, 2.15))
+    rows = []
+    order = [lab for lab in D.registry if lab in curves] + [lab for lab in curves if lab not in D.registry]
+    for lab in order:
+        cv = curves[lab]
+        lam = cv[0].get("lambda_share")
+        col = lam_color(lam if isinstance(lam, float) and not math.isnan(lam) else 1.0)
+        x = np.array([r["transitions"] for r in cv]) / 1e6
+        name = D.registry.get(lab, {}).get("name", lab)
+        axes[0].plot(x, [100 * r["success"] for r in cv], color=col, lw=1.6, label=f"{name}, all goals")
+        axes[0].plot(x, [100 * r["success_below"] for r in cv], color=col, lw=1.2, ls=(0, (3, 1.5)),
+                     label=f"{name}, below the table")
+        if "kd_mean" in cv[0]:
+            axes[1].plot(x, [r["kd_mean"] for r in cv], color=col, lw=1.6, label=name)
+            axes[1].fill_between(x, [r["kd_q25"] for r in cv], [r["kd_q75"] for r in cv], color=col, alpha=0.13, lw=0)
+        rows += [{"label": lab, **r} for r in cv]
+    axes[0].set_ylabel("Strict success (%)")
+    axes[0].set_ylim(-2, 102)
+    axes[1].set_ylabel("Curriculum depth level $k_d$")
+    axes[1].set_ylim(-0.3, 10.3)
+    for ax in axes:
+        ax.set_xlabel("Environment transitions (millions)")
+        ax.grid(True, axis="y")
+    axes[0].legend(loc="upper left", fontsize=6)
+    fig.tight_layout()
+    save(fig, "learning_curve", rows)
+
+
+def walking(D: Data):
+    """Velocity tracking error per command for every listed run (eval_walk.py), and the reach-walk trade-off."""
+    walks = {}
+    for lab in D.registry:
+        path = C.RESULTS_DIR / lab / "isaac_walk" / "walk.csv"
+        if path.is_file():
+            walks[lab] = read_csv(path)
+    if not walks:
+        return
+    cmds = [r["command"] for r in next(iter(walks.values()))]
+    fig, ax = plt.subplots(figsize=(DBL_W * 0.62, 2.1))
+    width = 0.8 / len(walks)
+    rows = []
+    for i, (lab, w) in enumerate(walks.items()):
+        key = f"{lab}/isaac"
+        col = D.style(key)["color"] if key in D.infos else lam_color(w[0]["lambda_share"] or 1.0)
+        x = np.arange(len(cmds)) + (i - (len(walks) - 1) / 2) * width
+        ax.bar(x, [100 * r["err_xy"] for r in w], width=width * 0.92, color=col, label=D.registry[lab].get("name", lab))
+        rows += [{"label": lab, **r} for r in w]
+    ax.set_xticks(np.arange(len(cmds)), [c.replace(" + ", "+\n") for c in cmds], fontsize=6.3)
+    ax.set_ylabel("Velocity error (cm/s)")
+    ax.grid(True, axis="y")
+    ax.legend(loc="upper left")
+    fig.tight_layout()
+    save(fig, "walking", rows)
+    # trade-off: reach success below the standing table against walking error, one point per run
+    pts = []
+    for lab, w in walks.items():
+        key = f"{lab}/isaac"
+        below = (D.infos.get(key) or {}).get("below_floor")
+        if not below:
+            continue
+        moving = [r for r in w if r["command"] != "stand"]
+        pts.append((lab, 100 * float(np.mean([r["err_xy"] for r in moving])), 100 * below["success"]))
+    if not pts:
+        return
+    fig, ax = plt.subplots(figsize=(COL_W, 2.2))
+    for lab, ex, sy in pts:
+        st = D.style(f"{lab}/isaac")
+        ax.plot(ex, sy, "o", ms=7, color=st["color"], mec="white", mew=1.2, zorder=3)
+        ax.annotate(D.registry[lab].get("name", lab), (ex, sy), textcoords="offset points", xytext=(6, 4), fontsize=6.5)
+    ax.set_xlabel("Walking velocity error, moving commands (cm/s)")
+    ax.set_ylabel("Strict success below the table (%)")
+    ax.grid(True)
+    save(fig, "tradeoff", [{"label": lab, "walk_err_cm_s": ex, "success_below_pct": sy} for lab, ex, sy in pts])
+
+
 def workspace_maps(D: Data):
     keys = D.main + [k for k in (D.blind, D.golem) if k] + D.mujoco[:1]
     if not keys:
@@ -511,6 +614,7 @@ def main():
         print(f"[figures] robot render skipped: {e}")
         layers, target = [], None
     fig_hero(D, layers, target, "height")
+    fig_hero(D, layers, target, "height", criterion="final10")
     fig_hero(D, layers, target, "depth")
     fig_hero_col(D, layers, target)
     fig_filmstrip(D)
@@ -522,6 +626,8 @@ def main():
     error_vs_depth(D)
     balance_vs_depth(D)
     sim2sim(D)
+    learning_curve(D)
+    walking(D)
     workspace_maps(D)
 
 

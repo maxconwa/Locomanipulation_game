@@ -54,7 +54,7 @@ def load_trials() -> dict[tuple[str, str], list[dict]]:
     out = {}
     for path in sorted(C.RESULTS_DIR.glob("*/*/trials.csv")):
         label, sim = path.parent.parent.name, path.parent.name
-        if label.startswith("_") or label == "summary":
+        if label.startswith("_") or label in ("summary", "curves") or "@" in label:   # @: learning-curve checkpoints
             continue
         with open(path) as f:
             rows = list(csv.DictReader(f))
@@ -92,7 +92,7 @@ def condition_info(key, rows, registry: dict) -> dict:
         if tag in variant:
             name += text
     if base_sim == "mujoco":
-        name += " (MuJoCo)"
+        name += " (MuJoCo, training joints)" if "isaacphys" in variant else " (MuJoCo, RoboCasa joints)"
     return {"key": f"{label}/{sim}", "label": label, "sim": sim, "base_sim": base_sim, "variant": variant, "kind": kind,
             "lambda": lam, "name": name, "n": len(rows),
             "checkpoint": rows[0].get("checkpoint", ""), "order": reg.get("order", 0)}
@@ -260,6 +260,22 @@ def main():
                 tol_rows.append({"condition": a_key(k), "group": group, "tau": float(tau), "n": len(sel),
                                  "success_pos": float(np.mean(he < tau))})
     C.write_csv(SUMMARY / "tolerance.csv", tol_rows)
+    # walking: velocity tracking per run (eval_walk.py), the legs' task
+    walk_rows = []
+    for path in sorted(C.RESULTS_DIR.glob("*/isaac_walk/walk.csv")):
+        label = path.parent.parent.name
+        if label.startswith("_") or "@" in label:
+            continue
+        w = list(csv.DictReader(open(path)))
+        moving = [r for r in w if r["command"] != "stand"]
+        turns = [r for r in w if float(r["wz_cmd"]) != 0.0]
+        stand = [r for r in w if r["command"] == "stand"]
+        walk_rows.append({"label": label, "lambda_share": float(w[0]["lambda_share"]) if w[0]["lambda_share"] not in ("", "nan") else math.nan,
+                          "err_xy_moving": float(np.mean([float(r["err_xy"]) for r in moving])),
+                          "err_yaw_turns": float(np.mean([float(r["err_yaw"]) for r in turns])) if turns else math.nan,
+                          "stand_drift": float(stand[0]["err_xy"]) if stand else math.nan,
+                          "falls": int(sum(int(r["falls"]) for r in w)), "n_env_commands": int(sum(int(r["n"]) + int(r["falls"]) for r in w))})
+    C.write_csv(SUMMARY / "walk.csv", walk_rows)
     pairs = paired(trials, infos)
     C.write_csv(SUMMARY / "by_depth.csv", by_depth)
     C.write_csv(SUMMARY / "by_height.csv", by_height)
@@ -302,6 +318,10 @@ def main():
                                         ("jitter", "ee_jitter_l_med", 1, ".1f")):
             if not math.isnan(b[field]):
                 entries[(b["condition"], f"{name}_d{d}")] = format(scale * b[field], fmt)
+    for w in walk_rows:
+        entries[(f"{w['label']}/walk", "err_xy")] = f"{100 * w['err_xy_moving']:.0f}"
+        entries[(f"{w['label']}/walk", "err_yaw")] = f"{w['err_yaw_turns']:.2f}"
+        entries[(f"{w['label']}/walk", "falls")] = w["falls"]
     for p in pairs:
         if p["depth"] == "all":
             entries[(f"{p['a']}-vs-{p['b']}", "diff")] = f"{100 * p['diff']:.0f}"

@@ -5,7 +5,7 @@
 
 For each condition whose run directory holds its checkpoint (conditions.yaml: run, optional checkpoint, default the
 newest checkpoints/agent_<N>.pt):
-    Isaac   full and legs_blind on --seeds, arms_ik on the first seed
+    Isaac   full and legs_blind on --seeds, arms_ik on the first seed, and velocity tracking (eval_walk.py)
     MuJoCo  full with RoboCasa's joint dynamics and with the training plant's, legs_blind with RoboCasa's
 A result is current when results/<label>/<sim>/meta.json names the same checkpoint file hash; anything else is
 (re)run. Then analyze.py, the robot renders, figures.py and build_page.py. Isaac jobs go through the workstation's
@@ -72,6 +72,10 @@ def main():
             if not current(label, sim, ckpt):
                 jobs.append(guard + [a.py, str(REACH / "tools" / "eval_isaac.py"), "--checkpoint", str(ckpt),
                                      "--label", label, "--device", a.device, *extra])
+        walk = C.RESULTS_DIR / label / "isaac_walk" / "meta.json"
+        if not (walk.is_file() and json.loads(walk.read_text()).get("checkpoint_sha256") == C.sha256(ckpt)):
+            jobs.append(guard + [a.py, str(REACH / "tools" / "eval_walk.py"), "--checkpoint", str(ckpt), "--label",
+                                 label, "--device", a.device])
         if not a.no_mujoco:
             mj = [("mujoco", []), ("mujoco_isaacphys", ["--physics", "isaac"]),
                   ("mujoco_legs_blind", ["--variant", "legs_blind"])]
