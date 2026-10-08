@@ -356,12 +356,12 @@ class MarlRewardsCfg:
 
 @configclass
 class MarlEventCfg(EventCfg):
-    # RoboCasa's MuJoCo robot gives every joint damping 10 and armature 0.1 on top of the PD
+    # RoboCasa's MuJoCo robot gives every joint passive damping 10 and armature 0.1 on top of the PD. While training,
+    # the env scales both from the asset's defaults (LocoManipMarlEnv._update_robocasa_physics).
     passive_damping = EventTerm(
-        func=mdp.randomize_actuator_gains,
+        func=mdp.passive_joint_damping,
         mode="startup",
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS), "damping_distribution_params": (8.0, 12.0),
-                "operation": "add"},
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS), "damping_distribution_params": (8.0, 12.0)},
     )
     joint_armature = EventTerm(
         func=mdp.randomize_joint_parameters,
@@ -443,6 +443,10 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     # joint targets land this many physics substeps (5 ms each) late, drawn per env and episode: the deploy
     # loop's latency. The agents observe their actions undelayed.
     action_delay_substeps: tuple[int, int] = (0, 4)
+    # RoboCasa's joint physics (the passive_damping and joint_armature events, the delay's upper end) ramps in over
+    # these steps from the step the walking gate opens; a fresh policy doesn't learn to walk with it. Outside
+    # training it is on in full.
+    robocasa_ramp_steps: int = 20000
     agent_action_terms: dict[str, str] = AGENT_ACTION_TERMS
     clip_actions: float = CLIP_ACTIONS
     # added after the rewards are floored at 0 on terminating (not timed-out) steps

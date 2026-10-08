@@ -11,7 +11,8 @@ them onto the per-agent dicts:
 After every step it moves the arm command by the pelvis motion the learned estimator (odometry.py) reports, or with
 estimator.odometry "legs" by leg odometry (_leg_odometry), and fits the estimator to the true motion. GolemEstopMonitor
 (golem_safety.py) checks GOLEM's e-stops at every physics substep, and joint targets land action_delay_substeps late.
-While training, the e-stops end the episode only once the legs walk (_update_walking_gate).
+While training, the e-stops end the episode only once the legs walk (_update_walking_gate), and RoboCasa's joint
+physics ramps in from then (_update_robocasa_physics).
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from .odometry import EstimatorTrainer, motion_to_transform, pelvis_motion
 
 
 WALKING_PROGRESS_EMA = 0.001  # per policy step: a time constant of 20 s of sim time
+ROBOCASA_SCALE_STEPS = 20  # the ramp of RoboCasa's joint physics is written in this many steps
 
 
 class LocoManipMarlEnv(DirectMARLEnv):
@@ -70,9 +72,15 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self.estops_end_episodes = not self.cfg.estimator.train
         self._walking_progress_ema = torch.tensor(0.0, device=self.device)
         self._gate_log: dict[str, torch.Tensor] = {}
+        # RoboCasa's joint damping and armature as the startup events drew them, and the step its ramp starts from
+        self._robocasa_damping = self._robot.data.joint_viscous_friction_coeff.clone()
+        self._robocasa_armature = self._robot.data.joint_armature.clone()
+        self._ramp_start: int | None = None if self.cfg.estimator.train else -self.cfg.robocasa_ramp_steps
+        self.robocasa_scale = -1.0
+        self._update_robocasa_physics()
         # the deploy loop's latency: per env, the substeps a new target waits; until then the robot holds the last
-        lo, hi = self.cfg.action_delay_substeps
-        self._delay = torch.randint(lo, hi + 1, (self.num_envs,), device=self.device)
+        lo = self.cfg.action_delay_substeps[0]
+        self._delay = torch.randint(lo, self._delay_max + 1, (self.num_envs,), device=self.device)
         self._delayed_target = self._robot.data.joint_pos.clone()
         self._substep = 0
 
@@ -182,9 +190,9 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._refresh_sensors_after_reset(env_ids)
         self._fresh[env_ids] = True
         self.golem_monitor.reset(env_ids)
-        lo, hi = self.cfg.action_delay_substeps
+        lo = self.cfg.action_delay_substeps[0]
         ids = torch.as_tensor(env_ids, device=self.device)
-        self._delay[ids] = torch.randint(lo, hi + 1, (len(ids),), device=self.device)
+        self._delay[ids] = torch.randint(lo, self._delay_max + 1, (len(ids),), device=self.device)
         # a fresh episode starts from a hold at its reset pose, as the deploy node's pre-pose ends
         self._delayed_target[ids] = self._robot.data.joint_pos[ids]
 
@@ -279,9 +287,40 @@ class LocoManipMarlEnv(DirectMARLEnv):
             self._walking_progress_ema += WALKING_PROGRESS_EMA * (progress - self._walking_progress_ema)
         if not self.estops_end_episodes and self._walking_progress_ema.item() > self.cfg.walking_gate:
             self.estops_end_episodes = True
-            print(f"[INFO] Walking gate open at step {self.common_step_counter}: GOLEM's e-stops end the episode")
+            self._ramp_start = self.common_step_counter
+            print(f"[INFO] Walking gate open at step {self.common_step_counter}: GOLEM's e-stops end the episode,"
+                  f" RoboCasa's joint physics ramps in over {self.cfg.robocasa_ramp_steps} steps")
+        self._update_robocasa_physics()
         self._gate_log["Safety/walking_progress"] = self._walking_progress_ema
         self._gate_log["Safety/estops_end_episodes"] = torch.tensor(float(self.estops_end_episodes), device=self.device)
+        self._gate_log["Safety/robocasa_scale"] = torch.tensor(self.robocasa_scale, device=self.device)
+
+    def _update_robocasa_physics(self):
+        """Write RoboCasa's joint physics at robocasa_scale of the way from the asset's defaults: 0 until the ramp
+        starts, then rising to 1 over cfg.robocasa_ramp_steps in ROBOCASA_SCALE_STEPS steps. It scales the passive
+        damping and armature the startup events drew, and the upper end of the action delay new episodes draw.
+        """
+        scale = 0.0
+        if self._ramp_start is not None:
+            progress = (self.common_step_counter - self._ramp_start) / max(self.cfg.robocasa_ramp_steps, 1)
+            scale = min(1.0, int(progress * ROBOCASA_SCALE_STEPS) / ROBOCASA_SCALE_STEPS)
+        if scale == self.robocasa_scale:
+            return
+        self.robocasa_scale = scale
+        data = self._robot.data
+        damping = torch.lerp(data.default_joint_viscous_friction_coeff, self._robocasa_damping, scale)
+        armature = torch.lerp(data.default_joint_armature, self._robocasa_armature, scale)
+        self._robot.write_joint_friction_coefficient_to_sim(
+            data.joint_friction_coeff.clone(), joint_viscous_friction_coeff=damping
+        )
+        self._robot.write_joint_armature_to_sim(armature)
+        lo, hi = self.cfg.action_delay_substeps
+        self._delay_max = lo + round(scale * (hi - lo))
+        print(
+            f"[INFO] RoboCasa's joint physics at {scale:.2f} (step {self.common_step_counter}): passive damping"
+            f" {damping.max().item():.2f} max, armature {armature.max().item():.3f} max, delay up to"
+            f" {self._delay_max} substeps"
+        )
 
     def _feet_in_pelvis(self) -> torch.Tensor:
         """Each foot's ankle-roll origin in the pelvis frame, (N, F, 3): on the robot, forward kinematics."""
@@ -338,13 +377,15 @@ class LocoManipMarlEnv(DirectMARLEnv):
             "goal_drift_ema": self._goal_drift_ema.clone(),
             "walking_progress_ema": self._walking_progress_ema.clone(),
             "estops_end_episodes": self.estops_end_episodes,
+            "robocasa_scale": self.robocasa_scale,
         }
         self.estimator.save(os.path.join(directory, f"estimator_{self.common_step_counter}.pt"), env_state)
         self.estimator.save(os.path.join(directory, "estimator_latest.pt"), env_state)
 
     def _load_env_state(self, state: dict):
-        """Curriculum levels, terrain tiles and the drift and walking gates saved by _save_estimator. Runs from
-        before the walking gate had e-stops end the episode from the start."""
+        """Curriculum levels, terrain tiles, the drift and walking gates and the RoboCasa ramp saved by
+        _save_estimator. Runs from before the walking gate had e-stops end the episode and RoboCasa's joint physics
+        on in full from the start."""
         self._arm_command.load_state_dict(state["arm_targets"])
         terrain = self.scene.terrain
         levels = state["terrain_levels"].to(self.device)
@@ -357,9 +398,14 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._goal_drift_ema = state["goal_drift_ema"].to(self.device)
         self._walking_progress_ema = state.get("walking_progress_ema", torch.tensor(1.0)).to(self.device)
         self.estops_end_episodes = self.estops_end_episodes or state.get("estops_end_episodes", True)
+        if self.estops_end_episodes and self.cfg.estimator.train:
+            scale = state.get("robocasa_scale", 1.0)
+            self._ramp_start = self.common_step_counter - round(scale * self.cfg.robocasa_ramp_steps)
+        self._update_robocasa_physics()
         print(
             f"[INFO] Restored curriculum: arm level mean {self._arm_command.level.float().mean().item():.2f},"
-            f" drift gate {self._goal_drift_ema.item():.3f}, e-stops end episodes {self.estops_end_episodes}"
+            f" drift gate {self._goal_drift_ema.item():.3f}, e-stops end episodes {self.estops_end_episodes},"
+            f" RoboCasa's joint physics at {self.robocasa_scale:.2f}"
         )
 
     """
