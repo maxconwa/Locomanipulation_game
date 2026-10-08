@@ -35,8 +35,9 @@ models:
 log_std_bounds:
   legs: [-3.0, -0.51]   # std 0.05 .. 0.6
   arms: [-3.0, 0.0]     # std 0.05 .. 1.0
-# Critics trained on raw returns: skrl fits the value scaler to the critic's own predictions too, and the arms' ran away.
-no_value_preprocessor: [arms]
+# Critics trained on raw returns: skrl fits the value scaler to the critic's own predictions too, and it ran away
+# (the arms' in runs A-B, the legs' in fresh runs to a mean of 1e5-1e14).
+no_value_preprocessor: [arms, legs]
 
 memory:
   class: RandomMemory

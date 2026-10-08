@@ -11,6 +11,7 @@ them onto the per-agent dicts:
 After every step it moves the arm command by the pelvis motion the learned estimator (odometry.py) reports, or with
 estimator.odometry "legs" by leg odometry (_leg_odometry), and fits the estimator to the true motion. GolemEstopMonitor
 (golem_safety.py) checks GOLEM's e-stops at every physics substep, and joint targets land action_delay_substeps late.
+While training, the e-stops end the episode only once the legs walk (_update_walking_gate).
 """
 
 from __future__ import annotations
@@ -33,6 +34,9 @@ from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_inv, quat_m
 from .golem_safety import GolemEstopMonitor
 from .locomanip_marl_env_cfg import ARM_COMMAND, LocoManipMarlEnvCfg
 from .odometry import EstimatorTrainer, motion_to_transform, pelvis_motion
+
+
+WALKING_PROGRESS_EMA = 0.001  # per policy step: a time constant of 20 s of sim time
 
 
 class LocoManipMarlEnv(DirectMARLEnv):
@@ -62,6 +66,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._robot = self.scene["robot"]
         self.golem_monitor = GolemEstopMonitor(self._robot, self.cfg.golem_estop, self.num_envs, self.device)
         self.golem_log: dict[str, torch.Tensor] = {}
+        # opens once and stays open; always open outside training
+        self.estops_end_episodes = not self.cfg.estimator.train
+        self._walking_progress_ema = torch.tensor(0.0, device=self.device)
+        self._gate_log: dict[str, torch.Tensor] = {}
         # the deploy loop's latency: per env, the substeps a new target waits; until then the robot holds the last
         lo, hi = self.cfg.action_delay_substeps
         self._delay = torch.randint(lo, hi + 1, (self.num_envs,), device=self.device)
@@ -154,11 +162,13 @@ class LocoManipMarlEnv(DirectMARLEnv):
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
         self._update_odometry()
+        self._update_walking_gate()
         self.command_manager.compute(dt=self.step_dt)
         groups = list(self.cfg.possible_agents) + ["critic"]
         self._obs_buf = {g: self.observation_manager.compute_group(g, update_history=True) for g in groups}
         self.extras.setdefault("log", {}).update(self._estimator_log)
         self.extras["log"].update(self.golem_log)
+        self.extras["log"].update(self._gate_log)
         return {agent: self._obs_buf[agent] for agent in self.cfg.possible_agents}
 
     def _get_states(self) -> torch.Tensor:
@@ -253,6 +263,26 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._estimator_log["Estimator/goal_drift"] = self._goal_drift_ema
         self._estimator_log["Estimator/gate_open"] = gate_open
 
+    def _update_walking_gate(self):
+        """Open the walking gate when the EMA of walking progress passes cfg.walking_gate: per step, the mean over
+        envs navigating on a command of at least walking_gate_min_speed (not just reset) of the pelvis velocity along
+        the command over the command's speed. 0 standing still, 1 on the command. Before the command manager
+        resamples, so the command is the one the step followed.
+        """
+        command = self.command_manager.get_command("base_velocity")[:, :2]
+        speed = torch.norm(command, dim=1)
+        arm = self._arm_command
+        nav = ~(arm.arm_mode | arm.settling) & (speed >= self.cfg.walking_gate_min_speed) & (self.episode_length_buf > 0)
+        if nav.any():
+            velocity = self._robot.data.root_lin_vel_b[:, :2]
+            progress = (torch.sum(velocity * command, dim=1) / speed.square().clamp(min=1e-6))[nav].mean()
+            self._walking_progress_ema += WALKING_PROGRESS_EMA * (progress - self._walking_progress_ema)
+        if not self.estops_end_episodes and self._walking_progress_ema.item() > self.cfg.walking_gate:
+            self.estops_end_episodes = True
+            print(f"[INFO] Walking gate open at step {self.common_step_counter}: GOLEM's e-stops end the episode")
+        self._gate_log["Safety/walking_progress"] = self._walking_progress_ema
+        self._gate_log["Safety/estops_end_episodes"] = torch.tensor(float(self.estops_end_episodes), device=self.device)
+
     def _feet_in_pelvis(self) -> torch.Tensor:
         """Each foot's ankle-roll origin in the pelvis frame, (N, F, 3): on the robot, forward kinematics."""
         feet = self._robot.data.body_pos_w[:, self._foot_ids] - self._robot.data.root_pos_w.unsqueeze(1)
@@ -306,12 +336,15 @@ class LocoManipMarlEnv(DirectMARLEnv):
             "terrain_levels": terrain.terrain_levels.clone(),
             "terrain_types": terrain.terrain_types.clone(),
             "goal_drift_ema": self._goal_drift_ema.clone(),
+            "walking_progress_ema": self._walking_progress_ema.clone(),
+            "estops_end_episodes": self.estops_end_episodes,
         }
         self.estimator.save(os.path.join(directory, f"estimator_{self.common_step_counter}.pt"), env_state)
         self.estimator.save(os.path.join(directory, "estimator_latest.pt"), env_state)
 
     def _load_env_state(self, state: dict):
-        """Curriculum levels, terrain tiles and the drift gate saved by _save_estimator."""
+        """Curriculum levels, terrain tiles and the drift and walking gates saved by _save_estimator. Runs from
+        before the walking gate had e-stops end the episode from the start."""
         self._arm_command.load_state_dict(state["arm_targets"])
         terrain = self.scene.terrain
         levels = state["terrain_levels"].to(self.device)
@@ -322,9 +355,11 @@ class LocoManipMarlEnv(DirectMARLEnv):
             terrain.terrain_levels[:] = levels[torch.randint(0, len(levels), (self.num_envs,), device=self.device)]
         terrain.env_origins[:] = terrain.terrain_origins[terrain.terrain_levels, terrain.terrain_types]
         self._goal_drift_ema = state["goal_drift_ema"].to(self.device)
+        self._walking_progress_ema = state.get("walking_progress_ema", torch.tensor(1.0)).to(self.device)
+        self.estops_end_episodes = self.estops_end_episodes or state.get("estops_end_episodes", True)
         print(
             f"[INFO] Restored curriculum: arm level mean {self._arm_command.level.float().mean().item():.2f},"
-            f" drift gate {self._goal_drift_ema.item():.3f}"
+            f" drift gate {self._goal_drift_ema.item():.3f}, e-stops end episodes {self.estops_end_episodes}"
         )
 
     """

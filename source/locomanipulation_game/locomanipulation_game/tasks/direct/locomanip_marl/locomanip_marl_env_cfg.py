@@ -434,6 +434,12 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
         ".*_ankle_pitch_joint": (0.05, 0.05),
         ".*_knee_joint": (0.05, 0.02),
     })
+    # while training, GOLEM's e-stops end the episode only from the step the legs first walk: the EMA of the share
+    # of the commanded speed the pelvis covers along navigation commands of at least walking_gate_min_speed passes
+    # walking_gate (LocoManipMarlEnv._update_walking_gate). Until then they are logged only, so a fresh policy's
+    # first steps don't end it.
+    walking_gate: float = 0.5
+    walking_gate_min_speed: float = 0.2  # m/s
     # joint targets land this many physics substeps (5 ms each) late, drawn per env and episode: the deploy
     # loop's latency. The agents observe their actions undelayed.
     action_delay_substeps: tuple[int, int] = (0, 4)
