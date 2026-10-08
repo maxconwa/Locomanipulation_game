@@ -73,3 +73,13 @@ tests/
 # TacSL sensor
 **/tactile_record/*
 **/gelsight_r15_data/*
+# paper/: the manuscript lives on Overleaf and stays untracked; the reach evaluation, its page and its section are
+# tracked so the figures and numbers can be regenerated from the trials
+paper/*
+!paper/reach/
+!paper/20261008-reach_cooperation.html
+!paper/20261008-experiments_reach.tex
+paper/reach/results/_*/
+paper/reach/results/*/*/envdir/
+paper/reach/results/*/*/traces.npz
+paper/reach/goals/*.pt

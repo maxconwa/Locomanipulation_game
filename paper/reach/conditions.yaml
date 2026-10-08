@@ -1,0 +1,30 @@
+# The controllers the paper compares. To add a run: set its `run` (relative to paper/reach, or absolute) and, if you
+# want an earlier checkpoint than the newest, `checkpoint`; then `make -C paper/reach all`.
+#
+#   label        names the results folder and the \reach{<label>/<sim>}{...} numbers; keep it short
+#   name         legend label in the figures and the page
+#   run          the run directory (with checkpoints/, estimator/, params/); lambda is read from params/env.yaml
+#   checkpoint   optional checkpoint file name inside checkpoints/ (default: the newest agent_<N>.pt)
+#   hero         this condition's workspace is the orange one in the hero figure (default: the highest lambda)
+#   status       shown on the page while the condition has no results
+#
+# Figures and tables show the conditions listed here (plus GOLEM's arm IK), in this order.
+conditions:
+  - label: l1
+    name: "λ = 1"
+    run: ""
+    status: "training (coworker)"
+    hero: true
+  - label: l0.5
+    name: "λ = 0.5"
+    run: ""
+    status: "training (coworker)"
+  - label: l0
+    name: "λ = 0"
+    run: ""
+    status: "training (coworker)"
+  - label: l0.5_52k
+    name: "λ = 0.5, 52.8k steps"
+    run: ../../logs/skrl/locomanip_marl/2026-10-08_14-34-36_paper_yaw_91k
+    checkpoint: agent_52800.pt
+    status: "evaluating"

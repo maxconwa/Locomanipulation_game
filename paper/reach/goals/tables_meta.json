@@ -1,0 +1,52 @@
+{
+ "table_file": "arm_target_tables_v3.pt",
+ "sha256": "8054afc82628b57a27ca4adc51b0e48a0a411956a185ecb00a8ac895f8934192",
+ "seed": 0,
+ "num_envs": 1024,
+ "rows": [
+  99687,
+  99735
+ ],
+ "standing_min_z": [
+  -0.10889577865600586,
+  -0.10945551842451096
+ ],
+ "rest_pose_b": [
+  [
+   0.23400567471981049,
+   0.20950527489185333,
+   0.09496846795082092,
+   1.0000001192092896,
+   2.5033950805664062e-06,
+   1.3417702575679868e-06,
+   9.291547030443326e-06
+  ],
+  [
+   0.2340119332075119,
+   -0.2094782292842865,
+   0.0949626937508583,
+   1.0000001192092896,
+   2.860987478925381e-06,
+   9.443214366910979e-06,
+   9.197575309372041e-06
+  ]
+ ],
+ "settings": {
+  "body_names": [
+   "left_wrist_yaw_link",
+   "right_wrist_yaw_link"
+  ],
+  "min_target_x": 0.1,
+  "balance_cell": 0.1,
+  "balance_min_rows": 4,
+  "table_size": 100000,
+  "build_size": 300000
+ },
+ "task": "LocoManip-Marl-Direct-v0",
+ "code": {
+  "path": "/home/humanoid/Programs/Locomanipulation_game-marl-direct",
+  "commit": "72171c7a3f93d409a87b233c182e612235653661",
+  "describe": "72171c7",
+  "status": ""
+ }
+}
