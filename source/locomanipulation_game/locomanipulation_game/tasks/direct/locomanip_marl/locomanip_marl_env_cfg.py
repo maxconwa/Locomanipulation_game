@@ -1,8 +1,9 @@
 """Two agents, one H1-2 on flat ground: the legs track a velocity command, the arms a wrist pose each. MAPPO via skrl.
 
-At every command event an env gets navigation (a velocity command, the arms at their rest pose) or an arm goal (zero
-velocity, a wrist pose per arm fixed in the world), with a settle between modes (mdp.ArmTargetsCommand). Low arm
-goals come from tables built in squats, so the legs must crouch to reach them. The policies see the arm command in
+At every command event an env gets walking (a velocity command, each wrist holding its start pose) or an arm goal
+(zero velocity, a wrist pose per arm fixed in the world, drawn at random in front of the robot; mdp.ArmTargetsCommand).
+Arm goals start once the legs walk. Their curriculum lowers the lowest goal height toward the floor and widens them
+sideways; nothing rewards a posture, so a crouch has to emerge from reaching. The policies see the arm command in
 the pelvis frame, moved by a learned pelvis-motion estimate as on the robot; rewards score the true target.
 
 Built for GOLEM's deployment: joint targets are bounded the way its safety layer clips them and by PD torque, its
@@ -34,12 +35,8 @@ from locomanipulation_game.assets.h1_2 import (
     LOWER_JOINT_NAMES,
     LOWER_LINK_NAMES,
     PELVIS_LINK_NAME,
-    STANDING_PELVIS_HEIGHT,
 )
-from locomanipulation_game.tasks.manager_based.locomanipulation_game.common.reward_cfg import (
-    BASE_HEIGHT_TARGET,
-    LowerRewardsCfg,
-)
+from locomanipulation_game.tasks.manager_based.locomanipulation_game.common.reward_cfg import LowerRewardsCfg
 from locomanipulation_game.tasks.manager_based.locomanipulation_game.common.scenes import (
     SELF_CONTACT_LINK_NAMES,
     SELF_CONTACT_SENSOR_NAMES,
@@ -75,11 +72,8 @@ BODY_JOINTS = [".*_hip_.*_joint", ".*_knee_joint", ".*_ankle_.*_joint", "torso_j
 
 POLICY_DT = 0.02          # decimation 4 x sim dt 0.005; reward weights are per second
 GOAL_BONUS = 5.0          # paid once per reached goal
-# Each agent's reward includes this share of the other's command-following terms.
-LEGS_SHARE_OF_ARMS = 0.5
-ARMS_SHARE_OF_LEGS = 0.1
-# The legs' gait shaping during arm goals, as a share of its weight: these terms resist a crouch.
-ARM_GOAL_SHAPING_SCALE = {"lin_vel_z": 0.0, "ang_vel_xy": 0.5, "hip_pos": 0.2}
+# lambda: each agent's reward includes this share of the other's command-following terms
+REWARD_SHARE = 0.25
 TRACKING_STD = 0.25       # velocity tracking kernel width, on the gait-cycle mean velocity
 CLIP_ACTIONS = 10.0       # the env clamps every raw policy action to +-this
 TORQUE_HEADROOM = 0.85    # targets ask for at most this share of a joint's effort limit (the e-stop trips at 0.9)
@@ -104,13 +98,6 @@ class MarlCommandsCfg:
         asset_name="robot",
         velocity_command_name="base_velocity",
         body_names=[LEFT_EE_BODY, RIGHT_EE_BODY],
-        joint_names=[LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES],
-        collision_body_names=[
-            ["left_(shoulder|elbow|wrist)_.*", "lg_.*"],
-            ["right_(shoulder|elbow|wrist)_.*", "rg_.*"],
-        ],
-        foot_body_names=FOOT_LINK_NAMES,
-        standing_height=STANDING_PELVIS_HEIGHT,
         resampling_time_range=(4.0, 4.0),
         debug_vis=True,
     )
@@ -203,7 +190,6 @@ class MarlObservationsCfg:
         ee_poses = ObsTerm(func=mdp.body_pose_in_root_xyzw, params={"asset_cfg": _WRISTS})
         true_ee_targets = ObsTerm(func=mdp.true_arm_targets_in_root_xyzw, params={"command_name": ARM_COMMAND})
         pelvis_height = ObsTerm(func=mdp.pelvis_height_above_ground)
-        target_drop = ObsTerm(func=mdp.arm_target_height_drop, params={"command_name": ARM_COMMAND})
 
         def __post_init__(self):
             self.enable_corruption = False
@@ -243,16 +229,16 @@ _SELF_CONTACT_PARAMS = {
 class LegsRewardsCfg(LowerRewardsCfg):
     """The manager-based game's legs reward, changed for the shared body.
 
-    action_rate and self_collision count the legs only; base_height and stand_still apply during navigation only,
-    so a crouch can emerge during arm goals, and the gait shaping that resists a crouch is scaled down then
-    (ARM_GOAL_SHAPING_SCALE). feet_swing_clearance replaces feet_swing_height, which a dragging foot never pays.
-    Velocity tracking scores the gait-cycle mean velocity, so stepping in place to turn doesn't pay for its sway.
+    No term holds a posture: base_height (a pelvis height), stand_still and hip_pos (joint angles at their defaults)
+    are gone. action_rate and self_collision count the legs only. feet_swing_clearance replaces feet_swing_height,
+    which a dragging foot never pays. Velocity tracking scores the gait-cycle mean velocity, so stepping in place to
+    turn doesn't pay for its sway.
     """
 
+    base_height = None
+    stand_still = None
+    hip_pos = None
     feet_swing_height = None
-    arm_goal_yaw_rate = RewTerm(
-        func=mdp.yaw_rate_l2_during_arm_goal, weight=-1.0, params={"arm_command_name": ARM_COMMAND}
-    )
     action_beyond_clip = RewTerm(
         func=mdp.action_beyond_clip,
         weight=-0.02,
@@ -282,22 +268,6 @@ class LegsRewardsCfg(LowerRewardsCfg):
         self.action_rate.params = {"action_name": AGENT_ACTION_TERMS["legs"]}
         self.self_collision.func = mdp.self_contacts_involving
         self.self_collision.params = {**_SELF_CONTACT_PARAMS, "own_links": LEGS_OWN_LINKS}
-        self.base_height.func = mdp.base_height_l2_navigation
-        self.base_height.params = {
-            "target_height": BASE_HEIGHT_TARGET,
-            "sensor_cfg": SceneEntityCfg("height_scanner"),
-            "arm_command_name": ARM_COMMAND,
-        }
-        self.stand_still.func = mdp.stand_still_navigation
-        self.stand_still.params = {**self.stand_still.params, "arm_command_name": ARM_COMMAND}
-        for name, func in (
-            ("lin_vel_z", mdp.lin_vel_z_l2_modal),
-            ("ang_vel_xy", mdp.ang_vel_xy_l2_modal),
-            ("hip_pos", mdp.joint_deviation_l2_modal),
-        ):
-            term = getattr(self, name)
-            term.func = func
-            term.params = {**term.params, "arm_command_name": ARM_COMMAND, "arm_goal_scale": ARM_GOAL_SHAPING_SCALE[name]}
 
 
 def _arm_tracking(arm: int, func, std: float) -> RewTerm:
@@ -320,9 +290,6 @@ class ArmsRewardsCfg:
     # weights are per second (the manager multiplies by dt), so this is GOAL_BONUS per goal
     goal_reached = RewTerm(func=mdp.arm_goal_reached, weight=GOAL_BONUS / POLICY_DT, params={"command_name": ARM_COMMAND})
     alive = RewTerm(func=mdp.is_alive, weight=0.15)
-    arm_goal_yaw_rate = RewTerm(
-        func=mdp.yaw_rate_l2_during_arm_goal, weight=-2.0, params={"arm_command_name": ARM_COMMAND}
-    )
     torques = _arm_joints(mdp.joint_torques_l2, -1.0e-5)
     dof_vel = _arm_joints(mdp.joint_vel_l2, -1.0e-3)
     dof_acc = _arm_joints(mdp.joint_acc_l2, -2.5e-7)
@@ -348,10 +315,10 @@ class MarlRewardsCfg:
         # logged as Episode_Reward/legs/arms_<term> and Episode_Reward/arms/legs_<term>
         for name in ARM_TRACKING_TERMS:
             term: RewTerm = getattr(self.arms, name)
-            setattr(self.legs, f"arms_{name}", term.replace(weight=LEGS_SHARE_OF_ARMS * term.weight))
+            setattr(self.legs, f"arms_{name}", term.replace(weight=REWARD_SHARE * term.weight))
         for name in LEG_TRACKING_TERMS:
             term = getattr(self.legs, name)
-            setattr(self.arms, f"legs_{name}", term.replace(weight=ARMS_SHARE_OF_LEGS * term.weight))
+            setattr(self.arms, f"legs_{name}", term.replace(weight=REWARD_SHARE * term.weight))
 
 
 @configclass
@@ -451,7 +418,8 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     clip_actions: float = CLIP_ACTIONS
     # added after the rewards are floored at 0 on terminating (not timed-out) steps
     termination_penalty: float = -5.0
-    # soft limits as a share of the hard range, over the asset's 0.9: the knee and ankle pitch bound a feet-flat squat
+    # soft limits as a share of the hard range, over the asset's 0.9: the knee and ankle pitch may use more of their
+    # range before dof_pos_limits charges
     soft_joint_pos_limit_factors: dict[str, float] = {".*_knee_joint": 0.95, ".*_ankle_pitch_joint": 0.95}
 
     def __post_init__(self):

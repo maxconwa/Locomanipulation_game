@@ -39,15 +39,9 @@ def true_arm_targets_in_root_xyzw(env: ManagerBasedRLEnv, command_name: str) -> 
 
 
 def arm_goal_active(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
-    """1 while the env has an arm goal, 0 otherwise. Shape (num_envs, 1)."""
+    """1 during an arm goal, 0 while walking. Shape (num_envs, 1)."""
     term: ArmTargetsCommand = env.command_manager.get_term(command_name)
     return term.arm_mode.float().unsqueeze(1)
-
-
-def arm_target_height_drop(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
-    """A low goal's squat depth (m), shape (num_envs, 1). Privileged: the actors read it from the targets' height."""
-    term: ArmTargetsCommand = env.command_manager.get_term(command_name)
-    return term.height_drop.unsqueeze(1)
 
 
 def pelvis_height_above_ground(env: ManagerBasedRLEnv, sensor_name: str = "height_scanner") -> torch.Tensor:

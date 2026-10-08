@@ -1,7 +1,7 @@
 """Reward terms for the two-agent task.
 
 Both agents' actions live in one ActionManager vector, and self-contact pairs involve both agents' links, so those
-terms here are restricted to one agent. Terms ending in _modal are the legs' gait shaping, scaled during arm goals.
+terms here are restricted to one agent.
 """
 
 from __future__ import annotations
@@ -9,16 +9,10 @@ from __future__ import annotations
 import torch
 from typing import TYPE_CHECKING
 
-from isaaclab.envs.mdp.rewards import ang_vel_xy_l2, lin_vel_z_l2
 from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 
-from locomanipulation_game.tasks.manager_based.locomanipulation_game.mdp.rewards import (
-    STANCE_THRESHOLD,
-    joint_deviation_l2,
-    leg_phase,
-    stand_still,
-)
+from locomanipulation_game.tasks.manager_based.locomanipulation_game.mdp.rewards import STANCE_THRESHOLD, leg_phase
 
 from .commands import ground_height
 
@@ -134,54 +128,6 @@ def arm_goal_reached(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     """1 on the step after both wrists were first held on the goal: a one-off bonus, so finishing pays more than
     hovering just outside the tolerance."""
     return env.command_manager.get_term(command_name).just_reached.float()
-
-
-def base_height_l2_navigation(
-    env: ManagerBasedRLEnv, target_height: float, sensor_cfg: SceneEntityCfg, arm_command_name: str
-) -> torch.Tensor:
-    """base_height_l2 during navigation only, so a crouch can emerge during arm goals. Rays that missed are ignored."""
-    asset = env.scene["robot"]
-    ground = ground_height(env.scene.sensors[sensor_cfg.name])
-    error = torch.square(asset.data.root_pos_w[:, 2] - (target_height + ground))
-    navigating = ~env.command_manager.get_term(arm_command_name).arm_mode
-    return torch.nan_to_num(error, nan=0.0) * navigating
-
-
-def stand_still_navigation(
-    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, command_name: str, arm_command_name: str
-) -> torch.Tensor:
-    """stand_still during navigation only: every arm goal zeroes the velocity command, and reaching moves the legs."""
-    navigating = ~env.command_manager.get_term(arm_command_name).arm_mode
-    return stand_still(env, asset_cfg, command_name) * navigating
-
-
-def yaw_rate_l2_during_arm_goal(env: ManagerBasedRLEnv, arm_command_name: str) -> torch.Tensor:
-    """Squared pelvis yaw rate during an arm goal: turning moves the world-fixed targets in the pelvis frame."""
-    yaw_rate = env.scene["robot"].data.root_ang_vel_b[:, 2]
-    return torch.square(yaw_rate) * env.command_manager.get_term(arm_command_name).arm_mode
-
-
-def _arm_goal_scale(env: ManagerBasedRLEnv, arm_command_name: str, arm_goal_scale: float) -> torch.Tensor:
-    arm_mode = env.command_manager.get_term(arm_command_name).arm_mode
-    return torch.where(arm_mode, arm_goal_scale, 1.0)
-
-
-def lin_vel_z_l2_modal(
-    env: ManagerBasedRLEnv, arm_command_name: str, arm_goal_scale: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
-) -> torch.Tensor:
-    return lin_vel_z_l2(env, asset_cfg) * _arm_goal_scale(env, arm_command_name, arm_goal_scale)
-
-
-def ang_vel_xy_l2_modal(
-    env: ManagerBasedRLEnv, arm_command_name: str, arm_goal_scale: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
-) -> torch.Tensor:
-    return ang_vel_xy_l2(env, asset_cfg) * _arm_goal_scale(env, arm_command_name, arm_goal_scale)
-
-
-def joint_deviation_l2_modal(
-    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, arm_command_name: str, arm_goal_scale: float
-) -> torch.Tensor:
-    return joint_deviation_l2(env, asset_cfg) * _arm_goal_scale(env, arm_command_name, arm_goal_scale)
 
 
 def feet_swing_clearance(

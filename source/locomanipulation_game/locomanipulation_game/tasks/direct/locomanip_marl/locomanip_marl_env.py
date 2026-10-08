@@ -11,8 +11,8 @@ them onto the per-agent dicts:
 After every step it moves the arm command by the pelvis motion the learned estimator (odometry.py) reports, or with
 estimator.odometry "legs" by leg odometry (_leg_odometry), and fits the estimator to the true motion. GolemEstopMonitor
 (golem_safety.py) checks GOLEM's e-stops at every physics substep, and joint targets land action_delay_substeps late.
-While training, the e-stops end the episode only once the legs walk (_update_walking_gate), and RoboCasa's joint
-physics ramps in from then (_update_robocasa_physics).
+While training, arm goals start, the e-stops end the episode, and RoboCasa's joint physics ramps in only once the
+legs walk (_update_walking_gate, _update_robocasa_physics); until then the episodes are walking only.
 """
 
 from __future__ import annotations
@@ -98,6 +98,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
 
         # -- pelvis odometry
         self._arm_command = self.command_manager.get_term(ARM_COMMAND)
+        self._arm_command.goals_enabled = self.estops_end_episodes
         self.estimator = EstimatorTrainer(
             self.cfg.estimator, group_dims["odometry"][0] + self.action_manager.total_action_dim, self.num_envs, self.device
         )
@@ -273,23 +274,24 @@ class LocoManipMarlEnv(DirectMARLEnv):
 
     def _update_walking_gate(self):
         """Open the walking gate when the EMA of walking progress passes cfg.walking_gate: per step, the mean over
-        envs navigating on a command of at least walking_gate_min_speed (not just reset) of the pelvis velocity along
+        envs walking on a command of at least walking_gate_min_speed (not just reset) of the pelvis velocity along
         the command over the command's speed. 0 standing still, 1 on the command. Before the command manager
-        resamples, so the command is the one the step followed.
+        resamples, so the command is the one the step followed. Opening it starts the arm goals and the e-stops.
         """
         command = self.command_manager.get_command("base_velocity")[:, :2]
         speed = torch.norm(command, dim=1)
         arm = self._arm_command
-        nav = ~(arm.arm_mode | arm.settling) & (speed >= self.cfg.walking_gate_min_speed) & (self.episode_length_buf > 0)
+        nav = ~arm.arm_mode & (speed >= self.cfg.walking_gate_min_speed) & (self.episode_length_buf > 0)
         if nav.any():
             velocity = self._robot.data.root_lin_vel_b[:, :2]
             progress = (torch.sum(velocity * command, dim=1) / speed.square().clamp(min=1e-6))[nav].mean()
             self._walking_progress_ema += WALKING_PROGRESS_EMA * (progress - self._walking_progress_ema)
         if not self.estops_end_episodes and self._walking_progress_ema.item() > self.cfg.walking_gate:
             self.estops_end_episodes = True
+            arm.goals_enabled = True
             self._ramp_start = self.common_step_counter
-            print(f"[INFO] Walking gate open at step {self.common_step_counter}: GOLEM's e-stops end the episode,"
-                  f" RoboCasa's joint physics ramps in over {self.cfg.robocasa_ramp_steps} steps")
+            print(f"[INFO] Walking gate open at step {self.common_step_counter}: arm goals start, GOLEM's e-stops end"
+                  f" the episode, RoboCasa's joint physics ramps in over {self.cfg.robocasa_ramp_steps} steps")
         self._update_robocasa_physics()
         self._gate_log["Safety/walking_progress"] = self._walking_progress_ema
         self._gate_log["Safety/estops_end_episodes"] = torch.tensor(float(self.estops_end_episodes), device=self.device)
@@ -398,6 +400,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._goal_drift_ema = state["goal_drift_ema"].to(self.device)
         self._walking_progress_ema = state.get("walking_progress_ema", torch.tensor(1.0)).to(self.device)
         self.estops_end_episodes = self.estops_end_episodes or state.get("estops_end_episodes", True)
+        self._arm_command.goals_enabled = self.estops_end_episodes
         if self.estops_end_episodes and self.cfg.estimator.train:
             scale = state.get("robocasa_scale", 1.0)
             self._ramp_start = self.common_step_counter - round(scale * self.cfg.robocasa_ramp_steps)
