@@ -75,6 +75,24 @@ def bound_log_std(agent, policy_cfg: dict, per_agent: dict):
     agent.update = update_and_project
 
 
+def restrict_entropy(agent, per_agent: dict):
+    """Pay each agent's entropy bonus over only some of its action dimensions: per_agent[uid] is [[include, count], ...]
+    per run of action dimensions in order (include 1 or 0). skrl's GaussianMixin sums the entropy over all of them."""
+    for uid, spec in per_agent.items():
+        policy = agent.policies[uid]
+        mask = torch.tensor([bool(include) for include, count in spec for _ in range(int(count))], device=policy.device)
+        if len(mask) != policy.log_std_parameter.numel():
+            raise ValueError(f"{uid}: the entropy mask covers {len(mask)} actions, the policy has {policy.log_std_parameter.numel()}")
+
+        def get_entropy(*, role: str = "", policy=policy, mask=mask) -> torch.Tensor:
+            if policy._g_distribution is None:
+                return torch.tensor(0.0, device=policy.device)
+            return policy._g_distribution.entropy()[..., mask].sum(dim=-1).unsqueeze(-1)
+
+        policy.get_entropy = get_entropy
+        print(f"[INFO] {uid}: entropy bonus over {int(mask.sum())} of {len(mask)} action dimensions {spec}")
+
+
 def drop_value_preprocessors(agent, uids):
     """Train these agents' critics on raw returns. Before loading a checkpoint, so the module is neither saved nor
     restored."""
@@ -115,6 +133,7 @@ def main(env_cfg, agent_cfg: dict):
         print(f"[INFO] Loading model checkpoint from: {args_cli.checkpoint}")
         runner.agent.load(os.path.abspath(args_cli.checkpoint))
     bound_log_std(runner.agent, agent_cfg["models"]["policy"], agent_cfg["log_std_bounds"])
+    restrict_entropy(runner.agent, agent_cfg.get("entropy_action_dims", {}))
 
     start_time = time.time()
     runner.run()

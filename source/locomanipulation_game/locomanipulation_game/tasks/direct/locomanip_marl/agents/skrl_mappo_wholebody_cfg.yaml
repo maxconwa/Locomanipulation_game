@@ -1,6 +1,7 @@
 # LocoManip-WholeBody-Direct-v0: skrl MAPPO with one agent, "whole", for all 26 joints, so everything but the split
 # matches skrl_mappo_cfg.yaml (the two-agent game). Its critic sees the env state (its observation plus privileged
-# information). Wider networks than each two-agent learner's [256, 128, 64], about the two agents' parameter count.
+# information). Wider networks than each two-agent learner's [256, 128, 64]: the actor has 1.7x the two actors'
+# parameters, actor and critic together 1.4x the two agents'.
 # https://skrl.readthedocs.io/en/latest/api/multi_agents/mappo.html
 
 seed: 42
@@ -39,6 +40,10 @@ log_std_bounds:
 # Critics trained on raw returns: skrl fits the value scaler to the critic's own predictions too, and it ran away
 # (the arms' in runs A-B, the legs' in fresh runs to a mean of 1e5-1e14).
 no_value_preprocessor: [whole]
+# Read by scripts/skrl/train.py: the entropy bonus counts these runs of action dimensions [include, count], in action
+# order. The two-agent legs had entropy 0.01 and the arms 0.
+entropy_action_dims:
+  whole: [[1, 12], [0, 14]]
 
 memory:
   class: RandomMemory
@@ -54,7 +59,7 @@ agent:
   learning_rate: 1.0e-03
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.02
+    kl_threshold: 0.04    # the two agents' 0.02 each, combined: the KL here is over all 26 action dimensions
     min_lr: 2.0e-04
     max_lr: 1.0e-02
   observation_preprocessor: RunningStandardScaler
@@ -69,7 +74,7 @@ agent:
   ratio_clip: 0.2
   value_clip: 0.2
   entropy_loss_scale:
-    whole: 0.01           # the legs' (the arms had 0)
+    whole: 0.01           # the legs', over the leg dimensions only (entropy_action_dims)
   value_loss_scale: 1.0
   kl_threshold: 0.0
   time_limit_bootstrap:
