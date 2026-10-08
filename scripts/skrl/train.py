@@ -41,12 +41,24 @@ from locomanipulation_game.tasks.direct.locomanip_marl.odometry import estimator
 
 def bound_log_std(agent, policy_cfg: dict, per_agent: dict):
     """Clamp each agent's log_std parameter into [min_log_std, max_log_std], narrowed per agent by per_agent, now
-    and after every update. skrl clamps log_std only in the forward pass; a parameter pushed past the bound then gets
-    no gradient and the std stays pinned."""
-    bounds = {uid: (policy_cfg["min_log_std"], policy_cfg["max_log_std"]) for uid in agent.policies}
-    for uid, (low, high) in per_agent.items():
-        bounds[uid] = (max(low, bounds[uid][0]), min(high, bounds[uid][1]))
-    print(f"[INFO] log_std bounds per agent: {bounds}")
+    and after every update. per_agent[uid] is [low, high] for all of the agent's actions, or [[low, high, count], ...]
+    for runs of its action dimensions in order. skrl clamps log_std only in the forward pass; a parameter pushed past
+    the bound then gets no gradient and the std stays pinned."""
+    floor, ceiling = policy_cfg["min_log_std"], policy_cfg["max_log_std"]
+    bounds = {uid: (floor, ceiling) for uid in agent.policies}
+    for uid, spec in per_agent.items():
+        if isinstance(spec[0], (list, tuple)):
+            param = agent.policies[uid].log_std_parameter
+            low = [max(lo, floor) for lo, _, count in spec for _ in range(int(count))]
+            high = [min(hi, ceiling) for _, hi, count in spec for _ in range(int(count))]
+            if len(low) != param.numel():
+                raise ValueError(f"{uid}: log_std bounds cover {len(low)} actions, the policy has {param.numel()}")
+            bounds[uid] = (torch.tensor(low, device=param.device), torch.tensor(high, device=param.device))
+            print(f"[INFO] {uid}: log_std bounds per run of actions {spec}")
+        else:
+            low, high = spec
+            bounds[uid] = (max(low, floor), min(high, ceiling))
+    print(f"[INFO] log_std bounds per agent: { {u: b for u, b in bounds.items() if not torch.is_tensor(b[0])} }")
 
     def project(uid):
         with torch.no_grad():

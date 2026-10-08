@@ -3,7 +3,7 @@
 DirectMARLEnv owns the step loop, the scene and the event manager; this class builds the other managers and maps
 them onto the per-agent dicts:
 
-    actions:      one ActionManager, the agents' terms concatenated in possible_agents order
+    actions:      one ActionManager, the agents' terms concatenated in possible_agents order (cfg.agent_action_terms)
     observations: agent -> its observation group; the env state is both agents' groups plus `critic`
     rewards:      agent -> its own RewardManager, floored at 0, plus termination_penalty on terminating steps
     dones:        one TerminationManager, shared (one body, one episode)
@@ -72,8 +72,12 @@ class LocoManipMarlEnv(DirectMARLEnv):
         group_dims = self.observation_manager.group_obs_dim
         self.cfg.observation_spaces = {agent: group_dims[agent][0] for agent in self.cfg.possible_agents}
         self.cfg.state_space = group_dims["critic"][0] + sum(group_dims[agent][0] for agent in self.cfg.possible_agents)
+        terms = [term for agent in self.cfg.possible_agents for term in self.cfg.agent_action_terms[agent]]
+        if terms != list(self.action_manager.active_terms):
+            raise ValueError(f"Agents' action terms {terms} are not the ActionManager's {self.action_manager.active_terms}")
         self.cfg.action_spaces = {
-            agent: self.action_manager.get_term(term).action_dim for agent, term in self.cfg.agent_action_terms.items()
+            agent: sum(self.action_manager.get_term(term).action_dim for term in self.cfg.agent_action_terms[agent])
+            for agent in self.cfg.possible_agents
         }
         self._configure_env_spaces()
         print(

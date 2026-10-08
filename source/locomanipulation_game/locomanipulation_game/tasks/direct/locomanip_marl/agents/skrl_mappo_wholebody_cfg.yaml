@@ -1,0 +1,88 @@
+# LocoManip-WholeBody-Direct-v0: skrl MAPPO with one agent, "whole", for all 26 joints, so everything but the split
+# matches skrl_mappo_cfg.yaml (the two-agent game). Its critic sees the env state (its observation plus privileged
+# information). Wider networks than each two-agent learner's [256, 128, 64], about the two agents' parameter count.
+# https://skrl.readthedocs.io/en/latest/api/multi_agents/mappo.html
+
+seed: 42
+
+# Instantiated per agent with that agent's spaces.
+models:
+  separate: True
+  policy:
+    class: GaussianMixin
+    clip_actions: False      # the env clips at cfg.clip_actions
+    clip_log_std: True
+    min_log_std: -3.0
+    max_log_std: 0.0
+    initial_log_std: 0.0
+    network:
+      - name: net
+        input: OBSERVATIONS
+        layers: [512, 256, 128]
+        activations: elu
+    output: ACTIONS
+  value:
+    class: DeterministicMixin
+    clip_actions: False
+    network:
+      - name: net
+        input: STATES
+        layers: [512, 256, 128]
+        activations: elu
+    output: ONE
+
+# Read by scripts/skrl/train.py. Log std bounds per run of action dimensions [low, high, count], in action order:
+# the two-agent game's legs' and arms' bounds. Applied to the parameter after every update (skrl only clamps it in
+# the forward pass, and a parameter past the bound then gets no gradient).
+log_std_bounds:
+  whole: [[-3.0, -0.51, 12], [-3.0, 0.0, 14]]   # legs std 0.05 .. 0.6, arms 0.05 .. 1.0
+# Critics trained on raw returns: skrl fits the value scaler to the critic's own predictions too, and it ran away
+# (the arms' in runs A-B, the legs' in fresh runs to a mean of 1e5-1e14).
+no_value_preprocessor: [whole]
+
+memory:
+  class: RandomMemory
+  memory_size: -1  # = agent.rollouts
+
+agent:
+  class: MAPPO
+  rollouts: 24
+  learning_epochs: 5
+  mini_batches: 4
+  discount_factor: 0.99
+  gae_lambda: 0.95
+  learning_rate: 1.0e-03
+  learning_rate_scheduler: KLAdaptiveLR
+  learning_rate_scheduler_kwargs:
+    kl_threshold: 0.02
+    min_lr: 2.0e-04
+    max_lr: 1.0e-02
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: null
+  state_preprocessor: RunningStandardScaler
+  state_preprocessor_kwargs: null
+  value_preprocessor: RunningStandardScaler
+  value_preprocessor_kwargs: null
+  random_timesteps: 0
+  learning_starts: 0
+  grad_norm_clip: 1.0
+  ratio_clip: 0.2
+  value_clip: 0.2
+  entropy_loss_scale:
+    whole: 0.01           # the legs' (the arms had 0)
+  value_loss_scale: 1.0
+  kl_threshold: 0.0
+  time_limit_bootstrap:
+    whole: True           # the legs' (the arms had False, from when they had a value scaler)
+  rewards_shaper_scale: 1.0
+  experiment:
+    directory: "locomanip_marl"
+    experiment_name: ""
+    write_interval: 24        # timesteps: one TensorBoard point per update
+    checkpoint_interval: 4800 # timesteps: every 200 updates
+    store_separately: False
+
+trainer:
+  class: SequentialTrainer
+  timesteps: 91200           # 3800 updates x 24 rollouts
+  environment_info: log

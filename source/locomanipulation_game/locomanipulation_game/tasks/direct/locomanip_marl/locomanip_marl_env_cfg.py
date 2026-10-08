@@ -63,8 +63,11 @@ ODOMETRY_HISTORY = 4  # frames in the estimator's window
 LEGS_OWN_LINKS = [PELVIS_LINK_NAME] + LOWER_LINK_NAMES
 ARMS_OWN_LINKS = ARM_LINK_NAMES + FINGER_LINK_NAMES
 
-# agent -> the action term it drives, in possible_agents order (the env concatenates actions in that order)
-AGENT_ACTION_TERMS = {"legs": "joint_pos", "arms": "arm_pos"}
+LEGS_ACTION = "joint_pos"
+ARMS_ACTION = "arm_pos"
+# agent -> the action terms it drives. In possible_agents order the terms follow MarlActionsCfg's order: the env
+# concatenates the agents' actions into the ActionManager's vector.
+AGENT_ACTION_TERMS = {"legs": [LEGS_ACTION], "arms": [ARMS_ACTION]}
 
 POLICY_DT = 0.02          # decimation 4 x sim dt 0.005; reward weights are per second
 GOAL_BONUS = 5.0          # paid once per reached goal
@@ -173,11 +176,11 @@ class MarlObservationsCfg:
 
     @configclass
     class LegsCfg(ProprioCfg):
-        actions = ObsTerm(func=mdp.applied_action, params={"action_name": AGENT_ACTION_TERMS["legs"]})
+        actions = ObsTerm(func=mdp.applied_action, params={"action_name": LEGS_ACTION})
 
     @configclass
     class ArmsCfg(ProprioCfg):
-        actions = ObsTerm(func=mdp.applied_action, params={"action_name": AGENT_ACTION_TERMS["arms"]})
+        actions = ObsTerm(func=mdp.applied_action, params={"action_name": ARMS_ACTION})
         wrist_poses = ObsTerm(func=mdp.body_pose_in_root_xyzw, params={"asset_cfg": _WRISTS},
                               noise=Unoise(n_min=-0.005, n_max=0.005))
         wrist_errors = ObsTerm(func=mdp.arm_target_error_in_root, params={"command_name": ARM_COMMAND},
@@ -248,7 +251,7 @@ class LegsRewardsCfg(LowerRewardsCfg):
     action_beyond_clip = RewTerm(
         func=mdp.action_beyond_clip,
         weight=-0.02,
-        params={"agent": "legs", "action_name": AGENT_ACTION_TERMS["legs"], "clip": CLIP_ACTIONS},
+        params={"agent": "legs", "action_name": LEGS_ACTION, "clip": CLIP_ACTIONS},
     )
     feet_swing_clearance = RewTerm(
         func=mdp.feet_swing_clearance,
@@ -271,7 +274,7 @@ class LegsRewardsCfg(LowerRewardsCfg):
             term.params = {"command_name": "base_velocity", "std": TRACKING_STD, "component": component,
                            "window_s": GAIT_PERIOD}
         self.action_rate.func = mdp.action_term_rate_l2
-        self.action_rate.params = {"action_name": AGENT_ACTION_TERMS["legs"]}
+        self.action_rate.params = {"action_name": LEGS_ACTION}
         self.self_collision.func = mdp.self_contacts_involving
         self.self_collision.params = {**_SELF_CONTACT_PARAMS, "own_links": LEGS_OWN_LINKS}
         self.hip_pos.func = mdp.joint_deviation_l2_modal
@@ -305,7 +308,7 @@ class ArmsRewardsCfg:
     torques = _arm_joints(mdp.joint_torques_l2, -1.0e-5)
     dof_vel = _arm_joints(mdp.joint_vel_l2, -1.0e-3)
     dof_acc = _arm_joints(mdp.joint_acc_l2, -2.5e-7)
-    action_rate = RewTerm(func=mdp.action_term_rate_l2, weight=-0.01, params={"action_name": AGENT_ACTION_TERMS["arms"]})
+    action_rate = RewTerm(func=mdp.action_term_rate_l2, weight=-0.01, params={"action_name": ARMS_ACTION})
     dof_pos_limits = _arm_joints(mdp.joint_pos_limits, -5.0)
     self_collision = RewTerm(
         func=mdp.self_contacts_involving, weight=-1.0, params={**_SELF_CONTACT_PARAMS, "own_links": ARMS_OWN_LINKS}
@@ -387,7 +390,7 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     # while training, episodes are navigation only until this share of episode ends are time-outs rather than falls
     # (LocoManipMarlEnv._update_warm_start); then arm goals start
     warm_start_timeout_share: float = 0.8
-    agent_action_terms: dict[str, str] = AGENT_ACTION_TERMS
+    agent_action_terms: dict[str, list[str]] = AGENT_ACTION_TERMS
     clip_actions: float = CLIP_ACTIONS
     # added after the rewards are floored at 0 on terminating (not timed-out) steps
     termination_penalty: float = -5.0
@@ -409,3 +412,60 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
             sensor.history_length = 1
         self.viewer.eye = (4.0, 4.0, 2.5)
         self.viewer.lookat = (0.0, 0.0, 1.0)
+
+
+"""
+One agent for the whole body (the comparison for the two-agent game).
+"""
+
+
+@configclass
+class WholeBodyObservationsCfg:
+    @configclass
+    class WholeCfg(MarlObservationsCfg.ProprioCfg):
+        """Both agents' observations: the shared vector once, then the legs' and the arms' own terms."""
+
+        leg_actions = ObsTerm(func=mdp.applied_action, params={"action_name": LEGS_ACTION})
+        arm_actions = ObsTerm(func=mdp.applied_action, params={"action_name": ARMS_ACTION})
+        wrist_poses = ObsTerm(func=mdp.body_pose_in_root_xyzw, params={"asset_cfg": _WRISTS},
+                              noise=Unoise(n_min=-0.005, n_max=0.005))
+        wrist_errors = ObsTerm(func=mdp.arm_target_error_in_root, params={"command_name": ARM_COMMAND},
+                               noise=Unoise(n_min=-0.005, n_max=0.005))
+
+    whole: WholeCfg = WholeCfg()
+    critic: MarlObservationsCfg.CriticCfg = MarlObservationsCfg.CriticCfg()
+    odometry: MarlObservationsCfg.OdometryCfg = MarlObservationsCfg.OdometryCfg()
+
+
+@configclass
+class WholeRewardsCfg:
+    """Filled by WholeBodyRewardsCfg."""
+
+
+@configclass
+class WholeBodyRewardsCfg:
+    """r = r(T^goal) + r(v^cmd) + r_U^shaping + r_L^shaping: every term of both agents' own rewards, once, and none of
+    the shared copies. Logged as Episode_Reward/whole/legs_<term> and Episode_Reward/whole/arms_<term>."""
+
+    whole: WholeRewardsCfg = WholeRewardsCfg()
+
+    def __post_init__(self):
+        for prefix, rewards in (("legs", LegsRewardsCfg()), ("arms", ArmsRewardsCfg())):
+            for name, term in vars(rewards).items():
+                if not isinstance(term, RewTerm):
+                    continue
+                if term.params.get("agent") is not None:
+                    term = term.replace(params={**term.params, "agent": "whole"})
+                setattr(self.whole, f"{prefix}_{name}", term)
+
+
+@configclass
+class LocoManipWholeBodyEnvCfg(LocoManipMarlEnvCfg):
+    """The two-agent task with one agent driving all 26 joints through both action terms."""
+
+    possible_agents = ["whole"]
+    action_spaces = {"whole": 26}
+    observation_spaces = {"whole": 1}
+    observations: WholeBodyObservationsCfg = WholeBodyObservationsCfg()
+    rewards: WholeBodyRewardsCfg = WholeBodyRewardsCfg()
+    agent_action_terms: dict[str, list[str]] = {"whole": [LEGS_ACTION, ARMS_ACTION]}

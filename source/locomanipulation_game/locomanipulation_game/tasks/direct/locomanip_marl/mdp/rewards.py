@@ -38,9 +38,16 @@ def action_term_rate_l2(env: ManagerBasedRLEnv, action_name: str) -> torch.Tenso
 
 
 def action_beyond_clip(env, agent: str, action_name: str, clip: float) -> torch.Tensor:
-    """How far the agent's raw actions are beyond the env's clip, plus what its action term's position bound cut off,
-    summed over its joints (action units). Nothing else pulls a policy mean back once it drifts past the clip."""
-    excess = (env.actions[agent].abs() - clip).clamp(min=0.0).sum(dim=1)
+    """How far the agent's raw actions for action_name's joints are beyond the env's clip, plus what that action
+    term's position bound cut off, summed over its joints (action units). Nothing else pulls a policy mean back once
+    it drifts past the clip."""
+    start = 0
+    for name in env.cfg.agent_action_terms[agent]:
+        dim = env.action_manager.get_term(name).action_dim
+        if name == action_name:
+            break
+        start += dim
+    excess = (env.actions[agent][:, start : start + dim].abs() - clip).clamp(min=0.0).sum(dim=1)
     return excess + env.action_manager.get_term(action_name).beyond_bounds.sum(dim=1)
 
 
