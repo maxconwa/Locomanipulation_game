@@ -1,14 +1,13 @@
 """Two agents, one H1-2 on flat ground: the legs track a velocity command, the arms a wrist pose each. MAPPO via skrl.
 
-At every command event an env gets walking (a velocity command, each wrist holding its start pose) or an arm goal
-(zero velocity, a wrist pose per arm fixed in the world, drawn at random in front of the robot; mdp.ArmTargetsCommand).
-Arm goals start once the legs walk. Their curriculum lowers the lowest goal height toward the floor and widens them
-sideways; nothing rewards a posture, so a crouch has to emerge from reaching. The policies see the arm command in
-the pelvis frame, moved by a learned pelvis-motion estimate as on the robot; rewards score the true target.
+At every command event an env gets navigation (a velocity command, each wrist holding its rest pose) or an arm goal
+(zero velocity, a wrist pose per arm fixed in the world; mdp.ArmTargetsCommand). Arm goals start once most episodes
+survive (warm_start_timeout_share). Goals are standing-reachable wrist poses lowered by a depth curriculum; nothing
+rewards a posture, so a crouch has to emerge from the legs' share of the arms' reward. The policies see the arm
+command in the pelvis frame, moved by a learned pelvis-motion estimate as on the robot; rewards score the true target.
 
-Built for GOLEM's deployment: joint targets are bounded the way its safety layer clips them and by PD torque, its
-e-stops end the episode (golem_safety.py), the joints carry RoboCasa's passive damping and armature, and targets
-land 0-20 ms late. torso_joint belongs to neither agent: its actuator holds it at default.
+Joint targets are bounded inside the joint limits (as GOLEM's safety layer clips them) and by PD torque.
+torso_joint belongs to neither agent: its actuator holds it at default.
 """
 
 import math
@@ -20,7 +19,6 @@ from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
@@ -35,6 +33,7 @@ from locomanipulation_game.assets.h1_2 import (
     LOWER_JOINT_NAMES,
     LOWER_LINK_NAMES,
     PELVIS_LINK_NAME,
+    STANDING_PELVIS_HEIGHT,
 )
 from locomanipulation_game.tasks.manager_based.locomanipulation_game.common.reward_cfg import LowerRewardsCfg
 from locomanipulation_game.tasks.manager_based.locomanipulation_game.common.scenes import (
@@ -50,7 +49,7 @@ from locomanipulation_game.tasks.manager_based.locomanipulation_game.legs_r0_env
 from locomanipulation_game.tasks.manager_based.locomanipulation_game.mdp.rewards import GAIT_PERIOD
 
 from . import mdp
-from .golem_safety import GOLEM_TARGET_CLIP, GolemEstopCfg
+from .golem_safety import GOLEM_TARGET_CLIP
 from .odometry import PelvisEstimatorCfg
 
 LEFT_ARM_JOINT_NAMES = ARM_JOINT_NAMES[:7]
@@ -66,14 +65,11 @@ ARMS_OWN_LINKS = ARM_LINK_NAMES + FINGER_LINK_NAMES
 
 # agent -> the action term it drives, in possible_agents order (the env concatenates actions in that order)
 AGENT_ACTION_TERMS = {"legs": "joint_pos", "arms": "arm_pos"}
-# The 27 motor joints (not the gripper hinges).
-BODY_JOINTS = [".*_hip_.*_joint", ".*_knee_joint", ".*_ankle_.*_joint", "torso_joint", ".*_shoulder_.*_joint",
-               ".*_elbow_joint", ".*_wrist_.*_joint"]
 
 POLICY_DT = 0.02          # decimation 4 x sim dt 0.005; reward weights are per second
 GOAL_BONUS = 5.0          # paid once per reached goal
 # lambda: each agent's reward includes this share of the other's command-following terms
-REWARD_SHARE = 0.25
+REWARD_SHARE = 0.5
 TRACKING_STD = 0.25       # velocity tracking kernel width, on the gait-cycle mean velocity
 CLIP_ACTIONS = 10.0       # the env clamps every raw policy action to +-this
 TORQUE_HEADROOM = 0.85    # targets ask for at most this share of a joint's effort limit (the e-stop trips at 0.9)
@@ -98,6 +94,12 @@ class MarlCommandsCfg:
         asset_name="robot",
         velocity_command_name="base_velocity",
         body_names=[LEFT_EE_BODY, RIGHT_EE_BODY],
+        joint_names=[LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES],
+        collision_body_names=[
+            ["left_(shoulder|elbow|wrist)_.*", "lg_.*"],
+            ["right_(shoulder|elbow|wrist)_.*", "rg_.*"],
+        ],
+        standing_height=STANDING_PELVIS_HEIGHT,
         resampling_time_range=(4.0, 4.0),
         debug_vis=True,
     )
@@ -323,19 +325,6 @@ class MarlRewardsCfg:
 
 @configclass
 class MarlEventCfg(EventCfg):
-    # RoboCasa's MuJoCo robot gives every joint passive damping 10 and armature 0.1 on top of the PD. While training,
-    # the env scales both from the asset's defaults (LocoManipMarlEnv._update_robocasa_physics).
-    passive_damping = EventTerm(
-        func=mdp.passive_joint_damping,
-        mode="startup",
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS), "damping_distribution_params": (8.0, 12.0)},
-    )
-    joint_armature = EventTerm(
-        func=mdp.randomize_joint_parameters,
-        mode="startup",
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=BODY_JOINTS),
-                "armature_distribution_params": (0.08, 0.12), "operation": "abs"},
-    )
     # frames without an inertial in the URDF, which the USD import gave 1 kg each
     massless_frames = EventTerm(
         func=mdp.randomize_rigid_body_mass,
@@ -345,9 +334,6 @@ class MarlEventCfg(EventCfg):
     )
 
     def __post_init__(self):
-        # slippery ground too: gaits that need less grip (MuJoCo's soft friction lets stance feet slip)
-        self.physics_material.params["static_friction_range"] = (0.3, 1.2)
-        self.physics_material.params["dynamic_friction_range"] = (0.2, 0.9)
         # resets on the ground, near still, joints near default
         self.reset_base.params = {
             **self.reset_base.params,
@@ -361,11 +347,6 @@ class MarlEventCfg(EventCfg):
             },
         }
         self.reset_joints.params = {**self.reset_joints.params, "position_range": (-0.05, 0.05), "velocity_range": (-0.1, 0.1)}
-
-
-@configclass
-class MarlTerminationsCfg(TerminationsCfg):
-    golem_estop = DoneTerm(func=mdp.golem_estop)
 
 
 @configclass
@@ -390,30 +371,12 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     actions: MarlActionsCfg = MarlActionsCfg()
     observations: MarlObservationsCfg = MarlObservationsCfg()
     rewards: MarlRewardsCfg = MarlRewardsCfg()
-    terminations: MarlTerminationsCfg = MarlTerminationsCfg()
+    terminations: TerminationsCfg = TerminationsCfg()
     curriculum: MarlCurriculumCfg = MarlCurriculumCfg()
     estimator: PelvisEstimatorCfg = PelvisEstimatorCfg(odometry="learned")
-    # GOLEM's e-stops tightened by a margin; wider at the joints behind RoboCasa's e-stops (the knee's only at
-    # extension, so the squat keeps its depth)
-    golem_estop: GolemEstopCfg = GolemEstopCfg(joint_position_margins={
-        ".*_hip_yaw_joint": (0.05, 0.05),
-        ".*_ankle_roll_joint": (0.05, 0.05),
-        ".*_ankle_pitch_joint": (0.05, 0.05),
-        ".*_knee_joint": (0.05, 0.02),
-    })
-    # while training, GOLEM's e-stops end the episode only from the step the legs first walk: the EMA of the share
-    # of the commanded speed the pelvis covers along navigation commands of at least walking_gate_min_speed passes
-    # walking_gate (LocoManipMarlEnv._update_walking_gate). Until then they are logged only, so a fresh policy's
-    # first steps don't end it.
-    walking_gate: float = 0.5
-    walking_gate_min_speed: float = 0.2  # m/s
-    # joint targets land this many physics substeps (5 ms each) late, drawn per env and episode: the deploy
-    # loop's latency. The agents observe their actions undelayed.
-    action_delay_substeps: tuple[int, int] = (0, 4)
-    # RoboCasa's joint physics (the passive_damping and joint_armature events, the delay's upper end) ramps in over
-    # these steps from the step the walking gate opens; a fresh policy doesn't learn to walk with it. Outside
-    # training it is on in full.
-    robocasa_ramp_steps: int = 20000
+    # while training, episodes are navigation only until this share of episode ends are time-outs rather than falls
+    # (LocoManipMarlEnv._update_warm_start); then arm goals start
+    warm_start_timeout_share: float = 0.8
     agent_action_terms: dict[str, str] = AGENT_ACTION_TERMS
     clip_actions: float = CLIP_ACTIONS
     # added after the rewards are floored at 0 on terminating (not timed-out) steps

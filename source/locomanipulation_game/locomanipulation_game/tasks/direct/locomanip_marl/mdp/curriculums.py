@@ -11,13 +11,8 @@ if TYPE_CHECKING:
 
 
 def arm_target_levels(env: ManagerBasedRLEnv, env_ids: Sequence[int], command_name: str) -> dict[str, torch.Tensor]:
-    """At episode end, a fall during an arm goal costs a level (ArmTargetsCommand.update_levels; the rest of the
-    reach curriculum moves at goal events). Logs the mean level and what it means: the lowest goal height and the
-    goals' sideways half-width."""
+    """At episode end, a fall during an arm goal drops the depth level (ArmTargetsCommand.update_levels; the rest of
+    the depth curriculum moves at goal events). Logs the mean depth level and z_max."""
     term = env.command_manager.get_term(command_name)
     term.update_levels(env_ids, fell=env.termination_manager.terminated[env_ids])
-    return {
-        "level": torch.mean(term.level.float()),
-        "min_height": torch.mean(term.min_height(term.level)),
-        "half_width": torch.mean(term.half_width(term.level)),
-    }
+    return {"depth_level": torch.mean(term.level.float()), "z_max": torch.mean(term.z_max(term.level))}

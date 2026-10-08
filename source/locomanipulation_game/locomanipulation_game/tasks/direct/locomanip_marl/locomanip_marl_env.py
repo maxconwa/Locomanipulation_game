@@ -9,10 +9,9 @@ them onto the per-agent dicts:
     dones:        one TerminationManager, shared (one body, one episode)
 
 After every step it moves the arm command by the pelvis motion the learned estimator (odometry.py) reports, or with
-estimator.odometry "legs" by leg odometry (_leg_odometry), and fits the estimator to the true motion. GolemEstopMonitor
-(golem_safety.py) checks GOLEM's e-stops at every physics substep, and joint targets land action_delay_substeps late.
-While training, arm goals start, the e-stops end the episode, and RoboCasa's joint physics ramps in only once the
-legs walk (_update_walking_gate, _update_robocasa_physics); until then the episodes are walking only.
+estimator.odometry "legs" by leg odometry (_leg_odometry), and fits the estimator to the true motion. While training,
+episodes are navigation only until cfg.warm_start_timeout_share of them end in a time-out rather than a fall
+(_update_warm_start); then arm goals start.
 """
 
 from __future__ import annotations
@@ -32,13 +31,11 @@ from isaaclab.managers import (
 )
 from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_inv, quat_mul
 
-from .golem_safety import GolemEstopMonitor
 from .locomanip_marl_env_cfg import ARM_COMMAND, LocoManipMarlEnvCfg
 from .odometry import EstimatorTrainer, motion_to_transform, pelvis_motion
 
 
-WALKING_PROGRESS_EMA = 0.001  # per policy step: a time constant of 20 s of sim time
-ROBOCASA_SCALE_STEPS = 20  # the ramp of RoboCasa's joint physics is written in this many steps
+WARM_START_DECAY = 0.999  # per policy step: the time-out share weighs episode ends of the last ~20 s of sim time
 
 
 class LocoManipMarlEnv(DirectMARLEnv):
@@ -66,23 +63,11 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self.curriculum_manager = CurriculumManager(self.cfg.curriculum, self)
         print("[INFO] Curriculum Manager: ", self.curriculum_manager)
         self._robot = self.scene["robot"]
-        self.golem_monitor = GolemEstopMonitor(self._robot, self.cfg.golem_estop, self.num_envs, self.device)
-        self.golem_log: dict[str, torch.Tensor] = {}
-        # opens once and stays open; always open outside training
-        self.estops_end_episodes = not self.cfg.estimator.train
-        self._walking_progress_ema = torch.tensor(0.0, device=self.device)
-        self._gate_log: dict[str, torch.Tensor] = {}
-        # RoboCasa's joint damping and armature as the startup events drew them, and the step its ramp starts from
-        self._robocasa_damping = self._robot.data.joint_viscous_friction_coeff.clone()
-        self._robocasa_armature = self._robot.data.joint_armature.clone()
-        self._ramp_start: int | None = None if self.cfg.estimator.train else -self.cfg.robocasa_ramp_steps
-        self.robocasa_scale = -1.0
-        self._update_robocasa_physics()
-        # the deploy loop's latency: per env, the substeps a new target waits; until then the robot holds the last
-        lo = self.cfg.action_delay_substeps[0]
-        self._delay = torch.randint(lo, self._delay_max + 1, (self.num_envs,), device=self.device)
-        self._delayed_target = self._robot.data.joint_pos.clone()
-        self._substep = 0
+        # the warm start: decayed counts of episode ends and of the time-outs among them; arm goals start once the
+        # share passes cfg.warm_start_timeout_share and stay on. Outside training they are on from the start.
+        self._ends = torch.tensor(0.0, device=self.device)
+        self._time_outs = torch.tensor(0.0, device=self.device)
+        self._warm_start_log: dict[str, torch.Tensor] = {}
 
         group_dims = self.observation_manager.group_obs_dim
         self.cfg.observation_spaces = {agent: group_dims[agent][0] for agent in self.cfg.possible_agents}
@@ -98,7 +83,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
 
         # -- pelvis odometry
         self._arm_command = self.command_manager.get_term(ARM_COMMAND)
-        self._arm_command.goals_enabled = self.estops_end_episodes
+        self._arm_command.goals_enabled = not self.cfg.estimator.train
         self.estimator = EstimatorTrainer(
             self.cfg.estimator, group_dims["odometry"][0] + self.action_manager.total_action_dim, self.num_envs, self.device
         )
@@ -135,24 +120,15 @@ class LocoManipMarlEnv(DirectMARLEnv):
             # a NaN joint target hangs the PhysX solver
             raise RuntimeError(f"Non-finite actions at step {self.common_step_counter}")
         self.action_manager.process_action(joint_action.clamp(-self.cfg.clip_actions, self.cfg.clip_actions))
-        self._substep = 0
 
     def _apply_action(self) -> None:
-        # once per physics substep: the state the previous substep left
-        self.golem_monitor.update()
         self.action_manager.apply_action()
-        # the targets just written are this step's; envs still inside their delay keep the last step's
-        new = self._robot.data.joint_pos_target.clone()
-        late = self._delay > self._substep
-        self._robot.set_joint_position_target(torch.where(late.unsqueeze(1), self._delayed_target, new))
-        self._substep += 1
-        if self._substep == self.cfg.decimation:
-            self._delayed_target = new
 
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         self.termination_manager.compute()
         terminated = self.termination_manager.terminated
         time_outs = self.termination_manager.time_outs
+        self._update_warm_start(terminated, time_outs)
         return (
             {agent: terminated for agent in self.cfg.possible_agents},
             {agent: time_outs for agent in self.cfg.possible_agents},
@@ -171,13 +147,11 @@ class LocoManipMarlEnv(DirectMARLEnv):
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
         self._update_odometry()
-        self._update_walking_gate()
         self.command_manager.compute(dt=self.step_dt)
         groups = list(self.cfg.possible_agents) + ["critic"]
         self._obs_buf = {g: self.observation_manager.compute_group(g, update_history=True) for g in groups}
         self.extras.setdefault("log", {}).update(self._estimator_log)
-        self.extras["log"].update(self.golem_log)
-        self.extras["log"].update(self._gate_log)
+        self.extras["log"].update(self._warm_start_log)
         return {agent: self._obs_buf[agent] for agent in self.cfg.possible_agents}
 
     def _get_states(self) -> torch.Tensor:
@@ -190,12 +164,6 @@ class LocoManipMarlEnv(DirectMARLEnv):
         super()._reset_idx(env_ids)  # scene, reset events, episode_length_buf
         self._refresh_sensors_after_reset(env_ids)
         self._fresh[env_ids] = True
-        self.golem_monitor.reset(env_ids)
-        lo = self.cfg.action_delay_substeps[0]
-        ids = torch.as_tensor(env_ids, device=self.device)
-        self._delay[ids] = torch.randint(lo, self._delay_max + 1, (len(ids),), device=self.device)
-        # a fresh episode starts from a hold at its reset pose, as the deploy node's pre-pose ends
-        self._delayed_target[ids] = self._robot.data.joint_pos[ids]
 
         log = {}
         log.update(self.observation_manager.reset(env_ids))
@@ -272,57 +240,20 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._estimator_log["Estimator/goal_drift"] = self._goal_drift_ema
         self._estimator_log["Estimator/gate_open"] = gate_open
 
-    def _update_walking_gate(self):
-        """Open the walking gate when the EMA of walking progress passes cfg.walking_gate: per step, the mean over
-        envs walking on a command of at least walking_gate_min_speed (not just reset) of the pelvis velocity along
-        the command over the command's speed. 0 standing still, 1 on the command. Before the command manager
-        resamples, so the command is the one the step followed. Opening it starts the arm goals and the e-stops.
-        """
-        command = self.command_manager.get_command("base_velocity")[:, :2]
-        speed = torch.norm(command, dim=1)
+    def _update_warm_start(self, terminated: torch.Tensor, time_outs: torch.Tensor):
+        """Count this step's episode ends and the time-outs among them, both decayed by WARM_START_DECAY per step,
+        and start the arm goals once the time-out share reaches cfg.warm_start_timeout_share. An episode that ends
+        in a fall or out of bounds on its last step counts as a fall."""
+        self._ends = WARM_START_DECAY * self._ends + (terminated | time_outs).sum()
+        self._time_outs = WARM_START_DECAY * self._time_outs + (time_outs & ~terminated).sum()
+        share = self._time_outs / self._ends.clamp(min=1.0)
         arm = self._arm_command
-        nav = ~arm.arm_mode & (speed >= self.cfg.walking_gate_min_speed) & (self.episode_length_buf > 0)
-        if nav.any():
-            velocity = self._robot.data.root_lin_vel_b[:, :2]
-            progress = (torch.sum(velocity * command, dim=1) / speed.square().clamp(min=1e-6))[nav].mean()
-            self._walking_progress_ema += WALKING_PROGRESS_EMA * (progress - self._walking_progress_ema)
-        if not self.estops_end_episodes and self._walking_progress_ema.item() > self.cfg.walking_gate:
-            self.estops_end_episodes = True
+        if not arm.goals_enabled and share.item() >= self.cfg.warm_start_timeout_share:
             arm.goals_enabled = True
-            self._ramp_start = self.common_step_counter
-            print(f"[INFO] Walking gate open at step {self.common_step_counter}: arm goals start, GOLEM's e-stops end"
-                  f" the episode, RoboCasa's joint physics ramps in over {self.cfg.robocasa_ramp_steps} steps")
-        self._update_robocasa_physics()
-        self._gate_log["Safety/walking_progress"] = self._walking_progress_ema
-        self._gate_log["Safety/estops_end_episodes"] = torch.tensor(float(self.estops_end_episodes), device=self.device)
-        self._gate_log["Safety/robocasa_scale"] = torch.tensor(self.robocasa_scale, device=self.device)
-
-    def _update_robocasa_physics(self):
-        """Write RoboCasa's joint physics at robocasa_scale of the way from the asset's defaults: 0 until the ramp
-        starts, then rising to 1 over cfg.robocasa_ramp_steps in ROBOCASA_SCALE_STEPS steps. It scales the passive
-        damping and armature the startup events drew, and the upper end of the action delay new episodes draw.
-        """
-        scale = 0.0
-        if self._ramp_start is not None:
-            progress = (self.common_step_counter - self._ramp_start) / max(self.cfg.robocasa_ramp_steps, 1)
-            scale = min(1.0, int(progress * ROBOCASA_SCALE_STEPS) / ROBOCASA_SCALE_STEPS)
-        if scale == self.robocasa_scale:
-            return
-        self.robocasa_scale = scale
-        data = self._robot.data
-        damping = torch.lerp(data.default_joint_viscous_friction_coeff, self._robocasa_damping, scale)
-        armature = torch.lerp(data.default_joint_armature, self._robocasa_armature, scale)
-        self._robot.write_joint_friction_coefficient_to_sim(
-            data.joint_friction_coeff.clone(), joint_viscous_friction_coeff=damping
-        )
-        self._robot.write_joint_armature_to_sim(armature)
-        lo, hi = self.cfg.action_delay_substeps
-        self._delay_max = lo + round(scale * (hi - lo))
-        print(
-            f"[INFO] RoboCasa's joint physics at {scale:.2f} (step {self.common_step_counter}): passive damping"
-            f" {damping.max().item():.2f} max, armature {armature.max().item():.3f} max, delay up to"
-            f" {self._delay_max} substeps"
-        )
+            print(f"[INFO] Warm start over at step {self.common_step_counter}: {share.item():.0%} of episodes time out;"
+                  " arm goals start")
+        self._warm_start_log["Curriculum/warm_start_timeout_share"] = share
+        self._warm_start_log["Curriculum/arm_goals_enabled"] = torch.tensor(float(arm.goals_enabled), device=self.device)
 
     def _feet_in_pelvis(self) -> torch.Tensor:
         """Each foot's ankle-roll origin in the pelvis frame, (N, F, 3): on the robot, forward kinematics."""
@@ -377,17 +308,13 @@ class LocoManipMarlEnv(DirectMARLEnv):
             "terrain_levels": terrain.terrain_levels.clone(),
             "terrain_types": terrain.terrain_types.clone(),
             "goal_drift_ema": self._goal_drift_ema.clone(),
-            "walking_progress_ema": self._walking_progress_ema.clone(),
-            "estops_end_episodes": self.estops_end_episodes,
-            "robocasa_scale": self.robocasa_scale,
+            "arm_goals_enabled": self._arm_command.goals_enabled,
         }
         self.estimator.save(os.path.join(directory, f"estimator_{self.common_step_counter}.pt"), env_state)
         self.estimator.save(os.path.join(directory, "estimator_latest.pt"), env_state)
 
     def _load_env_state(self, state: dict):
-        """Curriculum levels, terrain tiles, the drift and walking gates and the RoboCasa ramp saved by
-        _save_estimator. Runs from before the walking gate had e-stops end the episode and RoboCasa's joint physics
-        on in full from the start."""
+        """Curriculum levels, terrain tiles, the drift gate and the end of the warm start saved by _save_estimator."""
         self._arm_command.load_state_dict(state["arm_targets"])
         terrain = self.scene.terrain
         levels = state["terrain_levels"].to(self.device)
@@ -398,17 +325,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
             terrain.terrain_levels[:] = levels[torch.randint(0, len(levels), (self.num_envs,), device=self.device)]
         terrain.env_origins[:] = terrain.terrain_origins[terrain.terrain_levels, terrain.terrain_types]
         self._goal_drift_ema = state["goal_drift_ema"].to(self.device)
-        self._walking_progress_ema = state.get("walking_progress_ema", torch.tensor(1.0)).to(self.device)
-        self.estops_end_episodes = self.estops_end_episodes or state.get("estops_end_episodes", True)
-        self._arm_command.goals_enabled = self.estops_end_episodes
-        if self.estops_end_episodes and self.cfg.estimator.train:
-            scale = state.get("robocasa_scale", 1.0)
-            self._ramp_start = self.common_step_counter - round(scale * self.cfg.robocasa_ramp_steps)
-        self._update_robocasa_physics()
+        self._arm_command.goals_enabled |= state["arm_goals_enabled"]
         print(
-            f"[INFO] Restored curriculum: arm level mean {self._arm_command.level.float().mean().item():.2f},"
-            f" drift gate {self._goal_drift_ema.item():.3f}, e-stops end episodes {self.estops_end_episodes},"
-            f" RoboCasa's joint physics at {self.robocasa_scale:.2f}"
+            f"[INFO] Restored curriculum: depth level mean {self._arm_command.level.float().mean().item():.2f},"
+            f" drift gate {self._goal_drift_ema.item():.3f}, arm goals {self._arm_command.goals_enabled}"
         )
 
     """
