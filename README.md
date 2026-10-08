@@ -26,8 +26,10 @@ python -m pip install -e source/locomanipulation_game
 
 ```bash
 # train (3800 updates = 91.2k steps); --checkpoint resumes, with the estimator and curriculum saved beside it
-python scripts/skrl/train.py --headless --max_iterations 3800 [--checkpoint <run>/checkpoints/agent_<N>.pt]
+python scripts/skrl/train.py --headless --max_iterations 3800 [--name <run>] [--checkpoint <run>/checkpoints/agent_<N>.pt]
 python scripts/skrl/play.py --checkpoint <run>/checkpoints/agent_<N>.pt
+# Isaac evaluation: walking and turning speeds, reach rate, end-effector error, squat depth -> <run>/eval_<N>/eval.md
+python scripts/skrl/eval_final.py --checkpoint <run>/checkpoints/agent_<N>.pt --headless
 
 # deployment: networks + export.yaml, arm goals for the game commander, and parity with GOLEM's controller
 python scripts/skrl/export_marl.py --checkpoint <agent.pt> --out <GOLEM>/core_ws/src/locomotion_game_deploy/policies/marl_golem

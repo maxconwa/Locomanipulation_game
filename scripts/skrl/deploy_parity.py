@@ -3,7 +3,7 @@
 Runs the training env (sensor noise off) with the checkpoint's deterministic actions. Every step it hands env 0's
 state to the deploy controller (MarlController, numpy + pinocchio), synced to the env's command state (mode, arm
 command, velocity command, gait clock, last actions, residual filter), and compares:
-  observations   the legs' 96 and the arms' 124, term by term
+  observations   both agents', term by term
   networks       the exported legs.pt / arms.pt on the env's observation vs skrl's mean action (clamped)
   targets        the deploy joint targets for the env's action vs the targets the env applied
   odometry       the deploy leg odometry (IMU attitude + feet within stance_height of the lowest) vs the true
@@ -104,11 +104,9 @@ runner = Runner(env, agent_cfg)
 runner.agent.load(args.checkpoint)
 runner.agent.enable_training_mode(False, apply_to_models=True)
 
-# observation terms, in order, with their sizes (both groups share the first 84)
-COMMON = [("base_lin_acc", 3), ("base_ang_vel", 3), ("projected_gravity", 3), ("velocity_commands", 3), ("arm_goal", 1),
-          ("ee_targets", 14), ("height_drop", 1), ("joint_pos", 27), ("joint_vel", 27), ("gait_phase", 2)]
-LEGS = COMMON + [("actions", 12)]
-ARMS = COMMON + [("actions", 14), ("wrist_poses", 14), ("wrist_errors", 12)]
+# observation terms, in order, with their sizes, as the env builds them
+obs_manager = base.observation_manager
+LEGS, ARMS = ([(n, d[0]) for n, d in zip(obs_manager.active_terms[g], obs_manager.group_obs_term_dim[g])] for g in ("legs", "arms"))
 worst = {f"legs/{n}": 0.0 for n, _ in LEGS} | {f"arms/{n}": 0.0 for n, _ in ARMS}
 worst |= {"net/legs": 0.0, "net/arms": 0.0, "target/legs": 0.0, "target/arms": 0.0}
 odo_lin, odo_ang = [], []

@@ -8,8 +8,8 @@ them onto the per-agent dicts:
     rewards:      agent -> its own RewardManager, floored at 0, plus termination_penalty on terminating steps
     dones:        one TerminationManager, shared (one body, one episode)
 
-After every step it moves the arm command by the pelvis motion from leg odometry (_leg_odometry), with the learned
-estimator (odometry.py) where no foot stayed planted, and fits that estimator to the true motion. GolemEstopMonitor
+After every step it moves the arm command by the pelvis motion the learned estimator (odometry.py) reports, or with
+estimator.odometry "legs" by leg odometry (_leg_odometry), and fits the estimator to the true motion. GolemEstopMonitor
 (golem_safety.py) checks GOLEM's e-stops at every physics substep, and joint targets land action_delay_substeps late.
 """
 
@@ -94,11 +94,13 @@ class LocoManipMarlEnv(DirectMARLEnv):
         # running mean of the estimate's drift at the end of an arm goal; starts closed
         self._goal_drift_ema = torch.tensor(1.0, device=self.device)
         self._estimator_log: dict[str, torch.Tensor] = {}
-        feet = self.cfg.estimator.foot_body_names
-        self._contact_sensor = self.scene.sensors[self.cfg.estimator.contact_sensor_name]
-        self._foot_ids = self._robot.find_bodies(feet, preserve_order=True)[0]
-        self._foot_sensor_ids = self._contact_sensor.find_bodies(feet, preserve_order=True)[0]
-        self._prev_feet_in_pelvis = self._feet_in_pelvis()
+        self._legs = self.cfg.estimator.odometry == "legs"
+        if self._legs:
+            feet = self.cfg.estimator.foot_body_names
+            self._contact_sensor = self.scene.sensors[self.cfg.estimator.contact_sensor_name]
+            self._foot_ids = self._robot.find_bodies(feet, preserve_order=True)[0]
+            self._foot_sensor_ids = self._contact_sensor.find_bodies(feet, preserve_order=True)[0]
+            self._prev_feet_in_pelvis = self._feet_in_pelvis()
         if self.cfg.estimator.checkpoint_path:
             print(f"[INFO] Pelvis estimator file: {self.cfg.estimator.checkpoint_path}")
             self._load_env_state(self.estimator.load(self.cfg.estimator.checkpoint_path))
@@ -208,15 +210,16 @@ class LocoManipMarlEnv(DirectMARLEnv):
         root_pos = self._robot.data.root_pos_w.clone()
         root_quat = self._robot.data.root_quat_w.clone()
         cfg = self.cfg.estimator
-        feet_in_pelvis = self._feet_in_pelvis()
+        feet_in_pelvis = self._feet_in_pelvis() if self._legs else None
 
         if self._have_prev:
             valid = ~self._fresh
             inputs = torch.cat([odometry_obs, self.action_manager.action], dim=1)
             true_motion = pelvis_motion(self._prev_root_pos, self._prev_root_quat, root_pos, root_quat, self.step_dt)
             with torch.no_grad():  # the commands don't carry the estimator's graph from step to step
-                learned = motion_to_transform(self.estimator.model(inputs), self.step_dt)
-            estimated = self._leg_odometry(feet_in_pelvis, root_quat, learned, true_motion, valid)
+                estimated = motion_to_transform(self.estimator.model(inputs), self.step_dt)
+            if self._legs:
+                estimated = self._leg_odometry(feet_in_pelvis, root_quat, estimated, true_motion, valid)
             self._arm_command.apply_pelvis_motion(
                 estimated=estimated, true=motion_to_transform(true_motion, self.step_dt), env_mask=valid
             )
@@ -230,7 +233,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
 
         self._have_prev = True
         self._prev_root_pos, self._prev_root_quat = root_pos, root_quat
-        self._prev_feet_in_pelvis = feet_in_pelvis
+        if self._legs:
+            self._prev_feet_in_pelvis = feet_in_pelvis
         self._fresh[:] = False
 
         # the drift gate: one EMA sample of the estimate's drift (shadow command) per ended arm goal

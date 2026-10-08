@@ -1,9 +1,10 @@
 """Pelvis odometry: the pelvis's 6-DoF motion over one policy step, from what the robot measures.
 
-The env moves the arm command by leg odometry (LocoManipMarlEnv._leg_odometry). Where no foot stayed planted it
-falls back on this learned estimator: an MLP on the odometry observation group's history window and the action,
-whose output is the step's mean linear and angular velocity in the pelvis frame at its start. The env trains it
-online on the true motion and saves it beside the skrl checkpoints (<run>/estimator/), with the curriculum state.
+The env moves the arm command by this learned estimator (odometry "learned"): an MLP on the odometry observation
+group's history window and the action, whose output is the step's mean linear and angular velocity in the pelvis
+frame at its start. Or by leg odometry (odometry "legs", LocoManipMarlEnv._leg_odometry), with the estimator only
+where no foot stayed planted. The env trains it online on the true motion and saves it beside the skrl checkpoints
+(<run>/estimator/), with the curriculum state.
 """
 
 from __future__ import annotations
@@ -13,7 +14,6 @@ import os
 import re
 import torch
 import torch.nn as nn
-from dataclasses import MISSING
 
 from isaaclab.utils import configclass
 from isaaclab.utils.math import axis_angle_from_quat, quat_apply_inverse, quat_from_angle_axis, quat_inv, quat_mul
@@ -140,8 +140,10 @@ def estimator_checkpoint_for(agent_checkpoint: str) -> str | None:
 
 @configclass
 class PelvisEstimatorCfg:
-    foot_body_names: list[str] = MISSING
-    """The feet, as robot bodies and contact-sensor bodies (leg odometry)."""
+    odometry: str = "learned"
+    """What moves the arm command: "learned" (the estimator) or "legs" (attitude and a planted foot)."""
+    foot_body_names: list[str] | None = None
+    """odometry "legs": the feet, as robot bodies and contact-sensor bodies."""
     contact_sensor_name: str = "contact_forces"
     stance_force: float = 50.0
     """A foot counts as planted over a step if its contact force stayed above this (N) at every physics substep."""

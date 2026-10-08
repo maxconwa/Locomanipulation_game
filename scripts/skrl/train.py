@@ -1,6 +1,6 @@
 """Train the two-agent task with skrl's MAPPO.
 
-    python scripts/skrl/train.py --headless [--max_iterations 3800] [--checkpoint <run>/checkpoints/agent_<N>.pt]
+    python scripts/skrl/train.py --headless [--max_iterations 3800] [--name <run>] [--checkpoint <run>/checkpoints/agent_<N>.pt]
 
 --checkpoint resumes the agents and the env's pelvis estimator and curriculum state saved beside them. Arguments
 after these are Hydra overrides of the env and agent configs (env.<field>=..., agent.<field>=...).
@@ -17,6 +17,7 @@ parser.add_argument("--num_envs", type=int, default=None)
 parser.add_argument("--seed", type=int, default=None)
 parser.add_argument("--checkpoint", default=None, help="skrl checkpoint to resume from.")
 parser.add_argument("--max_iterations", type=int, default=None, help="Policy updates (rollouts of 24 steps).")
+parser.add_argument("--name", default="mappo_torch", help="Run directory suffix: <time>_<name>.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + hydra_args
@@ -84,7 +85,7 @@ def main(env_cfg, agent_cfg: dict):
     env_cfg.seed = agent_cfg["seed"]
 
     log_root = os.path.abspath(os.path.join("logs", "skrl", agent_cfg["agent"]["experiment"]["directory"]))
-    run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "_mappo_torch"
+    run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + f"_{args_cli.name}"
     agent_cfg["agent"]["experiment"]["directory"] = log_root
     agent_cfg["agent"]["experiment"]["experiment_name"] = run_name
     log_dir = os.path.join(log_root, run_name)

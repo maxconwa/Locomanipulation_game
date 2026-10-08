@@ -44,11 +44,10 @@ def arm_goal_active(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     return term.arm_mode.float().unsqueeze(1)
 
 
-def arm_target_height_drop(env: ManagerBasedRLEnv, command_name: str, visible: bool = True) -> torch.Tensor:
-    """A low goal's squat depth (m), shape (num_envs, 1). visible=False gives zeros: the actors keep the input so
-    their checkpoints load, but must read the depth from the targets' height."""
+def arm_target_height_drop(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """A low goal's squat depth (m), shape (num_envs, 1). Privileged: the actors read it from the targets' height."""
     term: ArmTargetsCommand = env.command_manager.get_term(command_name)
-    return term.height_drop.unsqueeze(1) * float(visible)
+    return term.height_drop.unsqueeze(1)
 
 
 def pelvis_height_above_ground(env: ManagerBasedRLEnv, sensor_name: str = "height_scanner") -> torch.Tensor:

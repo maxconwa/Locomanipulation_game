@@ -3,7 +3,7 @@
 At every command event an env gets navigation (a velocity command, the arms at their rest pose) or an arm goal (zero
 velocity, a wrist pose per arm fixed in the world), with a settle between modes (mdp.ArmTargetsCommand). Low arm
 goals come from tables built in squats, so the legs must crouch to reach them. The policies see the arm command in
-the pelvis frame, moved by leg odometry as on the robot; rewards score the true target.
+the pelvis frame, moved by a learned pelvis-motion estimate as on the robot; rewards score the true target.
 
 Built for GOLEM's deployment: joint targets are bounded the way its safety layer clips them and by PD torque, its
 e-stops end the episode (golem_safety.py), the joints carry RoboCasa's passive damping and armature, and targets
@@ -98,7 +98,7 @@ class MarlCommandsCfg:
         arm_command_name=ARM_COMMAND,
         # uniform sampling almost never draws a turn in place or a pure sideways walk
         pure_turn_prob=0.2,
-        pure_lateral_prob=0.1,
+        pure_lateral_prob=0.2,
     )
     arm_targets = mdp.ArmTargetsCommandCfg(
         asset_name="robot",
@@ -173,8 +173,6 @@ class MarlObservationsCfg:
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
         arm_goal = ObsTerm(func=mdp.arm_goal_active, params={"command_name": ARM_COMMAND})
         ee_targets = ObsTerm(func=mdp.arm_targets_in_root_xyzw, params={"command_name": ARM_COMMAND})
-        # zeros: a crouch is not commanded
-        height_drop = ObsTerm(func=mdp.arm_target_height_drop, params={"command_name": ARM_COMMAND, "visible": False})
         joint_pos = _joints(mdp.joint_pos_rel, 0.01)
         joint_vel = _joints(mdp.joint_vel_rel, 1.5)
         gait_phase = ObsTerm(func=mdp.gait_phase_sin, params={"command_name": "base_velocity"})
@@ -205,7 +203,7 @@ class MarlObservationsCfg:
         ee_poses = ObsTerm(func=mdp.body_pose_in_root_xyzw, params={"asset_cfg": _WRISTS})
         true_ee_targets = ObsTerm(func=mdp.true_arm_targets_in_root_xyzw, params={"command_name": ARM_COMMAND})
         pelvis_height = ObsTerm(func=mdp.pelvis_height_above_ground)
-        target_drop = ObsTerm(func=mdp.arm_target_height_drop, params={"command_name": ARM_COMMAND, "visible": True})
+        target_drop = ObsTerm(func=mdp.arm_target_height_drop, params={"command_name": ARM_COMMAND})
 
         def __post_init__(self):
             self.enable_corruption = False
@@ -262,7 +260,7 @@ class LegsRewardsCfg(LowerRewardsCfg):
     )
     feet_swing_clearance = RewTerm(
         func=mdp.feet_swing_clearance,
-        weight=-10.0,
+        weight=-25.0,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=FOOT_LINK_NAMES, preserve_order=True),
             "rest_height": 0.045,  # the ankle's standing height
@@ -380,6 +378,9 @@ class MarlEventCfg(EventCfg):
     )
 
     def __post_init__(self):
+        # slippery ground too: gaits that need less grip (MuJoCo's soft friction lets stance feet slip)
+        self.physics_material.params["static_friction_range"] = (0.3, 1.2)
+        self.physics_material.params["dynamic_friction_range"] = (0.2, 0.9)
         # resets on the ground, near still, joints near default
         self.reset_base.params = {
             **self.reset_base.params,
@@ -424,10 +425,11 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     rewards: MarlRewardsCfg = MarlRewardsCfg()
     terminations: MarlTerminationsCfg = MarlTerminationsCfg()
     curriculum: MarlCurriculumCfg = MarlCurriculumCfg()
-    estimator: PelvisEstimatorCfg = PelvisEstimatorCfg(foot_body_names=FOOT_LINK_NAMES)
+    estimator: PelvisEstimatorCfg = PelvisEstimatorCfg(odometry="learned")
     # GOLEM's e-stops tightened by a margin; wider at the joints behind RoboCasa's e-stops (the knee's only at
     # extension, so the squat keeps its depth)
     golem_estop: GolemEstopCfg = GolemEstopCfg(joint_position_margins={
+        ".*_hip_yaw_joint": (0.05, 0.05),
         ".*_ankle_roll_joint": (0.05, 0.05),
         ".*_ankle_pitch_joint": (0.05, 0.05),
         ".*_knee_joint": (0.05, 0.02),
