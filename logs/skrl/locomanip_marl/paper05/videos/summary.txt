@@ -1,0 +1,2 @@
+walking (steady part, deterministic): mean |yaw rate| 0.79 rad/s, std 0.99, dominant frequency 15.67 Hz, pelvis yaw swing +-5.8 deg (95th pct), forward speed 0.34 m/s
+crouch reach: lowest pelvis 0.72 m above ground (standing ~1.00), closest wrist error 1.8 cm, final 4.1 cm, mean |yaw rate| 0.19 rad/s
