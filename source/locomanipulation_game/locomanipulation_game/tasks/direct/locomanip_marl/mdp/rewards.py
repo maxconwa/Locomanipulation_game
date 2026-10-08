@@ -12,7 +12,11 @@ from typing import TYPE_CHECKING
 from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 
-from locomanipulation_game.tasks.manager_based.locomanipulation_game.mdp.rewards import STANCE_THRESHOLD, leg_phase
+from locomanipulation_game.tasks.manager_based.locomanipulation_game.mdp.rewards import (
+    STANCE_THRESHOLD,
+    joint_deviation_l2,
+    leg_phase,
+)
 
 from .commands import ground_height
 
@@ -128,6 +132,20 @@ def arm_goal_reached(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     """1 on the step after both wrists were first held on the goal: a one-off bonus, so finishing pays more than
     hovering just outside the tolerance."""
     return env.command_manager.get_term(command_name).just_reached.float()
+
+
+def yaw_rate_l2_during_arm_goal(env: ManagerBasedRLEnv, arm_command_name: str) -> torch.Tensor:
+    """Squared pelvis yaw rate during an arm goal: turning moves the world-fixed targets in the pelvis frame."""
+    yaw_rate = env.scene["robot"].data.root_ang_vel_b[:, 2]
+    return torch.square(yaw_rate) * env.command_manager.get_term(arm_command_name).arm_mode
+
+
+def joint_deviation_l2_modal(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, arm_command_name: str, arm_goal_scale: float
+) -> torch.Tensor:
+    """joint_deviation_l2, times arm_goal_scale during arm goals."""
+    arm_mode = env.command_manager.get_term(arm_command_name).arm_mode
+    return joint_deviation_l2(env, asset_cfg) * torch.where(arm_mode, arm_goal_scale, 1.0)
 
 
 def feet_swing_clearance(

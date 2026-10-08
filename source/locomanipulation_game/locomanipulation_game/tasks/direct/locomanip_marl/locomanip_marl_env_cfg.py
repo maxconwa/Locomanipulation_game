@@ -70,6 +70,7 @@ POLICY_DT = 0.02          # decimation 4 x sim dt 0.005; reward weights are per 
 GOAL_BONUS = 5.0          # paid once per reached goal
 # lambda: each agent's reward includes this share of the other's command-following terms
 REWARD_SHARE = 0.5
+ARM_GOAL_HIP_POS_SCALE = 0.2  # the legs' hip yaw/roll deviation term during arm goals, as a share of its weight
 TRACKING_STD = 0.25       # velocity tracking kernel width, on the gait-cycle mean velocity
 CLIP_ACTIONS = 10.0       # the env clamps every raw policy action to +-this
 TORQUE_HEADROOM = 0.85    # targets ask for at most this share of a joint's effort limit (the e-stop trips at 0.9)
@@ -231,16 +232,19 @@ _SELF_CONTACT_PARAMS = {
 class LegsRewardsCfg(LowerRewardsCfg):
     """The manager-based game's legs reward, changed for the shared body.
 
-    No term holds a posture: base_height (a pelvis height), stand_still and hip_pos (joint angles at their defaults)
-    are gone. action_rate and self_collision count the legs only. feet_swing_clearance replaces feet_swing_height,
-    which a dragging foot never pays. Velocity tracking scores the gait-cycle mean velocity, so stepping in place to
-    turn doesn't pay for its sway.
+    No term holds the pelvis height or the knees: base_height and stand_still are gone. hip_pos (hip yaw and roll at
+    their defaults) and arm_goal_yaw_rate, as in run R, hold the pelvis's yaw against twisting; hip_pos is scaled to
+    ARM_GOAL_HIP_POS_SCALE during arm goals. action_rate and self_collision count the legs only.
+    feet_swing_clearance replaces feet_swing_height, which a dragging foot never pays. Velocity tracking scores the
+    gait-cycle mean velocity, so stepping in place to turn doesn't pay for its sway.
     """
 
     base_height = None
     stand_still = None
-    hip_pos = None
     feet_swing_height = None
+    arm_goal_yaw_rate = RewTerm(
+        func=mdp.yaw_rate_l2_during_arm_goal, weight=-1.0, params={"arm_command_name": ARM_COMMAND}
+    )
     action_beyond_clip = RewTerm(
         func=mdp.action_beyond_clip,
         weight=-0.02,
@@ -270,6 +274,9 @@ class LegsRewardsCfg(LowerRewardsCfg):
         self.action_rate.params = {"action_name": AGENT_ACTION_TERMS["legs"]}
         self.self_collision.func = mdp.self_contacts_involving
         self.self_collision.params = {**_SELF_CONTACT_PARAMS, "own_links": LEGS_OWN_LINKS}
+        self.hip_pos.func = mdp.joint_deviation_l2_modal
+        self.hip_pos.params = {**self.hip_pos.params, "arm_command_name": ARM_COMMAND,
+                               "arm_goal_scale": ARM_GOAL_HIP_POS_SCALE}
 
 
 def _arm_tracking(arm: int, func, std: float) -> RewTerm:
@@ -292,6 +299,9 @@ class ArmsRewardsCfg:
     # weights are per second (the manager multiplies by dt), so this is GOAL_BONUS per goal
     goal_reached = RewTerm(func=mdp.arm_goal_reached, weight=GOAL_BONUS / POLICY_DT, params={"command_name": ARM_COMMAND})
     alive = RewTerm(func=mdp.is_alive, weight=0.15)
+    arm_goal_yaw_rate = RewTerm(
+        func=mdp.yaw_rate_l2_during_arm_goal, weight=-2.0, params={"arm_command_name": ARM_COMMAND}
+    )
     torques = _arm_joints(mdp.joint_torques_l2, -1.0e-5)
     dof_vel = _arm_joints(mdp.joint_vel_l2, -1.0e-3)
     dof_acc = _arm_joints(mdp.joint_acc_l2, -2.5e-7)
