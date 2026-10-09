@@ -1,1 +1,4 @@
-
+label,lambda_share,err_xy_moving,err_yaw_turns,stand_drift,falls,n_env_commands
+l0,0,0.0401921,0.0597348,0.0100721,0,2304
+l0.5,0.5,0.0508689,0.0410696,0.0210901,0,2304
+l1,1,0.231515,0.267048,0.0117602,0,2304

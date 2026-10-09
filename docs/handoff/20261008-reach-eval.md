@@ -1,9 +1,8 @@
 # Hand-off: reach evaluation of the lambda runs (2026-10-08)
 
 Page: paper/20261008-reach_cooperation.html (https://claude.ai/artifact/LHVKbdmtDGtoQpmfghMZBn, v5 at 18:28).
-Pipeline and commands: paper/reach/README.md. Local marl-direct is rebased on origin/marl-direct 65708f5 (paper1)
-with the paper/reach commits on top; NOT pushed: this machine has no GitHub credentials for maxconwa (memory
-locomanip-push-access), so the coworker gets a git bundle.
+Pipeline and commands: paper/reach/README.md. Pushed to origin/marl-direct (914af59, 19:00) over SSH:
+`git push git@github.com:maxconwa/Locomanipulation_game.git marl-direct` (origin's HTTPS URL has no credentials).
 
 State (18:35): conditions.yaml l1 = paper1, l0.5 = paper05, l0 = paper00 (all agent_91200), whole = not trained.
 - Done (Isaac, CPU physics, seed 0): l0.5 full, l0 full; MuJoCo l0.5 (RoboCasa, training joints, legs blind), l0

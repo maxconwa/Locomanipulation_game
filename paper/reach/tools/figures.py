@@ -643,26 +643,37 @@ def walking(D: Data):
     ax.legend(loc="upper left")
     fig.tight_layout()
     save(fig, "walking", rows)
-    # trade-off: reach success below the standing table against walking error, one point per run
+    # trade-off: reach within 10 cm below and above the standing table against walking error, one point per run
     pts = []
     for lab, w in walks.items():
-        key = f"{lab}/isaac"
-        below = (D.infos.get(key) or {}).get("below_floor")
-        if not below:
+        info = D.infos.get(f"{lab}/isaac") or {}
+        below, above = info.get("below_floor"), info.get("above_floor")
+        if not below or not above:
             continue
         moving = [r for r in w if r["command"] != "stand"]
-        pts.append((lab, 100 * float(np.mean([r["err_xy"] for r in moving])), 100 * below["success"]))
+        pts.append((lab, 100 * float(np.mean([r["err_xy"] for r in moving])), 100 * below.get("success_10cm", math.nan),
+                    100 * above.get("success_10cm", math.nan)))
     if not pts:
         return
-    fig, ax = plt.subplots(figsize=(COL_W, 2.2))
-    for lab, ex, sy in pts:
-        st = D.style(f"{lab}/isaac")
-        ax.plot(ex, sy, "o", ms=7, color=st["color"], mec="white", mew=1.2, zorder=3)
-        ax.annotate(D.registry[lab].get("name", lab), (ex, sy), textcoords="offset points", xytext=(6, 4), fontsize=6.5)
-    ax.set_xlabel("Walking velocity error, moving commands (cm/s)")
-    ax.set_ylabel("Strict success below the table (%)")
-    ax.grid(True)
-    save(fig, "tradeoff", [{"label": lab, "walk_err_cm_s": ex, "success_below_pct": sy} for lab, ex, sy in pts])
+    fig, axes = plt.subplots(1, 2, figsize=(COL_W * 1.25, 2.0), sharex=True)
+    for ax, idx, title in ((axes[0], 2, "Below the standing table"), (axes[1], 3, "Above the standing table")):
+        for p in pts:
+            st = D.style(f"{p[0]}/isaac")
+            ax.plot(p[1], p[idx], "o", ms=7, color=st["color"], mec="white", mew=1.2, zorder=3)
+            ax.annotate(D.registry[p[0]].get("name", p[0]), (p[1], p[idx]), textcoords="offset points", xytext=(6, -3),
+                        fontsize=6.5)
+        lo, hi = min(p[idx] for p in pts), max(p[idx] for p in pts)
+        pad = max(2.0, 0.25 * (hi - lo))
+        ax.set_ylim(lo - pad, hi + pad)
+        ax.set_title(title, fontsize=7.2, pad=3)
+        ax.grid(True)
+        ax.set_xlabel("Walking velocity error (cm/s)")
+    xs = [p[1] for p in pts]
+    axes[0].set_xlim(0, max(xs) * 1.35 + 1)
+    axes[0].set_ylabel("Success within 10 cm (%)")
+    fig.tight_layout(w_pad=1.0)
+    save(fig, "tradeoff", [{"label": p[0], "walk_err_cm_s": p[1], "success_10cm_below_pct": p[2],
+                            "success_10cm_above_pct": p[3]} for p in pts])
 
 
 def workspace_maps(D: Data):

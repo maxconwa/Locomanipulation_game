@@ -111,8 +111,8 @@ GALLERY = [
                          "base tilt, wrist jitter, mean foot lift-offs per goal, falls."),
     ("sim2sim", "The hero policy in Isaac and in MuJoCo with RoboCasa's and with the training plant's joint dynamics: "
                 "strict success, success within 10 cm, pelvis height."),
-    ("tradeoff", "Reach against walking: strict success below the standing table against the velocity-tracking "
-                 "error of the same checkpoint, one point per run (the two agents' tasks together)."),
+    ("tradeoff", "Reach against walking: success within 10 cm below and above the standing table against the "
+                 "velocity-tracking error on the eight moving commands, one point per run."),
     ("walking", "Velocity-tracking error per command, one bar per run."),
     ("training_curves", "Training curves from each run's TensorBoard log: curriculum level, goals reached (all and "
                         "below the table), wrist errors, pelvis drop against goal lowering, walking error."),
@@ -120,6 +120,12 @@ GALLERY = [
                        "every saved checkpoint of each run (make curve)."),
     ("workspace_maps", "Per-wrist success over the sagittal plane, one map per condition."),
 ]
+
+
+def s_walk() -> list[dict]:
+    import csv
+    path = SUMMARY / "walk.csv"
+    return list(csv.DictReader(open(path))) if path.is_file() else []
 
 
 def s_by_height(key: str) -> list[dict]:
@@ -183,6 +189,11 @@ def main():
                      f" {pct(side(k, 'above', t10))} within 10 cm, with its pelvis"
                      f" {num(side(k, 'below', 'pelvis_drop_last1s_med'), 100, 0)} and"
                      f" {num(side(k, 'above', 'pelvis_drop_last1s_med'), 100, 0)}&nbsp;cm low.")
+        walk_rows = {r["label"]: r for r in s_walk()}
+        if walk_rows:
+            lede += " Velocity-tracking error on the eight moving walking commands: " + ", ".join(
+                f"{esc(registry.get(lab, {}).get('name', lab))}: {num(float(r['err_xy_moving']), 100, 0)}&nbsp;cm/s"
+                for lab, r in walk_rows.items() if lab in registry) + "."
         if mj:
             lede += (f" In MuJoCo with RoboCasa's joint dynamics {esc(prose)} reaches {pct(mj.get('success_10cm'))} of all goals"
                      f" within 10 cm, against {pct(conds[hk].get('success_10cm'))} in Isaac.")
@@ -273,6 +284,13 @@ def main():
                 f" against {pct(h.get('success_10cm'))} in Isaac. The policy loop matches Isaac to 2e-5 from the same "
                 "state, so the gap lies in the plant; next: <code>tools/parity_check.py</code> extended from one step "
                 "to a second of stance from the same state, to find the first quantity that diverges.")
+    for r in s_walk():
+        if r["label"] in registry and float(r["err_xy_moving"]) > 0.15:
+            items.append(f"{esc(registry[r['label']].get('name', r['label']))} does not follow velocity commands "
+                         f"(mean error {num(float(r['err_xy_moving']), 100, 0)}&nbsp;cm/s on the moving commands, no "
+                         "falls; the same with the training friction range). Next: its legs' shared arm reward terms "
+                         "during navigation in TensorBoard (<code>Episode_Reward/legs/arms_*</code>), to see whether "
+                         "they pay the legs for standing still.")
     items.append("Learning curves on the fixed grid: <code>make -C paper/reach curve RUN=&lt;run&gt; LABEL=&lt;label&gt;</code>"
                  " (every saved checkpoint, unextended goals).")
     open_items = "\n".join(f"<li>{x}</li>" for x in items)
