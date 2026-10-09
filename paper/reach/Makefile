@@ -26,7 +26,7 @@ GUARD    ?= $(if $(wildcard $(HOME)/.claude/bin/resguard.sh),$(HOME)/.claude/bin
 
 DEVICE   ?= cuda:0
 
-.PHONY: all walk curve eval sim2sim paper analyze figures render page smoke baselines goals check-run
+.PHONY: all walk curve curves eval sim2sim paper analyze figures render page smoke baselines goals check-run
 
 # every run in conditions.yaml without current results: Isaac (full, legs blind, arms IK), MuJoCo; then make paper
 all:
@@ -39,14 +39,17 @@ check-run:
 
 eval: check-run
 	$(GUARD) $(PY_ISAAC) tools/eval_isaac.py --checkpoint $(CKPT) --label $(LABEL) --seeds $(SEEDS)
-	$(GUARD) $(PY_ISAAC) tools/eval_isaac.py --checkpoint $(CKPT) --label $(LABEL) --seeds $(SEEDS) --variant legs_blind
+	-$(GUARD) $(PY_ISAAC) tools/eval_isaac.py --checkpoint $(CKPT) --label $(LABEL) --seeds $(SEEDS) --variant legs_blind  # refused for a whole-body agent
 	$(GUARD) $(PY_ISAAC) tools/eval_isaac.py --checkpoint $(CKPT) --label $(LABEL) --seeds 0 --variant arms_ik
 
 sim2sim: check-run
 	$(PY) tools/eval_mujoco.py --checkpoint $(CKPT) --label $(LABEL) --workers $(WORKERS)
 	$(PY) tools/eval_mujoco.py --checkpoint $(CKPT) --label $(LABEL) --workers $(WORKERS) --physics isaac
 
-paper: analyze render figures page
+paper: analyze curves render figures page
+
+curves:
+	$(PY) tools/training_curves.py
 
 analyze:
 	$(PY) tools/analyze.py

@@ -31,16 +31,20 @@ in the standing frame at the moment they start and stay fixed in the world for 4
 
 \textbf{Trials.} A trial resets the robot with the training reset distribution, holds a zero velocity command for
 2\,s, then presents one goal. Policies act through their mean actions with observation noise on, and the learned
-pelvis estimator moves the goal they observe (Sec.~\ref{sec:estimator}). We run three seeds per goal in Isaac Lab
-with the training physics at its nominal values and pushes off.
+pelvis estimator moves the goal they observe (Sec.~\ref{sec:estimator}). Each controller runs
+\reach{l1/isaac}{n} trials in Isaac Lab, \reach{l1/isaac}{pergoal} per goal, with the training physics at its
+nominal values and pushes off.
 
 \textbf{Metrics.} A trial succeeds when both wrists stay within 5\,cm and 0.35\,rad of their true world-frame goals
-for 1\,s without a break, the criterion of the reach bonus. We report success with 95\% Wilson intervals, the wrist
+for 1\,s without a break, the criterion of the reach bonus; success within 10\,cm applies the same test at 10\,cm
+and 0.6\,rad. We report success with 95\% Wilson intervals, the wrist
 error over the last second of successful trials, and the pelvis height over that second. For balance we report the
-minimum signed distance of the centre of mass and of the divergent component of motion
-$\xi = c_{xy} + \dot c_{xy}/\omega$, $\omega = \sqrt{g/z_c}$, to the edge of the support polygon, the base tilt,
-planted-foot slip, and falls (tilt beyond 1\,rad). The operational floor of a controller is the lowest 0.1\,m band of
-lower target height from which every band above it has at least 80\% success on the goals without extension.
+signed distance of the centre of mass and of the divergent component of motion
+$\xi = c_{xy} + \dot c_{xy}/\omega$, $\omega = \sqrt{g/z_c}$, to the edge of the support polygon over the goal's
+last second, the foot lift-offs (steps) during the goal, the base tilt, and falls (tilt beyond 1\,rad). The
+operational floor of a controller is the lowest 0.1\,m band of lower target height from which every band above it
+has at least 80\% success on the goals without extension; its 10\,cm floor is the lowest band in which at least half
+of those goals succeed within 10\,cm.
 
 \textbf{Controllers.} We compare the three $\lambda$ runs with three references. \emph{Blind legs} runs the
 $\lambda = 1$ networks but gives $\pi_L$ the observation it has while standing in navigation mode, without the
@@ -56,11 +60,12 @@ whose pelvis cannot move.
   \centering
   \includegraphics[width=\textwidth]{reach/figures/fig_hero.pdf}
   \caption{Reach of the $\lambda = 1$ policy with and without its legs' cooperation, on \reach{goals}{n} fixed
-    goals. Left: wrist targets reached in at least half of the trials, drawn over the H1-2 in side view, for the
-    policy with blind legs (blue) and the full policy (orange); the robot is shown at the end of a successful
-    reach of the lowest goal it reached, with the standing pose behind it. Centre: success against the height of
-    the lower wrist target. Right: pelvis height over the last second of each goal. Grey: targets below the
-    lowest standing-reachable pose. Bands are 95\% Wilson intervals (centre) and interquartile ranges (right).}
+    goals. (a) Wrist targets that a wrist ended within 10\,cm of in at least half of the trials, drawn over the H1-2
+    in side view, for the policy with blind legs (blue) and the full policy (orange); the robot is shown at the end
+    of the lowest goal it reached, with the standing pose behind it. (b) Success within 10\,cm and 0.6\,rad for
+    1\,s against the height of the lower wrist target; GOLEM IK dashed. (c) Pelvis height over the last second of
+    each goal. Grey: targets below the lowest standing-reachable pose. Bands are 95\% Wilson intervals (b) and
+    interquartile ranges (c).}
   \label{fig:reach}
 \end{figure*}
 
@@ -68,8 +73,13 @@ Of the goals whose lower target lies below the standing tables, the $\lambda = 1
 \reach{l1/isaac}{success_below}\% and the same networks with blind legs reached
 \reach{l1/isaac_legs_blind}{success_below}\%; GOLEM IK reached \reach{golem_ik/kinematic}{success_below}\% of
 the \reach{golem_ik/kinematic}{n_below} such goals and \reach{golem_ik/kinematic}{success_above}\% of those above
-(Fig.~\ref{fig:reach}). The operational floor was \reach{l1/isaac}{floor}\,cm above the ground for the full
-policy and \reach{l1/isaac_legs_blind}{floor}\,cm with blind legs. % RESULT: one sentence on the gap.
+(Fig.~\ref{fig:reach}). Within 10\,cm the full policy reached \reach{l1/isaac}{successten_below}\% of the goals
+below the tables, blind legs \reach{l1/isaac_legs_blind}{successten_below}\% and GOLEM IK
+\reach{golem_ik/kinematic}{successten_below}\%; above the tables GOLEM IK reached
+\reach{golem_ik/kinematic}{successten_above}\% and the full policy \reach{l1/isaac}{successten_above}\%. The
+10\,cm floor was \reach{l1/isaac}{floorten}\,cm above the ground for the full policy,
+\reach{l1/isaac_legs_blind}{floorten}\,cm with blind legs and \reach{golem_ik/kinematic}{floorten}\,cm for GOLEM
+IK. % RESULT: one sentence on the gap.
 For goals below the tables the full policy's pelvis dropped by a median of \reach{l1/isaac}{drop_below}\,cm,
 against \reach{l1/isaac_legs_blind}{drop_below}\,cm with blind legs, so the crouch tracks the goal height only
 when $\pi_L$ observes the goal. % RESULT: check the sign of this comparison before keeping "so".
@@ -80,7 +90,8 @@ the standing tables ($e > 0$) requires leaning or stepping; the full policy reac
 
 \begin{table}[t]
   \centering
-  \caption{Success (\%) by goal lowering $d$, standing-table goals without extension, three seeds per goal.}
+  \caption{Strict success (\%) by goal lowering $d$ on the \reach{goals}{bases} standing-table goals without
+    extension.}
   \label{tab:depth}
   \setlength{\tabcolsep}{4pt}
   \begin{tabular}{lrrrrrr}
@@ -111,7 +122,8 @@ For goals below the tables their median pelvis drops were \reach{l1/isaac}{drop_
 \subsection{Balance and accuracy}
 \label{sec:balance}
 
-At $d = 0.6$\,m the $\lambda = 1$ policy kept a median minimum CoM margin of \reach{l1/isaac}{com_d0.6}\,cm and
+At $d = 0.6$\,m the $\lambda = 1$ policy held its centre of mass a median \reach{l1/isaac}{com_d0.6}\,cm inside the
+support polygon over the goal's last second, took \reach{l1/isaac}{steps_d0.6} steps per goal, and
 fell in \reach{l1/isaac}{falls_d0.6}\% of trials; reached goals ended with a median wrist error of
 \reach{l1/isaac}{err_d0.6}\,cm and a wrist jitter of \reach{l1/isaac}{jitter_d0.6}\,mm over the last
 second, against \reach{l1/isaac}{err_d0.0}\,cm and \reach{l1/isaac}{jitter_d0.0}\,mm at $d = 0$.

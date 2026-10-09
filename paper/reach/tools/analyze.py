@@ -32,6 +32,7 @@ import numpy as np
 REACH = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REACH))
 from reachlib import common as C  # noqa: E402
+from reachlib.metrics import TOL_PAIRS  # noqa: E402
 
 SUMMARY = C.RESULTS_DIR / "summary"
 HEIGHT_BIN = 0.1
@@ -66,6 +67,13 @@ def load_trials() -> dict[tuple[str, str], list[dict]]:
                     r[k] = float(v) if v not in ("", None) else math.nan
                 except ValueError:
                     pass
+        if rows and rows[0].get("kind") == "golem_ik" and "hold_err_pos" not in rows[0]:
+            # a kinematic solve holds its solution: the hold error is the final error, worst wrist
+            for r in rows:
+                r["hold_err_pos"] = max(r["err_final_l"], r["err_final_r"])
+                r["hold_err_rot"] = max(r["rot_final_l"], r["rot_final_r"])
+                for t, (tp, tr) in TOL_PAIRS.items():
+                    r[t] = float(r["hold_err_pos"] < tp and r["hold_err_rot"] < tr)
         if rows:
             out[(label, sim)] = rows
     return out
@@ -114,6 +122,14 @@ def summarize(rows: list[dict]) -> dict:
                                                                "success_10cm") if t in rows[0]},
            "success_l": float(np.nanmean(_f(rows, "success_l"))), "success_r": float(np.nanmean(_f(rows, "success_r"))),
            "fall_rate": float(np.nanmean(fell)) if n else math.nan}
+    for t in TOL_PAIRS:
+        if t in rows[0]:
+            out[f"{t}_lo"], out[f"{t}_hi"] = wilson(int(np.nansum(_f(rows, t))), n)
+    if "hold_err_pos" in rows[0]:
+        # which half of the strict test fails: position alone (5 cm) and orientation alone (0.35 rad), each on its own
+        # best 1 s window
+        out["pos_ok"] = float(np.mean(np.nan_to_num(_f(rows, "hold_err_pos"), nan=np.inf) < C.POS_TOL))
+        out["rot_ok"] = float(np.mean(np.nan_to_num(_f(rows, "hold_err_rot"), nan=np.inf) < C.ROT_TOL))
     for key in ("err_last1s", "rot_last1s", "closest", "hold_err_pos", "hold_err_rot", "pelvis_h_last1s",
                 "pelvis_drop_last1s", "pelvis_h_start",
                 "tilt_max_deg", "angvel_rms", "com_margin_min", "com_margin_last1s", "dcm_margin_min",
@@ -122,6 +138,8 @@ def summarize(rows: list[dict]) -> dict:
         v = _f(rows, key)
         v = v[ok & np.isfinite(v)] if key not in ("t_success",) else v[np.isfinite(v)]
         out[f"{key}_med"] = float(np.median(v)) if len(v) else math.nan
+        if key in ("steps", "foot_slip_max", "tilt_max_deg"):
+            out[f"{key}_mean"] = float(np.mean(v)) if len(v) else math.nan
         out[f"{key}_q25"] = float(np.percentile(v, 25)) if len(v) else math.nan
         out[f"{key}_q75"] = float(np.percentile(v, 75)) if len(v) else math.nan
     # wrist error of the successful trials only: the accuracy at which a goal counts as reached
@@ -157,6 +175,13 @@ def operational_floor(by_height: list[dict], thresh: float = 0.8, min_n: int = 2
         else:
             break
     return floor
+
+
+def lowest_bin(by_height: list[dict], key: str = "success_10cm", thresh: float = 0.5, min_n: int = 10) -> float:
+    """The lowest height bin whose success on `key` is >= thresh (m above ground): how low the wrists get at all,
+    where operational_floor asks how low the whole range above stays reliable."""
+    ok = [b["bin_lo"] for b in by_height if b["n"] >= min_n and b.get(key, math.nan) >= thresh]
+    return min(ok) if ok else math.nan
 
 
 def paired(trials: dict, infos: dict) -> list[dict]:
@@ -230,6 +255,7 @@ def main():
                 hb0[math.floor(r["target_min_height"] / HEIGHT_BIN)].append(r)
         rows_h0 = [{"bin_lo": round(b * HEIGHT_BIN, 2), **summarize(hb0[b])} for b in sorted(hb0)]
         totals[a_key(k)]["operational_floor_m"] = operational_floor(rows_h0, min_n=10)
+        totals[a_key(k)]["floor10_m"] = lowest_bin(rows_h0)
         # goals whose lower wrist target lies below / above the standing table's floor
         floor = C.STANDING_PELVIS_HEIGHT + min(json.loads((C.GOALS_DIR / "eval_goals_v1.json").read_text())["standing_min_z"])
         below = [r for r in rows if r["target_min_height"] < floor]
@@ -239,6 +265,11 @@ def main():
         for c in workspace(rows):
             ws_rows.append({"condition": a_key(k), **c})
         # ext 0 only: the standing-table goals lowered, the controlled comparison the brief asks for
+        ext0_rows = [r for r in rows if r["ext"] == 0.0]
+        if ext0_rows:
+            e0 = summarize(ext0_rows)
+            totals[a_key(k)]["ext0"] = {q: e0.get(q) for q in ("n", "success", "success_10cm", "fall_rate",
+                                                                "hold_err_pos_med", "pos_ok", "rot_ok")}
         for d in sorted({r["depth"] for r in rows}):
             sel = [r for r in rows if r["depth"] == d and r["ext"] == 0.0]
             if sel:
@@ -294,14 +325,21 @@ def main():
     }
     for key, t in totals.items():
         entries[(key, "n")] = t["n"]
+        entries[(key, "pergoal")] = round(t["n"] / goals_meta["goals"])
         entries[(key, "success")] = f"{100 * t['success']:.0f}"
+        if not math.isnan(t.get("success_10cm", math.nan)):
+            entries[(key, "successten")] = f"{100 * t['success_10cm']:.0f}"
         entries[(key, "falls")] = f"{100 * t['fall_rate']:.1f}"
         if not math.isnan(t["operational_floor_m"]):
             entries[(key, "floor")] = f"{100 * t['operational_floor_m']:.0f}"
+        if not math.isnan(t["floor10_m"]):
+            entries[(key, "floorten")] = f"{100 * t['floor10_m']:.0f}"
         for side in ("below", "above"):
             b = t.get(f"{side}_floor")
             if b:
                 entries[(key, f"success_{side}")] = f"{100 * b['success']:.0f}"
+                if not math.isnan(b.get("success_10cm", math.nan)):
+                    entries[(key, f"successten_{side}")] = f"{100 * b['success_10cm']:.0f}"
                 entries[(key, f"n_{side}")] = b["n"]
                 if not math.isnan(b["pelvis_drop_last1s_med"]):
                     entries[(key, f"drop_{side}")] = f"{100 * b['pelvis_drop_last1s_med']:.0f}"
@@ -314,7 +352,8 @@ def main():
                                         ("height", "pelvis_h_last1s_med", 100, ".0f"),
                                         ("err", "err_last1s_success_med", 100, ".1f"),
                                         ("falls", "fall_rate", 100, ".0f"),
-                                        ("com", "com_margin_min_med", 100, ".1f"),
+                                        ("com", "com_margin_last1s_med", 100, ".1f"),
+                                        ("steps", "steps_med", 1, ".1f"),
                                         ("jitter", "ee_jitter_l_med", 1, ".1f")):
             if not math.isnan(b[field]):
                 entries[(b["condition"], f"{name}_d{d}")] = format(scale * b[field], fmt)
@@ -336,7 +375,7 @@ def main():
     (C.TEX_DIR / "results_macros.tex").write_text("\n".join(lines) + "\n")
     for key, t in sorted(totals.items(), key=lambda kv: kv[1]["order"]):
         print(f"[analyze] {key:38s} {t['name']:34s} N={t['n']:5d} success {100 * t['success']:5.1f}%"
-              f" falls {100 * t['fall_rate']:4.1f}% floor {t['operational_floor_m']}")
+              f" falls {100 * t['fall_rate']:4.1f}% floor {t['operational_floor_m']} / 10 cm {t['floor10_m']}")
     print(f"[analyze] wrote {SUMMARY} and {C.TEX_DIR / 'results_macros.tex'}")
 
 

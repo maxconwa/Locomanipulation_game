@@ -129,7 +129,8 @@ def xyzw(pose):
 # ---------------------------------------------------------------- the sim
 
 class MarlMujoco:
-    """One H1-2 in MuJoCo driven by a checkpoint's two actors and its pelvis estimator."""
+    """One H1-2 in MuJoCo driven by a checkpoint's actors (legs and arms, or one whole-body actor) and its pelvis
+    estimator."""
 
     POLICY_DT = C.POLICY_DT
     RESIDUAL_ALPHA = 1.0 - math.exp(-2.0 * math.pi * 3.0 * C.POLICY_DT)
@@ -320,18 +321,30 @@ class MarlMujoco:
         wrist_pose = np.concatenate([xyzw(np.r_[c[:3], qunique(c[3:])]) for c in cur])
         errs = np.concatenate([np.r_[b[:3] - c[:3], axis_angle(qmul(b[3:], qconj(c[3:])))]
                                for b, c in zip(self.believed, cur)])
+        if "whole" in self.actors:
+            # LocoManip-WholeBody-Direct-v0: the shared terms once, the legs' and the arms' applied actions, then the
+            # arms' wrist terms (135)
+            return {"whole": np.concatenate(common + [legs_applied, self.residual, u(wrist_pose, n["wrist"]),
+                                                      u(errs, n["wrist"])])}
         legs = np.concatenate(common + [legs_applied])
         arms = np.concatenate(common + [self.residual, u(wrist_pose, n["wrist"]), u(errs, n["wrist"])])
         return {"legs": legs, "arms": arms}
 
     def step(self, obs: dict, legs_blind: bool = False, arms_ik: bool = False):
-        lo = obs["legs"].copy()
-        if legs_blind:
-            lo[12] = 0.0
-            lo[13:27] = np.concatenate([xyzw(b) for b in self.rest_b])
-        with torch.no_grad():
-            a_l = self.actors["legs"](torch.as_tensor(lo, dtype=torch.float32)[None])[0].numpy().astype(float)
-            a_a = self.actors["arms"](torch.as_tensor(obs["arms"], dtype=torch.float32)[None])[0].numpy().astype(float)
+        if "whole" in obs:
+            if legs_blind:
+                raise ValueError("legs_blind needs separate leg and arm actors")
+            with torch.no_grad():
+                a = self.actors["whole"](torch.as_tensor(obs["whole"], dtype=torch.float32)[None])[0].numpy()
+            a_l, a_a = a[:12].astype(float), a[12:].astype(float)
+        else:
+            lo = obs["legs"].copy()
+            if legs_blind:
+                lo[12] = 0.0
+                lo[13:27] = np.concatenate([xyzw(b) for b in self.rest_b])
+            with torch.no_grad():
+                a_l = self.actors["legs"](torch.as_tensor(lo, dtype=torch.float32)[None])[0].numpy().astype(float)
+                a_a = self.actors["arms"](torch.as_tensor(obs["arms"], dtype=torch.float32)[None])[0].numpy().astype(float)
         if arms_ik:
             a_a[:] = 0.0
         self.process_actions(a_l, a_a)

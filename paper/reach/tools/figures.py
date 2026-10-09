@@ -125,6 +125,9 @@ class Data:
         self.mujoco = [k for k in (f"{h}/mujoco", f"{h}/mujoco_isaacphys", f"{h}/mujoco_legs_blind")
                        if h and k in self.infos]
         self.lines = self.main + [k for k in (self.blind, self.armsik, self.golem) if k]
+        # the hero figure: the runs that are not marked hero_figure: false (e.g. an intermediate checkpoint)
+        self.hero_lines = [k for k in self.main if self.registry.get(k.split("/")[0], {}).get("hero_figure", True)] + \
+            [k for k in (self.blind, self.golem) if k]
 
     def name(self, key: str) -> str:
         return self.infos[key]["name"]
@@ -162,7 +165,7 @@ def curve(D: Data, ax, keys, table, xkey, ykey, lo=None, hi=None, scale=1.0, min
           band=True):
     out = []
     for k in keys:
-        rows = sorted([r for r in table.get(k, []) if r["n"] >= min_n and not math.isnan(r[ykey])],
+        rows = sorted([r for r in table.get(k, []) if r["n"] >= min_n and not math.isnan(r.get(ykey, math.nan))],
                       key=lambda r: r[xkey])
         if not rows:
             continue
@@ -189,10 +192,12 @@ def shade_below_floor(D: Data, ax, axis="x", label=True):
         ax.axhspan(0.0, D.floor, color=GREY_BAND, zorder=0, lw=0)
 
 
-def success_panel(D, ax, axis="height"):
+def success_panel(D, ax, axis="height", keys=None, metric="success"):
+    """Success against the lower wrist target's height (or the goal lowering), 95% Wilson band. metric "success" is
+    the strict test (5 cm, 0.35 rad, 1 s), "success_10cm" the same test at 10 cm and 0.6 rad."""
     table, xkey = (D.by_height, "bin_mid") if axis == "height" else (D.by_depth, "depth")
-    rows = curve(D, ax, D.lines, table, xkey, "success", "success_lo", "success_hi", scale=100)
-    ax.set_ylabel("Strict success (%)")
+    rows = curve(D, ax, keys or D.lines, table, xkey, metric, f"{metric}_lo", f"{metric}_hi", scale=100)
+    ax.set_ylabel({"success": "Strict success (%)", "success_10cm": "Success within 10 cm (%)"}[metric])
     ax.set_ylim(-2, 102)
     ax.grid(True, axis="y")
     if axis == "height":
@@ -204,9 +209,10 @@ def success_panel(D, ax, axis="height"):
     return rows
 
 
-def pelvis_panel(D, ax, axis="height"):
+def pelvis_panel(D, ax, axis="height", keys=None):
     table, xkey = (D.by_height, "bin_mid") if axis == "height" else (D.by_depth, "depth")
-    rows = curve(D, ax, D.lines, table, xkey, "pelvis_h_last1s_med", "pelvis_h_last1s_q25", "pelvis_h_last1s_q75")
+    rows = curve(D, ax, keys or D.lines, table, xkey, "pelvis_h_last1s_med", "pelvis_h_last1s_q25",
+                 "pelvis_h_last1s_q75")
     ax.set_ylabel("Pelvis height (m)")
     ax.axhline(C.STANDING_PELVIS_HEIGHT, color="#9aa1a7", lw=0.8, ls=(0, (2, 2)), zorder=1)
     ax.grid(True, axis="y")
@@ -334,42 +340,43 @@ def workspace_panel(D: Data, ax, layers, target, criterion: str = "strict"):
     return drawn
 
 
-def hero_legend(D, fig, ax_lines, drawn, y=0.995, ncol=4):
+def hero_legend(D, fig, ax_lines, drawn, y=0.995, ncol=4, criterion="final10"):
     handles, labels = ax_lines.get_legend_handles_labels()
     for key, col in drawn:
         handles.append(Patch(facecolor=col, alpha=0.3, edgecolor=col))
-        labels.append(f"Reached by {D.name(key)}")
+        labels.append(f"Wrist {CRITERIA[criterion]}: {D.name(key)}")
     handles.append(Line2D([], [], marker="x", ls="", color=INK, ms=5, mew=1.4))
     labels.append("Wrist targets of the pose shown")
     fig.legend(handles, labels, loc="upper center", ncol=ncol, bbox_to_anchor=(0.5, y), handlelength=2.0,
                columnspacing=1.1)
 
 
-def fig_hero(D: Data, layers, target, axis="height", criterion="strict"):
+def fig_hero(D: Data, layers, target, axis="height", criterion="final10"):
     fig = plt.figure(figsize=(DBL_W, 2.85))
     gs = fig.add_gridspec(1, 3, width_ratios=[1.12, 1.2, 1.2], wspace=0.36, left=0.06, right=0.995, bottom=0.14,
                           top=0.80)
     ax0, ax1, ax2 = (fig.add_subplot(gs[i]) for i in range(3))
     drawn = workspace_panel(D, ax0, layers, target, criterion)
-    rows = success_panel(D, ax1, axis) + pelvis_panel(D, ax2, axis)
+    metric = "success" if criterion == "strict" else "success_10cm"
+    rows = success_panel(D, ax1, axis, keys=D.hero_lines, metric=metric) + pelvis_panel(D, ax2, axis, keys=D.hero_lines)
     for ax, letter in zip((ax0, ax1, ax2), "abc"):
         ax.text(-0.02, 1.03, f"({letter})", transform=ax.transAxes, fontsize=8, fontweight="bold", va="bottom",
                 ha="right")
-    hero_legend(D, fig, ax1, drawn)
+    hero_legend(D, fig, ax1, drawn, criterion=criterion)
     name = "fig_hero" if axis == "height" else "fig_hero_depth"
-    save(fig, name + ("" if criterion == "strict" else f"_{criterion}"), rows)
+    save(fig, name + ("" if criterion == "final10" else f"_{criterion}"), rows)
 
 
 def fig_hero_col(D: Data, layers, target):
     fig = plt.figure(figsize=(COL_W, 2.55))
     gs = fig.add_gridspec(1, 2, width_ratios=[0.85, 1.15], wspace=0.42, left=0.13, right=0.99, bottom=0.16, top=0.74)
     ax0, ax1 = fig.add_subplot(gs[0]), fig.add_subplot(gs[1])
-    drawn = workspace_panel(D, ax0, layers, target)
+    drawn = workspace_panel(D, ax0, layers, target, "final10")
     ax0.set_xlabel("Forward (m)")
     ax0.set_ylabel("Height (m)")
-    rows = success_panel(D, ax1, "height")
+    rows = success_panel(D, ax1, "height", keys=D.hero_lines, metric="success_10cm")
     ax1.set_xlabel("Lower target height (m)")
-    hero_legend(D, fig, ax1, drawn, y=1.0, ncol=2)
+    hero_legend(D, fig, ax1, drawn, y=1.0, ncol=2, criterion="final10")
     save(fig, "fig_hero_col", rows)
 
 
@@ -399,9 +406,10 @@ def fig_filmstrip(D: Data):
         ax.set_title(f"t = {t:.1f} s" + tag, fontsize=7.2, pad=2)
         ax.set_xticks([0.0, 0.5])
     np.atleast_1d(axes)[0].set_ylabel("Height (m)")
-    fig.supxlabel(f"Forward of the pelvis (m). {D.name(D.hero + '/isaac')}, goal {row['goal_id']}: lower target "
-                  f"{float(row['target_min_height']):.2f} m above the ground", fontsize=7)
-    fig.tight_layout(pad=0.3, w_pad=0.4)
+    fig.supxlabel("Forward of the pelvis (m)", fontsize=7.5, y=0.01)
+    fig.suptitle(f"{D.name(D.hero + '/isaac')}, goal {row['goal_id']}: lower wrist target "
+                 f"{float(row['target_min_height']):.2f} m above the ground", fontsize=7.2, y=0.995)
+    fig.tight_layout(pad=0.3, w_pad=0.4, rect=(0, 0.05, 1, 0.93))
     save(fig, "fig_filmstrip", [{"goal_id": row["goal_id"], "t": t} for t in times])
 
 
@@ -466,9 +474,12 @@ def error_vs_depth(D: Data):
 
 
 def balance_vs_depth(D: Data):
-    panels = [("com_margin_min_med", "Min CoM margin (cm)", 100), ("dcm_margin_min_med", "Min DCM margin (cm)", 100),
+    # margins over the goal's last second (the hold): their minimum over the whole goal is set by the steps the legs
+    # take, during which the static margin to the one supporting foot is negative by construction
+    panels = [("com_margin_last1s_med", "CoM margin, last 1 s (cm)", 100),
+              ("dcm_margin_last1s_med", "DCM margin, last 1 s (cm)", 100),
               ("tilt_max_deg_med", "Max base tilt (deg)", 1), ("ee_jitter_l_med", "Wrist jitter, last 1 s (mm)", 1),
-              ("foot_slip_max_med", "Max planted-foot slip (cm/s)", 100), ("fall_rate", "Falls (%)", 100)]
+              ("steps_mean", "Foot lift-offs per goal, mean", 1), ("fall_rate", "Falls (%)", 100)]
     keys = [k for k in D.lines if D.infos[k]["kind"] != "golem_ik"]
     fig, axes = plt.subplots(2, 3, figsize=(DBL_W, 3.3), sharex=True)
     rows = []
@@ -476,6 +487,8 @@ def balance_vs_depth(D: Data):
         rows += curve(D, ax, keys, D.by_depth, "depth", field, scale=scale, band=False)
         ax.set_ylabel(label)
         ax.grid(True, axis="y")
+        lo, hi = ax.get_ylim()                   # from zero: the margins' zero is the support polygon's edge
+        ax.set_ylim(min(0.0, lo), hi + 0.08 * (hi - min(0.0, lo)))
     for ax in axes[1]:
         ax.set_xlabel("Goal lowering (m)")
     if keys:
@@ -488,26 +501,33 @@ def sim2sim(D: Data):
     if not D.mujoco:
         return
     keys = [f"{D.hero}/isaac"] + [k for k in (f"{D.hero}/isaac_legs_blind",) if k in D.infos] + D.mujoco
-    fig, axes = plt.subplots(1, 2, figsize=(DBL_W * 0.66, 2.2))
+    fig, axes = plt.subplots(1, 3, figsize=(DBL_W, 2.35))
     rows = curve(D, axes[0], keys, D.by_height, "bin_mid", "success", "success_lo", "success_hi", scale=100)
-    rows += curve(D, axes[1], keys, D.by_height, "bin_mid", "pelvis_h_last1s_med", band=False)
+    rows += curve(D, axes[1], keys, D.by_height, "bin_mid", "success_10cm", "success_10cm_lo", "success_10cm_hi",
+                  scale=100)
+    rows += curve(D, axes[2], keys, D.by_height, "bin_mid", "pelvis_h_last1s_med", band=False)
     axes[0].set_ylabel("Strict success (%)")
-    axes[0].set_ylim(-2, 102)
-    axes[1].set_ylabel("Pelvis height (m)")
+    axes[1].set_ylabel("Success within 10 cm (%)")
+    for ax in axes[:2]:
+        ax.set_ylim(-2, 102)
+    axes[2].set_ylabel("Pelvis height (m)")
+    axes[2].axhline(C.STANDING_PELVIS_HEIGHT, color="#9aa1a7", lw=0.8, ls=(0, (2, 2)), zorder=1)
     for ax in axes:
         shade_below_floor(D, ax, label=False)
         ax.set_xlim(0, 1.8)
         ax.set_xlabel("Lower wrist target height (m)")
         ax.grid(True, axis="y")
-    axes[0].legend(loc="upper left", fontsize=6.2)
-    fig.tight_layout()
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=min(3, len(labels)), bbox_to_anchor=(0.5, 1.0),
+               handlelength=2.6, columnspacing=1.2)
+    fig.tight_layout(rect=(0, 0, 1, 0.86 if len(labels) > 3 else 0.9))
     save(fig, "sim2sim", rows)
 
 
 def learning_curve(D: Data):
     """Strict success (all goals, and below the standing table) and the mean curriculum level against environment
     transitions, one line per run with curve data (results/curves/<label>.csv from eval_curve.py)."""
-    files = sorted((C.RESULTS_DIR / "curves").glob("*.csv"))
+    files = [f for f in sorted((C.RESULTS_DIR / "curves").glob("*.csv")) if not f.stem.endswith("_train")]
     curves = {f.stem: read_csv(f) for f in files}
     curves = {k: sorted(v, key=lambda r: r["transitions"]) for k, v in curves.items() if len(v) >= 2}
     if not curves:
@@ -538,6 +558,61 @@ def learning_curve(D: Data):
     axes[0].legend(loc="upper left", fontsize=6)
     fig.tight_layout()
     save(fig, "learning_curve", rows)
+
+
+def training_curves(D: Data):
+    """Training-time curves of every listed run (training_curves.py), smoothed over 50 updates."""
+    runs = {}
+    for lab in D.registry:
+        path = C.RESULTS_DIR / "curves" / f"{lab}_train.csv"
+        if path.is_file():
+            runs[lab] = read_csv(path)
+    if not runs:
+        return
+    panels = [("depth_level", None, "Curriculum depth level $k_d$"),
+              ("reach_rate", "crouch_reach_rate", "Goals reached in training (%)"),
+              ("goal_position_error_cm", "best_error_cm", "Wrist position error (cm)"),
+              ("goal_orientation_error_rad", None, "Wrist orientation error (rad)"),
+              ("pelvis_drop_cm", "target_drop_cm", "Drop during arm goals (cm)"),
+              ("walk_error_m_s", None, "Walking velocity error (m/s)")]
+    fig, axes = plt.subplots(2, 3, figsize=(DBL_W, 3.5), sharex=True)
+    rows = []
+
+    def smooth(y, w=50):
+        y = np.asarray(y, dtype=float)
+        k = np.ones(w) / w
+        ok = np.isfinite(y)
+        num = np.convolve(np.where(ok, y, 0.0), k, mode="same")
+        den = np.convolve(ok.astype(float), k, mode="same")
+        with np.errstate(invalid="ignore", divide="ignore"):
+            return num / den
+
+    for lab, cv in runs.items():
+        key = f"{lab}/isaac"
+        lam = D.infos[key]["lambda"] if key in D.infos else C.read_reward_share(Path(D.registry[lab]["run"]))
+        col = lam_color(lam if lam is not None else 1.0)
+        x = np.array([r["transitions"] for r in cv]) / 1e6
+        name = D.registry[lab].get("name", lab)
+        for ax, (main_key, second, label) in zip(axes.flat, panels):
+            scale = 100 if "rate" in main_key else 1
+            ax.plot(x, scale * smooth([r[main_key] for r in cv]), color=col, lw=1.4, label=name)
+            if second:
+                ax.plot(x, scale * smooth([r[second] for r in cv]), color=col, lw=1.1, ls=(0, (3, 1.5)))
+            ax.set_ylabel(label)
+            ax.grid(True, axis="y")
+        rows += [{"label": lab, **r} for r in cv]
+    axes[0, 1].text(0.03, 0.95, "dashed: goals below the table", transform=axes[0, 1].transAxes, ha="left", va="top",
+                    fontsize=6.2, color=MUTED)
+    axes[0, 2].text(0.98, 0.95, "dashed: closest approach", transform=axes[0, 2].transAxes, ha="right", va="top",
+                    fontsize=6.2, color=MUTED)
+    axes[1, 0].axhline(C.ROT_TOL, color="#9aa1a7", lw=0.8, ls=(0, (2, 2)))
+    axes[1, 1].text(0.98, 0.05, "dashed: goal lowering", transform=axes[1, 1].transAxes, ha="right", va="bottom",
+                    fontsize=6.2, color=MUTED)
+    for ax in axes[1]:
+        ax.set_xlabel("Environment transitions (millions)")
+    axes[0, 0].legend(loc="lower right")
+    fig.tight_layout()
+    save(fig, "training_curves", rows[::10])
 
 
 def walking(D: Data):
@@ -614,7 +689,7 @@ def main():
         print(f"[figures] robot render skipped: {e}")
         layers, target = [], None
     fig_hero(D, layers, target, "height")
-    fig_hero(D, layers, target, "height", criterion="final10")
+    fig_hero(D, layers, target, "height", criterion="strict")
     fig_hero(D, layers, target, "depth")
     fig_hero_col(D, layers, target)
     fig_filmstrip(D)
@@ -627,6 +702,7 @@ def main():
     balance_vs_depth(D)
     sim2sim(D)
     learning_curve(D)
+    training_curves(D)
     walking(D)
     workspace_maps(D)
 

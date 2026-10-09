@@ -1,0 +1,16 @@
+{
+ "label": "l0.5_52k",
+ "sim": "isaac",
+ "variant": "full",
+ "physics": "nominal",
+ "odometry": "learned",
+ "device": "cpu",
+ "checkpoint": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game/logs/skrl/locomanip_marl/2026-10-08_14-34-36_paper_yaw_91k/checkpoints/agent_52800.pt",
+ "checkpoint_sha256": "4adb58002ccfa9073e25fd3ae98bbb01a8c576859ea17c54778a4001a29c4712",
+ "lambda_share": 0.5,
+ "seeds": [
+  0
+ ],
+ "n_goals": 3168,
+ "note": "stopped after seed 0 to evaluate the final checkpoint (paper05); no traces"
+}

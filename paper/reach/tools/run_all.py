@@ -7,6 +7,7 @@ For each condition whose run directory holds its checkpoint (conditions.yaml: ru
 newest checkpoints/agent_<N>.pt):
     Isaac   full and legs_blind on --seeds, arms_ik on the first seed, and velocity tracking (eval_walk.py)
     MuJoCo  full with RoboCasa's joint dynamics and with the training plant's, legs_blind with RoboCasa's
+A one-agent whole-body checkpoint (LocoManip-WholeBody-Direct-v0) skips legs_blind, which needs a separate leg actor.
 A result is current when results/<label>/<sim>/meta.json names the same checkpoint file hash; anything else is
 (re)run. Then analyze.py, the robot renders, figures.py and build_page.py. Isaac jobs go through the workstation's
 resguard memory guard when it exists.
@@ -59,6 +60,8 @@ def main():
     a = p.parse_args()
     first = a.seeds.split(",")[0]
     guard = [str(GUARD), "run", "--mem", "14G", "--cpu", "800", "--"] if GUARD.is_file() else []
+    guard_mj = [str(GUARD), "run", "--mem", "10G", "--cpu", str(100 * (a.workers + 1)), "--"] if GUARD.is_file() else []
+    from reachlib.policy import checkpoint_agents
     jobs = []
     for cond in C.load_conditions():
         ckpt = checkpoint_of(cond)
@@ -66,8 +69,14 @@ def main():
             print(f"[run_all] {cond['label']}: no checkpoint on disk ({cond.get('run') or 'run not set'}), skipped")
             continue
         label = cond["label"]
+        if cond.get("evaluate") is False:
+            print(f"[run_all] {label}: evaluate: false, existing results only")
+            continue
+        whole = checkpoint_agents(str(ckpt)) == ["whole"]
         isaac = [("isaac", ["--seeds", a.seeds]), ("isaac_legs_blind", ["--seeds", a.seeds, "--variant", "legs_blind"]),
                  ("isaac_arms_ik", ["--seeds", first, "--variant", "arms_ik"])]
+        if whole:
+            isaac = [j for j in isaac if "legs_blind" not in j[0]]
         for sim, extra in isaac:
             if not current(label, sim, ckpt):
                 jobs.append(guard + [a.py, str(REACH / "tools" / "eval_isaac.py"), "--checkpoint", str(ckpt),
@@ -77,13 +86,14 @@ def main():
             jobs.append(guard + [a.py, str(REACH / "tools" / "eval_walk.py"), "--checkpoint", str(ckpt), "--label",
                                  label, "--device", a.device])
         if not a.no_mujoco:
-            mj = [("mujoco", []), ("mujoco_isaacphys", ["--physics", "isaac"]),
-                  ("mujoco_legs_blind", ["--variant", "legs_blind"])]
+            mj = [("mujoco", []), ("mujoco_isaacphys", ["--physics", "isaac"])] + \
+                ([] if whole else [("mujoco_legs_blind", ["--variant", "legs_blind"])])
             for sim, extra in mj:
                 if not current(label, sim, ckpt):
-                    jobs.append([a.py, str(REACH / "tools" / "eval_mujoco.py"), "--checkpoint", str(ckpt), "--label",
-                                 label, "--seeds", first, "--workers", str(a.workers), *extra])
+                    jobs.append(guard_mj + [a.py, str(REACH / "tools" / "eval_mujoco.py"), "--checkpoint", str(ckpt),
+                                            "--label", label, "--seeds", first, "--workers", str(a.workers), *extra])
     tail = [[a.py, str(REACH / "tools" / "analyze.py")],
+            [a.py, str(REACH / "tools" / "training_curves.py")],
             [a.py, str(REACH / "tools" / "render_robot.py"), "--pose", "standing", "--out",
              str(C.FIG_DIR / "render" / "render_standing.png")],
             [a.py, str(REACH / "tools" / "render_robot.py"), "--auto", "--out",
@@ -96,7 +106,7 @@ def main():
         if a.dry_run:
             continue
         r = subprocess.run(cmd, cwd=REACH)
-        if r.returncode != 0 and cmd not in tail[2:3]:      # the crouch render may have nothing to show yet
+        if r.returncode != 0 and cmd not in tail[3:4]:      # the crouch render may have nothing to show yet
             print(f"[run_all] exit {r.returncode}: {' '.join(cmd)}", flush=True)
 
 

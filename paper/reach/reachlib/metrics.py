@@ -20,9 +20,11 @@ Definitions (all used in the paper and the page):
     success           both wrists inside POS_TOL and ROT_TOL for HOLD_S without a break, before the goal ends
     closest           the least, over the goal, of the mean of both wrists' position errors (the curriculum's measure)
     support polygon   convex hull of the sole rectangles of the feet carrying more than CONTACT_FORCE_N
-    com margin        signed distance of the CoM's ground projection to the support polygon's edge, + inside
+    com margin        signed distance of the CoM's ground projection to the support polygon's edge, + inside;
+                      report it over the hold (last second): its minimum over a goal is set by steps, where the
+                      static margin to the single supporting foot is negative by construction
     dcm margin        the same for the divergent component of motion xi = c + c_dot / omega, omega = sqrt(g / z_c)
-    foot slip         horizontal speed of a foot carrying more than STANCE_FORCE_N
+    foot slip         horizontal speed of a foot carrying more than STANCE_FORCE_N (its maximum includes touchdown)
     steps             lift-offs: a foot going from more than CONTACT_FORCE_N to none
     ee jitter         RMS distance of a wrist from its own mean position over the goal's last second (mm)
 """
@@ -35,6 +37,10 @@ import numpy as np
 
 from .common import (CONTACT_FORCE_N, HOLD_S, POLICY_DT, POS_TOL, ROT_TOL, SOLE_X, SOLE_Y, SOLE_Z,
                      STANCE_FORCE_N)
+
+# looser and stricter versions of the success test: (position m, orientation rad) on the best 1 s window
+TOL_PAIRS = {"success_2cm": (0.02, 0.20), "success_3cm": (0.03, 0.25), "success_8cm": (0.08, 0.50),
+             "success_10cm": (0.10, 0.60)}
 
 G = 9.81
 
@@ -147,8 +153,7 @@ def trial_metrics(log: dict, pelvis_h_start: np.ndarray, standing_height: float,
     win_r = np.lib.stride_tricks.sliding_window_view(worst_r, hold, axis=0).max(-1)
     hold_err_pos, hold_err_rot = win_p.min(0), win_r.min(0)
     # strict success at other tolerance pairs (both wrists, both errors, the same window)
-    tol_pairs = {"success_2cm": (0.02, 0.20), "success_3cm": (0.03, 0.25), "success_8cm": (0.08, 0.50),
-                 "success_10cm": (0.10, 0.60)}
+    tol_pairs = TOL_PAIRS
     tol_success = {k: ((win_p < tp) & (win_r < tr)).any(0) for k, (tp, tr) in tol_pairs.items()}
 
     fell = ~alive.all(0)

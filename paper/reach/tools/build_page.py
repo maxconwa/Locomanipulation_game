@@ -95,8 +95,8 @@ def eq(svgs, key, number):
 GALLERY = [
     ("fig_hero", "Hero, double column: the reached-target workspace over the H1-2 with and without the legs' "
                  "cooperation, success and pelvis height against the lower wrist target's height."),
-    ("fig_hero_final10", "The hero with a looser workspace: wrist targets within 10 cm at the goal's end in at least "
-                         "half of the trials."),
+    ("fig_hero_strict", "The hero with the strict workspace: each wrist held within 5 cm and 0.35 rad for 1 s in at "
+                        "least half of the trials (empty while per-wrist success stays below half everywhere)."),
     ("fig_hero_depth", "The hero with goal lowering d on the right panels: the same base goals at every d."),
     ("fig_hero_col", "Single-column hero: workspace and success."),
     ("fig_filmstrip", "The robot every second of the deepest goal the hero policy reached, wrist targets marked."),
@@ -107,15 +107,29 @@ GALLERY = [
     ("pelvis_vs_height", "Pelvis height over the goal's last second against target height."),
     ("pelvis_drop_vs_depth", "Pelvis drop against goal lowering; the dashed line is a drop equal to the lowering."),
     ("error_vs_depth", "Wrist error of reached goals, and closest approach of all goals."),
-    ("balance_vs_depth", "Balance: CoM and DCM margins, base tilt, wrist jitter, foot slip, falls."),
-    ("sim2sim", "The hero policy in Isaac and in MuJoCo with RoboCasa's and with the training plant's joint dynamics."),
+    ("balance_vs_depth", "Balance against goal lowering: CoM and DCM margins over the goal's last second, maximum "
+                         "base tilt, wrist jitter, mean foot lift-offs per goal, falls."),
+    ("sim2sim", "The hero policy in Isaac and in MuJoCo with RoboCasa's and with the training plant's joint dynamics: "
+                "strict success, success within 10 cm, pelvis height."),
     ("tradeoff", "Reach against walking: strict success below the standing table against the velocity-tracking "
                  "error of the same checkpoint, one point per run (the two agents' tasks together)."),
     ("walking", "Velocity-tracking error per command, one bar per run."),
-    ("learning_curve", "Strict success and curriculum depth level against environment transitions, every saved "
-                       "checkpoint of each run."),
+    ("training_curves", "Training curves from each run's TensorBoard log: curriculum level, goals reached (all and "
+                        "below the table), wrist errors, pelvis drop against goal lowering, walking error."),
+    ("learning_curve", "Strict success on the fixed grid and curriculum depth level against environment transitions, "
+                       "every saved checkpoint of each run (make curve)."),
     ("workspace_maps", "Per-wrist success over the sagittal plane, one map per condition."),
 ]
+
+
+def s_by_height(key: str) -> list[dict]:
+    import csv
+    out = []
+    for r in csv.DictReader(open(SUMMARY / "by_height.csv")):
+        if r["condition"] == key:
+            out.append({k: (float(v) if k not in ("condition", "name") and v not in ("", None) else v)
+                        for k, v in r.items()})
+    return out
 
 
 def main():
@@ -139,40 +153,57 @@ def main():
     hk, bk, ik = (f"{hero}/isaac", f"{hero}/isaac_legs_blind", "golem_ik/kinematic") if hero else (None,) * 3
     if hero:
         mj = conds.get(f"{hero}/mujoco")
-        lede = (f"{esc(conds[hk]['name'])} reaches {pct(side(hk, 'below'))} of the goals whose lower wrist target"
-                f" lies below the standing table ({floor_m:.2f} m) and {pct(side(hk, 'above'))} of those above it.")
-        if bk in conds:
-            lede += (f" With its legs blind to the goal the same networks reach {pct(side(bk, 'below'))} and"
-                     f" {pct(side(bk, 'above'))}.")
+        prose = registry.get(hero, {}).get("prose") or f"the {conds[hk]['name']} policy"
+        cap = esc(prose[:1].upper() + prose[1:])
+        t10 = "success_10cm"
+        lede = (f"{cap} brings both wrists within 10 cm and 0.6 rad of their targets for 1 s in"
+                f" {pct(side(hk, 'below', t10))} of the goals whose lower wrist target lies below the standing table"
+                f" ({floor_m:.2f} m) and in {pct(side(hk, 'above', t10))} of those above it.")
         if ik in conds:
-            lede += f" GOLEM's arm IK on a standing robot reaches {pct(side(ik, 'below'))} and {pct(side(ik, 'above'))}."
+            lede += (f" GOLEM's arm IK on a standing robot does so for {pct(side(ik, 'below', t10))} and"
+                     f" {pct(side(ik, 'above', t10))}; the lowest 0.1 m band in which half of the unextended goals"
+                     f" succeed is {num(conds[hk].get('floor10_m'), 1, 1, ' m')} for the policy and"
+                     f" {num(conds[ik].get('floor10_m'), 1, 1, ' m')} for the IK.")
+        if bk in conds:
+            lede += (f" With its legs blind to the goal the same networks reach {pct(side(bk, 'below', t10))} and"
+                     f" {pct(side(bk, 'above', t10))}.")
+        lede += (f" Under the strict test (5 cm and 0.35 rad) the policy reaches {pct(side(hk, 'below'))} and"
+                 f" {pct(side(hk, 'above'))}.")
         drop = side(hk, "below", "pelvis_drop_last1s_med")
         if not isnan(drop):
             lede += f" For the low goals the pelvis drops a median {num(drop, 100, 0)}&nbsp;cm"
             dropb = side(bk, "below", "pelvis_drop_last1s_med") if bk in conds else None
             lede += f" ({num(dropb, 100, 0)}&nbsp;cm with blind legs)." if not isnan(dropb) else "."
         if mj:
-            lede += (f" In MuJoCo with RoboCasa's joint dynamics it reaches {pct(mj['success'])} of all goals,"
-                     f" against {pct(conds[hk]['success'])} in Isaac.")
+            lede += (f" In MuJoCo with RoboCasa's joint dynamics it reaches {pct(mj.get('success_10cm'))} of all goals"
+                     f" within 10 cm, against {pct(conds[hk].get('success_10cm'))} in Isaac.")
     else:
         lede = "No trained policy has been evaluated yet."
 
-    # -- key numbers
-    order = [f"{lab}/{sim}" for lab in registry for sim in ("isaac", "isaac_legs_blind", "isaac_arms_ik", "isaac_trueodom",
-                                                            "mujoco", "mujoco_isaacphys", "mujoco_legs_blind")
-             if f"{lab}/{sim}" in conds] + (["golem_ik/kinematic"] if "golem_ik/kinematic" in conds else [])
-    key_rows = []
-    for k in order:
+    # -- key numbers: one group per run, one row per evaluation
+    variants = [("isaac", "Isaac"), ("isaac_legs_blind", "Isaac, legs blind"), ("isaac_arms_ik", "Isaac, arms IK only"),
+                ("isaac_trueodom", "Isaac, true odometry"), ("mujoco", "MuJoCo, RoboCasa joints"),
+                ("mujoco_trueodom", "MuJoCo, RoboCasa joints, true odometry"),
+                ("mujoco_isaacphys", "MuJoCo, training joints"),
+                ("mujoco_isaacphys_trueodom", "MuJoCo, training joints, true odometry"),
+                ("mujoco_legs_blind", "MuJoCo, legs blind")]
+
+    def key_row(k, label):
         v = conds[k]
-        key_rows.append([esc(v["name"]), esc(v["base_sim"]), f"{v['n']:,}", pct(v["success"]),
-                         pct(side(k, "below")), pct(side(k, "above")),
-                         num(v.get("operational_floor_m"), 1, 2, " m") if not isnan(v.get("operational_floor_m")) else "–",
-                         num(side(k, "below", "pelvis_drop_last1s_med"), 100, 0, " cm"),
-                         num(v.get("hold_err_pos_med"), 100, 1, " cm"), pct(v["fall_rate"], 1)])
+        return [esc(label), f"{v['n']:,}", pct(v["success"]), pct(side(k, "below")), pct(side(k, "above")),
+                pct(v.get("success_10cm")),
+                num(v.get("floor10_m"), 1, 1, " m") if not isnan(v.get("floor10_m", float("nan"))) else "–",
+                num(side(k, "below", "pelvis_drop_last1s_med"), 100, 0, " cm"),
+                num(v.get("hold_err_pos_med"), 100, 1, " cm"), pct(v["fall_rate"], 1)]
+
+    key_rows = []
     for lab, c in registry.items():
-        if f"{lab}/isaac" not in conds:
-            key_rows.append([esc(c.get("name", lab)), "–", "–", "–", "–", "–", "–", "–", "–",
-                             f'<span class="pend">{esc(c.get("status", "not evaluated"))}</span>'])
+        present = [(f"{lab}/{sim}", text) for sim, text in variants if f"{lab}/{sim}" in conds]
+        key_rows.append(c.get("name", lab) + ("" if present else f" (pending: {c.get('status', 'not evaluated')})"))
+        key_rows += [key_row(k, text) for k, text in present]
+    if "golem_ik/kinematic" in conds:
+        key_rows.append("GOLEM arm IK, standing robot")
+        key_rows.append(key_row("golem_ik/kinematic", "Kinematic, deployed settings"))
 
     gallery = "".join(
         f'<figure class="card">{img(name, cap)}<figcaption><code>figures/{name}.pdf</code> {cap}</figcaption></figure>'
@@ -188,6 +219,54 @@ def main():
                        " computes it.")
     else:
         parity_text = ""
+
+    # -- open items: each names the measurement that settles it, with the numbers that raise it
+    items = []
+    pending = [c.get("name", lab) for lab, c in registry.items() if f"{lab}/isaac" not in conds]
+    if pending:
+        items.append(f"{esc(', '.join(pending))}: set <code>run:</code> in <code>conditions.yaml</code> and run "
+                     "<code>make -C paper/reach all</code>. Comparing their pelvis drop and 10 cm success below the "
+                     "table with the hero's tells whether the crouch depends on the reward share.")
+    if hero:
+        h = conds[hk]
+        it = (f"Position limits the strict test: {pct(h.get('pos_ok'))} of the hero's trials hold both wrists within "
+              f"5 cm for 1 s and {pct(h.get('rot_ok'))} within 0.35 rad")
+        if ik in conds:
+            it += f" (GOLEM IK: {pct(conds[ik].get('pos_ok'))} and {pct(conds[ik].get('rot_ok'))})"
+        ext0 = [(k, t) for k, t in ((f"{hero}/isaac_arms_ik", "arms IK only"), (f"{hero}/isaac_trueodom", "true odometry"))
+                if k in conds]
+        if ext0:
+            it += ". On the unextended goals, within 10 cm: " + ", ".join(
+                f"{t} {pct(conds[k].get('success_10cm'))}" for k, t in ext0) + \
+                f", against {pct((h.get('ext0') or {}).get('success_10cm'))} for the full policy."
+        else:
+            it += (". <code>eval_isaac.py --variant arms_ik --ext0</code> and <code>--odometry true --ext0</code> "
+                   "separate the learned residual and the pelvis estimator's drift.")
+        items.append(it)
+        hb = sorted([r for r in s_by_height(hk) if r["n"] >= 10], key=lambda r: r["bin_lo"])
+        if hb:
+            top = max(hb, key=lambda r: r.get("success_10cm", 0.0))
+            high = [r for r in hb if r["bin_lo"] > top["bin_lo"] and r.get("success_10cm", 1.0) < 0.5 * top["success_10cm"]]
+            if high:
+                r0 = high[0]
+                items.append(f"High goals: the hero's 10 cm success falls from {pct(top['success_10cm'])} at "
+                             f"{top['bin_lo']:.1f}&ndash;{top['bin_lo'] + 0.1:.1f} m to {pct(r0['success_10cm'])} at "
+                             f"{r0['bin_lo']:.1f}&ndash;{r0['bin_lo'] + 0.1:.1f} m, with the pelvis "
+                             f"{num(C.STANDING_PELVIS_HEIGHT - r0['pelvis_h_last1s_med'], 100, 0, ' cm')} below "
+                             "standing height. Next: the training curriculum's goal heights at depth level 10 against "
+                             "the grid's (<code>commands.py</code> lowers goals by up to 1.0 m).")
+        mjk = [(k, t) for k, t in ((f"{hero}/mujoco", "RoboCasa's joints"), (f"{hero}/mujoco_isaacphys",
+                                                                           "the training plant's joints"))
+               if k in conds]
+        if mjk:
+            items.append("MuJoCo transfer: within 10 cm the hero reaches " + ", ".join(
+                f"{pct(conds[k].get('success_10cm'))} with {t}" for k, t in mjk) +
+                f" against {pct(h.get('success_10cm'))} in Isaac. The policy loop matches Isaac to 2e-5 from the same "
+                "state, so the gap lies in the plant; next: <code>tools/parity_check.py</code> extended from one step "
+                "to a second of stance from the same state, to find the first quantity that diverges.")
+    items.append("Learning curves on the fixed grid: <code>make -C paper/reach curve RUN=&lt;run&gt; LABEL=&lt;label&gt;</code>"
+                 " (every saved checkpoint, unextended goals).")
+    open_items = "\n".join(f"<li>{x}</li>" for x in items)
 
     css = (REACH / "tools" / "page.css").read_text()
     today = date.today().isoformat()
@@ -210,18 +289,22 @@ def main():
 
 <section id="hero"><div class="col">
 <figure>{img("fig_hero", "Workspace, success and pelvis height of the hero policy")}
-<figcaption>(a) Wrist targets reached in at least half of the trials (per-wrist success, 5 cm kernel), side view
-over the H1-2, with blind legs (blue) and with the legs cooperating (orange); the robot is drawn at the end of the
-deepest goal it reached, the standing robot faint behind it, its targets marked &times;. (b) Strict success against
-the lower wrist target's height, 0.1 m bins, 95% Wilson band. (c) Median pelvis height over the goal's last second,
-interquartile band. Grey: below the standing table's lowest pose. GOLEM's arm IK is dashed.</figcaption></figure>
+<figcaption>(a) Wrist targets that a wrist ended within 10 cm of in at least half of the trials (5 cm kernel), side
+view over the H1-2: the policy with its legs cooperating (orange) and a standing reference (blue: the same policy with
+blind legs when evaluated, else GOLEM's arm IK); the robot is drawn at the end of the deepest goal the policy reached
+under the strict test, the standing robot faint behind it, its two wrist targets marked &times;. (b) Success within
+10 cm and 0.6 rad for 1 s against the lower wrist target's height, 0.1 m bins, 95% Wilson band; the strict version is
+<code>fig_hero_strict</code> in the gallery. (c) Median pelvis height over the goal's last second, interquartile band;
+the dotted line is the standing height. Grey: below the standing table's
+lowest pose. GOLEM's arm IK is dashed grey.</figcaption></figure>
 </div>
 <div class="col">
-{table(["Condition", "Sim", "Trials", "Success", "Below table", "Above table", "Floor", "Pelvis drop, low goals",
-        "1 s hold error", "Falls"], key_rows, text_cols=(0, 1),
-       caption="Strict success: both wrists within 5 cm and 0.35 rad for 1 s. Below / above table: goals whose lower "
-               "target is below / above the standing table's lowest pose. Floor: lowest height from which every "
-               "0.1 m band above reaches 80% (unextended goals). 1 s hold error: median over trials of the best "
+{table(["Evaluation", "Trials", "Success", "Below table", "Above table", "At 10 cm", "10 cm floor", "Pelvis drop, low goals",
+        "1 s hold error", "Falls"], key_rows, text_cols=(0,),
+       caption="Success: strict test, both wrists within 5 cm and 0.35 rad for 1 s; below / above table: the goals whose "
+               "lower target is below / above the standing table's lowest pose; at 10 cm: the same test at 10 cm and "
+               "0.6 rad. 10 cm floor: lowest 0.1 m band of lower target height in which half of the unextended "
+               "goals succeed at 10 cm. 1 s hold error: median over trials of the best "
                "1 s window's worst wrist position error.")}
 </div></section>
 
@@ -235,14 +318,15 @@ interquartile band. Grey: below the standing table's lowest pose. GOLEM's arm IK
 
 <section id="add"><div class="col">
 <h2>Adding a run</h2>
-<p>Set the run directory of each &lambda; in <code>paper/reach/conditions.yaml</code>, then from the
-Locomanipulation_game checkout:</p>
+<p>Set the run directory (<code>run:</code>) of each &lambda; in <code>paper/reach/conditions.yaml</code>, and of
+<code>whole</code> for the one-agent whole-body baseline (<code>LocoManip-WholeBody-Direct-v0</code>, recognised from
+its checkpoint), then from the Locomanipulation_game checkout:</p>
 <pre>conda activate env_isaaclab51        # Isaac Sim 5.1, Isaac Lab main 2.3.2, skrl 2.1
-make -C paper/reach all              # evaluates every listed run without results, then figures, numbers, page
+make -C paper/reach all              # evaluates every listed run without current results, then figures, numbers, page
                                      # (DEVICE=cpu when another job holds the GPU)</pre>
-<p>A run takes about 5 minutes on the GPU (Isaac, three variants) and 20 on 8 CPU cores (MuJoCo). The paper text
-quotes numbers as <code>\\reach{{l1/isaac}}{{success_below}}</code> from <code>paper/reach/tex/results_macros.tex</code>;
-a number not computed yet prints ??.</p>
+<p>Each Isaac variant takes about 5 minutes on the GPU or 20 on 12 CPU cores, each MuJoCo variant 3 minutes on 8
+cores. The paper text quotes numbers as <code>\\reach{{l1/isaac}}{{success_below}}</code> from
+<code>paper/reach/tex/results_macros.tex</code>; a number not computed yet prints ??.</p>
 </div></section>
 
 <section id="details"><div class="col">
@@ -307,11 +391,7 @@ environment's curriculum level.</li>
 
 <details><summary>Open items</summary>
 <ul>
-<li>&lambda;&nbsp;=&nbsp;1, 0.5 and 0 at 91.2k steps: set their runs in <code>conditions.yaml</code> and run
-<code>make all</code>.</li>
-<li>The MuJoCo gap: compare <code>sim2sim</code> with RoboCasa's and the training plant's joint dynamics; the
-policy loop matches Isaac to 2e-5 from the same state, so the gap lies in the dynamics.</li>
-<li>Learning curves: evaluate every 4800-step checkpoint of each run with <code>eval_isaac.py --seeds 0</code>.</li>
+{open_items}
 </ul>
 </details>
 </div></section>

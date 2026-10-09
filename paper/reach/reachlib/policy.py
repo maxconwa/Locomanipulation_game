@@ -41,11 +41,25 @@ def _mlp(state: dict, prefix: str) -> nn.Sequential:
     return nn.Sequential(*layers)
 
 
+AGENTS = ("legs", "arms", "whole")   # the two-agent game (LocoManip-Marl-Direct-v0); the one-agent whole-body baseline
+WHOLE_BODY_TASK = "LocoManip-WholeBody-Direct-v0"
+
+
+def checkpoint_agents(checkpoint: str) -> list[str]:
+    """The agents an skrl MAPPO checkpoint holds, in AGENTS order: ["legs", "arms"] or ["whole"]."""
+    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    agents = [a for a in AGENTS if isinstance(ckpt.get(a), dict) and "policy" in ckpt[a]]
+    if not agents:
+        raise KeyError(f"{checkpoint}: no agent among {AGENTS} (top-level keys {sorted(ckpt)[:8]})")
+    return agents
+
+
 def load_actors(checkpoint: str, device: str = "cpu", clip_actions: float = 10.0) -> dict[str, Actor]:
-    """{"legs": Actor, "arms": Actor} from an skrl MAPPO checkpoint (agent_<N>.pt)."""
+    """{agent: Actor} from an skrl MAPPO checkpoint (agent_<N>.pt): legs and arms for the two-agent game, whole for
+    the whole-body baseline, whose 26 actions are the legs' 12 then the arms' 14."""
     ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
     actors = {}
-    for agent in ("legs", "arms"):
+    for agent in checkpoint_agents(checkpoint):
         pre = ckpt[agent]["observation_preprocessor"]
         actors[agent] = Actor(pre["running_mean"], pre["running_variance"], _mlp(ckpt[agent]["policy"], "net_container"),
                               clip_actions=clip_actions).to(device).eval()
