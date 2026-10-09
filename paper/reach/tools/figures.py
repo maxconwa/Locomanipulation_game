@@ -134,14 +134,14 @@ class Data:
 
     def style(self, key: str) -> dict:
         info = self.infos[key]
-        if info["kind"] == "golem_ik":
-            return {"color": REF, "ls": (0, (4, 2)), "z": 2}
+        if info["kind"] == "golem_ik":                 # the standing reference: blue in every panel
+            return {"color": BLUE, "ls": (0, (4, 2)), "z": 2}
         label = key.split("/")[0]
         reg = self.registry.get(label, {})
         col = reg.get("color") or lam_color(info["lambda"] if info["lambda"] is not None else 1.0)
         ls = {"dotted": (0, (1, 1.2)), "dashed": (0, (4, 2))}.get(reg.get("dash"), "-")
         if "legs_blind" in info["variant"]:
-            col = BLUE
+            col = REF
         if "arms_ik" in info["variant"]:
             ls = (0, (1, 1.2))
         if info["base_sim"] == "mujoco":
@@ -318,12 +318,15 @@ def workspace_panel(D: Data, ax, layers, target, criterion: str = "strict"):
     shade_below_floor(D, ax, axis="y")
     for img, mp, alpha in layers:
         ax.imshow(img, extent=extent_of(mp), alpha=alpha, zorder=1, interpolation="lanczos")
-    standing = D.blind or D.golem
+    # the standing reference: GOLEM's arm IK on a robot that cannot crouch (the blind-legs policy also falls and
+    # misses, so its workspace mixes the two); each region takes its condition's line colour
+    standing = D.golem or D.blind
     crouch = f"{D.hero}/isaac" if D.hero else None
     drawn = []
-    for key, col in ((standing, BLUE), (crouch, lam_color(D.infos[crouch]["lambda"] or 1.0) if crouch else None)):
+    for key in (standing, crouch):
         if not key:
             continue
+        col = D.style(key)["color"]
         f = np.nan_to_num(success_field(wrist_points(key, criterion), xs, zs), nan=0.0)
         ax.contourf(xs, zs, f, levels=[0.5, 1.01], colors=[col], alpha=0.28, zorder=2)
         ax.contour(xs, zs, f, levels=[0.5], colors=[col], linewidths=1.1, zorder=3)

@@ -61,11 +61,11 @@ whose pelvis cannot move.
   \includegraphics[width=\textwidth]{reach/figures/fig_hero.pdf}
   \caption{Reach of the $\lambda = 1$ policy with and without its legs' cooperation, on \reach{goals}{n} fixed
     goals. (a) Wrist targets that a wrist ended within 10\,cm of in at least half of the trials, drawn over the H1-2
-    in side view, for the policy with blind legs (blue) and the full policy (orange); the robot is shown at the end
-    of the lowest goal it reached, with the standing pose behind it. (b) Success within 10\,cm and 0.6\,rad for
-    1\,s against the height of the lower wrist target; GOLEM IK dashed. (c) Pelvis height over the last second of
-    each goal. Grey: targets below the lowest standing-reachable pose. Bands are 95\% Wilson intervals (b) and
-    interquartile ranges (c).}
+    in side view, for GOLEM IK on a standing robot (blue) and the full policy (orange); the robot is shown at the
+    end of the lowest goal it reached, with the standing pose behind it. (b) Success within 10\,cm and 0.6\,rad for
+    1\,s against the height of the lower wrist target. (c) Pelvis height over the last second of each goal. Oranges:
+    the $\lambda$ runs; dark grey: blind legs; dashed blue: GOLEM IK. Grey band: targets below the lowest
+    standing-reachable pose. Bands are 95\% Wilson intervals (b) and interquartile ranges (c).}
   \label{fig:reach}
 \end{figure*}
 
@@ -114,10 +114,14 @@ the standing tables ($e > 0$) requires leaning or stepping; the full policy reac
 Over all goals, $\lambda = 1$, $0.5$ and $0$ reached \reach{l1/isaac}{success}\%,
 \reach{l0.5/isaac}{success}\% and \reach{l0/isaac}{success}\%, with operational floors of
 \reach{l1/isaac}{floor}, \reach{l0.5/isaac}{floor} and \reach{l0/isaac}{floor}\,cm.
-% RESULT: if lambda = 0 also crouches, the crouch follows from the legs observing the goal and sharing changes how
-% far; if it does not, sharing is what produces it. State which, with the pelvis drop below the tables:
-For goals below the tables their median pelvis drops were \reach{l1/isaac}{drop_below},
-\reach{l0.5/isaac}{drop_below} and \reach{l0/isaac}{drop_below}\,cm.
+All three runs crouch during arm goals: for goals below the tables their median pelvis drops were
+\reach{l1/isaac}{drop_below}, \reach{l0.5/isaac}{drop_below} and \reach{l0/isaac}{drop_below}\,cm. Sharing changes
+how the crouch follows the goal. For goals above the tables the $\lambda = 0$ pelvis stayed
+\reach{l0/isaac}{drop_above}\,cm low, against \reach{l0.5/isaac}{drop_above}\,cm at $\lambda = 0.5$
+(Fig.~\ref{fig:reach}c), and within 10\,cm the $\lambda = 0$ policy reached more of the goals below the tables
+(\reach{l0/isaac}{successten_below}\% against \reach{l0.5/isaac}{successten_below}\%) and fewer of those above
+(\reach{l0/isaac}{successten_above}\% against \reach{l0.5/isaac}{successten_above}\%).
+% RESULT: written from lambda 0 and 0.5; add lambda 1 when evaluated.
 
 \subsection{Balance and accuracy}
 \label{sec:balance}

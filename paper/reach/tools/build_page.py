@@ -171,11 +171,20 @@ def main():
                  f" {pct(side(hk, 'above'))}.")
         drop = side(hk, "below", "pelvis_drop_last1s_med")
         if not isnan(drop):
-            lede += f" For the low goals the pelvis drops a median {num(drop, 100, 0)}&nbsp;cm"
-            dropb = side(bk, "below", "pelvis_drop_last1s_med") if bk in conds else None
-            lede += f" ({num(dropb, 100, 0)}&nbsp;cm with blind legs)." if not isnan(dropb) else "."
+            lede += (f" Its pelvis drops a median {num(drop, 100, 0)}&nbsp;cm for the goals below the table and"
+                     f" {num(side(hk, 'above', 'pelvis_drop_last1s_med'), 100, 0)}&nbsp;cm for those above.")
+        # the other runs in the hero figure, one sentence each
+        for lab, c in registry.items():
+            k = f"{lab}/isaac"
+            if lab == hero or k not in conds or c.get("hero_figure") is False:
+                continue
+            name = esc(c.get("prose") or f"the {conds[k]['name']} policy")
+            lede += (f" {name[:1].upper() + name[1:]} reaches {pct(side(k, 'below', t10))} and"
+                     f" {pct(side(k, 'above', t10))} within 10 cm, with its pelvis"
+                     f" {num(side(k, 'below', 'pelvis_drop_last1s_med'), 100, 0)} and"
+                     f" {num(side(k, 'above', 'pelvis_drop_last1s_med'), 100, 0)}&nbsp;cm low.")
         if mj:
-            lede += (f" In MuJoCo with RoboCasa's joint dynamics it reaches {pct(mj.get('success_10cm'))} of all goals"
+            lede += (f" In MuJoCo with RoboCasa's joint dynamics {esc(prose)} reaches {pct(mj.get('success_10cm'))} of all goals"
                      f" within 10 cm, against {pct(conds[hk].get('success_10cm'))} in Isaac.")
     else:
         lede = "No trained policy has been evaluated yet."
@@ -290,13 +299,13 @@ def main():
 <section id="hero"><div class="col">
 <figure>{img("fig_hero", "Workspace, success and pelvis height of the hero policy")}
 <figcaption>(a) Wrist targets that a wrist ended within 10 cm of in at least half of the trials (5 cm kernel), side
-view over the H1-2: the policy with its legs cooperating (orange) and a standing reference (blue: the same policy with
-blind legs when evaluated, else GOLEM's arm IK); the robot is drawn at the end of the deepest goal the policy reached
-under the strict test, the standing robot faint behind it, its two wrist targets marked &times;. (b) Success within
-10 cm and 0.6 rad for 1 s against the lower wrist target's height, 0.1 m bins, 95% Wilson band; the strict version is
-<code>fig_hero_strict</code> in the gallery. (c) Median pelvis height over the goal's last second, interquartile band;
-the dotted line is the standing height. Grey: below the standing table's
-lowest pose. GOLEM's arm IK is dashed grey.</figcaption></figure>
+view over the H1-2: the hero policy (orange) and GOLEM's arm IK on a standing robot (blue); the robot is drawn at the
+end of the deepest goal the policy reached under the strict test, the standing robot faint behind it, its two wrist
+targets marked &times;. (b) Success within 10 cm and 0.6 rad for 1 s against the lower wrist target's height, 0.1 m
+bins, 95% Wilson band; the strict version is <code>fig_hero_strict</code> in the gallery. (c) Median pelvis height
+over the goal's last second, interquartile band; the dotted line is the nominal standing height. Oranges: &lambda;
+runs; dark grey: the hero's networks with blind legs; dashed blue: GOLEM's arm IK. Grey band: below the standing
+table's lowest pose.</figcaption></figure>
 </div>
 <div class="col">
 {table(["Evaluation", "Trials", "Success", "Below table", "Above table", "At 10 cm", "10 cm floor", "Pelvis drop, low goals",
