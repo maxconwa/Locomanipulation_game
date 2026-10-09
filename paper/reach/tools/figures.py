@@ -343,15 +343,15 @@ def workspace_panel(D: Data, ax, layers, target, criterion: str = "strict"):
     return drawn
 
 
-def hero_legend(D, fig, ax_lines, drawn, y=0.995, ncol=4, criterion="final10"):
+def hero_legend(D, fig, ax_lines, drawn, y=0.995, ncol=None, criterion="final10"):
     handles, labels = ax_lines.get_legend_handles_labels()
     for key, col in drawn:
         handles.append(Patch(facecolor=col, alpha=0.3, edgecolor=col))
-        labels.append(f"Wrist {CRITERIA[criterion]}: {D.name(key)}")
+        labels.append(f"Workspace, {D.name(key)}")
     handles.append(Line2D([], [], marker="x", ls="", color=INK, ms=5, mew=1.4))
     labels.append("Wrist targets of the pose shown")
-    fig.legend(handles, labels, loc="upper center", ncol=ncol, bbox_to_anchor=(0.5, y), handlelength=2.0,
-               columnspacing=1.1)
+    fig.legend(handles, labels, loc="upper center", ncol=ncol or math.ceil(len(labels) / 2), bbox_to_anchor=(0.5, y),
+               handlelength=2.0, columnspacing=1.0)
 
 
 def fig_hero(D: Data, layers, target, axis="height", criterion="final10"):

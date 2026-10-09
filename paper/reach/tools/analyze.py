@@ -329,6 +329,9 @@ def main():
         entries[(key, "success")] = f"{100 * t['success']:.0f}"
         if not math.isnan(t.get("success_10cm", math.nan)):
             entries[(key, "successten")] = f"{100 * t['success_10cm']:.0f}"
+        e0 = t.get("ext0") or {}
+        if e0.get("success_10cm") is not None and not math.isnan(e0["success_10cm"]):
+            entries[(key, "successten_e0")] = f"{100 * e0['success_10cm']:.0f}"
         entries[(key, "falls")] = f"{100 * t['fall_rate']:.1f}"
         if not math.isnan(t["operational_floor_m"]):
             entries[(key, "floor")] = f"{100 * t['operational_floor_m']:.0f}"

@@ -1,0 +1,52 @@
+{
+ "label": "l1",
+ "sim": "isaac",
+ "variant": "arms_ik",
+ "physics": "nominal",
+ "odometry": "learned",
+ "checkpoint": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game/logs/skrl/locomanip_marl/paper1/checkpoints/agent_91200.pt",
+ "checkpoint_sha256": "102dcfc5902661463ae21be9ff9b00c9b2e6d1275127b27999c972cc914057c3",
+ "run_dir": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game/logs/skrl/locomanip_marl/paper1",
+ "lambda_share": 1.0,
+ "estimator": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game/logs/skrl/locomanip_marl/paper1/estimator/estimator_91200.pt",
+ "goals": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game/paper/reach/goals/eval_goals_v1.csv",
+ "goals_sha256": "596589e5d9d4ac0bcfaf2cd0935efcf8826833466c844efd524360e12bb6eb90",
+ "n_goals": 1056,
+ "seeds": [
+  0
+ ],
+ "batch": 1056,
+ "agents": [
+  "legs",
+  "arms"
+ ],
+ "actors": {
+  "legs": {
+   "obs": 95,
+   "actions": 12,
+   "params": 66508
+  },
+  "arms": {
+   "obs": 123,
+   "actions": 14,
+   "params": 73806
+  }
+ },
+ "total_mass_kg": 67.92400360107422,
+ "settle_s": 2.0,
+ "goal_s": 4.0,
+ "task": "LocoManip-Marl-Direct-v0",
+ "code": {
+  "path": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game",
+  "commit": "4af0bf9fcd4118a27b8d53a52d398b3fe9e99b83",
+  "describe": "4af0bf9-dirty",
+  "status": "M paper/reach/conditions.yaml\n?? loco_manipulation_codex_experiment_brief.md\n?? paper/reach/results/l1/isaac_arms_ik/"
+ },
+ "versions": {
+  "isaacsim": "5.1.0.0",
+  "isaaclab": "0.54.4",
+  "torch": "2.7.0+cu128",
+  "skrl": "2.1.0"
+ },
+ "wall_s": 502.1
+}

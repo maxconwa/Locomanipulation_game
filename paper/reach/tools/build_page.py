@@ -316,14 +316,14 @@ def main():
 
 <section id="hero"><div class="col">
 <figure>{img("fig_hero", "Workspace, success and pelvis height of the hero policy")}
-<figcaption>(a) Wrist targets that a wrist ended within 10 cm of in at least half of the trials (5 cm kernel), side
+<figcaption>(a) Workspace: wrist targets that a wrist ended within 10 cm of in at least half of the trials (5 cm kernel), side
 view over the H1-2: the hero policy (orange) and GOLEM's arm IK on a standing robot (blue); the robot is drawn at the
 end of the deepest goal the policy reached under the strict test, the standing robot faint behind it, its two wrist
 targets marked &times;. (b) Success within 10 cm and 0.6 rad for 1 s against the lower wrist target's height, 0.1 m
 bins, 95% Wilson band; the strict version is <code>fig_hero_strict</code> in the gallery. (c) Median pelvis height
 over the goal's last second, interquartile band; the dotted line is the nominal standing height. Oranges: &lambda;
-runs; dark grey: the hero's networks with blind legs; dashed blue: GOLEM's arm IK. Grey band: below the standing
-table's lowest pose.</figcaption></figure>
+runs; purple: one agent for the whole body; dark grey: the hero's networks with blind legs; dashed blue: GOLEM's arm
+IK. Grey band: below the standing table's lowest pose.</figcaption></figure>
 </div>
 <div class="col">
 {table(["Evaluation", "Trials", "Success", "Below table", "Above table", "At 10 cm", "10 cm floor", "Pelvis drop, low goals",

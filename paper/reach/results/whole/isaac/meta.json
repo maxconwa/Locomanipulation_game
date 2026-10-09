@@ -1,0 +1,46 @@
+{
+ "label": "whole",
+ "sim": "isaac",
+ "variant": "full",
+ "physics": "nominal",
+ "odometry": "learned",
+ "checkpoint": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game/logs/skrl/locomanip_marl/paperwb/checkpoints/agent_91200.pt",
+ "checkpoint_sha256": "c24bf8aff3727e1e2b85767e4a06fc56b17d26483a2a90ea9bb397835fb0c99a",
+ "run_dir": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game/logs/skrl/locomanip_marl/paperwb",
+ "lambda_share": null,
+ "estimator": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game/logs/skrl/locomanip_marl/paperwb/estimator/estimator_91200.pt",
+ "goals": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game/paper/reach/goals/eval_goals_v1.csv",
+ "goals_sha256": "596589e5d9d4ac0bcfaf2cd0935efcf8826833466c844efd524360e12bb6eb90",
+ "n_goals": 3168,
+ "seeds": [
+  0
+ ],
+ "batch": 1584,
+ "agents": [
+  "whole"
+ ],
+ "actors": {
+  "whole": {
+   "obs": 135,
+   "actions": 26,
+   "params": 237210
+  }
+ },
+ "total_mass_kg": 67.92400360107422,
+ "settle_s": 2.0,
+ "goal_s": 4.0,
+ "task": "LocoManip-WholeBody-Direct-v0",
+ "code": {
+  "path": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game",
+  "commit": "4af0bf9fcd4118a27b8d53a52d398b3fe9e99b83",
+  "describe": "4af0bf9-dirty",
+  "status": "M paper/reach/conditions.yaml\n?? loco_manipulation_codex_experiment_brief.md\n?? paper/reach/results/l1/isaac_arms_ik/\n?? paper/reach/results/whole/"
+ },
+ "versions": {
+  "isaacsim": "5.1.0.0",
+  "isaaclab": "0.54.4",
+  "torch": "2.7.0+cu128",
+  "skrl": "2.1.0"
+ },
+ "wall_s": 1142.5
+}

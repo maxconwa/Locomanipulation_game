@@ -49,7 +49,10 @@ of those goals succeed within 10\,cm.
 \textbf{Controllers.} We compare the three $\lambda$ runs with three references. \emph{Blind legs} runs the
 $\lambda = 1$ networks but gives $\pi_L$ the observation it has while standing in navigation mode, without the
 wrist goals; its lower body balances and does not cooperate. \emph{IK arms} holds $\pi_U$'s residual at zero, so the
-arms follow the damped-least-squares step alone. \emph{GOLEM IK} is the upper-body controller of our lab's deployed
+arms follow the damped-least-squares step alone. \emph{Whole-body agent} is one MAPPO agent that drives all 26 joints
+through the same two action terms, observes both agents' observations and is paid every term of both agents' own
+rewards once, with the same commands, curriculum, estimator and training budget. \emph{GOLEM IK} is the upper-body
+controller of our lab's deployed
 stack, a quadratic-programming IK over the 14 arm joints with self-collision avoidance, solved on a standing robot
 whose pelvis cannot move.
 
@@ -64,7 +67,7 @@ whose pelvis cannot move.
     in side view, for GOLEM IK on a standing robot (blue) and the full policy (orange); the robot is shown at the
     end of the lowest goal it reached, with the standing pose behind it. (b) Success within 10\,cm and 0.6\,rad for
     1\,s against the height of the lower wrist target. (c) Pelvis height over the last second of each goal. Oranges:
-    the $\lambda$ runs; dark grey: blind legs; dashed blue: GOLEM IK. Grey band: targets below the lowest
+    the $\lambda$ runs; purple: one agent for the whole body; dark grey: blind legs; dashed blue: GOLEM IK. Grey band: targets below the lowest
     standing-reachable pose. Bands are 95\% Wilson intervals (b) and interquartile ranges (c).}
   \label{fig:reach}
 \end{figure*}
@@ -128,6 +131,16 @@ $\lambda = 0$ policy reached the most goals below the tables (\reach{l0/isaac}{s
 commands (0.2--0.5\,m/s forward, backward and sideways, and turns), the velocity error was
 \reach{l1/walk}{err_xy}\,cm/s at $\lambda = 1$, whose legs stood still, against \reach{l0.5/walk}{err_xy} and
 \reach{l0/walk}{err_xy}\,cm/s at $\lambda = 0.5$ and $0$.
+
+\subsection{One agent for the whole body}
+\label{sec:wholebody}
+
+The whole-body agent reached \reach{whole/isaac}{successten}\% of all goals within 10\,cm
+(\reach{whole/isaac}{successten_below}\% below the tables and \reach{whole/isaac}{successten_above}\% above),
+against \reach{l1/isaac}{successten}\% for $\lambda = 1$, with a median pelvis drop of
+\reach{whole/isaac}{drop_below}\,cm for goals below the tables. With the arms' residual held at zero, the
+$\lambda = 1$ networks reached \reach{l1/isaac_arms_ik}{successten_e0}\% of the unextended goals within 10\,cm,
+against \reach{l1/isaac}{successten_e0}\% with it.
 
 \subsection{Balance and accuracy}
 \label{sec:balance}

@@ -36,10 +36,11 @@ conditions:
     status: "evaluating"
   - label: whole
     name: "Whole-body agent"
-    run: ""
-    color: "#7b3fa0"     # purple: >= 9 OKLab x100 from the orange ramp, the blind blue and GOLEM's grey under CVD
+    run: ../../logs/skrl/locomanip_marl/paperwb
+    checkpoint: agent_91200.pt
+    color: "#7b3fa0"     # purple: >= 9 OKLab x100 from the orange ramp, GOLEM's blue and the blind-legs grey under CVD
     prose: "the one-agent whole-body policy"
-    status: "not trained (LocoManip-WholeBody-Direct-v0, b701ed0)"
+    status: "evaluating"
   - label: l0.5_52k
     name: "λ = 0.5, 52.8k steps"
     run: ../../logs/skrl/locomanip_marl/2026-10-08_14-34-36_paper_yaw_91k
