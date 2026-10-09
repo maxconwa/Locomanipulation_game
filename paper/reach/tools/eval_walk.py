@@ -32,7 +32,7 @@ parser.add_argument("--checkpoint", required=True)
 parser.add_argument("--label", required=True)
 parser.add_argument("--num_envs", type=int, default=256)
 parser.add_argument("--seed", type=int, default=0)
-parser.add_argument("--task", default="LocoManip-Marl-Direct-v0")
+parser.add_argument("--task", default=None, help="default: from the checkpoint's agents")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True
@@ -49,7 +49,7 @@ from locomanipulation_game.tasks.direct.locomanip_marl.odometry import estimator
 
 sys.path.insert(0, str(REACH))
 from reachlib import common as C  # noqa: E402
-from reachlib.policy import load_actors  # noqa: E402
+from reachlib.policy import WHOLE_BODY_TASK, checkpoint_agents, load_actors  # noqa: E402
 
 COMMANDS = [("stand", (0.0, 0.0, 0.0)), ("forward", (0.5, 0.0, 0.0)), ("slow forward", (0.2, 0.0, 0.0)),
             ("backward", (-0.4, 0.0, 0.0)), ("left", (0.0, 0.25, 0.0)), ("right", (0.0, -0.25, 0.0)),
@@ -58,6 +58,8 @@ STAND_S, WALK_S, MEASURE_S = 2.0, 6.0, 4.5
 
 t0 = time.time()
 checkpoint = Path(args.checkpoint).resolve()
+if args.task is None:
+    args.task = WHOLE_BODY_TASK if checkpoint_agents(str(checkpoint)) == ["whole"] else "LocoManip-Marl-Direct-v0"
 out_dir = C.RESULTS_DIR / args.label / "isaac_walk"
 out_dir.mkdir(parents=True, exist_ok=True)
 env_dir = out_dir / "envdir"
@@ -103,14 +105,15 @@ with torch.inference_mode():
     for name, cmd in COMMANDS:
         for _ in range(int(STAND_S / dt)):
             hold((0.0, 0.0, 0.0))
-            obs, _, _, _, _ = base.step({"legs": actors["legs"](obs["legs"]), "arms": actors["arms"](obs["arms"])})
+            obs, _, _, _, _ = base.step({a: actors[a](obs[a]) for a in actors})
         up = torch.ones(base.num_envs, dtype=torch.bool, device=base.device)
         v = []
         steps = int(WALK_S / dt)
         for i in range(steps):
             hold(cmd)
-            obs, _, term, trunc, _ = base.step({"legs": actors["legs"](obs["legs"]), "arms": actors["arms"](obs["arms"])})
-            up &= ~(term["legs"] | trunc["legs"])
+            obs, _, term, trunc, _ = base.step({a: actors[a](obs[a]) for a in actors})
+            a0 = base.cfg.possible_agents[0]
+            up &= ~(term[a0] | trunc[a0])
             if i * dt >= WALK_S - MEASURE_S:
                 d = robot.data
                 v.append(torch.cat([d.root_lin_vel_b[:, :2], d.root_ang_vel_b[:, 2:3]], 1).cpu().numpy())

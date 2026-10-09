@@ -1,4 +1,5 @@
-"""Fixed-grid reach evaluation of a LocoManip-Marl-Direct-v0 checkpoint in Isaac Lab, the training simulator.
+"""Fixed-grid reach evaluation of a LocoManip-Marl-Direct-v0 checkpoint in Isaac Lab, the training simulator, or of a
+LocoManip-WholeBody-Direct-v0 checkpoint (one agent for all 26 joints; the task follows from the checkpoint's agents).
 
     python paper/reach/tools/eval_isaac.py --checkpoint <run>/checkpoints/agent_<N>.pt --label lambda1 \
         [--variant full|legs_blind|arms_ik] [--seeds 0,1,2] [--goals paper/reach/goals/eval_goals_v1.csv] \
@@ -15,6 +16,7 @@ Variants, all from the same checkpoint:
     legs_blind   the legs see navigation inputs (no arm goal, the arms' rest pose) while the arms chase the goal:
                  a lower body that balances but does not cooperate
     arms_ik      the arms' learned residual held at zero: the damped-least-squares IK step alone
+legs_blind needs separate leg and arm actors; arms_ik zeroes a whole-body agent's last 14 actions.
 
 Physics: nominal (default) pins the training randomization at its midpoint (friction 0.9 / 0.65, no torso mass
 offset) and turns pushes off; train keeps the training distribution (pushes off).
@@ -49,7 +51,7 @@ parser.add_argument("--odometry", choices=["learned", "true"], default="learned"
 parser.add_argument("--limit", type=int, default=0, help="evaluate only the first N goals (smoke test)")
 parser.add_argument("--ext0", action="store_true", help="only the goals without extension (learning curves)")
 parser.add_argument("--trace_bases", type=int, default=12, help="full traces for these many base goals, ext 0, seed 0")
-parser.add_argument("--task", default="LocoManip-Marl-Direct-v0")
+parser.add_argument("--task", default=None, help="default: from the checkpoint's agents")
 parser.add_argument("--out", default=None)
 parser.add_argument("--zero_gravity", action="store_true",
                     help="pipeline self-test: no gravity, so a zero-action robot stays up while its arms run the IK step"
@@ -74,12 +76,18 @@ from locomanipulation_game.tasks.direct.locomanip_marl.odometry import estimator
 sys.path.insert(0, str(REACH))
 from reachlib import common as C  # noqa: E402
 from reachlib.metrics import trial_metrics  # noqa: E402
-from reachlib.policy import describe, load_actors  # noqa: E402
+from reachlib.policy import WHOLE_BODY_TASK, checkpoint_agents, describe, load_actors  # noqa: E402
 
 t_start = time.time()
 checkpoint = Path(args.checkpoint).resolve()
 run_dir = checkpoint.parent.parent
 seeds = [int(s) for s in args.seeds.split(",")]
+agents = checkpoint_agents(str(checkpoint))
+whole = agents == ["whole"]
+if args.task is None:
+    args.task = WHOLE_BODY_TASK if whole else "LocoManip-Marl-Direct-v0"
+if whole and args.variant == "legs_blind":
+    raise SystemExit("legs_blind needs separate leg and arm actors; this checkpoint has one whole-body agent")
 goals = C.read_goals(Path(args.goals))
 if args.ext0:
     goals = [g for g in goals if g["ext"] == 0.0]
@@ -156,16 +164,24 @@ groups = {
 effort = robot.data.joint_effort_limits
 
 # legs_blind: where the arm-goal flag and the arm command sit in the legs' observation
-term_names = base.observation_manager.active_terms["legs"]
-term_dims = [int(np.prod(d)) for d in base.observation_manager.group_obs_term_dim["legs"]]
-offsets = dict(zip(term_names, np.cumsum([0] + term_dims[:-1]).tolist()))
-goal_flag = slice(offsets["arm_goal"], offsets["arm_goal"] + 1)
-goal_cmd = slice(offsets["ee_targets"], offsets["ee_targets"] + 14)
+if not whole:
+    term_names = base.observation_manager.active_terms["legs"]
+    term_dims = [int(np.prod(d)) for d in base.observation_manager.group_obs_term_dim["legs"]]
+    offsets = dict(zip(term_names, np.cumsum([0] + term_dims[:-1]).tolist()))
+    goal_flag = slice(offsets["arm_goal"], offsets["arm_goal"] + 1)
+    goal_cmd = slice(offsets["ee_targets"], offsets["ee_targets"] + 14)
 rest = arm.rest_pose_b                                                     # (2, 7) wxyz
 rest_xyzw = torch.cat([rest[:, :3], rest[:, 4:7], rest[:, 3:4]], dim=-1).reshape(1, 14)
+first_agent = base.cfg.possible_agents[0]                                   # dones are shared (one body)
 
 
 def act(obs: dict) -> dict:
+    if whole:
+        a = actors["whole"](obs["whole"])
+        if args.variant == "arms_ik":
+            a = a.clone()
+            a[:, 12:] = 0.0                                                 # the arm term follows the legs' 12
+        return {"whole": a}
     legs_obs = obs["legs"]
     if args.variant == "legs_blind":
         legs_obs = legs_obs.clone()
@@ -257,7 +273,7 @@ with torch.inference_mode():
             for t in range(goal_steps):
                 hold_still(goal_envs)
                 obs, _, terminated, truncated, _ = base.step(act(obs))
-                ended = (terminated["legs"] | truncated["legs"])[:m]
+                ended = (terminated[first_agent] | truncated[first_agent])[:m]
                 alive &= ~ended
                 d = robot.data
                 pos_err, rot_err = arm.errors()
@@ -269,15 +285,16 @@ with torch.inference_mode():
                 ratio = (d.applied_torque.abs() / effort).nan_to_num(0.0)
                 torque = torch.stack([ratio[:, groups[k]].amax(1) for k in ("hip", "knee", "ankle", "arm")], dim=1)
                 step = {
-                    "pos_err": pos_err, "rot_err": rot_err, "alive": alive, "root_pos": d.root_pos_w,
+                    "pos_err": pos_err, "rot_err": rot_err, "alive": alive.clone(), "root_pos": d.root_pos_w,
                     "root_quat": d.root_quat_w, "root_ang_vel_b": d.root_ang_vel_b, "ground": ground_height(scanner),
                     "com": com, "com_vel": com_vel, "feet_pos": d.body_pos_w[:, feet], "feet_quat": d.body_quat_w[:, feet],
                     "feet_vel": d.body_lin_vel_w[:, feet],
                     "feet_force": contact.data.net_forces_w[:, feet_sensor].norm(dim=-1),
                     "wrist_pos": d.body_pos_w[:, arm.body_ids], "torque_ratio": torque, "cmd_drift": drift,
                 }
+                # copies: on a CPU device .cpu().numpy() is a view, and alive and the sim's buffers change in place
                 for k, v in step.items():
-                    log[k].append(v[:m].float().cpu().numpy() if v.dtype != torch.bool else v[:m].cpu().numpy())
+                    log[k].append((v[:m].float() if v.dtype != torch.bool else v[:m]).cpu().numpy().copy())
                 if t in (0, 1, 10, 50, goal_steps - 1):
                     debug(f"t={t}")
                 keep = alive.clone()
@@ -331,7 +348,7 @@ C.write_json(out_dir / "meta.json", {
     "checkpoint": str(checkpoint), "checkpoint_sha256": C.sha256(checkpoint), "run_dir": str(run_dir),
     "lambda_share": lam, "estimator": estimator, "goals": str(Path(args.goals).resolve()),
     "goals_sha256": C.sha256(Path(args.goals)), "n_goals": len(goals), "seeds": seeds, "batch": n_envs,
-    "actors": describe(actors), "total_mass_kg": float(total_mass[0]),
+    "agents": agents, "actors": describe(actors), "total_mass_kg": float(total_mass[0]),
     "settle_s": C.SETTLE_S, "goal_s": C.GOAL_S, "task": args.task,
     "code": {"path": str(C.DEFAULT_CODE), **C.git_info(C.DEFAULT_CODE)},
     "versions": versions("isaacsim", "isaaclab", "torch", "skrl"),

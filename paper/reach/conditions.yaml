@@ -28,8 +28,10 @@ conditions:
     status: "evaluating"
   - label: l0
     name: "λ = 0"
-    run: ""
-    status: "training (coworker)"
+    run: ../../logs/skrl/locomanip_marl/paper00
+    checkpoint: agent_91200.pt
+    prose: "the λ = 0 policy"
+    status: "evaluating"
   - label: whole
     name: "Whole-body agent"
     run: ""
