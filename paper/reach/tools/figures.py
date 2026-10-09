@@ -604,12 +604,12 @@ def training_curves(D: Data):
             ax.set_ylabel(label)
             ax.grid(True, axis="y")
         rows += [{"label": lab, **r} for r in cv]
-    axes[0, 1].text(0.03, 0.95, "dashed: goals below the table", transform=axes[0, 1].transAxes, ha="left", va="top",
+    axes[0, 1].text(0.03, 0.95, "Dashed: goals below the table", transform=axes[0, 1].transAxes, ha="left", va="top",
                     fontsize=6.2, color=MUTED)
-    axes[0, 2].text(0.98, 0.95, "dashed: closest approach", transform=axes[0, 2].transAxes, ha="right", va="top",
+    axes[0, 2].text(0.98, 0.95, "Dashed: closest approach", transform=axes[0, 2].transAxes, ha="right", va="top",
                     fontsize=6.2, color=MUTED)
     axes[1, 0].axhline(C.ROT_TOL, color="#9aa1a7", lw=0.8, ls=(0, (2, 2)))
-    axes[1, 1].text(0.98, 0.05, "dashed: goal lowering", transform=axes[1, 1].transAxes, ha="right", va="bottom",
+    axes[1, 1].text(0.98, 0.05, "Dashed: goal lowering", transform=axes[1, 1].transAxes, ha="right", va="bottom",
                     fontsize=6.2, color=MUTED)
     for ax in axes[1]:
         ax.set_xlabel("Environment transitions (millions)")
