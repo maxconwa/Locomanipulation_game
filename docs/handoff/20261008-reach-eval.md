@@ -1,24 +1,19 @@
 # Hand-off: reach evaluation of the lambda runs (2026-10-08)
 
-Page: paper/20261008-reach_cooperation.html (https://claude.ai/artifact/LHVKbdmtDGtoQpmfghMZBn, v5 at 18:28).
+Page: paper/20261008-reach_cooperation.html (https://claude.ai/artifact/LHVKbdmtDGtoQpmfghMZBn, v8 at 21:45).
 Pipeline and commands: paper/reach/README.md. Pushed to origin/marl-direct (914af59, 19:00) over SSH:
 `git push git@github.com:maxconwa/Locomanipulation_game.git marl-direct` (origin's HTTPS URL has no credentials).
 
-State (18:35): conditions.yaml l1 = paper1, l0.5 = paper05, l0 = paper00 (all agent_91200), whole = not trained.
-- Done (Isaac, CPU physics, seed 0): l0.5 full, l0 full; MuJoCo l0.5 (RoboCasa, training joints, legs blind), l0
-  (RoboCasa, training joints). GOLEM IK kinematic.
-- Fixed at 18:10: eval_isaac logged `alive` by reference, so on CPU a trial that fell at any time counted as fallen
-  from step 0. l0.5 full (6 falls) is barely affected; l0.5 legs_blind (746 falls) is being re-run.
-- Running: paper/reach/logs/queue_paper1.sh: l1 full (ends ~18:50) -> l1 MuJoCo x2 -> walk l1, l0.5, l0 ->
-  legs_blind l1, l0.5, l0 -> l0.5 full re-run; ends ~20:45 with "=== done" in logs/queue_paper1.log.
-- Findings so far (within 10 cm and 0.6 rad for 1 s): below the standing table lambda 0 17%, lambda 0.5 11%, GOLEM IK
-  0.4%; above it 41%, 49%, 52%. lambda 0 holds one deep crouch (pelvis ~0.71 m for every goal); lambda 0.5's pelvis
-  rises with the goal (0.71 -> 0.83 m).
+State (21:45): every planned evaluation is done for l1 = paper1, l0.5 = paper05, l0 = paper00 (agent_91200, Isaac
+on CPU physics, seed 0): full, legs blind, MuJoCo with RoboCasa's and the training plant's joints, walking. Page v8.
+- Within 10 cm (and 0.6 rad, 1 s): lambda 1 30% of all goals (13% below the standing table, 54% above), lambda 0.5
+  27% (11%, 49%), lambda 0 27% (17%, 41%), GOLEM IK 21% (0.4%, 52%). Blind legs: 18%, 9%, 7%, with 0%, 24%, 41%
+  falls. lambda 1's legs do not walk (23 cm/s velocity error; 0.5 and 0: 5 and 4 cm/s).
+- l1 arms_ik --ext0 running (logs/queue_l1_armsik.log) for the table's IK-arms row.
 
 Next:
-1. When l1 lands: `make -C paper/reach paper`, check fig_hero (l1 is the hero), republish the page (same URL).
-2. When the queue ends: `make -C paper/reach paper`, republish, commit, `git bundle create` of
-   origin/marl-direct..marl-direct for the coworker.
-3. Revise the tex's "Effect of reward sharing" paragraph with lambda 1 (marked % RESULT).
+1. Commit and push the arms_ik result (SSH URL, see memory locomanip-push-access).
+2. lambda 1 standing still: read the legs' shared arm terms during navigation in its TensorBoard log.
+3. The whole-body baseline, when trained: set `run:` of `whole` in conditions.yaml, `make -C paper/reach all`.
 
-Waiting on owner: the whole-body baseline run (conditions.yaml `whole`), push access for badinkajink.
+Waiting on owner: the whole-body baseline run.

@@ -1,14 +1,14 @@
 {
- "label": "l0.5",
+ "label": "l1",
  "sim": "isaac",
  "variant": "legs_blind",
  "physics": "nominal",
  "odometry": "learned",
- "checkpoint": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game/logs/skrl/locomanip_marl/paper05/checkpoints/agent_91200.pt",
- "checkpoint_sha256": "b4251109cbe1904da21a9d7a82b8b6c0482527a908353ba8398d05af2be1d847",
- "run_dir": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game/logs/skrl/locomanip_marl/paper05",
- "lambda_share": 0.5,
- "estimator": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game/logs/skrl/locomanip_marl/paper05/estimator/estimator_91200.pt",
+ "checkpoint": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game/logs/skrl/locomanip_marl/paper1/checkpoints/agent_91200.pt",
+ "checkpoint_sha256": "102dcfc5902661463ae21be9ff9b00c9b2e6d1275127b27999c972cc914057c3",
+ "run_dir": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game/logs/skrl/locomanip_marl/paper1",
+ "lambda_share": 1.0,
+ "estimator": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game/logs/skrl/locomanip_marl/paper1/estimator/estimator_91200.pt",
  "goals": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game/paper/reach/goals/eval_goals_v1.csv",
  "goals_sha256": "596589e5d9d4ac0bcfaf2cd0935efcf8826833466c844efd524360e12bb6eb90",
  "n_goals": 3168,
@@ -39,8 +39,8 @@
  "code": {
   "path": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game",
   "commit": "36ad696286747f194b4c383ae76cc29dd8fd08b8",
-  "describe": "36ad696-dirty",
-  "status": "M paper/reach/results/l0.5/isaac_legs_blind/trials.csv\n?? loco_manipulation_codex_experiment_brief.md\n?? paper/reach/results/l1/isaac_legs_blind/"
+  "describe": "36ad696",
+  "status": "?? loco_manipulation_codex_experiment_brief.md\n?? paper/reach/results/l1/isaac_legs_blind/"
  },
  "versions": {
   "isaacsim": "5.1.0.0",
@@ -48,5 +48,5 @@
   "torch": "2.7.0+cu128",
   "skrl": "2.1.0"
  },
- "wall_s": 1333.7
+ "wall_s": 1086.5
 }
