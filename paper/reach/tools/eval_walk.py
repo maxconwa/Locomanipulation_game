@@ -9,7 +9,7 @@ the pelvis's body-frame (vx, vy, yaw rate) averaged over the last MEASURE_S. Per
     tracking error   |v_xy - v_cmd_xy| (m/s) and |yaw rate - cmd| (rad/s), means over upright envs
     ratio            achieved / commanded along the command's main axis
     falls            envs that tilted past 1 rad during the command (left out of the velocities)
-Writes results/<label>/isaac_walk/{walk.csv, meta.json}.
+Writes logs/reach/results/<label>/isaac_walk/{walk.csv, meta.json}.
 """
 
 import argparse
@@ -45,11 +45,11 @@ import torch  # noqa: E402
 from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry  # noqa: E402
 
 import locomanipulation_game.tasks  # noqa: E402, F401
-from locomanipulation_game.tasks.direct.locomanip_marl.odometry import estimator_checkpoint_for  # noqa: E402
+from locomanipulation_game.tasks.locomanip_marl.odometry import estimator_checkpoint_for  # noqa: E402
 
 sys.path.insert(0, str(REACH))
 from reachlib import common as C  # noqa: E402
-from reachlib.policy import WHOLE_BODY_TASK, checkpoint_agents, load_actors  # noqa: E402
+from mujoco_evals.policy import WHOLE_BODY_TASK, checkpoint_agents, load_actors  # noqa: E402
 
 COMMANDS = [("stand", (0.0, 0.0, 0.0)), ("forward", (0.5, 0.0, 0.0)), ("slow forward", (0.2, 0.0, 0.0)),
             ("backward", (-0.4, 0.0, 0.0)), ("left", (0.0, 0.25, 0.0)), ("right", (0.0, -0.25, 0.0)),

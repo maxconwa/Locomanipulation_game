@@ -5,7 +5,7 @@ deterministic actions, and is recorded in sim2sim_walk.py's format, one director
 the policy rate (pelvis pose, the 27 motor joints, the ankle_roll_link origins and each foot's vertical contact
 force) and commander.jsonl (the schedule's events, falls). GOLEM's scorer then compares it with the MuJoCo runs:
 
-    python scripts/skrl/eval_sim2sim_walk.py --checkpoint <run>/checkpoints/agent_<N>.pt --out <dir> --headless
+    python mujoco_evals/eval_sim2sim_walk.py --checkpoint <run>/checkpoints/agent_<N>.pt --out <dir> --headless
     python3 ~/GOLEM/tests/locomanipulation_game/sim2sim_walk.py --score <dir>/env* --out <dir>/scored
 
 --passive_damping and --armature hold every motor joint's added passive damping and armature at one value; the
@@ -16,8 +16,12 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
-from isaaclab.app import AppLauncher
+# the repository root in place of this directory, whose module names (common, policy, metrics) are generic
+sys.path[0] = str(Path(__file__).resolve().parents[1])
+
+from isaaclab.app import AppLauncher  # noqa: E402
 
 DEFAULT_SCHEDULE = ("stand:2,walk:8:0.5:0:0,stand:2,walk:6:-0.4:0:0,stand:2,walk:6:0:0.25:0,stand:2,walk:6:0:-0.25:0,"
                     "stand:2,walk:5:0:0:0.4,stand:2,walk:8:0.3:0:0.3,stand:2,walk:6:0.7:0:0,stand:2,walk:6:0.5:0:0,stand:2")
@@ -47,7 +51,7 @@ from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry  # noqa: E402
 
 import locomanipulation_game.tasks  # noqa: E402, F401
 from locomanipulation_game.assets.h1_2 import ALL_JOINTS_NAMES  # noqa: E402
-from locomanipulation_game.tasks.direct.locomanip_marl.odometry import estimator_checkpoint_for  # noqa: E402
+from locomanipulation_game.tasks.locomanip_marl.odometry import estimator_checkpoint_for  # noqa: E402
 
 FEET = ["left_ankle_roll_link", "right_ankle_roll_link"]
 SETTLE_AFTER_RESET_S = 2.0   # a fallen env restarts its episode: its first seconds don't count as walking

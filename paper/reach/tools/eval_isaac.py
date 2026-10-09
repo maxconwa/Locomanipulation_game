@@ -2,14 +2,14 @@
 LocoManip-WholeBody-Direct-v0 checkpoint (one agent for all 26 joints; the task follows from the checkpoint's agents).
 
     python paper/reach/tools/eval_isaac.py --checkpoint <run>/checkpoints/agent_<N>.pt --label lambda1 \
-        [--variant full|legs_blind|arms_ik] [--seeds 0,1,2] [--goals paper/reach/goals/eval_goals_v1.csv] \
+        [--variant full|legs_blind|arms_ik] [--seeds 0,1,2] [--goals logs/reach/goals/eval_goals_v1.csv] \
         [--batch 1600] [--physics nominal|train] [--odometry learned|true] [--limit N]
 
 One trial per env. The robot stands for SETTLE_S (navigation mode, zero velocity command), then one goal of the grid
 is placed in the standing frame at that instant, the way ArmTargetsCommand places a goal, and held for GOAL_S. The
-actors are the checkpoint's deterministic policies (reachlib.policy, no skrl). The depth curriculum is frozen. The
+actors are the checkpoint's deterministic policies (mujoco_evals.policy, no skrl). The depth curriculum is frozen. The
 learned pelvis estimator moves the command the policies see, as on the robot (--odometry true: the true pelvis
-motion). Every metric scores the true world target (reachlib.metrics).
+motion). Every metric scores the true world target (mujoco_evals.metrics).
 
 Variants, all from the same checkpoint:
     full         both policies as trained
@@ -21,7 +21,7 @@ legs_blind needs separate leg and arm actors; arms_ik zeroes a whole-body agent'
 Physics: nominal (default) pins the training randomization at its midpoint (friction 0.9 / 0.65, no torso mass
 offset) and turns pushes off; train keeps the training distribution (pushes off).
 
-Writes paper/reach/results/<label>/isaac[_<variant>][_<physics>][_<odometry>]/{trials.csv, traces.npz, meta.json}.
+Writes logs/reach/results/<label>/isaac[_<variant>][_<physics>][_<odometry>]/{trials.csv, traces.npz, meta.json}.
 """
 
 import argparse
@@ -34,7 +34,7 @@ from pathlib import Path
 import os as _os
 import sys as _sys
 _sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
-from reachlib.common import DEFAULT_ASSETS as _ASSETS  # noqa: E402
+from reachlib.common import DEFAULT_ASSETS as _ASSETS, GOALS_DIR as _GOALS_DIR  # noqa: E402
 _os.environ.setdefault("CL_ASSETS_DIR", str(_ASSETS))   # the task reads it when imported
 from isaaclab.app import AppLauncher
 
@@ -43,7 +43,7 @@ parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.R
 parser.add_argument("--checkpoint", required=True)
 parser.add_argument("--label", required=True)
 parser.add_argument("--variant", choices=["full", "legs_blind", "arms_ik"], default="full")
-parser.add_argument("--goals", default=str(REACH / "goals" / "eval_goals_v1.csv"))
+parser.add_argument("--goals", default=str(_GOALS_DIR / "eval_goals_v1.csv"))
 parser.add_argument("--seeds", default="0,1,2")
 parser.add_argument("--batch", type=int, default=1600, help="envs per Isaac batch (one trial each)")
 parser.add_argument("--physics", choices=["nominal", "train"], default="nominal")
@@ -70,13 +70,13 @@ from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry  # noqa: E402
 
 import locomanipulation_game.tasks  # noqa: E402, F401
 from locomanipulation_game.assets.h1_2 import ARM_JOINT_NAMES, FOOT_LINK_NAMES  # noqa: E402
-from locomanipulation_game.tasks.direct.locomanip_marl.mdp.commands import _apply, _relative, ground_height  # noqa: E402
-from locomanipulation_game.tasks.direct.locomanip_marl.odometry import estimator_checkpoint_for  # noqa: E402
+from locomanipulation_game.tasks.locomanip_marl.mdp.commands import _apply, _relative, ground_height  # noqa: E402
+from locomanipulation_game.tasks.locomanip_marl.odometry import estimator_checkpoint_for  # noqa: E402
 
 sys.path.insert(0, str(REACH))
 from reachlib import common as C  # noqa: E402
-from reachlib.metrics import trial_metrics  # noqa: E402
-from reachlib.policy import WHOLE_BODY_TASK, checkpoint_agents, describe, load_actors  # noqa: E402
+from mujoco_evals.metrics import trial_metrics  # noqa: E402
+from mujoco_evals.policy import WHOLE_BODY_TASK, checkpoint_agents, describe, load_actors  # noqa: E402
 
 t_start = time.time()
 checkpoint = Path(args.checkpoint).resolve()

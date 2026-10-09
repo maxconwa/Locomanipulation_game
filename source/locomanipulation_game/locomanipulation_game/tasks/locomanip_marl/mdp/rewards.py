@@ -12,13 +12,8 @@ from typing import TYPE_CHECKING
 from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 
-from locomanipulation_game.tasks.manager_based.locomanipulation_game.mdp.rewards import (
-    STANCE_THRESHOLD,
-    joint_deviation_l2,
-    leg_phase,
-)
-
 from .commands import ground_height
+from .legs_rewards import STANCE_THRESHOLD, joint_deviation_l2, leg_phase
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv

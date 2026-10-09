@@ -54,13 +54,14 @@ dependencies:
 # Install them from source, outside this repository:
 #
 #   git clone https://github.com/isaac-sim/IsaacLab.git
-#   cd IsaacLab && ./isaaclab.sh --install rsl_rl
+#   cd IsaacLab && ./isaaclab.sh --install skrl
 #
-# Track IsaacLab `main`, not the 2.3.x release: scripts/rsl_rl/train.py imports
-# RslRlBaseRunnerCfg and handle_deprecated_rsl_rl_cfg, which the release does
-# not have. `--install rsl_rl` also pins the matching rsl-rl-lib, and pulls in
-# the runtime deps this file omits on purpose (gymnasium, prettytable,
-# tensorboard, hydra-core) so their versions stay Isaac Lab's to choose.
+# Track IsaacLab `main` (the runs here were trained on isaaclab 0.54.4 with
+# skrl 2.1.0). `--install skrl` installs isaaclab_rl with skrl, whose wrapper
+# scripts/skrl/ uses, and pulls in the runtime deps this file omits on purpose
+# (gymnasium, prettytable, tensorboard, hydra-core) so their versions stay
+# Isaac Lab's to choose. mujoco_evals/eval_mujoco.py also needs `pip install
+# mujoco`; it runs in any python with mujoco, torch and pyyaml.
 #
 # Then, back in this repository:
 #

@@ -36,7 +36,7 @@ from isaaclab_rl.skrl import SkrlVecEnvWrapper  # noqa: E402
 from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 
 import locomanipulation_game.tasks  # noqa: E402, F401
-from locomanipulation_game.tasks.direct.locomanip_marl.odometry import estimator_checkpoint_for  # noqa: E402
+from locomanipulation_game.tasks.locomanip_marl.odometry import estimator_checkpoint_for  # noqa: E402
 
 
 def bound_log_std(agent, policy_cfg: dict, per_agent: dict):

@@ -1,6 +1,6 @@
 """The fixed goal grid every controller is scored on.
 
-    python paper/reach/tools/make_goals.py [--table goals/arm_target_tables_v3.pt] [--bases 96] \
+    python paper/reach/tools/make_goals.py [--table logs/reach/goals/arm_target_tables_v3.pt] [--bases 96] \
         [--depths 0,0.1,0.2,0.3,0.4,0.5,0.6] [--exts 0,0.1,0.2] [--seed 2026] [--name v1]
 
 Base goals are pairs of wrist poses drawn uniformly (independently per arm, as in training) from the task's
@@ -14,8 +14,8 @@ base pair is then
 for every (d, e) on the grid, orientation unchanged. Every controller sees the same goals in the same order, so a
 difference between controllers at a (base, d, e) cell is paired.
 
-Writes goals/eval_goals_<name>.csv (one row per goal: id, base, d, e, both poses as x y z qw qx qy qz) and
-goals/eval_goals_<name>.json (settings, table hash, the base pairs' table rows).
+Writes logs/reach/goals/eval_goals_<name>.csv (one row per goal: id, base, d, e, both poses as x y z qw qx qy qz) and
+logs/reach/goals/eval_goals_<name>.json (settings, table hash, the base pairs' table rows).
 """
 
 import argparse

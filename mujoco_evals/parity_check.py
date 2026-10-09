@@ -1,7 +1,10 @@
-"""Does the MuJoCo port (reachlib/mujoco_sim.py) build the same observations and arm targets as the Isaac env?
+"""Does the MuJoCo port (mujoco_sim.py) build the same observations and arm targets as the Isaac env?
 
-    python paper/reach/tools/parity_check.py --side isaac  [--out results/_parity/isaac.json]   # env_isaaclab51
-    python paper/reach/tools/parity_check.py --side mujoco [--out results/_parity/mujoco.json]  # any MuJoCo python
+    python mujoco_evals/parity_check.py --side isaac  [--out <dir>/isaac.json]   # env_isaaclab51
+    python mujoco_evals/parity_check.py --side mujoco [--out <dir>/mujoco.json]  # any MuJoCo python
+
+<dir> defaults to logs/reach/results/_parity. The MuJoCo side reads <dir>/isaac.json and writes <dir>/report.json;
+it builds the sim with the zero-action checkpoint from paper/reach/tools/smoke_checkpoint.py (make -C paper/reach smoke).
 
 The Isaac side puts the robot in a fixed, non-trivial state (tilted pelvis, both arms bent away from default, legs
 crouched a little), sets a known arm command, turns observation noise off and records both actors' observations
@@ -20,13 +23,16 @@ import os
 import sys
 from pathlib import Path
 
-REACH = Path(__file__).resolve().parents[1]
+# the repository root in place of this directory, so mujoco_evals' modules are only ever imported as mujoco_evals.*
+sys.path[0] = str(Path(__file__).resolve().parents[1])
+from mujoco_evals import common as C  # noqa: E402  (standard library only: safe before AppLauncher)
+
 p = argparse.ArgumentParser()
 p.add_argument("--side", choices=["isaac", "mujoco"], required=True)
 p.add_argument("--out", default=None)
 p.add_argument("--task", default="LocoManip-Marl-Direct-v0")
 a, rest = p.parse_known_args()
-OUT = Path(a.out) if a.out else REACH / "results" / "_parity" / f"{a.side}.json"
+OUT = Path(a.out) if a.out else C.RESULTS_DIR / "_parity" / f"{a.side}.json"
 OUT.parent.mkdir(parents=True, exist_ok=True)
 
 ARM_Q = {"left_shoulder_pitch_joint": -0.6, "left_shoulder_roll_joint": 0.3, "left_shoulder_yaw_joint": 0.2,
@@ -40,9 +46,7 @@ ROOT = [0.0, 0.0, 0.92, 0.9950042, 0.0399467, 0.0898501, 0.0]          # pelvis 
 GOAL_B = [[0.35, 0.25, -0.05, 0.9238795, 0.0, 0.3826834, 0.0], [0.30, -0.22, 0.10, 0.9659258, 0.0, 0.0, 0.258819]]
 
 if a.side == "isaac":
-    sys.path.insert(0, str(REACH))
-    from reachlib.common import DEFAULT_ASSETS
-    os.environ.setdefault("CL_ASSETS_DIR", str(DEFAULT_ASSETS))   # the task reads it when imported
+    os.environ.setdefault("CL_ASSETS_DIR", str(C.DEFAULT_ASSETS))   # the task reads it when imported
     from isaaclab.app import AppLauncher
     sys.argv = [sys.argv[0]] + rest
     ap = argparse.ArgumentParser()
@@ -54,11 +58,9 @@ if a.side == "isaac":
     import torch
     from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
     import locomanipulation_game.tasks  # noqa: F401
-    sys.path.insert(0, str(REACH))
-    from reachlib import common as C
     cfg = load_cfg_from_registry(a.task, "env_cfg_entry_point")
     cfg.scene.num_envs = 2
-    cfg.log_dir = str(REACH / "results" / "_parity" / "envdir")
+    cfg.log_dir = str(C.RESULTS_DIR / "_parity" / "envdir")
     os.makedirs(cfg.log_dir, exist_ok=True)
     import shutil
     if not os.path.isfile(os.path.join(cfg.log_dir, "arm_target_tables_v3.pt")):
@@ -121,14 +123,12 @@ if a.side == "isaac":
 import mujoco  # noqa: E402
 import numpy as np  # noqa: E402
 
-sys.path.insert(0, str(REACH))
-from reachlib import common as C  # noqa: E402
-from reachlib.mujoco_sim import ALL_NAMES, MarlMujoco  # noqa: E402
-from reachlib.policy import load_actors  # noqa: E402
+from mujoco_evals.mujoco_sim import ALL_NAMES, MarlMujoco  # noqa: E402
+from mujoco_evals.policy import load_actors  # noqa: E402
 
 ref = json.loads((OUT.parent / "isaac.json").read_text())
 meta = json.loads((C.GOALS_DIR / "tables_meta.json").read_text())
-smoke = REACH / "results" / "_smoke_run" / "checkpoints" / "agent_0.pt"
+smoke = C.RESULTS_DIR / "_smoke_run" / "checkpoints" / "agent_0.pt"
 sim = MarlMujoco(load_actors(str(smoke)), None, rest_pose_b=np.array(meta["rest_pose_b"]))
 sim.reset(np.random.default_rng(0))
 d = sim.d
@@ -140,7 +140,7 @@ for n in ALL_NAMES:
 lin_w, ang_w = np.array(ref["root_vel"][:3]), np.array(ref["root_vel"][3:])
 d.qvel[0:3] = lin_w
 q = np.array(ref["root"][3:])
-from reachlib.mujoco_sim import qconj, qrot
+from mujoco_evals.mujoco_sim import qconj, qrot  # noqa: E402
 d.qvel[3:6] = qrot(qconj(q), ang_w)                              # MuJoCo's free joint: angular velocity in body frame
 mujoco.mj_forward(sim.m, d)
 prev = ref["applied_before"]

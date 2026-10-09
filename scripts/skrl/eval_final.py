@@ -49,8 +49,8 @@ from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry  # noqa: E402
 
 import locomanipulation_game.tasks  # noqa: E402, F401
 from locomanipulation_game.assets.h1_2 import FOOT_LINK_NAMES  # noqa: E402
-from locomanipulation_game.tasks.direct.locomanip_marl.mdp.commands import ground_height  # noqa: E402
-from locomanipulation_game.tasks.direct.locomanip_marl.odometry import estimator_checkpoint_for  # noqa: E402
+from locomanipulation_game.tasks.locomanip_marl.mdp.commands import ground_height  # noqa: E402
+from locomanipulation_game.tasks.locomanip_marl.odometry import estimator_checkpoint_for  # noqa: E402
 
 WALKS = [("forward", [0.5, 0.0, 0.0]), ("backward", [-0.4, 0.0, 0.0]), ("left", [0.0, 0.25, 0.0]),
          ("right", [0.0, -0.25, 0.0]), ("turn left", [0.0, 0.0, 0.4]), ("turn right", [0.0, 0.0, -0.4]),

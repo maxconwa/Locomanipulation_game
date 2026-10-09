@@ -2,11 +2,11 @@
 
     python paper/reach/tools/analyze.py
 
-Reads results/<label>/<sim>/trials.csv for every label not starting with "_" (smoke tests). A condition is one
+Reads logs/reach/results/<label>/<sim>/trials.csv for every label not starting with "_" (smoke tests). A condition is one
 (label, sim) pair, e.g. (lambda1, isaac), (lambda1, isaac_legs_blind), (golem_ik, kinematic). Display names,
 colours and order come from conditions.yaml when it names the label, otherwise from the label and its lambda.
 
-Writes
+Writes (under logs/reach)
     results/summary/by_depth.csv        per condition and depth: N, strict success with a Wilson 95% interval,
                                         per-wrist success, errors, pelvis height and drop, falls, balance metrics
     results/summary/by_height.csv       the same per 0.1 m bin of the lower wrist target's height above the ground
@@ -32,7 +32,7 @@ import numpy as np
 REACH = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REACH))
 from reachlib import common as C  # noqa: E402
-from reachlib.metrics import TOL_PAIRS  # noqa: E402
+from mujoco_evals.metrics import TOL_PAIRS  # noqa: E402
 
 SUMMARY = C.RESULTS_DIR / "summary"
 HEIGHT_BIN = 0.1

@@ -1,6 +1,6 @@
 """GOLEM's arm IK on a standing robot, scored on the fixed goal grid: the split stack's non-learned reach.
 
-    python3 paper/reach/tools/ik_baselines.py [--goals goals/eval_goals_v1.csv] [--workers 8] [--limit N]
+    python3 paper/reach/tools/ik_baselines.py [--goals logs/reach/goals/eval_goals_v1.csv] [--workers 8] [--limit N]
 
 It reads the same goals as the policies, in the standing frame (pelvis level, standing_height above the ground).
 
@@ -11,7 +11,7 @@ golem_ik  GOLEM's upper-body IK (core_ws/src/h12_ros2_controller, IKSolver.solve
           UpperController.plan_to_ik_target deploys. The robot cannot crouch, so this is the standing reach of
           the deployed split stack's arm controller.
 Success: each wrist within POS_TOL and ROT_TOL of its goal (no hold time: there are no dynamics).
-Writes results/golem_ik/kinematic/{trials.csv, meta.json, solutions.npz}. Runs in a Python with pinocchio and
+Writes logs/reach/results/golem_ik/kinematic/{trials.csv, meta.json, solutions.npz}. Runs in a Python with pinocchio and
 pink (on this workstation the base python3: pinocchio 4.1, pink 4.1).
 """
 

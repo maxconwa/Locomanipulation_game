@@ -1,5 +1,6 @@
 # Reach evaluation of the LocoManip-Marl-Direct-v0 policies: evaluate a run, then rebuild every table, figure,
 # LaTeX number and the result page from the trials. Run from anywhere: make -C paper/reach <target> RUN=... LABEL=...
+# Everything it writes goes to logs/reach (OUT); the MuJoCo evaluation is in mujoco_evals (MJ).
 #
 #   make all                                     every run in conditions.yaml without results, then the paper
 #   make eval    RUN=<run dir> LABEL=lambda1     Isaac Lab: full policy, legs blind, arms IK only (3 seeds)
@@ -25,6 +26,8 @@ export MUJOCO_GL ?= egl
 GUARD    ?= $(if $(wildcard $(HOME)/.claude/bin/resguard.sh),$(HOME)/.claude/bin/resguard.sh run --mem 12G --cpu 400 --,)
 
 DEVICE   ?= cuda:0
+OUT      := $(abspath ../../logs/reach)
+MJ       := ../../mujoco_evals
 
 .PHONY: all walk curve curves eval sim2sim paper analyze figures render page smoke baselines goals check-run
 
@@ -43,8 +46,8 @@ eval: check-run
 	$(GUARD) $(PY_ISAAC) tools/eval_isaac.py --checkpoint $(CKPT) --label $(LABEL) --seeds 0 --variant arms_ik
 
 sim2sim: check-run
-	$(PY) tools/eval_mujoco.py --checkpoint $(CKPT) --label $(LABEL) --workers $(WORKERS)
-	$(PY) tools/eval_mujoco.py --checkpoint $(CKPT) --label $(LABEL) --workers $(WORKERS) --physics isaac
+	$(PY) $(MJ)/eval_mujoco.py --checkpoint $(CKPT) --label $(LABEL) --workers $(WORKERS)
+	$(PY) $(MJ)/eval_mujoco.py --checkpoint $(CKPT) --label $(LABEL) --workers $(WORKERS) --physics isaac
 
 paper: analyze curves render figures page
 
@@ -55,8 +58,8 @@ analyze:
 	$(PY) tools/analyze.py
 
 render:
-	$(PY) tools/render_robot.py --pose standing --out figures/render/render_standing.png
-	$(PY) tools/render_robot.py --auto --out figures/render/render_crouch.png || true
+	$(PY) tools/render_robot.py --pose standing --out $(OUT)/figures/render/render_standing.png
+	$(PY) tools/render_robot.py --auto --out $(OUT)/figures/render/render_crouch.png || true
 
 figures:
 	$(PY) tools/figures.py
@@ -72,9 +75,9 @@ curve: check-run
 
 smoke:
 	$(PY) tools/smoke_checkpoint.py
-	$(GUARD) $(PY_ISAAC) tools/eval_isaac.py --checkpoint results/_smoke_run/checkpoints/agent_0.pt --label _smoke \
+	$(GUARD) $(PY_ISAAC) tools/eval_isaac.py --checkpoint $(OUT)/results/_smoke_run/checkpoints/agent_0.pt --label _smoke \
 		--odometry true --seeds 0 --limit 33 --zero_gravity
-	$(PY) tools/eval_mujoco.py --checkpoint results/_smoke_run/checkpoints/agent_0.pt --label _smoke \
+	$(PY) $(MJ)/eval_mujoco.py --checkpoint $(OUT)/results/_smoke_run/checkpoints/agent_0.pt --label _smoke \
 		--odometry true --limit 8 --workers 4
 
 baselines:

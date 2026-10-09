@@ -35,20 +35,16 @@ from locomanipulation_game.assets.h1_2 import (
     PELVIS_LINK_NAME,
     STANDING_PELVIS_HEIGHT,
 )
-from locomanipulation_game.tasks.manager_based.locomanipulation_game.common.reward_cfg import LowerRewardsCfg
-from locomanipulation_game.tasks.manager_based.locomanipulation_game.common.scenes import (
-    SELF_CONTACT_LINK_NAMES,
-    SELF_CONTACT_SENSOR_NAMES,
-    TERRAINS_FLAT_CFG,
-    TerrainSceneCfg,
-)
-from locomanipulation_game.tasks.manager_based.locomanipulation_game.legs_r0_env_cfg import (
-    EventCfg,
-    TerminationsCfg,
-)
-from locomanipulation_game.tasks.manager_based.locomanipulation_game.mdp.rewards import GAIT_PERIOD
 
 from . import mdp
+from .base_cfg import (
+    SELF_CONTACT_LINK_NAMES,
+    SELF_CONTACT_SENSOR_NAMES,
+    EventCfg,
+    LowerRewardsCfg,
+    TerminationsCfg,
+    TerrainSceneCfg,
+)
 from .golem_safety import GOLEM_TARGET_CLIP
 from .odometry import PelvisEstimatorCfg
 
@@ -111,7 +107,7 @@ class MarlCommandsCfg:
 
 @configclass
 class MarlActionsCfg:
-    # Named joint_pos so the manager-based reward ankle_action_rate_l2 finds the legs' term, and first: that reward
+    # Named joint_pos so mdp.ankle_action_rate_l2 (legs_rewards.py) finds the legs' term, and first: that reward
     # indexes the whole action vector by the term's joint order.
     joint_pos = mdp.BoundedJointPositionActionCfg(
         asset_name="robot",
@@ -233,7 +229,7 @@ _SELF_CONTACT_PARAMS = {
 
 @configclass
 class LegsRewardsCfg(LowerRewardsCfg):
-    """The manager-based game's legs reward, changed for the shared body.
+    """ALMI's legs reward (base_cfg.LowerRewardsCfg), changed for the shared body.
 
     No term holds the pelvis height or the knees: base_height and stand_still are gone. hip_pos (hip yaw and roll at
     their defaults) and arm_goal_yaw_rate, as in run R, hold the pelvis's yaw against twisting; hip_pos is scaled to
@@ -272,7 +268,7 @@ class LegsRewardsCfg(LowerRewardsCfg):
         for term, component in ((self.track_lin_vel_xy, "lin_xy"), (self.track_ang_vel_z, "ang_z")):
             term.func = mdp.track_velocity_avg_exp
             term.params = {"command_name": "base_velocity", "std": TRACKING_STD, "component": component,
-                           "window_s": GAIT_PERIOD}
+                           "window_s": mdp.GAIT_PERIOD}
         self.action_rate.func = mdp.action_term_rate_l2
         self.action_rate.params = {"action_name": LEGS_ACTION}
         self.self_collision.func = mdp.self_contacts_involving
@@ -399,7 +395,6 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     soft_joint_pos_limit_factors: dict[str, float] = {".*_knee_joint": 0.95, ".*_ankle_pitch_joint": 0.95}
 
     def __post_init__(self):
-        self.scene.terrain.terrain_generator = TERRAINS_FLAT_CFG
         # contacts every physics step (the gait-phase terms and leg odometry read them), the IMU too (its
         # finite-difference lin_acc divides by the physics dt), the height scan once per policy step
         self.scene.height_scanner.update_period = self.decimation * self.sim.dt

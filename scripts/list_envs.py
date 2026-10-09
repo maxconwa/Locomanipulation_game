@@ -9,8 +9,7 @@ Script to print all the available environments in Isaac Lab.
 The script iterates over all registered environments and stores the details in a table.
 It prints the name of the environment, the entry point and the config file.
 
-All the environments are registered in the `locomanipulation_game` extension. They start
-with `Isaac` in their name.
+The tasks are registered in the `locomanipulation_game` extension; their ids contain `LocoManip-`.
 """
 
 """Launch Isaac Sim Simulator first."""
@@ -52,7 +51,7 @@ def main():
     index = 0
     # acquire all Isaac environments names
     for task_spec in gym.registry.values():
-        if any(p in task_spec.id for p in ("Legs-", "Upper-", "LocoManip-", "WB-")) and (
+        if "LocoManip-" in task_spec.id and (
             args_cli.keyword is None or args_cli.keyword in task_spec.id
         ):
             # add details to table

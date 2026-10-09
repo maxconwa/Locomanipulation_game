@@ -1,4 +1,4 @@
-"""Build the result page paper/20261008-reach_cooperation.html from results/summary and figures/.
+"""Build the result page logs/reach/20261008-reach_cooperation.html from logs/reach/results/summary and figures/.
 
     python paper/reach/tools/build_page.py
 
@@ -26,7 +26,7 @@ from reachlib import common as C  # noqa: E402
 
 import texsvg  # noqa: E402
 
-PAGE = C.PAPER / "20261008-reach_cooperation.html"
+PAGE = C.PAGE
 SUMMARY = C.RESULTS_DIR / "summary"
 ARTIFACT_URL = "https://claude.ai/artifact/LHVKbdmtDGtoQpmfghMZBn"
 
@@ -226,7 +226,7 @@ def main():
         key_rows.append(key_row("golem_ik/kinematic", "Kinematic, deployed settings"))
 
     gallery = "".join(
-        f'<figure class="card">{img(name, cap)}<figcaption><code>figures/{name}.pdf</code> {cap}</figcaption></figure>'
+        f'<figure class="card">{img(name, cap)}<figcaption><code>logs/reach/figures/{name}.pdf</code> {cap}</figcaption></figure>'
         for name, cap in GALLERY)
 
     parity = C.RESULTS_DIR / "_parity" / "report.json"
@@ -234,7 +234,7 @@ def main():
         rep = json.loads(parity.read_text())
         obs_err = max(v for k, v in rep.items() if not k.startswith("target") and v == v)
         parity_text = (f"From the same state, the MuJoCo port reproduces every observation term to {obs_err:.1e} and the"
-                       f" joint targets to {rep['target.arm_pos']:.1e}&nbsp;rad (<code>tools/parity_check.py</code>). The"
+                       f" joint targets to {rep['target.arm_pos']:.1e}&nbsp;rad (<code>mujoco_evals/parity_check.py</code>). The"
                        " arms' IK step matches only with the wrist Jacobian at the link's centre of mass, where PhysX"
                        " computes it.")
     else:
@@ -282,7 +282,7 @@ def main():
             items.append("MuJoCo transfer: within 10 cm the hero reaches " + ", ".join(
                 f"{pct(conds[k].get('success_10cm'))} with {t}" for k, t in mjk) +
                 f" against {pct(h.get('success_10cm'))} in Isaac. The policy loop matches Isaac to 2e-5 from the same "
-                "state, so the gap lies in the plant; next: <code>tools/parity_check.py</code> extended from one step "
+                "state, so the gap lies in the plant; next: <code>mujoco_evals/parity_check.py</code> extended from one step "
                 "to a second of stance from the same state, to find the first quantity that diverges.")
     for r in s_walk():
         if r["label"] in registry and float(r["err_xy_moving"]) > 0.15:
@@ -310,8 +310,8 @@ def main():
   <div class="eyebrow">{today} · LocoManip-Marl-Direct-v0, marl-direct · Isaac Sim 5.1 and MuJoCo 3.15</div>
   <h1>Reach below standing height with reward-coupled leg and arm policies on the Unitree H1-2</h1>
   <p class="lede">{lede}</p>
-  <p class="byline">Local file <code>paper/20261008-reach_cooperation.html</code> in Locomanipulation_game · artifact
-  {esc(ARTIFACT_URL)} · pipeline <code>paper/reach/</code> · {goals['goals']:,} fixed goals, one trial per goal and seed</p>
+  <p class="byline">Local file <code>logs/reach/20261008-reach_cooperation.html</code> in Locomanipulation_game · artifact
+  {esc(ARTIFACT_URL)} · pipeline <code>paper/reach/</code> and <code>mujoco_evals/</code> · {goals['goals']:,} fixed goals, one trial per goal and seed</p>
 </div></header>
 
 <section id="hero"><div class="col">
@@ -337,8 +337,8 @@ IK. Grey band: below the standing table's lowest pose.</figcaption></figure>
 
 <section id="gallery"><div class="col">
 <h2>Figures</h2>
-<p>Every figure is in <code>paper/reach/figures/</code> as PDF (fonts embedded) and PNG, with its plotted numbers in
-<code>figures/data/</code>.</p>
+<p>Every figure is in <code>logs/reach/figures/</code> as PDF (fonts embedded) and PNG, with its plotted numbers in
+<code>logs/reach/figures/data/</code>.</p>
 </div>
 <div class="gallery">{gallery}</div>
 </section>
@@ -353,7 +353,7 @@ make -C paper/reach all              # evaluates every listed run without curren
                                      # (DEVICE=cpu when another job holds the GPU)</pre>
 <p>Each Isaac variant takes about 5 minutes on the GPU or 20 on 12 CPU cores, each MuJoCo variant 3 minutes on 8
 cores. The paper text quotes numbers as <code>\\reach{{l1/isaac}}{{success_below}}</code> from
-<code>paper/reach/tex/results_macros.tex</code>; a number not computed yet prints ??.</p>
+<code>logs/reach/tex/results_macros.tex</code>; a number not computed yet prints ??.</p>
 </div></section>
 
 <section id="details"><div class="col">
@@ -424,8 +424,8 @@ environment's curriculum level.</li>
 </div></section>
 
 <footer><div class="col">
-<p>Rebuild: <code>make -C paper/reach paper</code>. Trials: <code>paper/reach/results/&lt;label&gt;/&lt;sim&gt;/trials.csv</code>;
-goals <code>paper/reach/goals/eval_goals_v1.csv</code>.</p>
+<p>Rebuild: <code>make -C paper/reach paper</code>. Trials: <code>logs/reach/results/&lt;label&gt;/&lt;sim&gt;/trials.csv</code>;
+goals <code>logs/reach/goals/eval_goals_v1.csv</code>.</p>
 </div></footer>
 </div>
 """

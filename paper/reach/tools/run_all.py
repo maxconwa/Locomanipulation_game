@@ -8,7 +8,7 @@ newest checkpoints/agent_<N>.pt):
     Isaac   full and legs_blind on --seeds, arms_ik on the first seed, and velocity tracking (eval_walk.py)
     MuJoCo  full with RoboCasa's joint dynamics and with the training plant's, legs_blind with RoboCasa's
 A one-agent whole-body checkpoint (LocoManip-WholeBody-Direct-v0) skips legs_blind, which needs a separate leg actor.
-A result is current when results/<label>/<sim>/meta.json names the same checkpoint file hash; anything else is
+A result is current when logs/reach/results/<label>/<sim>/meta.json names the same checkpoint file hash; anything else is
 (re)run. Then analyze.py, the robot renders, figures.py and build_page.py. Isaac jobs go through the workstation's
 resguard memory guard when it exists.
 """
@@ -61,7 +61,7 @@ def main():
     first = a.seeds.split(",")[0]
     guard = [str(GUARD), "run", "--mem", "14G", "--cpu", "800", "--"] if GUARD.is_file() else []
     guard_mj = [str(GUARD), "run", "--mem", "10G", "--cpu", str(100 * (a.workers + 1)), "--"] if GUARD.is_file() else []
-    from reachlib.policy import checkpoint_agents
+    from mujoco_evals.policy import checkpoint_agents
     jobs = []
     for cond in C.load_conditions():
         ckpt = checkpoint_of(cond)
@@ -90,7 +90,7 @@ def main():
                 ([] if whole else [("mujoco_legs_blind", ["--variant", "legs_blind"])])
             for sim, extra in mj:
                 if not current(label, sim, ckpt):
-                    jobs.append(guard_mj + [a.py, str(REACH / "tools" / "eval_mujoco.py"), "--checkpoint", str(ckpt),
+                    jobs.append(guard_mj + [a.py, str(REACH.parents[1] / "mujoco_evals" / "eval_mujoco.py"), "--checkpoint", str(ckpt),
                                             "--label", label, "--seeds", first, "--workers", str(a.workers), *extra])
     tail = [[a.py, str(REACH / "tools" / "analyze.py")],
             [a.py, str(REACH / "tools" / "training_curves.py")],

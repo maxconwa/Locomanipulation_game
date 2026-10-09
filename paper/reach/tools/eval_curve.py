@@ -4,8 +4,8 @@
     make -C paper/reach curve RUN=<run dir> LABEL=l1
 
 For each checkpoints/agent_<N>.pt (every --every-th, the newest always): eval_isaac.py on the 1056 goals without
-extension, one seed, as results/<label>@<N>/isaac/ (skipped when already evaluated for the same file). Then
-results/curves/<label>.csv, one row per checkpoint: environment transitions (N policy steps x the run's num_envs),
+extension, one seed, as logs/reach/results/<label>@<N>/isaac/ (skipped when already evaluated for the same file). Then
+logs/reach/results/curves/<label>.csv, one row per checkpoint: environment transitions (N policy steps x the run's num_envs),
 strict success over all goals and over those below / above the standing table, the median closest approach and
 1 s hold error, and the curriculum levels saved beside the checkpoint (estimator_<N>.pt): mean k_d, its quartiles
 and the share of environments at the deepest level. figures.py draws learning_curve from these files.

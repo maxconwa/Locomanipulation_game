@@ -3,7 +3,7 @@ training-time reach and walking metrics against environment transitions.
 
     python paper/reach/tools/training_curves.py          # all listed runs with an events file
 
-Writes results/curves/<label>_train.csv, one row per logged update (every 24 policy steps):
+Writes logs/reach/results/curves/<label>_train.csv, one row per logged update (every 24 policy steps):
     step, transitions        policy steps, and policy steps x the run's num_envs
     depth_level              mean curriculum level k_d over the environments (0-10; z_max = 0.1 k_d m)
     reach_rate               goals reached / goals ended, over the episodes that ended in that update (the task's

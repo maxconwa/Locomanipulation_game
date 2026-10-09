@@ -1,6 +1,6 @@
 # Hand-off: reach evaluation of the lambda runs (2026-10-08)
 
-Page: paper/20261008-reach_cooperation.html (https://claude.ai/artifact/LHVKbdmtDGtoQpmfghMZBn, v9 at 23:15).
+Page: logs/reach/20261008-reach_cooperation.html (https://claude.ai/artifact/LHVKbdmtDGtoQpmfghMZBn, v9 at 23:15).
 Pipeline and commands: paper/reach/README.md. Pushed to origin/marl-direct (914af59, 19:00) over SSH:
 `git push git@github.com:maxconwa/Locomanipulation_game.git marl-direct` (origin's HTTPS URL has no credentials).
 

@@ -1,8 +1,8 @@
 """Orthographic side views of the H1-2 for the workspace figure, with an alpha mask and a metric pixel scale.
 
-    MUJOCO_GL=egl python paper/reach/tools/render_robot.py --pose standing --out figures/render_standing.png
-    MUJOCO_GL=egl python paper/reach/tools/render_robot.py --trace results/<label>/isaac/traces.npz \
-        --goal_id b003_d50_e00 --out figures/render_crouch.png
+    MUJOCO_GL=egl python paper/reach/tools/render_robot.py --pose standing --out logs/reach/figures/render/render_standing.png
+    MUJOCO_GL=egl python paper/reach/tools/render_robot.py --trace logs/reach/results/<label>/isaac/traces.npz \
+        --goal_id b003_d50_e00 --out logs/reach/figures/render/render_crouch.png
 
 The camera looks along +y at the robot's right side, so the robot faces +x = right in the image; orthographic, so
 world (x, z) maps linearly to pixels and the workspace contours (metres) overlay the image exactly. Writes the PNG

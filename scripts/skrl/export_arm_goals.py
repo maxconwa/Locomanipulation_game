@@ -39,8 +39,8 @@ import torch  # noqa: E402
 from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry  # noqa: E402
 
 import locomanipulation_game.tasks  # noqa: E402, F401
-from locomanipulation_game.tasks.direct.locomanip_marl.mdp.commands import _relative  # noqa: E402
-from locomanipulation_game.tasks.direct.locomanip_marl.odometry import estimator_checkpoint_for  # noqa: E402
+from locomanipulation_game.tasks.locomanip_marl.mdp.commands import _relative  # noqa: E402
+from locomanipulation_game.tasks.locomanip_marl.odometry import estimator_checkpoint_for  # noqa: E402
 
 torch.set_grad_enabled(False)
 RUN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(args.checkpoint)))

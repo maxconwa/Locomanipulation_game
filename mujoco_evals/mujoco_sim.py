@@ -252,7 +252,7 @@ class MarlMujoco:
         jacp, jacr = np.zeros((3, m.nv)), np.zeros((3, m.nv))
         for arm in range(2):
             # PhysX's articulation Jacobian is taken at the link's centre of mass (the task's pose error is at the
-            # link origin); mj_jacBodyCom reproduces Isaac's IK step to 2e-5 rad (tools/parity_check.py)
+            # link origin); mj_jacBodyCom reproduces Isaac's IK step to 2e-5 rad (parity_check.py)
             mujoco.mj_jacBodyCom(m, d, jacp, jacr, self.wrists[arm])
             J = np.vstack([Rr.T @ jacp[:, self.arm_cols[arm]], Rr.T @ jacr[:, self.arm_cols[arm]]])
             tgt = self.believed[arm]

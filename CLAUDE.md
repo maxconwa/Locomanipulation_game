@@ -78,12 +78,17 @@ whole-body triplicates mirror the curriculum stages in `ALMI_RL/README.md`.
 
 # This repo (`Locomanipulation_game`)
 
-An Isaac Lab manager-based external project — separate from `ALMI_RL`.
+An Isaac Lab external project (a DirectMARLEnv trained with skrl MAPPO) — separate
+from `ALMI_RL`.
 
 - **Activate the env first:** `conda activate env_isaaclab`
 - **Tasks live in**
-  `source/locomanipulation_game/locomanipulation_game/tasks/manager_based/`
-- **Train:** `python scripts/rsl_rl/train.py --task=<TASK> --headless`
-- When adding a new task name, update the `"Template-"` search pattern in
-  `scripts/list_envs.py:60` — it only lists ids containing that substring, so a
-  task registered under a different prefix silently won't show up.
+  `source/locomanipulation_game/locomanipulation_game/tasks/locomanip_marl/`
+  (`LocoManip-Marl-Direct-v0`, and the one-agent `LocoManip-WholeBody-Direct-v0`)
+- **Train:** `python scripts/skrl/train.py --headless [--task <TASK>]`; runs go to
+  `logs/skrl/locomanip_marl/`
+- **MuJoCo transfer** lives in `mujoco_evals/`; the reach evaluation in
+  `paper/reach/` (`make -C paper/reach all`) writes to `logs/reach/`.
+- When adding a new task name, keep `LocoManip-` in it: `scripts/list_envs.py:54`
+  only lists ids containing that substring, so a task registered under a
+  different name silently won't show up.

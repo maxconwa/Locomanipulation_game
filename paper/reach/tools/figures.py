@@ -1,11 +1,11 @@
-"""Paper figures from results/summary (run analyze.py first). Every figure draws the conditions that exist.
+"""Paper figures from logs/reach/results/summary (run analyze.py first). Every figure draws the conditions that exist.
 
     python paper/reach/tools/figures.py
 
 Which conditions appear, their names and order come from conditions.yaml; GOLEM's arm IK is always the reference.
 The hero condition (conditions.yaml `hero`, else the highest lambda evaluated) also contributes its blind-legs and
-IK-arms variants and its MuJoCo runs. Writes figures/<name>.pdf, .png and the plotted numbers as
-figures/data/<name>.csv:
+IK-arms variants and its MuJoCo runs. Writes logs/reach/figures/<name>.pdf, .png and the plotted numbers as
+logs/reach/figures/data/<name>.csv:
 
     fig_hero               double column: reached-target workspace over the H1-2 | success | pelvis height,
                            both against the lower wrist target's height (the paper's main figure)

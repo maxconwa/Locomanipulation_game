@@ -5,7 +5,7 @@ a velocity command (vx, vy, yaw rate). The **arms** track a wrist pose each, and
 deployment target is GOLEM: its `locomotion_game_deploy` controller and its `h12_safety_layer`, in RoboCasa (MuJoCo)
 through ROS.
 
-Today the task is `LocoManip-Marl-Direct-v0` (`source/.../tasks/direct/locomanip_marl/`), configured for
+Today the task is `LocoManip-Marl-Direct-v0` (`source/.../tasks/locomanip_marl/`), configured for
 [the final run](#the-final-run). The task ids named below (Flat-Curriculum, IK, IK2, IK3, Golem … Golem7) were folded into it
 in commit c8ee31a; git history has each one.
 
@@ -128,7 +128,7 @@ lessons carried over:
 ### Sim-to-sim: Isaac vs RoboCasa's MuJoCo
 
 GOLEM's `tests/locomanipulation_game/sim2sim_walk.py` runs the deploy controller on a RoboCasa run's compiled MuJoCo
-scene without ROS, on an open floor, with physics variants. `scripts/skrl/eval_sim2sim_walk.py` records the same
+scene without ROS, on an open floor, with physics variants. `mujoco_evals/eval_sim2sim_walk.py` records the same
 schedule in Isaac in the same format.
 
 - **The slow walking in RoboCasa was the commands, not ROS or the kitchen.** Replaying a game's commands on an open
@@ -268,12 +268,15 @@ Not included: an e-stop warm-up and several seeds. Evaluate with `scripts/skrl/e
 - Isaac ignores SIGTERM: `timeout -s KILL`, and check `nvidia-smi --query-compute-apps` after tests. A leftover
   play.py ran 2.6 h beside runs Q and R.
 - Evaluating an old run against changed task code: `git worktree add --detach <dir> <commit>`, symlink
-  `third_party/CL_Assets` into it, and run with `PYTHONPATH=<dir>/source/locomanipulation_game`.
+  `third_party/CL_Assets` into it, and run with `PYTHONPATH=<dir>/source/locomanipulation_game`. Commits before
+  the restructure into `tasks/locomanip_marl` keep the task at `tasks/direct/locomanip_marl`, so run that commit's own
+  scripts in the worktree.
 
 ## Where things are
 
-- Task: `source/locomanipulation_game/locomanipulation_game/tasks/direct/locomanip_marl/`. Scripts: `scripts/skrl/`;
-  see the README for the commands.
+- Task: `source/locomanipulation_game/locomanipulation_game/tasks/locomanip_marl/`. Scripts: `scripts/skrl/`; MuJoCo
+  transfer: `mujoco_evals/`; the reach evaluation: `paper/reach/`, writing to `logs/reach/`. See the README for the
+  commands.
 - Reports, published as Artifacts:
   - flat runs A–F: https://claude.ai/artifact/7d2dW2XKmSjeendsPb7DJw
   - run G by quarter: https://claude.ai/artifact/TAtpzWkN5fyPVx2rL3xpKL

@@ -50,7 +50,7 @@ from isaaclab_rl.skrl import SkrlVecEnvWrapper  # noqa: E402
 from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry  # noqa: E402
 
 import locomanipulation_game.tasks  # noqa: E402, F401
-from locomanipulation_game.tasks.direct.locomanip_marl.odometry import estimator_checkpoint_for  # noqa: E402
+from locomanipulation_game.tasks.locomanip_marl.odometry import estimator_checkpoint_for  # noqa: E402
 
 sys.path.insert(0, args.deploy_pkg)
 from locomotion_game_deploy.controller import ARM_START, NUM_LEGS, MarlController, Mode, RobotState  # noqa: E402

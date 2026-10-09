@@ -1,15 +1,5 @@
-"""Reward terms ported from ALMI-Open's h1_2_lower_env.py.
-
-Each function names the ALMI method it came from so it can be checked against
-the source. Two deliberate divergences from legged_gym:
-
-  * legged_gym sets `only_positive_rewards = True`, clipping the total per-step
-    reward at zero. Isaac Lab has no equivalent, so early returns here will be
-    far more negative than ALMI's. If training diverges in the first few
-    hundred iterations, suspect this first.
-  * ALMI's `termination` scale is -0.0 (inherited from the legged_gym base and
-    never overridden), so there is no terminal penalty. We match that.
-"""
+"""The legs' gait clock and reward terms ported from ALMI-Open's h1_2_lower_env.py; base_cfg.LowerRewardsCfg
+uses them."""
 
 from __future__ import annotations
 
@@ -24,7 +14,6 @@ from isaaclab.sensors import ContactSensor, RayCaster
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-from isaaclab.utils.math import combine_frame_transforms, quat_error_magnitude, quat_mul
 
 
 # --- gait clock (ALMI h1_2_lower_env.py, ~line 500) ---
@@ -195,71 +184,3 @@ def ankle_action_rate_l2(
     a = env.action_manager.action[:, ids]
     prev = env.action_manager.prev_action[:, ids]
     return torch.sum(torch.square(prev - a), dim=1)
-
-
-
-
-
-
-# ---------------------------------------------------------------------------
-# End-effector pose tracking (upper-body rounds).
-#
-# Isaac Lab ships UniformPoseCommand, but the matching reward terms live inside
-# the Franka reach task (isaaclab_tasks.manager_based.manipulation.reach.mdp),
-# not in isaaclab.envs.mdp, so they are reimplemented here.
-# ---------------------------------------------------------------------------
-def ee_position_error(
-    env: ManagerBasedRLEnv, command_name: str, asset_cfg: SceneEntityCfg
-) -> torch.Tensor:
-    """Euclidean distance (m) between a body and its commanded position.
-
-    `asset_cfg` must resolve to exactly one body -- pass body_names as a
-    literal link name, not a pattern.
-    """
-    asset: Articulation = env.scene[asset_cfg.name]
-    command = env.command_manager.get_command(command_name)
-    # The command is expressed in the asset's ROOT frame (pelvis on H1-2), so
-    # lift it to world before comparing against a world-frame body position.
-    des_pos_w, _ = combine_frame_transforms(
-        asset.data.root_pos_w, asset.data.root_quat_w, command[:, :3]
-    )
-    curr_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids[0]]
-    return torch.norm(curr_pos_w - des_pos_w, dim=-1)
-
-
-def ee_orientation_error(
-    env: ManagerBasedRLEnv, command_name: str, asset_cfg: SceneEntityCfg
-) -> torch.Tensor:
-    """Geodesic angle (rad) between a body's orientation and its command.
-
-    command[:, 3:7] is w-first (qw, qx, qy, qz), the Isaac Lab convention --
-    NOT the (qx, qy, qz, qw) order used by ROS / Eigen. Roll a ROS quaternion
-    at the boundary, not here.
-    """
-    asset: Articulation = env.scene[asset_cfg.name]
-    command = env.command_manager.get_command(command_name)
-    des_quat_w = quat_mul(asset.data.root_quat_w, command[:, 3:7])
-    curr_quat_w = asset.data.body_quat_w[:, asset_cfg.body_ids[0]]
-    return quat_error_magnitude(curr_quat_w, des_quat_w)
-
-
-def track_ee_pos_exp(
-    env: ManagerBasedRLEnv, command_name: str, asset_cfg: SceneEntityCfg, std: float
-) -> torch.Tensor:
-    """exp(-d^2 / std^2) on the position error.
-
-    Same kernel shape as track_lin_vel_xy_exp, so the two rounds' task rewards
-    read on the same scale in TensorBoard. Positive-valued, which is what makes
-    it safe to pair with a fall termination: an all-negative tracking reward
-    would pay the policy to terminate early instead of reaching.
-    """
-    error = ee_position_error(env, command_name, asset_cfg)
-    return torch.exp(-error.square() / std**2)
-
-
-def track_ee_quat_exp(
-    env: ManagerBasedRLEnv, command_name: str, asset_cfg: SceneEntityCfg, std: float
-) -> torch.Tensor:
-    """exp(-theta^2 / std^2) on the orientation error, std in radians."""
-    error = ee_orientation_error(env, command_name, asset_cfg)
-    return torch.exp(-error.square() / std**2)

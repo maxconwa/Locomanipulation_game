@@ -1,16 +1,16 @@
 """Sim-to-sim: a checkpoint on the fixed goal grid in MuJoCo, the RoboCasa model GOLEM deploys into, without ROS.
 
-    python paper/reach/tools/eval_mujoco.py --checkpoint <run>/checkpoints/agent_<N>.pt --label lambda1 \
+    python mujoco_evals/eval_mujoco.py --checkpoint <run>/checkpoints/agent_<N>.pt --label lambda1 \
         [--variant full|legs_blind|arms_ik] [--physics robocasa|isaac] [--odometry learned|true] \
         [--seeds 0] [--workers 8] [--limit N]
 
-Same trial as eval_isaac.py: the task's reset randomization, SETTLE_S standing in navigation mode with a zero velocity
+Same trial as paper/reach/tools/eval_isaac.py: the task's reset randomization, SETTLE_S standing in navigation mode with a zero velocity
 command, then one goal of the grid placed in the standing frame and held for GOAL_S; deterministic actors; the
-learned pelvis estimator moves the command. The policy loop is reachlib/mujoco_sim.py (a port of the Isaac env's
+learned pelvis estimator moves the command. The policy loop is mujoco_sim.py (a port of the Isaac env's
 observations, actions, PD and odometry). Physics: robocasa = the CL_Assets MJCF as GOLEM's RoboCasa sim loads it
 (joint damping 10, armature 0.1, friction loss 0.2, 2 ms steps); isaac = those set to the training plant's values.
 
-Writes results/<label>/mujoco[_<variant>][_<physics>][_trueodom]/{trials.csv, traces.npz, meta.json}.
+Writes logs/reach/results/<label>/mujoco[_<variant>][_<physics>][_trueodom]/{trials.csv, traces.npz, meta.json}.
 """
 
 from __future__ import annotations
@@ -26,9 +26,9 @@ from pathlib import Path
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 import numpy as np  # noqa: E402
 
-REACH = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REACH))
-from reachlib import common as C  # noqa: E402
+# the repository root in place of this directory, so mujoco_evals' modules are only ever imported as mujoco_evals.*
+sys.path[0] = str(Path(__file__).resolve().parents[1])
+from mujoco_evals import common as C  # noqa: E402
 
 _W = {}
 
@@ -36,13 +36,12 @@ _W = {}
 def _init(args):
     import torch
     torch.set_num_threads(1)
-    from reachlib.mujoco_sim import MarlMujoco, load_estimator
-    from reachlib.policy import load_actors
+    from mujoco_evals.mujoco_sim import MarlMujoco, load_estimator
+    from mujoco_evals.policy import load_actors
     meta = json.loads((C.GOALS_DIR / "tables_meta.json").read_text())
     rest = np.array(meta["rest_pose_b"], dtype=float)
     est_path = None
     if args["odometry"] == "learned":
-        sys.path.insert(0, str(C.DEFAULT_CODE / "source" / "locomanipulation_game"))
         est_path = _estimator_for(args["checkpoint"])
     sim = MarlMujoco(load_actors(args["checkpoint"]), load_estimator(est_path), physics=args["physics"],
                      rest_pose_b=rest)
@@ -64,7 +63,7 @@ def _estimator_for(checkpoint: str) -> str | None:
 
 
 def _trial(job):
-    from reachlib.metrics import trial_metrics
+    from mujoco_evals.metrics import trial_metrics
     sim, args = _W["sim"], _W["args"]
     seed, index, goal = job
     rng = np.random.default_rng(seed * 1_000_003 + index)
