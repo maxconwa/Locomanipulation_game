@@ -1,25 +1,25 @@
 # Hand-off: reach evaluation of the lambda runs (2026-10-08)
 
-Page: paper/20261008-reach_cooperation.html (https://claude.ai/artifact/LHVKbdmtDGtoQpmfghMZBn). Pipeline and
-commands: paper/reach/README.md. Local marl-direct carries 008c29e, 200e1dc on top of 2a10ffb; origin/marl-direct
-has since gained b701ed0 (LocoManip-WholeBody-Direct-v0), not yet rebased onto. NOT pushed: this machine cannot push
-to maxconwa/Locomanipulation_game (memory locomanip-push-access).
+Page: paper/20261008-reach_cooperation.html (https://claude.ai/artifact/LHVKbdmtDGtoQpmfghMZBn, v5 at 18:28).
+Pipeline and commands: paper/reach/README.md. Local marl-direct is rebased on origin/marl-direct 65708f5 (paper1)
+with the paper/reach commits on top; NOT pushed: this machine has no GitHub credentials for maxconwa (memory
+locomanip-push-access), so the coworker gets a git bundle.
 
-State (17:50): label l0.5 = paper05 agent_91200 (lambda 0.5, final). Isaac full done: strict 4.3% (below table 1.5%,
-above 8.4%); within 10 cm 27% (below 11%, above 49%); 10 cm floor 0.8 m vs GOLEM IK 1.0 m. MuJoCo (RoboCasa joints)
-0.3% strict, 11% at 10 cm. l0.5_52k (52.8k steps) is kept as a dotted, non-hero line.
-- Running: paper/reach/logs/queue_paper05.sh (PID 3192511), CPU physics (GPU held by the hand project's
-  rl_train_cube.py): Isaac legs_blind -> MuJoCo legs_blind, isaacphys, isaacphys+trueodom -> walk -> Isaac arms_ik
-  --ext0 -> MuJoCo trueodom -> Isaac trueodom --ext0; ends ~18:45 with "=== done" in logs/queue_paper05.log.
-- Hero figure now shows the 10 cm criterion (fig_hero); the strict version is fig_hero_strict.
+State (18:35): conditions.yaml l1 = paper1, l0.5 = paper05, l0 = paper00 (all agent_91200), whole = not trained.
+- Done (Isaac, CPU physics, seed 0): l0.5 full, l0 full; MuJoCo l0.5 (RoboCasa, training joints, legs blind), l0
+  (RoboCasa, training joints). GOLEM IK kinematic.
+- Fixed at 18:10: eval_isaac logged `alive` by reference, so on CPU a trial that fell at any time counted as fallen
+  from step 0. l0.5 full (6 falls) is barely affected; l0.5 legs_blind (746 falls) is being re-run.
+- Running: paper/reach/logs/queue_paper1.sh: l1 full (ends ~18:50) -> l1 MuJoCo x2 -> walk l1, l0.5, l0 ->
+  legs_blind l1, l0.5, l0 -> l0.5 full re-run; ends ~20:45 with "=== done" in logs/queue_paper1.log.
+- Findings so far (within 10 cm and 0.6 rad for 1 s): below the standing table lambda 0 17%, lambda 0.5 11%, GOLEM IK
+  0.4%; above it 41%, 49%, 52%. lambda 0 holds one deep crouch (pelvis ~0.71 m for every goal); lambda 0.5's pelvis
+  rises with the goal (0.71 -> 0.83 m).
 
 Next:
-1. When the queue log ends with "done": `make -C paper/reach paper`; check fig_hero (blue = legs blind), tradeoff,
-   walking, sim2sim; republish the page (same file path, same URL).
-2. Rebase onto origin/marl-direct (b701ed0), then teach the evaluators the one-agent "whole" checkpoint
-   (load_actors over the checkpoint's agents; eval_isaac/eval_walk act per agent; MuJoCo port's whole observation =
-   shared terms + leg actions + arm residual + wrist poses + wrist errors, 135).
-3. Commit results + figures + page + tex; git bundle origin/marl-direct..marl-direct; tell the user push needs
-   badinkajink added as a collaborator.
+1. When l1 lands: `make -C paper/reach paper`, check fig_hero (l1 is the hero), republish the page (same URL).
+2. When the queue ends: `make -C paper/reach paper`, republish, commit, `git bundle create` of
+   origin/marl-direct..marl-direct for the coworker.
+3. Revise the tex's "Effect of reward sharing" paragraph with lambda 1 (marked % RESULT).
 
-Waiting on owner: the lambda 1 and 0 runs (conditions.yaml `run:`), the whole-body baseline run, and push access.
+Waiting on owner: the whole-body baseline run (conditions.yaml `whole`), push access for badinkajink.

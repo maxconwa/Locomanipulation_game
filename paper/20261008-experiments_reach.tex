@@ -111,17 +111,20 @@ the standing tables ($e > 0$) requires leaning or stepping; the full policy reac
 \subsection{Effect of reward sharing}
 \label{sec:sharing}
 
-Over all goals, $\lambda = 1$, $0.5$ and $0$ reached \reach{l1/isaac}{success}\%,
-\reach{l0.5/isaac}{success}\% and \reach{l0/isaac}{success}\%, with operational floors of
-\reach{l1/isaac}{floor}, \reach{l0.5/isaac}{floor} and \reach{l0/isaac}{floor}\,cm.
+Over all goals, $\lambda = 1$, $0.5$ and $0$ reached \reach{l1/isaac}{successten}\%,
+\reach{l0.5/isaac}{successten}\% and \reach{l0/isaac}{successten}\% within 10\,cm
+(\reach{l1/isaac}{success}\%, \reach{l0.5/isaac}{success}\% and \reach{l0/isaac}{success}\% under the strict test),
+with 10\,cm floors of \reach{l1/isaac}{floorten}, \reach{l0.5/isaac}{floorten} and \reach{l0/isaac}{floorten}\,cm.
 All three runs crouch during arm goals: for goals below the tables their median pelvis drops were
 \reach{l1/isaac}{drop_below}, \reach{l0.5/isaac}{drop_below} and \reach{l0/isaac}{drop_below}\,cm. Sharing changes
 how the crouch follows the goal. For goals above the tables the $\lambda = 0$ pelvis stayed
-\reach{l0/isaac}{drop_above}\,cm low, against \reach{l0.5/isaac}{drop_above}\,cm at $\lambda = 0.5$
-(Fig.~\ref{fig:reach}c), and within 10\,cm the $\lambda = 0$ policy reached more of the goals below the tables
-(\reach{l0/isaac}{successten_below}\% against \reach{l0.5/isaac}{successten_below}\%) and fewer of those above
-(\reach{l0/isaac}{successten_above}\% against \reach{l0.5/isaac}{successten_above}\%).
-% RESULT: written from lambda 0 and 0.5; add lambda 1 when evaluated.
+\reach{l0/isaac}{drop_above}\,cm low, against \reach{l0.5/isaac}{drop_above} and \reach{l1/isaac}{drop_above}\,cm at
+$\lambda = 0.5$ and $1$, whose pelvis height rises with the target (Fig.~\ref{fig:reach}c). Within 10\,cm the
+$\lambda = 0$ policy reached the most goals below the tables (\reach{l0/isaac}{successten_below}\%, against
+\reach{l0.5/isaac}{successten_below}\% and \reach{l1/isaac}{successten_below}\%) and the fewest above
+(\reach{l0/isaac}{successten_above}\%, against \reach{l0.5/isaac}{successten_above}\% and
+\reach{l1/isaac}{successten_above}\%); above the tables $\lambda = 1$ matched GOLEM IK
+(\reach{golem_ik/kinematic}{successten_above}\%).
 
 \subsection{Balance and accuracy}
 \label{sec:balance}

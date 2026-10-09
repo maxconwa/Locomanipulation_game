@@ -17,8 +17,10 @@
 conditions:
   - label: l1
     name: "λ = 1"
-    run: ""
-    status: "training (coworker)"
+    run: ../../logs/skrl/locomanip_marl/paper1
+    checkpoint: agent_91200.pt
+    prose: "the λ = 1 policy"
+    status: "evaluating"
     hero: true
   - label: l0.5
     name: "λ = 0.5"
