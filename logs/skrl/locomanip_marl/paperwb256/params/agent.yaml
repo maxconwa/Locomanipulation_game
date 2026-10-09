@@ -1,0 +1,92 @@
+seed: 42
+models:
+  separate: true
+  policy:
+    class: GaussianMixin
+    clip_actions: false
+    clip_log_std: true
+    min_log_std: -3.0
+    max_log_std: 0.0
+    initial_log_std: 0.0
+    network:
+    - name: net
+      input: OBSERVATIONS
+      layers:
+      - 256
+      - 128
+      - 64
+      activations: elu
+    output: ACTIONS
+  value:
+    class: DeterministicMixin
+    clip_actions: false
+    network:
+    - name: net
+      input: STATES
+      layers:
+      - 256
+      - 128
+      - 64
+      activations: elu
+    output: ONE
+log_std_bounds:
+  whole:
+  - - -3.0
+    - -0.51
+    - 12
+  - - -3.0
+    - 0.0
+    - 14
+no_value_preprocessor:
+- whole
+entropy_action_dims:
+  whole:
+  - - 1
+    - 12
+  - - 0
+    - 14
+memory:
+  class: RandomMemory
+  memory_size: -1
+agent:
+  class: MAPPO
+  rollouts: 24
+  learning_epochs: 5
+  mini_batches: 4
+  discount_factor: 0.99
+  gae_lambda: 0.95
+  learning_rate: 0.001
+  learning_rate_scheduler: KLAdaptiveLR
+  learning_rate_scheduler_kwargs:
+    kl_threshold: 0.04
+    min_lr: 0.0002
+    max_lr: 0.01
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: null
+  state_preprocessor: RunningStandardScaler
+  state_preprocessor_kwargs: null
+  value_preprocessor: RunningStandardScaler
+  value_preprocessor_kwargs: null
+  random_timesteps: 0
+  learning_starts: 0
+  grad_norm_clip: 1.0
+  ratio_clip: 0.2
+  value_clip: 0.2
+  entropy_loss_scale:
+    whole: 0.01
+  value_loss_scale: 1.0
+  kl_threshold: 0.0
+  time_limit_bootstrap:
+    whole: true
+  rewards_shaper_scale: 1.0
+  experiment:
+    directory: /home/max/Locomanipulation_game/logs/skrl/locomanip_marl
+    experiment_name: 2026-10-08_21-00-30_paperwb256
+    write_interval: 24
+    checkpoint_interval: 4800
+    store_separately: false
+trainer:
+  class: SequentialTrainer
+  timesteps: 91200
+  environment_info: log
+  close_environment_at_exit: false
