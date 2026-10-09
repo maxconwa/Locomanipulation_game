@@ -1,0 +1,23 @@
+{
+ "label": "l0",
+ "sim": "mujoco",
+ "variant": "full",
+ "physics": "isaac",
+ "odometry": "learned",
+ "checkpoint": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game/logs/skrl/locomanip_marl/paper00/checkpoints/agent_91200.pt",
+ "checkpoint_sha256": "ea96f13feb8f77e77d4907a998337fd9189e918313edd81152de6988f02fe640",
+ "lambda_share": 0.0,
+ "estimator": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game/logs/skrl/locomanip_marl/paper00/estimator/estimator_91200.pt",
+ "goals": "/home/humanoid/Programs/Humanoid_Simulation/Locomanipulation_game/paper/reach/goals/eval_goals_v1.csv",
+ "goals_sha256": "596589e5d9d4ac0bcfaf2cd0935efcf8826833466c844efd524360e12bb6eb90",
+ "seeds": [
+  0
+ ],
+ "n": 3168,
+ "mjcf": "/home/humanoid/Programs/CL_Assets-cf87bfe/mujoco_assets/h1_2_magpie.xml",
+ "versions": {
+  "mujoco": "3.15.0",
+  "torch": "2.7.0+cu128"
+ },
+ "wall_s": 162.3
+}
