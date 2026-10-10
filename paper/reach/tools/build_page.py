@@ -337,8 +337,8 @@ IK. Grey band: below the standing table's lowest pose.</figcaption></figure>
 
 <section id="gallery"><div class="col">
 <h2>Figures</h2>
-<p>Every figure is in <code>logs/reach/figures/</code> as PDF (fonts embedded) and PNG, with its plotted numbers in
-<code>logs/reach/figures/data/</code>.</p>
+<p>Every figure is in <code>logs/reach/figures/</code> as PDF (fonts embedded) and PNG; the rebuild also writes its
+plotted numbers to <code>logs/reach/figures/data/</code>, which is not in the repository.</p>
 </div>
 <div class="gallery">{gallery}</div>
 </section>
@@ -424,7 +424,8 @@ environment's curriculum level.</li>
 </div></section>
 
 <footer><div class="col">
-<p>Rebuild: <code>make -C paper/reach paper</code>. Trials: <code>logs/reach/results/&lt;label&gt;/&lt;sim&gt;/trials.csv</code>;
+<p>Rebuild: <code>make -C paper/reach paper</code>, from the trials in
+<code>logs/reach/results/&lt;label&gt;/&lt;sim&gt;/trials.csv</code> (not in the repository; see paper/reach/README.md);
 goals <code>logs/reach/goals/eval_goals_v1.csv</code>.</p>
 </div></footer>
 </div>

@@ -5,7 +5,11 @@ fixed grid of two-wrist goals, in Isaac Lab and in MuJoCo, and rebuilds every ta
 result page from the trials. Built against `marl-direct` 3d9c8c3 (paper task) and b701ed0 (whole-body baseline).
 The tools here are the Isaac side, the analysis and the page; the MuJoCo port and its evaluator are in
 `mujoco_evals/`. Everything the evaluation writes (goals, trials, summaries, figures, LaTeX macros and the page)
-goes to `logs/reach/`, which is tracked; `paper/reach/` holds only code and `conditions.yaml`.
+goes to `logs/reach/`; `paper/reach/` holds only code and `conditions.yaml`. The goal grid, figures, macros and page
+are tracked. The trials, summaries and curves (`logs/reach/results/`) and the figures' plotted data stay local, so a
+fresh clone has no results: `make all` re-evaluates every listed run (the published numbers are seed 0 on CPU physics,
+`SEEDS=0 DEVICE=cpu`), and `l0.5_52k` (`evaluate: false`) and `golem_ik` (`make baselines`) only run by hand. The
+published results are in commit 6be6c6f; `git restore --source=6be6c6f --worktree -- logs/reach/results` puts them back.
 
 ## Evaluating a run (the coworker's path)
 

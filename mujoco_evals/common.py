@@ -1,6 +1,6 @@
 """Paths, task constants and file helpers shared by the MuJoCo evaluation here and the reach evaluation in paper/reach.
 
-Data (under logs/reach; tracked except traces.npz, goals/*.pt and results/_*/):
+Data (under logs/reach; the goal grid is tracked, goals/*.pt and results/ stay local):
     goals/eval_goals_<v>.csv        the fixed goal grid every controller is scored on
     results/<label>/<sim>/          trials.csv (one row per trial), traces.npz, meta.json
 

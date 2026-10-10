@@ -21,7 +21,8 @@ layer into RoboCasa.
 - `paper/reach/`: the reach evaluation (Isaac and MuJoCo on one fixed goal grid, then the paper's tables, figures,
   numbers and result page); see its README.
 - `logs/`: everything the code writes. Training runs go to `logs/skrl/locomanip_marl/`, the reach evaluation to
-  `logs/reach/`. Published runs and the reach outputs are tracked.
+  `logs/reach/`. Tracked: the published runs, and the reach evaluation's goal grid, figures, LaTeX macros and page;
+  its trials and summaries stay local.
 
 ## Setup
 

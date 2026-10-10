@@ -48,5 +48,5 @@ conditions:
     prose: "the λ = 0.5 policy at 52.8k steps"
     dash: dotted
     hero_figure: false
-    evaluate: false        # its Isaac (full) and MuJoCo results are in; make all does not add more
+    evaluate: false        # make all skips it; its Isaac (full) and MuJoCo results were run by hand
     status: "evaluated in part"

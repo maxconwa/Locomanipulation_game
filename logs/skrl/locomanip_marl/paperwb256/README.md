@@ -24,7 +24,8 @@ differs only in the layers and the experiment name.
 | Falls (share of episode ends) | 2.7% | 1.6% | 4.4% |
 
 **Sample efficiency** (millions of environment transitions to reach each target, on curves smoothed over 50 updates,
-computed as `logs/figures/sample_efficiency/milestones.csv` is; that figure does not include this run):
+computed as `logs/figures/sample_efficiency/sample_efficiency.py` computes its milestones; that figure does not include
+this run):
 
 | | paper05 | paperwb | paperwb256 |
 |---|---|---|---|
