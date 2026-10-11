@@ -1,0 +1,92 @@
+/home/max/Locomanipulation_game/logs/skrl/locomanip_marl/2026-10-11_09-13-13_golemlim_zrange_200k/checkpoints/agent_182400.pt  512 envs x 1500 policy steps (first 50 dropped), training distribution
+substeps: arm goals 1555580, walking 2156420
+share of substeps over GOLEM's real e-stop threshold (q, dq x ratio, tau x ratio); dq/tau also at the 0.9x monitor
+joint                        mode     q_low   q_high   dq_0.9   dq_1.0  tau_0.9  tau_1.0
+left_hip_yaw_joint           arm      0.19%    0.00%    0.00%    0.00%    0.00%    0.00%
+left_hip_yaw_joint           walk     0.00%    0.00%    0.00%    0.00%    0.00%    0.00%
+left_hip_pitch_joint         arm      0.00%    0.00%    0.00%    0.00%    0.01%    0.00%
+left_hip_pitch_joint         walk     0.00%    0.00%    0.00%    0.00%    0.00%    0.00%
+left_hip_roll_joint          arm      0.00%    0.00%    0.00%    0.00%    0.00%    0.00%
+left_hip_roll_joint          walk     0.00%    0.00%    0.00%    0.00%    0.00%    0.00%
+left_knee_joint              arm      0.00%    0.03%    0.13%    0.03%    0.00%    0.00%
+left_knee_joint              walk     0.00%    0.00%    0.11%    0.01%    0.00%    0.00%
+left_ankle_pitch_joint       arm      0.11%    0.00%    0.00%    0.00%    0.03%    0.00%
+left_ankle_pitch_joint       walk     0.02%    0.00%    0.00%    0.00%    0.00%    0.00%
+left_ankle_roll_joint        arm      0.19%    0.00%    0.00%    0.00%    0.00%    0.00%
+left_ankle_roll_joint        walk     0.01%    0.09%    0.00%    0.00%    0.00%    0.00%
+right_hip_yaw_joint          arm      0.15%    0.00%    0.01%    0.00%    0.00%    0.00%
+right_hip_yaw_joint          walk     0.00%    0.00%    0.00%    0.00%    0.00%    0.00%
+right_hip_pitch_joint        arm      0.00%    0.00%    0.00%    0.00%    0.01%    0.00%
+right_hip_pitch_joint        walk     0.00%    0.00%    0.00%    0.00%    0.00%    0.00%
+right_hip_roll_joint         arm      0.00%    0.00%    0.00%    0.00%    0.00%    0.00%
+right_hip_roll_joint         walk     0.00%    0.00%    0.00%    0.00%    0.00%    0.00%
+right_knee_joint             arm      0.00%    1.24%    0.11%    0.01%    0.01%    0.00%
+right_knee_joint             walk     0.00%    0.07%    0.08%    0.00%    0.00%    0.00%
+right_ankle_pitch_joint      arm      0.59%    0.00%    0.00%    0.00%    0.04%    0.00%
+right_ankle_pitch_joint      walk     0.14%    0.00%    0.00%    0.00%    0.01%    0.00%
+right_ankle_roll_joint       arm      0.01%    0.01%    0.00%    0.00%    0.00%    0.00%
+right_ankle_roll_joint       walk     0.01%    0.00%    0.00%    0.00%    0.00%    0.00%
+left_shoulder_pitch_joint    arm      0.01%    0.06%    0.05%    0.01%    0.01%    0.01%
+left_shoulder_pitch_joint    walk     0.05%    0.25%    0.12%    0.02%    0.01%    0.00%
+left_shoulder_roll_joint     arm      0.00%    0.02%    0.01%    0.00%    0.01%    0.01%
+left_shoulder_roll_joint     walk     0.00%    0.05%    0.01%    0.00%    0.00%    0.00%
+left_shoulder_yaw_joint      arm      0.34%    0.03%    0.00%    0.00%    0.05%    0.02%
+left_shoulder_yaw_joint      walk     0.10%    0.10%    0.00%    0.00%    0.04%    0.02%
+left_elbow_joint             arm      0.08%    0.02%    0.00%    0.00%    0.01%    0.01%
+left_elbow_joint             walk     0.00%    0.00%    0.00%    0.00%    0.01%    0.01%
+left_wrist_roll_joint        arm      0.06%    0.13%    0.00%    0.00%    0.01%    0.01%
+left_wrist_roll_joint        walk     0.01%    0.05%    0.00%    0.00%    0.00%    0.00%
+left_wrist_yaw_joint         arm      0.00%    0.00%    0.00%    0.00%    0.00%    0.00%
+left_wrist_yaw_joint         walk     0.00%    0.00%    0.00%    0.00%    0.00%    0.00%
+right_shoulder_pitch_joint   arm      0.01%    0.12%    0.03%    0.00%    0.01%    0.01%
+right_shoulder_pitch_joint   walk     0.00%    0.27%    0.07%    0.01%    0.01%    0.00%
+right_shoulder_roll_joint    arm      0.00%    0.00%    0.01%    0.00%    0.01%    0.01%
+right_shoulder_roll_joint    walk     0.03%    0.00%    0.01%    0.00%    0.00%    0.00%
+right_shoulder_yaw_joint     arm      0.05%    0.15%    0.00%    0.00%    0.04%    0.02%
+right_shoulder_yaw_joint     walk     0.01%    0.18%    0.00%    0.00%    0.02%    0.01%
+right_elbow_joint            arm      0.22%    0.06%    0.00%    0.00%    0.02%    0.01%
+right_elbow_joint            walk     0.00%    0.00%    0.00%    0.00%    0.02%    0.01%
+right_wrist_roll_joint       arm      0.15%    0.03%    0.00%    0.00%    0.01%    0.01%
+right_wrist_roll_joint       walk     0.00%    0.00%    0.00%    0.00%    0.00%    0.00%
+right_wrist_yaw_joint        arm      0.00%    0.00%    0.00%    0.00%    0.00%    0.00%
+right_wrist_yaw_joint        walk     0.00%    0.00%    0.00%    0.00%    0.00%    0.00%
+
+worst exceedance: q past threshold (rad), dq and tau as a multiple of GOLEM's threshold
+left_hip_yaw_joint           q_low +0.011  q_high +0.001  dq x1.00  tau x0.84   [q -0.4299, +0.4299] dq 23.0 tau 200.0
+left_hip_pitch_joint         q_low -0.432  q_high -2.539  dq x0.73  tau x2.07   [q -3.1399, +2.4999] dq 23.0 tau 200.0
+left_hip_roll_joint          q_low +0.003  q_high -1.635  dq x1.00  tau x0.99   [q -0.4299, +3.1399] dq 23.0 tau 200.0
+left_knee_joint              q_low +0.003  q_high +0.018  dq x1.21  tau x1.67   [q -0.1199, +2.1899] dq 14.0 tau 300.0
+left_ankle_pitch_joint       q_low +0.239  q_high +0.143  dq x0.92  tau x1.29   [q -0.8972, +0.5235] dq 27.0 tau 60.0
+left_ankle_roll_joint        q_low +0.078  q_high +0.016  dq x0.68  tau x1.03   [q -0.2617, +0.2617] dq 27.0 tau 40.0
+right_hip_yaw_joint          q_low +0.010  q_high +0.009  dq x1.01  tau x0.99   [q -0.4299, +0.4299] dq 23.0 tau 200.0
+right_hip_pitch_joint        q_low +0.001  q_high -2.053  dq x1.00  tau x2.00   [q -3.1399, +2.4999] dq 23.0 tau 200.0
+right_hip_roll_joint         q_low -1.366  q_high +0.002  dq x1.00  tau x1.12   [q -3.1399, +0.4299] dq 23.0 tau 200.0
+right_knee_joint             q_low +0.000  q_high +0.019  dq x1.03  tau x1.61   [q -0.1199, +2.1899] dq 14.0 tau 300.0
+right_ankle_pitch_joint      q_low +0.249  q_high -0.202  dq x0.54  tau x1.17   [q -0.8972, +0.5235] dq 27.0 tau 60.0
+right_ankle_roll_joint       q_low +0.015  q_high +0.017  dq x0.57  tau x0.99   [q -0.2617, +0.2617] dq 27.0 tau 40.0
+torso_joint                  q_low -2.002  q_high -1.877  dq x0.70  tau x0.74   [q -2.3499, +2.3499] dq 23.0 tau 200.0
+left_shoulder_pitch_joint    q_low +0.001  q_high +0.002  dq x1.00  tau x9.34   [q -3.1399, +1.5699] dq 9.0 tau 40.0
+left_shoulder_roll_joint     q_low -0.189  q_high +0.000  dq x1.00  tau x10.13   [q -0.3799, +3.3999] dq 9.0 tau 40.0
+left_shoulder_yaw_joint      q_low +0.001  q_high +0.000  dq x0.69  tau x20.24   [q -2.6599, +3.0099] dq 20.0 tau 18.0
+left_elbow_joint             q_low +0.001  q_high +0.001  dq x0.82  tau x11.75   [q -0.9499, +3.1799] dq 20.0 tau 21.6
+left_wrist_roll_joint        q_low +0.000  q_high +0.001  dq x0.91  tau x6.36   [q -3.0099, +2.7499] dq 31.4 tau 19.0
+left_wrist_pitch_joint       q_low -0.100  q_high -0.100  dq x0.53  tau x0.52   [q -0.5625, +0.5625] dq 31.4 tau 38.0
+left_wrist_yaw_joint         q_low -0.100  q_high -0.100  dq x0.53  tau x1.36   [q -1.3700, +1.3700] dq 31.4 tau 38.0
+right_shoulder_pitch_joint   q_low +0.001  q_high +0.002  dq x1.01  tau x9.44   [q -3.1399, +1.5699] dq 9.0 tau 40.0
+right_shoulder_roll_joint    q_low +0.001  q_high -0.189  dq x1.00  tau x10.09   [q -3.3999, +0.3799] dq 9.0 tau 40.0
+right_shoulder_yaw_joint     q_low +0.001  q_high +0.001  dq x0.74  tau x20.26   [q -3.0099, +2.6599] dq 20.0 tau 18.0
+right_elbow_joint            q_low +0.000  q_high +0.000  dq x0.94  tau x11.62   [q -0.9499, +3.1799] dq 20.0 tau 21.6
+right_wrist_roll_joint       q_low +0.002  q_high +0.000  dq x0.47  tau x6.37   [q -2.7499, +3.0099] dq 31.4 tau 19.0
+right_wrist_pitch_joint      q_low -0.100  q_high -0.100  dq x0.37  tau x0.51   [q -0.5625, +0.5625] dq 31.4 tau 38.0
+right_wrist_yaw_joint        q_low -0.097  q_high -0.100  dq x0.76  tau x1.37   [q -1.3700, +1.3700] dq 31.4 tau 38.0
+
+arm goals: how far past GOLEM's position threshold, when past (rad): p50 / p90 / p99 / max
+left_hip_yaw_joint         high 0.0003 / 0.0003 / 0.0003 / 0.0003
+right_hip_yaw_joint        high 0.0055 / 0.0073 / 0.0086 / 0.0087
+left_ankle_pitch_joint     low  0.0057 / 0.0226 / 0.0836 / 0.1110
+right_ankle_pitch_joint    low  0.0058 / 0.0156 / 0.1085 / 0.2009
+right_ankle_roll_joint     high 0.0040 / 0.0086 / 0.0160 / 0.0173
+left_knee_joint            high 0.0006 / 0.0016 / 0.0055 / 0.0080
+right_knee_joint           high 0.0009 / 0.0015 / 0.0022 / 0.0190
+
+policy steps with any real e-stop: arm 4.5%, walk 1.6%
