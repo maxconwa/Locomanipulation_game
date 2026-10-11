@@ -1,0 +1,2 @@
+# TensorBoard event files: binaries tracked via Git LFS, like the checkpoints (*.pt, root .gitattributes).
+events.out.tfevents.* filter=lfs diff=lfs merge=lfs -text
