@@ -11,7 +11,9 @@ from typing import TYPE_CHECKING
 
 from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
 from isaaclab.sensors import ContactSensor
+from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 
+from ..golem_safety import GOLEM_LIMITS
 from .commands import ground_height
 from .legs_rewards import STANCE_THRESHOLD, joint_deviation_l2, leg_phase
 
@@ -130,6 +132,16 @@ def arm_target_quat_exp(env: ManagerBasedRLEnv, command_name: str, arm: int, std
     return torch.exp(-rot_error[:, arm].square() / std**2)
 
 
+def arm_target_pos_exp_annealed(env: ManagerBasedRLEnv, command_name: str, arm: int) -> torch.Tensor:
+    """arm_target_pos_exp with the command's current fine_pos_std (its tracking-kernel curriculum)."""
+    return arm_target_pos_exp(env, command_name, arm, env.command_manager.get_term(command_name).fine_pos_std)
+
+
+def arm_target_quat_exp_annealed(env: ManagerBasedRLEnv, command_name: str, arm: int) -> torch.Tensor:
+    """arm_target_quat_exp with the command's current rot_std (its tracking-kernel curriculum)."""
+    return arm_target_quat_exp(env, command_name, arm, env.command_manager.get_term(command_name).rot_std)
+
+
 def arm_goal_reached(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     """1 on the step after both wrists were first held on the goal: a one-off bonus, so finishing pays more than
     hovering just outside the tolerance."""
@@ -148,6 +160,27 @@ def joint_deviation_l2_modal(
     """joint_deviation_l2, times arm_goal_scale during arm goals."""
     arm_mode = env.command_manager.get_term(arm_command_name).arm_mode
     return joint_deviation_l2(env, asset_cfg) * torch.where(arm_mode, arm_goal_scale, 1.0)
+
+
+def knee_valgus(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, margin: float = 0.0) -> torch.Tensor:
+    """How far each knee sits medial of its hip-ankle line beyond margin, summed over the legs (m).
+
+    Seen from the front in the pelvis's heading frame (yaw only, z up): the y of the line from the hip to the ankle at
+    the knee's height, minus the knee's y, toward the midline. It is 0 at the default pose, where hip, knee and ankle
+    share one y, and grows when the knees fall inward, as in a crouch on hip yaw turned in. Knees bowed outward
+    cost nothing. asset_cfg's bodies are the left hip, knee and ankle, then the right (preserve_order).
+    """
+    asset = env.scene[asset_cfg.name]
+    pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids]  # (n, 6, 3)
+    n, k = pos_w.shape[:2]
+    quat = yaw_quat(asset.data.root_quat_w).unsqueeze(1).expand(n, k, 4).reshape(-1, 4)
+    rel = quat_apply_inverse(quat, (pos_w - asset.data.root_pos_w.unsqueeze(1)).reshape(-1, 3)).view(n, 2, 3, 3)
+    hip, knee, ankle = rel[:, :, 0], rel[:, :, 1], rel[:, :, 2]  # (n, leg, xyz)
+    # the ankle is below the hip; the clamp only guards the division
+    s = (knee[..., 2] - hip[..., 2]) / (ankle[..., 2] - hip[..., 2]).clamp(max=-0.05)
+    line_y = hip[..., 1] + s * (ankle[..., 1] - hip[..., 1])
+    medial = (line_y - knee[..., 1]) * torch.tensor([1.0, -1.0], device=pos_w.device)  # the right leg's midline is +y
+    return (medial - margin).clamp(min=0.0).sum(dim=1)
 
 
 def feet_swing_clearance(
@@ -175,3 +208,52 @@ def feet_swing_clearance(
     progress = ((phase - STANCE_THRESHOLD) / (1.0 - STANCE_THRESHOLD)).clamp(0.0, 1.0)
     reference = rest_height + lift_height * torch.sin(torch.pi * progress)
     return torch.sum((reference - foot_z).clamp(min=0.0) * swing, dim=1)
+
+
+class golem_limits(ManagerTermBase):
+    """The measured joint state against GOLEM's e-stop thresholds (golem_safety.GOLEM_LIMITS, relax_safety_split),
+    summed over asset_cfg's joints. The target clip bounds only the targets: a joint pushed past its target by the
+    robot's weight still e-stops the robot.
+
+    quantity:
+    - "position": how far each joint is inside `margin` (rad) of its position thresholds (rad).
+    - "velocity", "torque": how far |dq| or the motor's PD torque is beyond `margin` x the threshold, as a share of
+      the threshold.
+    - "velocity_l2", "torque_l2": (dq / threshold)^2 or (tau / threshold)^2; margin unused.
+
+    Torque is the motor's PD demand at the measured state with the motor's own damping, as GolemEstopMonitor computes
+    it (GOLEM reads the motor's torque estimate).
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        self._asset = env.scene[asset_cfg.name]
+        ids = asset_cfg.joint_ids
+        self._ids = list(range(self._asset.num_joints)) if isinstance(ids, slice) else list(ids)
+        rows = {row[0]: row for row in GOLEM_LIMITS}
+        names = [self._asset.joint_names[i] for i in self._ids]
+        missing = [n for n in names if n not in rows]
+        if missing:
+            raise ValueError(f"golem_limits: no GOLEM limits for {missing}")
+        # (motor, low, high, velocity, torque, clip offset, estop offset, velocity ratio, torque ratio)
+        table = torch.tensor([rows[n][1:] for n in names], device=env.device)
+        low, high, vel, tau, _, q_off, vel_ratio, tau_ratio = table.T
+        self._q_low, self._q_high = low + q_off, high - q_off
+        self._dq_max, self._tau_max = vel * vel_ratio, tau * tau_ratio
+
+    def __call__(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, quantity: str, margin: float = 0.0):
+        data, ids = self._asset.data, self._ids
+        if quantity == "position":
+            q = data.joint_pos[:, ids]
+            inside = (self._q_low + margin - q).clamp(min=0.0) + (q - (self._q_high - margin)).clamp(min=0.0)
+            return inside.sum(dim=1)
+        if quantity.startswith("velocity"):
+            ratio = data.joint_vel[:, ids].abs() / self._dq_max
+        else:
+            error = data.joint_pos_target[:, ids] - data.joint_pos[:, ids]
+            torque = data.joint_stiffness[:, ids] * error - data.default_joint_damping[:, ids] * data.joint_vel[:, ids]
+            ratio = torque.abs() / self._tau_max
+        if quantity.endswith("_l2"):
+            return ratio.square().sum(dim=1)
+        return (ratio - margin).clamp(min=0.0).sum(dim=1)

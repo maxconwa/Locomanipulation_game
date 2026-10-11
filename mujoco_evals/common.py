@@ -147,6 +147,20 @@ def read_reward_share(run_dir: Path) -> float | None:
     return round(float(to_legs), 6)
 
 
+def read_target_limits(run_dir: Path) -> dict[str, tuple[float, float]] | None:
+    """joint name -> (low, high) a run's action terms clipped every target into (GOLEM's position e-stop range,
+    actions.*.joint_limits in params/env.yaml); None for runs without it, whose targets only kept to the URDF clip."""
+    path = Path(run_dir) / "params" / "env.yaml"
+    if not path.is_file():
+        return None
+    actions = _yaml_load_any(path.read_text()).get("actions", {})
+    limits = {}
+    for term in ("joint_pos", "arm_pos"):
+        for name, bounds in ((actions.get(term) or {}).get("joint_limits") or {}).items():
+            limits[name] = (float(bounds[0]), float(bounds[1]))
+    return limits or None
+
+
 def write_csv(path: Path, rows: list[dict], columns: list[str] | None = None):
     path.parent.mkdir(parents=True, exist_ok=True)
     columns = columns or list(dict.fromkeys(k for r in rows for k in r))

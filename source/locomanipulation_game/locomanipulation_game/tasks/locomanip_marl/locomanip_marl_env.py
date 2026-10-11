@@ -9,9 +9,11 @@ them onto the per-agent dicts:
     dones:        one TerminationManager, shared (one body, one episode)
 
 After every step it moves the arm command by the pelvis motion the learned estimator (odometry.py) reports, or with
-estimator.odometry "legs" by leg odometry (_leg_odometry), and fits the estimator to the true motion. While training,
-episodes are navigation only until cfg.warm_start_timeout_share of them end in a time-out rather than a fall
-(_update_warm_start); then arm goals start.
+estimator.odometry "legs" by leg odometry (_leg_odometry), and fits the estimator to the true motion (with
+estimator.train_on_arm_goals_only, the motion during arm goals only). While training, episodes are navigation only
+until cfg.warm_start_timeout_share of them end in a time-out rather than a fall (_update_warm_start); then arm goals
+start. GolemEstopMonitor (golem_safety.py) checks GOLEM's e-stops at every physics substep and logs them; with
+cfg.golem_estop_ends_episode they end the episode whenever arm goals are on (always outside training).
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from isaaclab.managers import (
 )
 from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_inv, quat_mul
 
+from .golem_safety import GolemEstopMonitor
 from .locomanip_marl_env_cfg import ARM_COMMAND, LocoManipMarlEnvCfg
 from .odometry import EstimatorTrainer, motion_to_transform, pelvis_motion
 
@@ -68,6 +71,11 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._ends = torch.tensor(0.0, device=self.device)
         self._time_outs = torch.tensor(0.0, device=self.device)
         self._warm_start_log: dict[str, torch.Tensor] = {}
+        # GOLEM's e-stops (None: no e-stop checks)
+        self.golem_monitor = (
+            GolemEstopMonitor(self._robot, self.cfg.golem_estop, self.num_envs, self.device) if self.cfg.golem_estop else None
+        )
+        self.golem_log: dict[str, torch.Tensor] = {}
 
         group_dims = self.observation_manager.group_obs_dim
         self.cfg.observation_spaces = {agent: group_dims[agent][0] for agent in self.cfg.possible_agents}
@@ -126,6 +134,9 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self.action_manager.process_action(joint_action.clamp(-self.cfg.clip_actions, self.cfg.clip_actions))
 
     def _apply_action(self) -> None:
+        if self.golem_monitor is not None:
+            # once per physics substep: the state the previous substep left (mdp.golem_estop checks the last)
+            self.golem_monitor.update()
         self.action_manager.apply_action()
 
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -156,6 +167,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._obs_buf = {g: self.observation_manager.compute_group(g, update_history=True) for g in groups}
         self.extras.setdefault("log", {}).update(self._estimator_log)
         self.extras["log"].update(self._warm_start_log)
+        self.extras["log"].update(self.golem_log)
         return {agent: self._obs_buf[agent] for agent in self.cfg.possible_agents}
 
     def _get_states(self) -> torch.Tensor:
@@ -168,6 +180,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
         super()._reset_idx(env_ids)  # scene, reset events, episode_length_buf
         self._refresh_sensors_after_reset(env_ids)
         self._fresh[env_ids] = True
+        if self.golem_monitor is not None:
+            self.golem_monitor.reset(env_ids)
 
         log = {}
         log.update(self.observation_manager.reset(env_ids))
@@ -192,7 +206,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
     def _update_odometry(self):
         """Move the arm commands by this step's pelvis motion, fit the estimator, and set the arm command's
         estimate_prob: while training, arm goals follow the estimate only while its drift over whole goals is under
-        drift_gate.
+        drift_gate, and never with estimator.true_odometry_while_training.
 
         Runs after resets: reset envs are skipped (their previous sample is from the old episode) and get an exact
         command from the command manager anyway.
@@ -215,7 +229,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
                 estimated=estimated, true=motion_to_transform(true_motion, self.step_dt), env_mask=valid
             )
             if cfg.train:
-                self.estimator.add(inputs, true_motion, valid)
+                # the command moves by odometry only during arm goals: with train_on_arm_goals_only the estimator
+                # fits that motion (standing, crouching, reaching), not the walking it is never used for
+                train = valid & self._arm_command.arm_mode if cfg.train_on_arm_goals_only else valid
+                self.estimator.add(inputs, true_motion, train)
                 if self.common_step_counter % cfg.train_every == 0:
                     stats = self.estimator.train()
                     self._estimator_log.update({f"Estimator/{k}": v for k, v in stats.items()})
@@ -239,10 +256,18 @@ class LocoManipMarlEnv(DirectMARLEnv):
         arm.ended_goal_drift_sum.zero_()
         arm.ended_goal_count.zero_()
         gate_open = (self._goal_drift_ema < cfg.drift_gate).float()
+        if cfg.true_odometry_while_training:
+            gate_open = torch.zeros_like(gate_open)
         arm.estimate_prob = gate_open if cfg.train else torch.tensor(1.0, device=self.device)
         self._estimator_log["Estimator/estimate_prob"] = arm.estimate_prob
         self._estimator_log["Estimator/goal_drift"] = self._goal_drift_ema
         self._estimator_log["Estimator/gate_open"] = gate_open
+
+    @property
+    def estops_end_episodes(self) -> bool:
+        """With cfg.golem_estop_ends_episode, GOLEM's e-stops end the episode from the end of the warm start, as the
+        arm goals start (and outside training from the start), so a fresh policy's first steps don't end it."""
+        return self.cfg.golem_estop_ends_episode and self._arm_command.goals_enabled
 
     def _update_warm_start(self, terminated: torch.Tensor, time_outs: torch.Tensor):
         """Count this step's episode ends and the time-outs among them, both decayed by WARM_START_DECAY per step,
@@ -255,7 +280,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
         if not arm.goals_enabled and share.item() >= self.cfg.warm_start_timeout_share:
             arm.goals_enabled = True
             print(f"[INFO] Warm start over at step {self.common_step_counter}: {share.item():.0%} of episodes time out;"
-                  " arm goals start")
+                  f" arm goals start{', GOLEM e-stops end the episode' if self.estops_end_episodes else ''}")
         self._warm_start_log["Curriculum/warm_start_timeout_share"] = share
         self._warm_start_log["Curriculum/arm_goals_enabled"] = torch.tensor(float(arm.goals_enabled), device=self.device)
 

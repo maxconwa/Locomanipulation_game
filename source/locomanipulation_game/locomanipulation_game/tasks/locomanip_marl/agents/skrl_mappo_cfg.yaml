@@ -86,5 +86,5 @@ agent:
 
 trainer:
   class: SequentialTrainer
-  timesteps: 91200           # 3800 updates x 24 rollouts
+  timesteps: 200016          # 8334 updates x 24 rollouts (200k steps)
   environment_info: log

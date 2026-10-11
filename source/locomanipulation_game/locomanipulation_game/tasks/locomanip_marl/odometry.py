@@ -160,5 +160,11 @@ class PelvisEstimatorCfg:
     """Env steps between saves: the skrl checkpoint interval."""
     drift_gate: float = 0.05
     """While training, arm goals follow the estimate only while its mean drift over a whole goal is below this (m)."""
+    true_odometry_while_training: bool = False
+    """While training, move every arm goal by the true pelvis motion (the drift gate stays shut); the estimator still
+    trains on it, and outside training the estimate moves the command as before."""
+    train_on_arm_goals_only: bool = False
+    """Fit the estimator only on steps during arm goals, the only motion it moves the command by (standing,
+    crouching and reaching), not walking, whose larger and faster motion it is never used for."""
     drift_ema_per_goal: float = 0.001
     """EMA weight of each ended arm goal's drift."""

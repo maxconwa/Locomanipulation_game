@@ -6,7 +6,8 @@ odometry.py at marl-direct 72171c7):
     policy step (50 Hz)   actions -> joint targets; 10 MuJoCo steps of 2 ms with PD torques recomputed each step;
                           then the odometry history and the learned pelvis estimator move the arm command; then the
                           actors' observations (with the training noise) for the next step
-    legs action           target = default + 0.25 a, inside [hard lower + 1 mm, hard upper - 1 mm] and then inside the
+    legs action           target = default + 0.25 a, inside [hard lower + 1 mm, hard upper - 1 mm] (and the run's
+                          target_limits, GOLEM's position e-stop range, where it has them) and then inside the
                           targets whose PD torque at the measured state stays within 85% of the effort limit
     arms action           one damped-least-squares IK step per arm toward the believed command (6-D pose error
                           [p_t - p, axis-angle(q_t q^-1)] in the pelvis frame; the wrist Jacobian in the pelvis frame
@@ -63,6 +64,10 @@ def _gains(name: str) -> tuple[float, float, float]:
     if "wrist" in name:
         return 40.0, 1.0, 19.0
     raise KeyError(name)
+
+
+def mjcf_path(assets: Path = C.DEFAULT_ASSETS) -> Path:
+    return assets / "mujoco_assets" / "h1_2_magpie.xml"
 
 
 def urdf_limits(urdf: Path) -> dict[str, tuple[float, float]]:
@@ -138,8 +143,11 @@ class MarlMujoco:
     NOISE_ODOM = {"lin_acc": 0.05, "ang_vel": 0.02, "grav": 0.005, "jpos": 0.001, "jvel": 0.05, "tau": 2.0}
 
     def __init__(self, actors: dict, estimator: torch.nn.Module | None, physics: str = "robocasa",
-                 assets: Path = C.DEFAULT_ASSETS, rest_pose_b: np.ndarray | None = None):
-        self.m = mujoco.MjModel.from_xml_path(str(assets / "mujoco_assets" / "h1_2_magpie.xml"))
+                 assets: Path = C.DEFAULT_ASSETS, rest_pose_b: np.ndarray | None = None,
+                 model: mujoco.MjModel | None = None, target_limits: dict[str, tuple[float, float]] | None = None):
+        # model: the CL_Assets MJCF compiled with extra bodies that leave the robot untouched (human_control.py's
+        # target markers); default the MJCF as it is
+        self.m = model if model is not None else mujoco.MjModel.from_xml_path(str(mjcf_path(assets)))
         self.d = mujoco.MjData(self.m)
         m = self.m
         self.substeps = int(round(self.POLICY_DT / m.opt.timestep))
@@ -154,6 +162,11 @@ class MarlMujoco:
         lim = urdf_limits(assets / "ros_assets" / "h1_2_magpie.urdf")
         self.lower = np.array([lim[n][0] for n in ALL_NAMES]) + 0.001
         self.upper = np.array([lim[n][1] for n in ALL_NAMES]) - 0.001
+        # target_limits: the run's own target clip, GOLEM's position e-stop range (common.read_target_limits)
+        for i, n in enumerate(ALL_NAMES):
+            if target_limits and n in target_limits:
+                self.lower[i] = max(self.lower[i], target_limits[n][0])
+                self.upper[i] = min(self.upper[i], target_limits[n][1])
         self.act_id = np.array([mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_ACTUATOR, n) for n in ALL_NAMES])
         if (self.act_id < 0).any():
             raise RuntimeError("MJCF lacks a motor for some joint")

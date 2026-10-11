@@ -3,9 +3,11 @@
 On the robot, GOLEM's h12_safety_layer (preset relax_safety_split, the one the real launch uses) clips each position
 target into the URDF range shrunk by 0.001 rad, and e-stops the robot when the measured state leaves the e-stop range,
 polled at 500 Hz: a joint within its position offset of a URDF limit, |dq| above the URDF velocity limit times its
-ratio, or |tau_est| above the URDF torque limit times its ratio. GolemEstopMonitor applies those thresholds,
-tightened by GolemEstopCfg's margins, for the golem_estop termination. Torque is the motor's PD demand at the current
-state. The table is copied from GOLEM (core/joint_limits.py and config/relax_safety_split.yaml at commit 462c479).
+ratio, or |tau_est| above the URDF torque limit times its ratio. The action terms clip every joint target into
+position_envelope, GOLEM's edges (its target clip, or its position e-stop where tighter) tightened by GolemEstopCfg's
+position margins, so a target never asks for a position GOLEM would clip or e-stop at. GolemEstopMonitor checks the measured state against GOLEM's own position
+thresholds and its velocity and torque thresholds times GolemEstopCfg's margins, for the golem_estop term (logged; it
+ends the episode only with cfg.golem_estop_ends_episode). Torque is the motor's PD demand at the current state. The table is copied from GOLEM (core/joint_limits.py and config/relax_safety_split.yaml at commit 462c479).
 """
 
 from __future__ import annotations
@@ -58,17 +60,32 @@ CAUSES = ("velocity", "position", "torque")
 
 @configclass
 class GolemEstopCfg:
-    """Sim thresholds: GOLEM's e-stops tightened for sim-to-real error (encoder noise, GOLEM's 500 Hz polling
-    against the 200 Hz physics, the torque estimate)."""
+    """GOLEM's e-stops tightened for sim-to-real error (encoder noise, GOLEM's 500 Hz polling against the 200 Hz
+    physics, the torque estimate): the position margins place the target clip, the velocity and torque margins the
+    monitor's thresholds."""
 
     velocity_margin: float = 0.9
     """Trip at this fraction of GOLEM's velocity e-stop."""
     torque_margin: float = 0.9
     """Trip at this fraction of GOLEM's torque e-stop."""
     position_margin: float = 0.02
-    """Trip this far (rad) inside GOLEM's position e-stop."""
+    """Clip targets this far (rad) inside GOLEM's edges (position_envelope)."""
     joint_position_margins: dict[str, tuple[float, float]] = {}
     """Per-joint overrides of position_margin: joint-name regex -> (margin at the lower limit, at the upper)."""
+
+
+def position_envelope(cfg: GolemEstopCfg) -> dict[str, tuple[float, float]]:
+    """joint name -> (low, high): GOLEM's edges, the tighter of its target clip and its position e-stop (the wrists'
+    e-stop lies past their URDF limits), tightened by cfg's margins."""
+    out = {}
+    for name, low, high, _, _, _, q_off, _, _ in GOLEM_LIMITS:
+        m_low = m_high = cfg.position_margin
+        for pattern, (p_low, p_high) in cfg.joint_position_margins.items():
+            if re.fullmatch(pattern, name):
+                m_low, m_high = p_low, p_high
+        edge_low, edge_high = low + max(q_off, GOLEM_TARGET_CLIP), high - max(q_off, GOLEM_TARGET_CLIP)
+        out[name] = (edge_low + m_low, edge_high - m_high)
+    return out
 
 
 class GolemEstopMonitor:
@@ -80,23 +97,19 @@ class GolemEstopMonitor:
         self.joint_ids = robot.find_joints(GOLEM_JOINT_NAMES, preserve_order=True)[0]
         table = torch.tensor([row[1:] for row in GOLEM_LIMITS], device=device)
         low, high, vel, tau, _, q_off, vel_ratio, tau_ratio = table.T
-        margin_low = torch.full_like(low, cfg.position_margin)
-        margin_high = torch.full_like(high, cfg.position_margin)
-        for pattern, (m_low, m_high) in cfg.joint_position_margins.items():
-            hits = [i for i, n in enumerate(GOLEM_JOINT_NAMES) if re.fullmatch(pattern, n)]
-            if not hits:
+        for pattern in cfg.joint_position_margins:
+            if not any(re.fullmatch(pattern, n) for n in GOLEM_JOINT_NAMES):
                 raise ValueError(f"joint_position_margins: {pattern!r} matches no GOLEM joint")
-            margin_low[hits], margin_high[hits] = m_low, m_high
-        self.q_low = low + q_off + margin_low
-        self.q_high = high - q_off - margin_high
+        # GOLEM's own position thresholds: the targets are clipped cfg's margins inside them (position_envelope)
+        self.q_low = low + q_off
+        self.q_high = high - q_off
         self.dq_max = vel * vel_ratio * cfg.velocity_margin
         self.tau_max = tau * tau_ratio * cfg.torque_margin
         self.flags = {c: torch.zeros(num_envs, dtype=torch.bool, device=device) for c in CAUSES}
         self.joint_hits = {c: torch.zeros(len(GOLEM_LIMITS), device=device) for c in CAUSES}
         self._skip_torque = torch.ones(num_envs, dtype=torch.bool, device=device)
         print(f"[INFO] GolemEstopMonitor ({GOLEM_PRESET}, velocity x{cfg.velocity_margin}, torque x{cfg.torque_margin},"
-              f" position {cfg.position_margin} rad inside"
-              f"{f', {cfg.joint_position_margins}' if cfg.joint_position_margins else ''}): " + ", ".join(
+              f" position at GOLEM's thresholds): " + ", ".join(
                   f"{n} q [{lo:.3f}, {hi:.3f}] dq {dq:.1f} tau {t:.1f}" for n, lo, hi, dq, t in zip(
                       GOLEM_JOINT_NAMES, self.q_low.tolist(), self.q_high.tolist(), self.dq_max.tolist(), self.tau_max.tolist())))
 

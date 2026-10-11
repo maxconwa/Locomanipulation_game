@@ -2,11 +2,15 @@
 
 At every command event an env gets navigation (a velocity command, each wrist holding its rest pose) or an arm goal
 (zero velocity, a wrist pose per arm fixed in the world; mdp.ArmTargetsCommand). Arm goals start once most episodes
-survive (warm_start_timeout_share). Goals are standing-reachable wrist poses lowered by a depth curriculum; nothing
-rewards a posture, so a crouch has to emerge from the legs' share of the arms' reward. The policies see the arm
-command in the pelvis frame, moved by a learned pelvis-motion estimate as on the robot; rewards score the true target.
+survive (warm_start_timeout_share). Goal heights are uniform between a fixed z_max and a z_min that a depth
+curriculum lowers; nothing rewards a pelvis height, so a crouch has to emerge from the legs' share of the arms' reward. The policies see the arm
+command in the pelvis frame, moved by a learned pelvis-motion estimate as on the robot (trained beside the policies
+on the motion during arm goals); rewards score the true target, with fine kernels that narrow as the error falls
+(ArmTargetsCommand's kernel curriculum).
 
-Joint targets are bounded inside the joint limits (as GOLEM's safety layer clips them) and by PD torque.
+Joint targets are clipped 0.02 rad inside GOLEM's edges (its URDF command clip) and bounded by PD torque; GOLEM's e-stops
+are checked and logged (golem_safety.py). Each agent pays for its measured joints nearing GOLEM's e-stops
+(mdp.golem_limits), which the clip alone can't prevent; the arms also for their speed and effort.
 torso_joint belongs to neither agent: its actuator holds it at default.
 """
 
@@ -19,6 +23,7 @@ from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
@@ -45,7 +50,7 @@ from .base_cfg import (
     TerminationsCfg,
     TerrainSceneCfg,
 )
-from .golem_safety import GOLEM_TARGET_CLIP
+from .golem_safety import GOLEM_TARGET_CLIP, GolemEstopCfg, position_envelope
 from .odometry import PelvisEstimatorCfg
 
 LEFT_ARM_JOINT_NAMES = ARM_JOINT_NAMES[:7]
@@ -73,6 +78,18 @@ ARM_GOAL_HIP_POS_SCALE = 0.2  # the legs' hip yaw/roll deviation term during arm
 TRACKING_STD = 0.25       # velocity tracking kernel width, on the gait-cycle mean velocity
 CLIP_ACTIONS = 10.0       # the env clamps every raw policy action to +-this
 TORQUE_HEADROOM = 0.85    # targets ask for at most this share of a joint's effort limit (the e-stop trips at 0.9)
+KNEE_VALGUS_MARGIN = 0.02  # m: each knee may sit this far inside its hip-ankle line before knee_valgus charges
+# mdp.golem_limits: the measured joints are charged within GOLEM_POSITION_MARGIN (rad) of GOLEM's position e-stops,
+# and for |dq| or the motor torque beyond GOLEM_RATE_MARGIN of its velocity or torque e-stop
+GOLEM_POSITION_MARGIN = 0.03
+GOLEM_RATE_MARGIN = 0.8
+# The tracking-kernel curriculum (ArmTargetsCommand._judge_kernels): the fine wrist-position and the wrist-rotation
+# kernels' stds per stage, narrowed as the arm goals' errors fall. Stage 0 is wider than the paper runs' fixed 0.05 m,
+# so the fine term still has a slope at their ~9 cm closest approach.
+FINE_POS_STDS = (0.10, 0.07, 0.05, 0.035, 0.025, 0.018, 0.012)  # m
+ROT_STDS = (0.5, 0.4, 0.3, 0.22, 0.16, 0.12, 0.08)               # rad
+# knee_valgus's bodies: hip, knee, ankle per leg, left then right
+VALGUS_LINK_NAMES = [f"{side}_{link}_link" for side in ("left", "right") for link in ("hip_roll", "knee", "ankle_pitch")]
 
 
 @configclass
@@ -101,6 +118,8 @@ class MarlCommandsCfg:
         ],
         standing_height=STANDING_PELVIS_HEIGHT,
         resampling_time_range=(4.0, 4.0),
+        fine_pos_stds=FINE_POS_STDS,
+        rot_stds=ROT_STDS,
         debug_vis=True,
     )
 
@@ -227,14 +246,24 @@ _SELF_CONTACT_PARAMS = {
 }
 
 
+def _golem(joint_names: list[str], quantity: str, weight: float, margin: float = 0.0) -> RewTerm:
+    """mdp.golem_limits on joint_names (the agent's own joints)."""
+    return RewTerm(func=mdp.golem_limits, weight=weight, params={
+        "asset_cfg": SceneEntityCfg("robot", joint_names=joint_names, preserve_order=True),
+        "quantity": quantity, "margin": margin})
+
+
 @configclass
 class LegsRewardsCfg(LowerRewardsCfg):
     """ALMI's legs reward (base_cfg.LowerRewardsCfg), changed for the shared body.
 
-    No term holds the pelvis height or the knees: base_height and stand_still are gone. hip_pos (hip yaw and roll at
-    their defaults) and arm_goal_yaw_rate, as in run R, hold the pelvis's yaw against twisting; hip_pos is scaled to
-    ARM_GOAL_HIP_POS_SCALE during arm goals. action_rate and self_collision count the legs only.
-    feet_swing_clearance replaces feet_swing_height, which a dragging foot never pays. Velocity tracking scores the
+    No term holds the pelvis height or the knees' bend: base_height and stand_still are gone. hip_pos (hip yaw and
+    roll at their defaults) and arm_goal_yaw_rate, as in run R, hold the pelvis's yaw against twisting; hip_pos is
+    scaled to ARM_GOAL_HIP_POS_SCALE during arm goals. knee_valgus charges the knees falling inward, which paper05
+    crouched on (hip yaw turned in to its limit, knees 13 cm apart over ankles 35 cm apart; agent_scripts/
+    knee_bow_test.py). action_rate and self_collision count the legs only.
+    feet_swing_clearance replaces feet_swing_height, which a dragging foot never pays. golem_* charge the measured
+    legs near GOLEM's e-stops: the deep squat rested hip yaw and ankle pitch on their stops. Velocity tracking scores the
     gait-cycle mean velocity, so stepping in place to turn doesn't pay for its sway.
     """
 
@@ -260,6 +289,15 @@ class LegsRewardsCfg(LowerRewardsCfg):
             "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
         },
     )
+    knee_valgus = RewTerm(
+        func=mdp.knee_valgus,
+        weight=-10.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=VALGUS_LINK_NAMES, preserve_order=True),
+                "margin": KNEE_VALGUS_MARGIN},
+    )
+    golem_position = _golem(LOWER_JOINT_NAMES, "position", -40.0, GOLEM_POSITION_MARGIN)
+    golem_velocity = _golem(LOWER_JOINT_NAMES, "velocity", -10.0, GOLEM_RATE_MARGIN)
+    golem_torque = _golem(LOWER_JOINT_NAMES, "torque", -10.0, GOLEM_RATE_MARGIN)
 
     def __post_init__(self):
         self.alive.weight = 1.0
@@ -278,6 +316,11 @@ class LegsRewardsCfg(LowerRewardsCfg):
                                "arm_goal_scale": ARM_GOAL_HIP_POS_SCALE}
 
 
+def _arm_tracking_annealed(arm: int, func) -> RewTerm:
+    """A tracking term whose std the arm command's kernel curriculum sets (FINE_POS_STDS, ROT_STDS)."""
+    return RewTerm(func=func, weight=1.0, params={"command_name": ARM_COMMAND, "arm": arm})
+
+
 def _arm_tracking(arm: int, func, std: float) -> RewTerm:
     return RewTerm(func=func, weight=1.0, params={"command_name": ARM_COMMAND, "arm": arm, "std": std})
 
@@ -288,21 +331,26 @@ def _arm_joints(func, weight: float) -> RewTerm:
 
 @configclass
 class ArmsRewardsCfg:
-    # exp kernels: the per-step total stays positive
+    # exp kernels: the per-step total stays positive. The coarse position kernel is fixed (a slope from afar); the fine
+    # position and the rotation kernels narrow with the arm command's kernel curriculum.
     left_ee_pos = _arm_tracking(0, mdp.arm_target_pos_exp, 0.25)
-    left_ee_pos_fine = _arm_tracking(0, mdp.arm_target_pos_exp, 0.05)
-    left_ee_quat = _arm_tracking(0, mdp.arm_target_quat_exp, 0.5)
+    left_ee_pos_fine = _arm_tracking_annealed(0, mdp.arm_target_pos_exp_annealed)
+    left_ee_quat = _arm_tracking_annealed(0, mdp.arm_target_quat_exp_annealed)
     right_ee_pos = _arm_tracking(1, mdp.arm_target_pos_exp, 0.25)
-    right_ee_pos_fine = _arm_tracking(1, mdp.arm_target_pos_exp, 0.05)
-    right_ee_quat = _arm_tracking(1, mdp.arm_target_quat_exp, 0.5)
+    right_ee_pos_fine = _arm_tracking_annealed(1, mdp.arm_target_pos_exp_annealed)
+    right_ee_quat = _arm_tracking_annealed(1, mdp.arm_target_quat_exp_annealed)
     # weights are per second (the manager multiplies by dt), so this is GOAL_BONUS per goal
     goal_reached = RewTerm(func=mdp.arm_goal_reached, weight=GOAL_BONUS / POLICY_DT, params={"command_name": ARM_COMMAND})
     alive = RewTerm(func=mdp.is_alive, weight=0.15)
     arm_goal_yaw_rate = RewTerm(
         func=mdp.yaw_rate_l2_during_arm_goal, weight=-2.0, params={"arm_command_name": ARM_COMMAND}
     )
-    torques = _arm_joints(mdp.joint_torques_l2, -1.0e-5)
-    dof_vel = _arm_joints(mdp.joint_vel_l2, -1.0e-3)
+    # speed and effort as shares of GOLEM's velocity and torque e-stops, squared; then the measured arms near them
+    effort = _golem(ARM_JOINT_NAMES, "torque_l2", -1.0)
+    speed = _golem(ARM_JOINT_NAMES, "velocity_l2", -2.0)
+    golem_position = _golem(ARM_JOINT_NAMES, "position", -20.0, GOLEM_POSITION_MARGIN)
+    golem_velocity = _golem(ARM_JOINT_NAMES, "velocity", -10.0, GOLEM_RATE_MARGIN)
+    golem_torque = _golem(ARM_JOINT_NAMES, "torque", -10.0, GOLEM_RATE_MARGIN)
     dof_acc = _arm_joints(mdp.joint_acc_l2, -2.5e-7)
     action_rate = RewTerm(func=mdp.action_term_rate_l2, weight=-0.01, params={"action_name": ARMS_ACTION})
     dof_pos_limits = _arm_joints(mdp.joint_pos_limits, -5.0)
@@ -359,6 +407,11 @@ class MarlEventCfg(EventCfg):
 
 
 @configclass
+class MarlTerminationsCfg(TerminationsCfg):
+    golem_estop = DoneTerm(func=mdp.golem_estop)
+
+
+@configclass
 class MarlCurriculumCfg:
     arm_target_levels = CurrTerm(func=mdp.arm_target_levels, params={"command_name": ARM_COMMAND})
 
@@ -380,9 +433,17 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     actions: MarlActionsCfg = MarlActionsCfg()
     observations: MarlObservationsCfg = MarlObservationsCfg()
     rewards: MarlRewardsCfg = MarlRewardsCfg()
-    terminations: TerminationsCfg = TerminationsCfg()
+    terminations: MarlTerminationsCfg = MarlTerminationsCfg()
+    # GOLEM's e-stops. Every joint target is clipped 0.02 rad inside GOLEM's edges, its 0.001 rad URDF command clip
+    # (__post_init__ fills the action terms' joint_limits from it); trips are logged under Safety/ and end the
+    # episode only with golem_estop_ends_episode (then with the arm goals, LocoManipMarlEnv.estops_end_episodes).
+    # None: no e-stop checks and no clip past the URDF one.
+    golem_estop: GolemEstopCfg | None = GolemEstopCfg(position_margin=0.02)
+    golem_estop_ends_episode: bool = False
     curriculum: MarlCurriculumCfg = MarlCurriculumCfg()
-    estimator: PelvisEstimatorCfg = PelvisEstimatorCfg(odometry="learned")
+    # the estimate moves the arm command, while training once the drift gate opens; the estimator fits the pelvis
+    # motion during arm goals only
+    estimator: PelvisEstimatorCfg = PelvisEstimatorCfg(odometry="learned", train_on_arm_goals_only=True)
     # while training, episodes are navigation only until this share of episode ends are time-outs rather than falls
     # (LocoManipMarlEnv._update_warm_start); then arm goals start
     warm_start_timeout_share: float = 0.8
@@ -407,6 +468,11 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
             sensor.history_length = 1
         self.viewer.eye = (4.0, 4.0, 2.5)
         self.viewer.lookat = (0.0, 0.0, 1.0)
+        # every joint target inside GOLEM's position e-stop range (written here so params/env.yaml records it)
+        if self.golem_estop is not None:
+            envelope = {name: list(bounds) for name, bounds in position_envelope(self.golem_estop).items()}
+            self.actions.joint_pos.joint_limits = envelope
+            self.actions.arm_pos.joint_limits = envelope
 
 
 """

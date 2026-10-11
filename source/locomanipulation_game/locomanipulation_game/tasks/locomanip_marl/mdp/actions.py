@@ -1,7 +1,7 @@
 """Joint-position actions with bounded targets.
 
 Both terms bound each target to [hard lower - target_margin, hard upper + target_margin] (a negative margin keeps it
-inside GOLEM's clip) and then to where the PD torque it asks for at the measured state, stiffness (target - q) -
+inside GOLEM's clip), narrowed to joint_limits where the cfg gives them (GOLEM's position e-stop range), and then to where the PD torque it asks for at the measured state, stiffness (target - q) -
 damping qd, stays within torque_headroom of the joint's effort limit (torque_bounds): GOLEM's safety layer e-stops
 on torque. The policy observes what was applied (applied_actions, action units), and beyond_bounds (action units)
 is what the position bound cut off, for the legs' action_beyond_clip penalty.
@@ -31,6 +31,18 @@ __all__ = [
 ]
 
 
+def position_bounds(asset, joint_ids, joint_names, margin: float, joint_limits: dict | None):
+    """(lower, upper) of each target, (N, J): the hard limits widened by margin, narrowed to joint_limits[name]."""
+    hard = asset.data.joint_pos_limits[:, joint_ids]
+    lower, upper = hard[..., 0] - margin, hard[..., 1] + margin
+    for i, name in enumerate(joint_names):
+        if joint_limits and name in joint_limits:
+            low, high = joint_limits[name]
+            lower[:, i] = lower[:, i].clamp(min=low)
+            upper[:, i] = upper[:, i].clamp(max=high)
+    return lower, upper
+
+
 def torque_bounds(asset, joint_ids, headroom: float) -> tuple[torch.Tensor, torch.Tensor]:
     """Per joint, the targets whose PD torque at the measured state stays within headroom x the effort limit:
     [q + (-h tau + kd qd) / kp, q + (h tau + kd qd) / kp], with the motor's own damping (the randomized passive
@@ -49,12 +61,14 @@ class BoundedJointPositionAction(JointPositionAction):
 
     def __init__(self, cfg: BoundedJointPositionActionCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
-        hard = self._asset.data.joint_pos_limits[:, self._joint_ids]
-        self._lower = hard[..., 0] - cfg.target_margin
-        self._upper = hard[..., 1] + cfg.target_margin
+        self._lower, self._upper = position_bounds(
+            self._asset, self._joint_ids, self._joint_names, cfg.target_margin, cfg.joint_limits
+        )
         self._applied = self._asset.data.joint_pos[:, self._joint_ids].clone()
         self._beyond = torch.zeros_like(self._raw_actions)
-        print(f"[INFO] {type(self).__name__}: targets within the hard limits +- {cfg.target_margin} rad")
+        print(f"[INFO] {type(self).__name__}: targets within the hard limits +- {cfg.target_margin} rad"
+              f"{' and joint_limits' if cfg.joint_limits else ''}: " + ", ".join(
+                  f"{n} [{lo:.3f}, {hi:.3f}]" for n, lo, hi in zip(self._joint_names, self._lower[0].tolist(), self._upper[0].tolist())))
 
     @property
     def applied_actions(self) -> torch.Tensor:
@@ -86,6 +100,8 @@ class BoundedJointPositionActionCfg(JointPositionActionCfg):
 
     target_margin: float = MISSING
     """rad past each hard joint limit a target may go (negative: inside it)."""
+    joint_limits: dict[str, tuple[float, float]] | None = None
+    """joint name -> (low, high) the target must also stay inside (golem_safety.position_envelope)."""
     torque_headroom: float = MISSING
     """Share of the effort limit the PD torque of a target may ask for at the measured state."""
 
@@ -104,9 +120,7 @@ class IKResidualArmAction(JointPositionAction):
     def __init__(self, cfg: IKResidualArmActionCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
         robot = self._asset
-        hard = robot.data.joint_pos_limits[:, self._joint_ids]
-        self._lower = hard[..., 0] - cfg.target_margin
-        self._upper = hard[..., 1] + cfg.target_margin
+        self._lower, self._upper = position_bounds(robot, self._joint_ids, self._joint_names, cfg.target_margin, cfg.joint_limits)
         self._arm_cols, self._jac_cols, self._jac_body, self._body_ids, self._ik = [], [], [], [], []
         names = list(self._joint_names)
         for body, arm_joints in zip(cfg.body_names, cfg.arm_joint_names):
@@ -127,8 +141,10 @@ class IKResidualArmAction(JointPositionAction):
         self._filter_alpha = 1.0 - math.exp(-2.0 * math.pi * cfg.residual_cutoff_hz * env.step_dt)
         self._residual = torch.zeros_like(self._raw_actions)  # the filtered residual, action units
         print(f"[INFO] {type(self).__name__}: IK on {cfg.body_names}, damping {cfg.ik_damping}, step cap"
-              f" {cfg.max_ik_step} rad, residual scale {cfg.scale}, bounds +- {cfg.target_margin} rad past the limits,"
-              f" residual low-pass {cfg.residual_cutoff_hz} Hz (alpha {self._filter_alpha:.3f})")
+              f" {cfg.max_ik_step} rad, residual scale {cfg.scale}, bounds +- {cfg.target_margin} rad past the limits"
+              f"{' and joint_limits' if cfg.joint_limits else ''}, residual low-pass {cfg.residual_cutoff_hz} Hz"
+              f" (alpha {self._filter_alpha:.3f}): " + ", ".join(
+                  f"{n} [{lo:.3f}, {hi:.3f}]" for n, lo, hi in zip(self._joint_names, self._lower[0].tolist(), self._upper[0].tolist())))
 
     @property
     def applied_actions(self) -> torch.Tensor:
@@ -191,4 +207,6 @@ class IKResidualArmActionCfg(JointPositionActionCfg):
     """rad per joint per policy step."""
     residual_cutoff_hz: float = MISSING
     target_margin: float = MISSING
+    joint_limits: dict[str, tuple[float, float]] | None = None
+    """joint name -> (low, high) the target must also stay inside (golem_safety.position_envelope)."""
     torque_headroom: float = MISSING

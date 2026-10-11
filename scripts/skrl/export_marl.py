@@ -5,7 +5,9 @@ Writes into --out (a policies/<name> directory of the deploy package):
                      policy MLP's mean, and the env's +-clip_actions clamp. Raw observation in, applied raw action out.
   estimator.pt       TorchScript: the pelvis-motion estimator (input norm + MLP) saved with the checkpoint.
   export.yaml        per-checkpoint values the node loads over its template: the navigation rest pose (the run's
-                     arm target table default_poses) and the source files.
+                     arm target table default_poses), target_limits (joint -> [low, high], the run's clip of every
+                     joint target into GOLEM's position e-stop range; null for runs before it; the node must clip
+                     targets into it as the env did) and the source files.
 Needs only torch; no simulator.
 
     python scripts/skrl/export_marl.py --checkpoint logs/skrl/locomanip_marl/<run>/checkpoints/agent_<step>.pt \
@@ -16,11 +18,16 @@ import argparse
 import glob
 import os
 import re
+import sys
 from datetime import datetime
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from mujoco_evals.common import read_target_limits  # noqa: E402  (standard library and yaml only)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", required=True)
@@ -95,8 +102,10 @@ rest = None
 if tables:
     data = torch.load(tables[-1], map_location="cpu", weights_only=False)
     rest = [[round(float(v), 6) for v in pose] for pose in data["default_poses"]]
+limits = read_target_limits(Path(run_dir))
 export = {
     "rest_pose": rest,
+    "target_limits": {name: [round(low, 6), round(high, 6)] for name, (low, high) in limits.items()} if limits else None,
     "source": {"checkpoint": ckpt_path, "estimator": est_path, "target_tables": tables[-1] if tables else None,
                "task": args.task, "exported": datetime.now().isoformat(timespec="seconds")},
 }

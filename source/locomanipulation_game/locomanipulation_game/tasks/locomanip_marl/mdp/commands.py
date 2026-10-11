@@ -187,16 +187,25 @@ class ArmTargetsCommand(CommandTerm):
     at the default joint angles in the pelvis frame. During an arm goal the velocity command is zero
     (ModalVelocityCommand).
 
-    **Goals.** Each arm's pose is drawn uniformly from its table: collision-free wrist poses at random arm joint
-    angles with the robot standing, in the pelvis frame, those less than min_target_x ahead of the pelvis dropped,
-    balanced over balance_cell cubes. The tables are built once per run and saved to <log_dir>/<table_file>. At the
-    event both poses are placed in the standing frame (the pelvis's x, y and yaw, standing_height above the scanned
-    ground), lowered by one z_offset ~ U[0, z_max], and kept fixed in the world for the goal.
+    **Goals.** The tables hold collision-free wrist poses at random arm joint angles with the robot standing, in the
+    pelvis frame, those less than min_target_x ahead of the pelvis dropped, balanced over balance_cell cubes. They
+    are built once per run and saved to <log_dir>/<table_file>. A goal's height h above the ground is drawn
+    uniformly from [z_min, z_max]. Each arm's pose is drawn uniformly from its table rows within arm_height_spread
+    of h, so the wrists sit at h +- arm_height_spread with their table's reach at that height. Below what the
+    standing table reaches, the rows come from its lowest band and both are lowered together by the difference
+    (target_drop): the robot has to crouch. The poses are placed in the standing frame (the pelvis's x, y and yaw,
+    standing_height above the scanned ground) and kept fixed in the world for the goal.
 
-    **Curriculum.** A depth level k_d per env, 0..levels, sets z_max = depth_per_level * k_d. Once the env's last
-    level_window arm goals have ended, k_d rises when their mean closest approach (per goal, the least mean of both
-    wrists' position errors) is within promote_error and falls when it is beyond demote_error; each move restarts
-    the window. A fall during an arm goal drops k_d by one and restarts the window.
+    **Curriculum.** z_max stays put, a height the standing arms reach; z_min falls with a depth level k_d per env,
+    0..levels: z_min = z_min_start - depth_per_level * k_d. Goals keep coming from the whole range, high and low.
+    Only the low goals (height within judge_band of z_min) are judged: once the env's last level_window of them have
+    ended, k_d rises when their mean closest approach (per goal, the least mean of both wrists' position errors) is
+    within promote_error and falls when it is beyond demote_error; each move restarts the window. A fall during any
+    arm goal drops k_d by one and restarts the window.
+
+    **Kernels.** The annealed tracking rewards read fine_pos_std and rot_std, one stage of cfg.fine_pos_stds /
+    cfg.rot_stds for all envs. After every kernel_window_goals ended arm goals the stage narrows when enough of them
+    came within its kernels, and widens when too few did (_judge_kernels), so the kernels follow the error down.
 
     **Reach.** A goal lasts its timer. It is reached once, when both wrists are first held inside the tolerances
     for reach_hold_s (the bonus is paid then); the tracking terms keep paying for staying on target.
@@ -228,7 +237,8 @@ class ArmTargetsCommand(CommandTerm):
         self.anchor_w[..., 3] = 1.0
         self.believed_b[..., 3] = 1.0
         self.shadow_b[..., 3] = 1.0
-        self.target_drop = zeros()  # the goal's z_offset (m)
+        self.target_drop = zeros()  # how far both poses were lowered below the standing table (m)
+        self.goal_height = zeros()  # the goal's height h above the ground (m)
         self.needs_crouch = flags()  # a target below anything the table reaches standing
         self.use_estimate = flags()
         self.estimate_prob = 0.0  # set by the env
@@ -243,8 +253,17 @@ class ArmTargetsCommand(CommandTerm):
         self.level = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.error_outcomes = torch.zeros(self.num_envs, cfg.level_window, device=self.device)
         self.outcome_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        # each arm goal's closest approach (mean of both wrists' position error, m)
+        # each arm goal's closest approach (mean of both wrists' position error, m) and least rotation error (rad)
         self.goal_best_error = torch.full((self.num_envs,), float("inf"), device=self.device)
+        self.goal_best_rot_error = torch.full((self.num_envs,), float("inf"), device=self.device)
+
+        # -- tracking-kernel curriculum: one stage for all envs, judged on windows of ended arm goals
+        if len(cfg.fine_pos_stds) != len(cfg.rot_stds):
+            raise ValueError("fine_pos_stds and rot_stds need one entry per kernel stage")
+        self.kernel_stage = 0
+        self._kernel_hits = torch.zeros((), device=self.device)
+        self._kernel_goals = torch.zeros((), device=self.device)
+        self.kernel_window_share = torch.tensor(float("nan"), device=self.device)  # the last judged window's
 
         # -- metrics. CommandTerm.reset logs their mean over the reset envs, then zeroes them.
         for name in ("command_drift", "estimator_drift", "goals_reached", "goals_missed", "crouch_goals_reached",
@@ -264,6 +283,20 @@ class ArmTargetsCommand(CommandTerm):
         self._tables: list[torch.Tensor] = data["tables"]
         # (num_arms,): the lowest wrist height each arm reaches standing, pelvis frame
         self._standing_min_z = torch.stack([table[:, 2].min() for table in self._tables])
+        # each table sorted by height, for drawing rows within arm_height_spread of a goal height
+        order = [table[:, 2].argsort() for table in self._tables]
+        self._sorted_tables = [table[o] for table, o in zip(self._tables, order)]
+        self._sorted_z = [table[:, 2].contiguous() for table in self._sorted_tables]
+        spread = cfg.arm_height_spread
+        # the lowest band every arm's table fills (its 0.5th percentile up), and the highest goal it can hold
+        floor = max(torch.quantile(z, 0.005).item() for z in self._sorted_z)
+        top = min(torch.quantile(z, 0.995).item() for z in self._sorted_z)
+        self._lowest_source = floor + spread
+        if cfg.z_max - cfg.standing_height + spread > top:
+            raise ValueError(f"z_max {cfg.z_max} m: the standing tables reach {top + cfg.standing_height:.2f} m;"
+                             f" z_max + arm_height_spread must stay below it")
+        if self.z_min(torch.tensor(cfg.levels)).item() >= cfg.z_max or cfg.z_min_start >= cfg.z_max:
+            raise ValueError("z_min must stay below z_max at every depth level")
         # (num_arms, 7): the wrist poses at the default joint angles, the navigation rest pose
         self.rest_pose_b = torch.stack(data["default_poses"])
 
@@ -272,7 +305,8 @@ class ArmTargetsCommand(CommandTerm):
         msg = "ArmTargetsCommand:\n"
         msg += f"\tBodies: {cfg.body_names}\n"
         msg += f"\tArm goal probability once enabled: {cfg.arm_goal_prob}, navigation {cfg.nav_time_range} s\n"
-        msg += f"\tDepth levels: {cfg.levels + 1}, z_max = {cfg.depth_per_level} m per level\n"
+        msg += (f"\tGoal heights: U[z_min, {cfg.z_max}] m, z_min = {cfg.z_min_start} - {cfg.depth_per_level} k_d m,"
+                f" k_d 0..{cfg.levels}\n")
         for arm, table in enumerate(self._tables):
             msg += f"\tTargets ({cfg.body_names[arm]}): {len(table)}\n"
         return msg
@@ -366,9 +400,9 @@ class ArmTargetsCommand(CommandTerm):
     Curriculum.
     """
 
-    def z_max(self, level: torch.Tensor) -> torch.Tensor:
-        """The deepest z_offset at each depth level (m)."""
-        return self.cfg.depth_per_level * level.float()
+    def z_min(self, level: torch.Tensor) -> torch.Tensor:
+        """The lowest goal height above the ground at each depth level (m)."""
+        return self.cfg.z_min_start - self.cfg.depth_per_level * level.float()
 
     def update_levels(self, env_ids: Sequence[int], fell: torch.Tensor):
         """At episode end: a fall during an arm goal drops the depth level by one and restarts the env's window."""
@@ -379,9 +413,11 @@ class ArmTargetsCommand(CommandTerm):
         self.outcome_count = torch.where(down, 0, self.outcome_count)
 
     def _record_outcomes(self, ended: torch.Tensor):
-        """Push this step's ended arm goals' closest approach into each env's window of its last level_window goals;
-        move the level on a full window, and restart the window when it moves."""
+        """Push this step's ended low arm goals' closest approach into each env's window of its last level_window low
+        goals; move the level on a full window, and restart the window when it moves."""
         cfg, window = self.cfg, self.cfg.level_window
+        self._judge_kernels(ended)
+        ended = ended & (self.goal_height <= self.z_min(self.level) + cfg.judge_band)
         slot = (self.outcome_count % window).unsqueeze(1)
         value = torch.where(ended, self.goal_best_error.clamp(max=10.0), self.error_outcomes.gather(1, slot).squeeze(1))
         self.error_outcomes.scatter_(1, slot, value.unsqueeze(1))
@@ -393,14 +429,49 @@ class ArmTargetsCommand(CommandTerm):
         self.level += up.long() - down.long()
         self.outcome_count = torch.where(up | down, 0, self.outcome_count)
 
+    @property
+    def fine_pos_std(self) -> float:
+        """The fine wrist-position kernel's std at the current kernel stage (m)."""
+        return self.cfg.fine_pos_stds[self.kernel_stage]
+
+    @property
+    def rot_std(self) -> float:
+        """The wrist-rotation kernel's std at the current kernel stage (rad)."""
+        return self.cfg.rot_stds[self.kernel_stage]
+
+    def _judge_kernels(self, ended: torch.Tensor):
+        """Count the ended arm goals that came within the current stage's kernels (closest approach under
+        fine_pos_std and least rotation error under rot_std, each the mean of both wrists, not necessarily at the same
+        instant). After every kernel_window_goals of them: narrow the kernels a stage if at least kernel_promote_share
+        did, widen them a stage if fewer than kernel_demote_share did, and start a new window."""
+        cfg = self.cfg
+        if len(cfg.fine_pos_stds) < 2:
+            return
+        hit = ended & (self.goal_best_error < self.fine_pos_std) & (self.goal_best_rot_error < self.rot_std)
+        self._kernel_hits += hit.sum()
+        self._kernel_goals += ended.sum()
+        if self._kernel_goals.item() < cfg.kernel_window_goals:
+            return
+        share = self._kernel_hits / self._kernel_goals
+        self.kernel_window_share = share
+        if share.item() >= cfg.kernel_promote_share and self.kernel_stage < len(cfg.fine_pos_stds) - 1:
+            self.kernel_stage += 1
+        elif share.item() < cfg.kernel_demote_share and self.kernel_stage > 0:
+            self.kernel_stage -= 1
+        self._kernel_hits.zero_()
+        self._kernel_goals.zero_()
+
     def state_dict(self) -> dict[str, torch.Tensor]:
         """Curriculum state, saved with the estimator so a resumed or played run keeps its levels."""
-        return {"level": self.level.clone()}
+        return {"level": self.level.clone(), "kernel_stage": torch.tensor(self.kernel_stage)}
 
     def load_state_dict(self, state: dict[str, torch.Tensor]):
         saved = state["level"].to(self.device)
         pick = slice(None) if len(saved) == self.num_envs else torch.randint(0, len(saved), (self.num_envs,), device=self.device)
         self.level[:] = saved[pick].clamp(0, self.cfg.levels)
+        # runs saved before the kernel curriculum have no stage: they start at the first
+        stage = int(state.get("kernel_stage", 0))
+        self.kernel_stage = min(max(stage, 0), len(self.cfg.fine_pos_stds) - 1)
 
     """
     Table construction.
@@ -555,6 +626,8 @@ class ArmTargetsCommand(CommandTerm):
         self.metrics["crouch_goals_missed"] += (timed_out & self.needs_crouch).float()
         best = torch.minimum(self.goal_best_error, pos_error.mean(dim=1))
         self.goal_best_error = torch.where(self.arm_mode, best, self.goal_best_error)
+        best_rot = torch.minimum(self.goal_best_rot_error, rot_error.mean(dim=1))
+        self.goal_best_rot_error = torch.where(self.arm_mode, best_rot, self.goal_best_rot_error)
         self._best_err_sum += torch.where(ended, self.goal_best_error.clamp(max=10.0), 0.0)
         self._best_err_n += ended.float()
         # before CommandTerm.compute resamples the ended goals, so the next goal is drawn at the new level
@@ -568,9 +641,11 @@ class ArmTargetsCommand(CommandTerm):
         arm_goal = (torch.rand(n, device=self.device) < self.cfg.arm_goal_prob) & self.goals_enabled
         self.arm_mode[env_ids] = arm_goal
         self.goal_best_error[env_ids] = float("inf")
+        self.goal_best_rot_error[env_ids] = float("inf")
         self.goal_reached[env_ids] = False
         self.hold_time[env_ids] = 0.0
         self.target_drop[env_ids] = 0.0
+        self.goal_height[env_ids] = 0.0
         self.needs_crouch[env_ids] = False
         self.use_estimate[env_ids] = torch.rand(n, device=self.device) < self.estimate_prob
 
@@ -582,17 +657,27 @@ class ArmTargetsCommand(CommandTerm):
             self.time_left[nav_ids] = torch.empty(len(nav_ids), device=self.device).uniform_(*self.cfg.nav_time_range)
             velocity._resample(nav_ids)
 
-        # -- arm goal: table poses, lowered by one z_offset, anchored in the world now
+        # -- arm goal: a height in [z_min, z_max], table poses near it (lowered below the table), anchored in the world
         arm_ids = env_ids[arm_goal]
         m = len(arm_ids)
         if m == 0:
             return
-        targets_s = torch.stack(
-            [table[(torch.rand(m, device=self.device) * len(table)).long()] for table in self._tables], dim=1
-        )
-        z_offset = torch.rand(m, device=self.device) * self.z_max(self.level[arm_ids])
-        targets_s[..., 2] -= z_offset.unsqueeze(1)
-        self.target_drop[arm_ids] = z_offset
+        cfg = self.cfg
+        z_min = self.z_min(self.level[arm_ids])
+        height = z_min + torch.rand(m, device=self.device) * (cfg.z_max - z_min)
+        height_s = height - cfg.standing_height  # in the standing frame
+        source = height_s.clamp(min=self._lowest_source)
+        rows = []
+        for table, z in zip(self._sorted_tables, self._sorted_z):
+            lo = torch.searchsorted(z, source - cfg.arm_height_spread)
+            hi = torch.searchsorted(z, source + cfg.arm_height_spread, right=True)
+            pick = lo + (torch.rand(m, device=self.device) * (hi - lo)).long().clamp(max=(hi - lo - 1).clamp(min=0))
+            rows.append(table[pick.clamp(max=len(table) - 1)])
+        targets_s = torch.stack(rows, dim=1)
+        drop = source - height_s
+        targets_s[..., 2] -= drop.unsqueeze(1)
+        self.target_drop[arm_ids] = drop
+        self.goal_height[arm_ids] = height
         self.needs_crouch[arm_ids] = (targets_s[..., 2] < self._standing_min_z).any(dim=1)
 
         origin, quat = self.standing_frame_w()
@@ -669,13 +754,32 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     reach_rot_tol: float = 0.35
     reach_hold_s: float = 1.0
 
-    # -- depth curriculum
-    levels: int = 10
+    # -- height curriculum: goal heights above the ground ~ U[z_min, z_max]
+    z_max: float = 1.7
+    """m: the highest goal height, fixed; the standing tables still reach it with arm_height_spread to spare."""
+    z_min_start: float = 1.0
+    """m: the lowest goal height at depth level 0 (about the lowest the standing arms reach)."""
+    levels: int = 8
     depth_per_level: float = 0.1
-    """m: z_max = depth_per_level * k_d."""
+    """m: z_min = z_min_start - depth_per_level * k_d."""
+    arm_height_spread: float = 0.15
+    """m: each wrist sits within this of the goal height."""
+    judge_band: float = 0.3
+    """m: goals no higher than z_min + this are the low goals the depth level is judged on."""
     level_window: int = 5
     promote_error: float = 0.12
     demote_error: float = 0.18
+
+    # -- tracking-kernel curriculum (ArmTargetsCommand._judge_kernels): the annealed reward terms' stds per stage,
+    # narrowest last. One stage: fixed kernels.
+    fine_pos_stds: tuple[float, ...] = (0.05,)
+    """m: the fine wrist-position kernel."""
+    rot_stds: tuple[float, ...] = (0.5,)
+    """rad: the wrist-rotation kernel."""
+    kernel_window_goals: int = 20000
+    """Ended arm goals (all envs) per judged window."""
+    kernel_promote_share: float = 0.5
+    kernel_demote_share: float = 0.25
 
     # -- tables
     table_file: str = "arm_target_tables_v3.pt"
