@@ -96,6 +96,30 @@ observation or an action, so those checkpoints still load (a saved depth level a
   - The depth level is judged only on the low goals, those within 0.3 m of z_min. TensorBoard logs `z_min` in place
     of `z_max`.
   - The paper runs lowered table poses by a uniform offset instead, with 10 levels.
+- **Odometry: height and tilt are absolute, and the estimator is fit against drift** (`estimator.*`).
+  - `vertical_from_feet`: each step's vertical pelvis motion is the change in the pelvis's height above the lowest
+    ankle along gravity, from forward kinematics, in place of the estimator's.
+  - `tilt_from_gravity`: the estimated rotation is turned so that its roll and pitch follow gravity.
+  - Only the horizontal motion and yaw are integrated from the estimate. On `golemlim120k` over a 16 s hold, the
+    targets' vertical error stays under 0.1 cm in MuJoCo, against a 29 cm rise without these. In Isaac it stays at
+    1.7 cm (p90) against 6.9 cm and growing. Both apply to any checkpoint: the Isaac env and `mujoco_sim.py` turn them
+    on by default.
+  - The fit adds, at weight 10 (`window_loss_weight`), the squared mean error over every 1 s window
+    (`window_steps` 50) in the world frame. A steady bias, which is what drifts the arm goals, counts in full there,
+    while the noise averages out. The buffer keeps the last 100 steps in order and fits every 50.
+  - The estimator sees 25 frames (0.5 s, `ODOMETRY_HISTORY`), up from 4. Its file records its window, and an older
+    file's 4 frames are restored when it is loaded. `export_marl.py` writes `odometry` (the window, and the feet and
+    gravity rules) to `export.yaml`; GOLEM's deploy node must apply them.
+  - TensorBoard: `Estimator/window_lin_vel_error`, `window_vertical_vel_error` and `window_ang_vel_error` (drift rates);
+    `feet_vertical_error`, `learned_vertical_error` and `learned_vertical_bias`.
+- **Knees charged from 0.08 rad** of their e-stops (`GOLEM_KNEE_POSITION_MARGIN`; every other joint 0.03), through
+  `mdp.golem_limits`' `joint_margins`. `golemlim_zrange_200k` pressed the right knee past 2.19 rad in 1.2% of its
+  arm-goal substeps, the most of any joint.
+- **The legs learn more gently** (`skrl_mappo_cfg.yaml`): their KL-adaptive learning rate aims at a KL of 0.01 (the
+  arms keep 0.02), between 1e-4 and 1e-3, and an update stops early once its KL passes 0.03. At about 187k steps
+  `golemlim_zrange_200k`'s legs took one update that spiked their value loss and raised falls from 1% to 6-10%.
+- **Falls cost 20, not 5** (`termination_penalty`). Both agents get it once, on the step the robot falls, after
+  their rewards are floored at 0. Every run up to `golemlim_zrange_200k` used -5.
 
 ## Knee-bow test (`agent_scripts/`)
 

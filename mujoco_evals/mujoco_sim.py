@@ -4,7 +4,9 @@ Mirrors, step for step, what the Isaac env computes (locomanip_marl_env.py, mdp/
 odometry.py at marl-direct 72171c7):
 
     policy step (50 Hz)   actions -> joint targets; 10 MuJoCo steps of 2 ms with PD torques recomputed each step;
-                          then the odometry history and the learned pelvis estimator move the arm command; then the
+                          then the odometry history and the learned pelvis estimator move the arm command (its
+                          vertical motion from the feet and its tilt from gravity, as estimator.vertical_from_feet
+                          and tilt_from_gravity do); then the
                           actors' observations (with the training noise) for the next step
     legs action           target = default + 0.25 a, inside [hard lower + 1 mm, hard upper - 1 mm] (and the run's
                           target_limits, GOLEM's position e-stop range, where it has them) and then inside the
@@ -144,7 +146,8 @@ class MarlMujoco:
 
     def __init__(self, actors: dict, estimator: torch.nn.Module | None, physics: str = "robocasa",
                  assets: Path = C.DEFAULT_ASSETS, rest_pose_b: np.ndarray | None = None,
-                 model: mujoco.MjModel | None = None, target_limits: dict[str, tuple[float, float]] | None = None):
+                 model: mujoco.MjModel | None = None, target_limits: dict[str, tuple[float, float]] | None = None,
+                 vertical_from_feet: bool = True, tilt_from_gravity: bool = True):
         # model: the CL_Assets MJCF compiled with extra bodies that leave the robot untouched (human_control.py's
         # target markers); default the MJCF as it is
         self.m = model if model is not None else mujoco.MjModel.from_xml_path(str(mjcf_path(assets)))
@@ -186,6 +189,9 @@ class MarlMujoco:
         self.foot_geoms = [set(np.nonzero(m.geom_bodyid == f)[0].tolist()) for f in self.feet]
         self.arm_cols = [self.vadr[13:20], self.vadr[20:27]]
         self.actors, self.estimator = actors, estimator
+        # the estimator's input window, from its input size (Estimator.history_frames)
+        self.history_frames = estimator.history_frames if estimator is not None else 4
+        self.vertical_from_feet, self.tilt_from_gravity = vertical_from_feet, tilt_from_gravity
         self.rest_b = np.asarray(rest_pose_b, float) if rest_pose_b is not None else None
         self.rng = np.random.default_rng(0)
         self.total_mass = float(m.body_subtreemass[self.pelvis])
@@ -216,6 +222,7 @@ class MarlMujoco:
         self.use_estimate = True
         self.vel_cmd = np.zeros(3)
         self._prev_root = (d.qpos[0:3].copy(), d.qpos[3:7].copy())
+        self._prev_heights = self._feet_heights()
         self._hist = None
         self._update_odometry(first=True)
 
@@ -296,10 +303,19 @@ class MarlMujoco:
         return [u(acc, n["lin_acc"]), u(gyro, n["ang_vel"]), u(grav, n["grav"]), u(q - self.default, n["jpos"]),
                 u(qd, n["jvel"]), u(tau, n["tau"])]
 
+    def _feet_heights(self) -> np.ndarray:
+        """The pelvis's height above each ankle-roll origin along gravity, from the pelvis frame: -up . p (env
+        _from_feet_and_gravity)."""
+        # the pelvis's pose from the same forward kinematics as the feet (xpos lags qpos by one substep)
+        p, q = self.d.xpos[self.pelvis], self.d.xquat[self.pelvis]
+        up = qrot(qconj(q), np.array([0.0, 0.0, 1.0]))
+        return np.array([-(qrot(qconj(q), self.d.xpos[f] - p) @ up) for f in self.feet])
+
     def _update_odometry(self, first=False):
         frame = self._odom_frame()
+        heights = self._feet_heights()
         if first or self._hist is None:
-            self._hist = [[f.copy() for _ in range(4)] for f in frame]
+            self._hist = [[f.copy() for _ in range(self.history_frames)] for f in frame]
         else:
             for h, f in zip(self._hist, frame):
                 h.pop(0)
@@ -314,10 +330,22 @@ class MarlMujoco:
                 with torch.no_grad():
                     v = self.estimator(torch.as_tensor(x, dtype=torch.float32)[None])[0].numpy().astype(float)
                 dp, dq = v[:3] * self.POLICY_DT, quat_from_rotvec(v[3:] * self.POLICY_DT)
+                up_prev = qrot(qconj(pq), np.array([0.0, 0.0, 1.0]))
+                if self.tilt_from_gravity:
+                    # the smallest turn that carries the vertical in the new frame onto the previous one's
+                    # (odometry.align_tilt): roll and pitch from gravity, yaw from the estimate
+                    carried = qrot(dq, qrot(qconj(q), np.array([0.0, 0.0, 1.0])))
+                    axis = np.cross(carried, up_prev)
+                    dq = qmul(quat_from_rotvec(axis / max(np.linalg.norm(axis), 1e-9)
+                                               * math.atan2(np.linalg.norm(axis), carried @ up_prev)), dq)
+                if self.vertical_from_feet:
+                    # the lowest ankle is on the ground: the pelvis rose by the change in its height above it
+                    dp = dp + (heights.max() - self._prev_heights.max() - dp @ up_prev) * up_prev
             else:
                 dp, dq = true_dp, true_dq
             self.believed = np.stack([relative(dp, dq, b) for b in self.believed])
         self._prev_root = (p, q)
+        self._prev_heights = heights
 
     # -- observations
     def observations(self) -> dict[str, np.ndarray]:
@@ -435,12 +463,18 @@ def load_estimator(path: str | None) -> torch.nn.Module | None:
     state = torch.load(path, map_location="cpu", weights_only=False)["model"]
     from .policy import _mlp
 
+    # inputs: history_frames odometry frames of 75 values (IMU 9, joints 27 + 27, leg torques 12), then 26 actions
+    frames, rest = divmod(state["norm.mean"].numel() - 26, 75)
+    if rest:
+        raise ValueError(f"{path}: {state['norm.mean'].numel()} estimator inputs is not 26 + 75 per frame")
+
     class Estimator(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.register_buffer("mean", state["norm.mean"].float())
             self.register_buffer("var", state["norm.var"].float())
             self.net = _mlp(state, "net")
+            self.history_frames = frames
 
         def forward(self, x):
             return self.net((x - self.mean) / torch.sqrt(self.var + 1e-8))

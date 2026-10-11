@@ -6,6 +6,7 @@ terms here are restricted to one agent.
 
 from __future__ import annotations
 
+import re
 import torch
 from typing import TYPE_CHECKING
 
@@ -216,7 +217,8 @@ class golem_limits(ManagerTermBase):
     robot's weight still e-stops the robot.
 
     quantity:
-    - "position": how far each joint is inside `margin` (rad) of its position thresholds (rad).
+    - "position": how far each joint is inside `margin` (rad) of its position thresholds (rad); `joint_margins`
+      (joint-name regex -> rad) overrides the margin for the joints it matches.
     - "velocity", "torque": how far |dq| or the motor's PD torque is beyond `margin` x the threshold, as a share of
       the threshold.
     - "velocity_l2", "torque_l2": (dq / threshold)^2 or (tau / threshold)^2; margin unused.
@@ -241,12 +243,19 @@ class golem_limits(ManagerTermBase):
         low, high, vel, tau, _, q_off, vel_ratio, tau_ratio = table.T
         self._q_low, self._q_high = low + q_off, high - q_off
         self._dq_max, self._tau_max = vel * vel_ratio, tau * tau_ratio
+        overrides = cfg.params.get("joint_margins") or {}
+        margins = []
+        for name in names:
+            matched = [m for pattern, m in overrides.items() if re.fullmatch(pattern, name)]
+            margins.append(matched[0] if matched else cfg.params.get("margin", 0.0))
+        self._q_margin = torch.tensor(margins, device=env.device)
 
-    def __call__(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, quantity: str, margin: float = 0.0):
+    def __call__(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, quantity: str, margin: float = 0.0,
+                 joint_margins: dict[str, float] | None = None):
         data, ids = self._asset.data, self._ids
         if quantity == "position":
-            q = data.joint_pos[:, ids]
-            inside = (self._q_low + margin - q).clamp(min=0.0) + (q - (self._q_high - margin)).clamp(min=0.0)
+            q, m = data.joint_pos[:, ids], self._q_margin
+            inside = (self._q_low + m - q).clamp(min=0.0) + (q - (self._q_high - m)).clamp(min=0.0)
             return inside.sum(dim=1)
         if quantity.startswith("velocity"):
             ratio = data.joint_vel[:, ids].abs() / self._dq_max

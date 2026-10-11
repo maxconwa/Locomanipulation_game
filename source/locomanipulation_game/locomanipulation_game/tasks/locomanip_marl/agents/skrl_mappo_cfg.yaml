@@ -52,10 +52,17 @@ agent:
   gae_lambda: 0.95
   learning_rate: 1.0e-03
   learning_rate_scheduler: KLAdaptiveLR
+  # The legs adapt to half the arms' KL and may go lower: golemlim_zrange_200k's legs took one update at ~187k steps
+  # that spiked their value loss and raised falls from 1% to 6-10%.
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.02
-    min_lr: 2.0e-04
-    max_lr: 1.0e-02
+    legs:
+      kl_threshold: 0.01
+      min_lr: 1.0e-04
+      max_lr: 1.0e-03
+    arms:
+      kl_threshold: 0.02
+      min_lr: 2.0e-04
+      max_lr: 1.0e-02
   observation_preprocessor: RunningStandardScaler
   observation_preprocessor_kwargs: null
   state_preprocessor: RunningStandardScaler
@@ -71,7 +78,10 @@ agent:
     legs: 0.01
     arms: 0.0
   value_loss_scale: 1.0
-  kl_threshold: 0.0
+  # early stop: the legs' update ends, mid-epoch, once its KL passes this
+  kl_threshold:
+    legs: 0.03
+    arms: 0.0
   # Not the arms: bootstrapping time-outs through their value scaler fed back into it.
   time_limit_bootstrap:
     legs: True

@@ -7,7 +7,9 @@ Writes into --out (a policies/<name> directory of the deploy package):
   export.yaml        per-checkpoint values the node loads over its template: the navigation rest pose (the run's
                      arm target table default_poses), target_limits (joint -> [low, high], the run's clip of every
                      joint target into GOLEM's position e-stop range; null for runs before it; the node must clip
-                     targets into it as the env did) and the source files.
+                     targets into it as the env did), odometry (the estimator's input window in frames, and
+                     vertical_from_feet: the node replaces the estimate's vertical motion with the lowest foot's, as
+                     the env and mujoco_sim.py do) and the source files.
 Needs only torch; no simulator.
 
     python scripts/skrl/export_marl.py --checkpoint logs/skrl/locomanip_marl/<run>/checkpoints/agent_<step>.pt \
@@ -95,7 +97,8 @@ if not est_path or not os.path.isfile(est_path):
 est = torch.load(est_path, map_location="cpu", weights_only=False)["model"]
 estimator = Estimator(est["norm.mean"], est["norm.var"], mlp(est, "net")).eval()
 torch.jit.script(estimator).save(os.path.join(args.out, "estimator.pt"))
-print(f"estimator: {est['norm.mean'].shape[0]} inputs ({est_path})")
+history_frames, rest = divmod(est["norm.mean"].shape[0] - 26, 75)  # 75 values per frame, then 26 actions
+print(f"estimator: {est['norm.mean'].shape[0]} inputs, {history_frames} frames ({est_path})")
 
 tables = sorted(glob.glob(os.path.join(run_dir, "arm_target_tables*.pt")))
 rest = None
@@ -106,6 +109,7 @@ limits = read_target_limits(Path(run_dir))
 export = {
     "rest_pose": rest,
     "target_limits": {name: [round(low, 6), round(high, 6)] for name, (low, high) in limits.items()} if limits else None,
+    "odometry": {"history_frames": history_frames, "vertical_from_feet": True},
     "source": {"checkpoint": ckpt_path, "estimator": est_path, "target_tables": tables[-1] if tables else None,
                "task": args.task, "exported": datetime.now().isoformat(timespec="seconds")},
 }

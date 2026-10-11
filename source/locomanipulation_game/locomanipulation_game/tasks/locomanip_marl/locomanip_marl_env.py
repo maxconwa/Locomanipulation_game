@@ -9,8 +9,9 @@ them onto the per-agent dicts:
     dones:        one TerminationManager, shared (one body, one episode)
 
 After every step it moves the arm command by the pelvis motion the learned estimator (odometry.py) reports, or with
-estimator.odometry "legs" by leg odometry (_leg_odometry), and fits the estimator to the true motion (with
-estimator.train_on_arm_goals_only, the motion during arm goals only). While training, episodes are navigation only
+estimator.odometry "legs" by leg odometry (_leg_odometry), with estimator.vertical_from_feet / tilt_from_gravity its
+vertical motion and tilt from the feet and gravity (_from_feet_and_gravity), and fits the estimator to the true motion
+(with estimator.train_on_arm_goals_only, the motion during arm goals only). While training, episodes are navigation only
 until cfg.warm_start_timeout_share of them end in a time-out rather than a fall (_update_warm_start); then arm goals
 start. GolemEstopMonitor (golem_safety.py) checks GOLEM's e-stops at every physics substep and logs them; with
 cfg.golem_estop_ends_episode they end the episode whenever arm goals are on (always outside training).
@@ -28,6 +29,7 @@ from isaaclab.managers import (
     CommandManager,
     CurriculumManager,
     ObservationManager,
+    ObservationTermCfg,
     RewardManager,
     TerminationManager,
 )
@@ -35,7 +37,7 @@ from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_inv, quat_m
 
 from .golem_safety import GolemEstopMonitor
 from .locomanip_marl_env_cfg import ARM_COMMAND, LocoManipMarlEnvCfg
-from .odometry import EstimatorTrainer, motion_to_transform, pelvis_motion
+from .odometry import EstimatorTrainer, align_tilt, motion_to_transform, pelvis_motion, saved_history_frames
 
 
 WARM_START_DECAY = 0.999  # per policy step: the time-out share weighs episode ends of the last ~20 s of sim time
@@ -54,6 +56,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
         print("[INFO] Command Manager: ", self.command_manager)
         self.action_manager = ActionManager(self.cfg.actions, self)
         print("[INFO] Action Manager: ", self.action_manager)
+        history_frames = self._odometry_history()
         self.observation_manager = ObservationManager(self.cfg.observations, self)
         print("[INFO] Observation Manager:", self.observation_manager)
         self.termination_manager = TerminationManager(self.cfg.terminations, self)
@@ -97,7 +100,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._arm_command = self.command_manager.get_term(ARM_COMMAND)
         self._arm_command.goals_enabled = not self.cfg.estimator.train
         self.estimator = EstimatorTrainer(
-            self.cfg.estimator, group_dims["odometry"][0] + self.action_manager.total_action_dim, self.num_envs, self.device
+            self.cfg.estimator, group_dims["odometry"][0] + self.action_manager.total_action_dim, self.num_envs,
+            self.device, history_frames,
         )
         print(f"[INFO] Pelvis estimator: {self.estimator.model}")
         self._have_prev = False
@@ -109,12 +113,15 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._goal_drift_ema = torch.tensor(1.0, device=self.device)
         self._estimator_log: dict[str, torch.Tensor] = {}
         self._legs = self.cfg.estimator.odometry == "legs"
-        if self._legs:
+        self._vertical = self.cfg.estimator.vertical_from_feet
+        self._tilt = self.cfg.estimator.tilt_from_gravity
+        if self._legs or self._vertical:
             feet = self.cfg.estimator.foot_body_names
-            self._contact_sensor = self.scene.sensors[self.cfg.estimator.contact_sensor_name]
             self._foot_ids = self._robot.find_bodies(feet, preserve_order=True)[0]
-            self._foot_sensor_ids = self._contact_sensor.find_bodies(feet, preserve_order=True)[0]
             self._prev_feet_in_pelvis = self._feet_in_pelvis()
+        if self._legs:
+            self._contact_sensor = self.scene.sensors[self.cfg.estimator.contact_sensor_name]
+            self._foot_sensor_ids = self._contact_sensor.find_bodies(feet, preserve_order=True)[0]
         if self.cfg.estimator.checkpoint_path:
             print(f"[INFO] Pelvis estimator file: {self.cfg.estimator.checkpoint_path}")
             self._load_env_state(self.estimator.load(self.cfg.estimator.checkpoint_path))
@@ -215,7 +222,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
         root_pos = self._robot.data.root_pos_w.clone()
         root_quat = self._robot.data.root_quat_w.clone()
         cfg = self.cfg.estimator
-        feet_in_pelvis = self._feet_in_pelvis() if self._legs else None
+        feet_in_pelvis = self._feet_in_pelvis() if self._legs or self._vertical else None
 
         if self._have_prev:
             valid = ~self._fresh
@@ -223,6 +230,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
             true_motion = pelvis_motion(self._prev_root_pos, self._prev_root_quat, root_pos, root_quat, self.step_dt)
             with torch.no_grad():  # the commands don't carry the estimator's graph from step to step
                 estimated = motion_to_transform(self.estimator.model(inputs), self.step_dt)
+            if self._vertical or self._tilt:
+                estimated = self._from_feet_and_gravity(feet_in_pelvis, root_quat, estimated, true_motion, valid)
             if self._legs:
                 estimated = self._leg_odometry(feet_in_pelvis, root_quat, estimated, true_motion, valid)
             self._arm_command.apply_pelvis_motion(
@@ -232,7 +241,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
                 # the command moves by odometry only during arm goals: with train_on_arm_goals_only the estimator
                 # fits that motion (standing, crouching, reaching), not the walking it is never used for
                 train = valid & self._arm_command.arm_mode if cfg.train_on_arm_goals_only else valid
-                self.estimator.add(inputs, true_motion, train)
+                self.estimator.add(inputs, true_motion, self._prev_root_quat, train)
                 if self.common_step_counter % cfg.train_every == 0:
                     stats = self.estimator.train()
                     self._estimator_log.update({f"Estimator/{k}": v for k, v in stats.items()})
@@ -241,7 +250,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
 
         self._have_prev = True
         self._prev_root_pos, self._prev_root_quat = root_pos, root_quat
-        if self._legs:
+        if self._legs or self._vertical:
             self._prev_feet_in_pelvis = feet_in_pelvis
         self._fresh[:] = False
 
@@ -290,6 +299,60 @@ class LocoManipMarlEnv(DirectMARLEnv):
         n, f = feet.shape[:2]
         quat = self._robot.data.root_quat_w.unsqueeze(1).expand(n, f, 4).reshape(-1, 4)
         return quat_apply_inverse(quat, feet.reshape(-1, 3)).view(n, f, 3)
+
+    def _from_feet_and_gravity(
+        self,
+        feet_in_pelvis: torch.Tensor | None,
+        root_quat: torch.Tensor,
+        estimated: tuple[torch.Tensor, torch.Tensor],
+        true_motion: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The estimate (delta_pos, delta_quat), previous pelvis frame, with its rotation's roll and pitch made to
+        match gravity's (tilt_from_gravity, odometry.align_tilt) and its vertical motion replaced by the feet's
+        (vertical_from_feet).
+
+        The pelvis's height above an ankle along gravity is -up . p, with p the ankle in the pelvis frame (forward
+        kinematics) and up the world's vertical in the pelvis frame (on the robot, the IMU's gravity). The lowest ankle
+        is taken to be on the ground, so the pelvis's height above the ground is the largest of those heights, and the
+        step's rise is its change: no contact sensing, and the rises telescope, so over any stretch they add up to the
+        change in height above the ground, whichever foot carries the robot. (Tracking one planted foot instead drifts
+        down: a pushing-off ankle rises while it is still the lowest, and stepping never gives that back.) Uneven
+        ground costs at most the step between the footholds, once.
+        """
+        z = torch.tensor([0.0, 0.0, 1.0], device=self.device).expand(self.num_envs, 3)
+        up, up_prev = quat_apply_inverse(root_quat, z), quat_apply_inverse(self._prev_root_quat, z)
+        delta_quat = align_tilt(estimated[1], up_prev, up) if self._tilt else estimated[1]
+        if not self._vertical:
+            return estimated[0], delta_quat
+        height = -(feet_in_pelvis * up.unsqueeze(1)).sum(-1)  # (N, F), pelvis above each ankle
+        height_prev = -(self._prev_feet_in_pelvis * up_prev.unsqueeze(1)).sum(-1)
+        rise = height.max(dim=1).values - height_prev.max(dim=1).values
+        delta_pos = estimated[0]
+        learned_rise = (delta_pos * up_prev).sum(-1)
+        delta_pos = delta_pos + (rise - learned_rise).unsqueeze(-1) * up_prev
+
+        # vertical speed errors during arm goals (m/s): the feet's and the estimator's it replaces
+        true_rise = (true_motion[:, :3] * up_prev).sum(-1) * self.step_dt
+        arm = (valid & self._arm_command.arm_mode).float()
+        n = arm.sum().clamp(min=1.0) * self.step_dt
+        self._estimator_log["Estimator/feet_vertical_error"] = ((rise - true_rise).abs() * arm).sum() / n
+        self._estimator_log["Estimator/learned_vertical_error"] = ((learned_rise - true_rise).abs() * arm).sum() / n
+        self._estimator_log["Estimator/learned_vertical_bias"] = ((learned_rise - true_rise) * arm).sum() / n
+        return delta_pos, delta_quat
+
+    def _odometry_history(self) -> int:
+        """The odometry group's window. An estimator file to start from sets it to the window it was trained on
+        (4 frames before that was saved), so older runs still load."""
+        terms = [t for t in vars(self.cfg.observations.odometry).values() if isinstance(t, ObservationTermCfg)]
+        path = self.cfg.estimator.checkpoint_path
+        if path:
+            frames = saved_history_frames(path)
+            if frames != terms[0].history_length:
+                print(f"[INFO] Odometry window: {frames} frames, as {path} was trained")
+            for term in terms:
+                term.history_length = frames
+        return terms[0].history_length
 
     def _leg_odometry(
         self,

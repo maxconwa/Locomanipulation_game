@@ -58,7 +58,7 @@ RIGHT_ARM_JOINT_NAMES = ARM_JOINT_NAMES[7:]
 LEFT_EE_BODY = "left_wrist_yaw_link"
 RIGHT_EE_BODY = "right_wrist_yaw_link"
 ARM_COMMAND = "arm_targets"
-ODOMETRY_HISTORY = 4  # frames in the estimator's window
+ODOMETRY_HISTORY = 25  # frames in the estimator's window (0.5 s); every run up to golemlim_zrange_200k used 4
 
 # Each agent is charged for the self-contact pairs that include one of its links.
 LEGS_OWN_LINKS = [PELVIS_LINK_NAME] + LOWER_LINK_NAMES
@@ -82,6 +82,9 @@ KNEE_VALGUS_MARGIN = 0.02  # m: each knee may sit this far inside its hip-ankle 
 # mdp.golem_limits: the measured joints are charged within GOLEM_POSITION_MARGIN (rad) of GOLEM's position e-stops,
 # and for |dq| or the motor torque beyond GOLEM_RATE_MARGIN of its velocity or torque e-stop
 GOLEM_POSITION_MARGIN = 0.03
+# the knees get a wider one: golemlim_zrange_200k's deep squats still pressed the right knee past its 2.19 rad e-stop
+# in 1.2% of arm-goal substeps, the most of any joint
+GOLEM_KNEE_POSITION_MARGIN = 0.08
 GOLEM_RATE_MARGIN = 0.8
 # The tracking-kernel curriculum (ArmTargetsCommand._judge_kernels): the fine wrist-position and the wrist-rotation
 # kernels' stds per stage, narrowed as the arm goals' errors fall. Stage 0 is wider than the paper runs' fixed 0.05 m,
@@ -246,11 +249,12 @@ _SELF_CONTACT_PARAMS = {
 }
 
 
-def _golem(joint_names: list[str], quantity: str, weight: float, margin: float = 0.0) -> RewTerm:
+def _golem(joint_names: list[str], quantity: str, weight: float, margin: float = 0.0,
+           joint_margins: dict[str, float] | None = None) -> RewTerm:
     """mdp.golem_limits on joint_names (the agent's own joints)."""
     return RewTerm(func=mdp.golem_limits, weight=weight, params={
         "asset_cfg": SceneEntityCfg("robot", joint_names=joint_names, preserve_order=True),
-        "quantity": quantity, "margin": margin})
+        "quantity": quantity, "margin": margin, "joint_margins": joint_margins})
 
 
 @configclass
@@ -295,7 +299,8 @@ class LegsRewardsCfg(LowerRewardsCfg):
         params={"asset_cfg": SceneEntityCfg("robot", body_names=VALGUS_LINK_NAMES, preserve_order=True),
                 "margin": KNEE_VALGUS_MARGIN},
     )
-    golem_position = _golem(LOWER_JOINT_NAMES, "position", -40.0, GOLEM_POSITION_MARGIN)
+    golem_position = _golem(LOWER_JOINT_NAMES, "position", -40.0, GOLEM_POSITION_MARGIN,
+                            {".*_knee_joint": GOLEM_KNEE_POSITION_MARGIN})
     golem_velocity = _golem(LOWER_JOINT_NAMES, "velocity", -10.0, GOLEM_RATE_MARGIN)
     golem_torque = _golem(LOWER_JOINT_NAMES, "torque", -10.0, GOLEM_RATE_MARGIN)
 
@@ -442,15 +447,22 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     golem_estop_ends_episode: bool = False
     curriculum: MarlCurriculumCfg = MarlCurriculumCfg()
     # the estimate moves the arm command, while training once the drift gate opens; the estimator fits the pelvis
-    # motion during arm goals only
-    estimator: PelvisEstimatorCfg = PelvisEstimatorCfg(odometry="learned", train_on_arm_goals_only=True)
+    # motion during arm goals only; the vertical motion comes from the feet and the tilt from gravity instead
+    estimator: PelvisEstimatorCfg = PelvisEstimatorCfg(
+        odometry="learned",
+        train_on_arm_goals_only=True,
+        vertical_from_feet=True,
+        tilt_from_gravity=True,
+        foot_body_names=FOOT_LINK_NAMES,
+    )
     # while training, episodes are navigation only until this share of episode ends are time-outs rather than falls
     # (LocoManipMarlEnv._update_warm_start); then arm goals start
     warm_start_timeout_share: float = 0.8
     agent_action_terms: dict[str, list[str]] = AGENT_ACTION_TERMS
     clip_actions: float = CLIP_ACTIONS
-    # added after the rewards are floored at 0 on terminating (not timed-out) steps
-    termination_penalty: float = -5.0
+    # added after the rewards are floored at 0 on terminating (not timed-out) steps, i.e. falls; every run up to
+    # golemlim_zrange_200k used -5
+    termination_penalty: float = -20.0
     # soft limits as a share of the hard range, over the asset's 0.9: the knee and ankle pitch may use more of their
     # range before dof_pos_limits charges
     soft_joint_pos_limit_factors: dict[str, float] = {".*_knee_joint": 0.95, ".*_ankle_pitch_joint": 0.95}
