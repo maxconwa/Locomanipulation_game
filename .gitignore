@@ -82,8 +82,13 @@ paper/*
 # stay local
 !logs/reach/
 logs/reach/results/*
-# except the whole-body baseline's (paperwb) trials and training curve, published with its checkpoint
+# except the published runs' learned-odometry trials (lambda 1, 0.5, 0) and the whole-body baseline's (paperwb) trials
+# and training curve
 !logs/reach/results/whole/
+!logs/reach/results/l1/
+!logs/reach/results/l0.5/
+!logs/reach/results/l0/
+logs/reach/results/*/*trueodom*/
 !logs/reach/results/curves/
 logs/reach/results/curves/*
 !logs/reach/results/curves/whole_train.csv
