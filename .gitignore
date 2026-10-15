@@ -81,7 +81,12 @@ paper/*
 # cache are tracked; the trials, summaries and curves (results/), the figures' plotted data and the render metadata
 # stay local
 !logs/reach/
-logs/reach/results/
+logs/reach/results/*
+# except the whole-body baseline's (paperwb) trials and training curve, published with its checkpoint
+!logs/reach/results/whole/
+!logs/reach/results/curves/
+logs/reach/results/curves/*
+!logs/reach/results/curves/whole_train.csv
 logs/reach/figures/data/
 logs/reach/figures/render/*.json
 logs/reach/goals/*.pt
