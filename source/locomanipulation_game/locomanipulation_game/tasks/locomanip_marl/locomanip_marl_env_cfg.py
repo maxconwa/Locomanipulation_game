@@ -1,4 +1,4 @@
-"""Two agents, one H1-2 on flat ground: the legs track a velocity command, the arms a wrist pose each. MAPPO via skrl.
+"""Two agents, one H1-2 on rough ground: the legs track a velocity command, the arms a wrist pose each. MAPPO via skrl.
 
 At every command event an env gets navigation (a velocity command, each wrist holding its rest pose) or an arm goal
 (zero velocity, a wrist pose per arm fixed in the world; mdp.ArmTargetsCommand). Arm goals start once most episodes
@@ -12,10 +12,19 @@ Joint targets are clipped 0.02 rad inside GOLEM's edges (its URDF command clip) 
 are checked and logged (golem_safety.py). Each agent pays for its measured joints nearing GOLEM's e-stops
 (mdp.golem_limits), which the clip alone can't prevent; the arms also for their speed and effort.
 torso_joint belongs to neither agent: its actuator holds it at default.
+
+As ALMI-Open trains its H1-2 policies: explicit PD (the torque computed every physics step and clipped at the
+effort limit, IdealPDActuatorCfg, not PhysX's implicit drive; at 200 Hz, where ALMI-Open's runs at 500), joint targets 0-2 policy steps late
+(action_delay_range), fixed observation scales in place of running normalization (observation_scales), its friction,
+mass, centre-of-mass and push randomization (base_cfg.EventCfg), and its rough terrain with a terrain-level curriculum.
+Unlike ALMI-Open, the pushes ramp up per env on a push-level curriculum, and both an env's push level and its terrain
+row go down after a fall and up after an episode that tracked its velocity commands (mdp.push_levels,
+mdp.terrain_levels_tracking); the terrain not by distance walked.
 """
 
 import math
 
+from isaaclab.actuators import IdealPDActuatorCfg, ImplicitActuatorCfg
 from isaaclab.envs import DirectMARLEnvCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -58,6 +67,10 @@ RIGHT_ARM_JOINT_NAMES = ARM_JOINT_NAMES[7:]
 LEFT_EE_BODY = "left_wrist_yaw_link"
 RIGHT_EE_BODY = "right_wrist_yaw_link"
 ARM_COMMAND = "arm_targets"
+TERRAIN_MAX_TRACKING_ERROR = 0.4  # m/s, an episode's mean navigation velocity error for a terrain row or push level up
+PUSH_LEVELS = 10  # the push curriculum's levels: level L pushes at up to L / PUSH_LEVELS x MAX_PUSH_SPEED
+MAX_PUSH_SPEED = 1.0  # m/s, ALMI-Open's fixed push
+MIN_PELVIS_HEIGHT = 0.55  # m above the ground: lower ends the episode as a fall (standing is STANDING_PELVIS_HEIGHT)
 ODOMETRY_HISTORY = 25  # frames in the estimator's window (0.5 s); every run up to golemlim_zrange_200k used 4
 
 # Each agent is charged for the self-contact pairs that include one of its links.
@@ -70,7 +83,23 @@ ARMS_ACTION = "arm_pos"
 # concatenates the agents' actions into the ActionManager's vector.
 AGENT_ACTION_TERMS = {"legs": [LEGS_ACTION], "arms": [ARMS_ACTION]}
 
-POLICY_DT = 0.02          # decimation 4 x sim dt 0.005; reward weights are per second
+# physics 200 Hz, as every run up to feetodom_knee_200k; almitrain_200k to lstm_run ran ALMI-Open's 500 Hz (0.002, 10)
+SIM_DT = 0.005
+DECIMATION = 4
+POLICY_DT = 0.02          # DECIMATION x SIM_DT; reward weights are per second
+# Each env's joint targets reach the robot this many policy steps late, drawn at every reset (ALMI-Open's 0-2)
+ACTION_DELAY_RANGE = (0, 2)
+# Fixed input scales, ALMI-Open's (legged_gym obs_scales and commands_scale) where it has the term: skrl's scalers are
+# frozen at mean 0 and std 1/scale (train.py), in place of running normalization. Terms not listed are scaled by 1.
+OBSERVATION_SCALES = {
+    "base_ang_vel": 0.25,
+    "joint_vel": 0.05,
+    "velocity_commands": (2.0, 2.0, 0.25),  # lin x, lin y, yaw rate
+    "base_lin_vel": 2.0,                    # critic
+    "base_lin_acc": 0.1,                    # ALMI's policies don't see it; gravity -> about 1
+}
+# Kept implicit: the grippers are locked open by stiff gains that an explicit PD at SIM_DT would not hold stably.
+IMPLICIT_ACTUATORS = ("grippers",)
 GOAL_BONUS = 5.0          # paid once per reached goal
 # lambda: each agent's reward includes this share of the other's command-following terms
 REWARD_SHARE = 0.5
@@ -388,6 +417,13 @@ class MarlRewardsCfg:
 @configclass
 class MarlEventCfg(EventCfg):
     # frames without an inertial in the URDF, which the USD import gave 1 kg each
+    # ALMI-Open's pushes (base_cfg.EventCfg), scaled per env by the push curriculum
+    push_robot = EventTerm(
+        func=mdp.push_by_level,
+        mode="interval",
+        interval_range_s=(10.0, 10.0),
+        params={"num_levels": PUSH_LEVELS, "max_speed": MAX_PUSH_SPEED, "fixed": False},
+    )
     massless_frames = EventTerm(
         func=mdp.randomize_rigid_body_mass,
         mode="startup",
@@ -413,17 +449,55 @@ class MarlEventCfg(EventCfg):
 
 @configclass
 class MarlTerminationsCfg(TerminationsCfg):
+    # the deepest crouches lower the pelvis about 25 cm; kneeling lowers it about 60
+    fell = DoneTerm(func=mdp.fell_or_knelt, params={"limit_angle": 1.0, "min_pelvis_height": MIN_PELVIS_HEIGHT})
     golem_estop = DoneTerm(func=mdp.golem_estop)
 
 
 @configclass
 class MarlCurriculumCfg:
+    # down a row after a fall, up one after a time-out that tracked the velocity commands (not ALMI-Open's
+    # terrain_levels_vel, which demoted almitrain_lstm_200k's robots to the easiest row as they tracked better)
+    # gated: rows above 0 only after navigation is robust and the crouch has emerged, one more every steps_per_row
+    # steps (Explicit500); not gated, as every run before it
+    terrain_levels = CurrTerm(func=mdp.gated_terrain_levels, params={
+        "command_name": "base_velocity", "max_error": TERRAIN_MAX_TRACKING_ERROR, "arm_command_name": ARM_COMMAND,
+        "gated": False, "max_fall_share": 0.02, "min_tracked_share": 0.7, "min_depth_level": 4.0,
+        "min_crouch_ratio": 0.75, "steps_per_row": 8000,
+    })
+    # as terrain_levels: down after a fall, up after a time-out that tracked the velocity commands
+    push_levels = CurrTerm(func=mdp.push_levels, params={
+        "num_levels": PUSH_LEVELS, "max_speed": MAX_PUSH_SPEED, "command_name": "base_velocity",
+        "max_error": TERRAIN_MAX_TRACKING_ERROR,
+    })
     arm_target_levels = CurrTerm(func=mdp.arm_target_levels, params={"command_name": ARM_COMMAND})
+
+
+def explicit_pd(actuators: dict) -> dict:
+    """The actuators as IdealPDActuatorCfg (torque = kp (target - q) - kd qd, clipped at the effort limit every
+    physics step), with the same gains and limits; those in IMPLICIT_ACTUATORS stay as they are."""
+    out = {}
+    for name, act in actuators.items():
+        if name in IMPLICIT_ACTUATORS or not isinstance(act, ImplicitActuatorCfg):
+            out[name] = act
+            continue
+        out[name] = IdealPDActuatorCfg(
+            joint_names_expr=act.joint_names_expr,
+            effort_limit=act.effort_limit_sim,
+            effort_limit_sim=act.effort_limit_sim,  # the torque bounds read it (mdp.actions.torque_bounds)
+            velocity_limit=act.velocity_limit_sim,
+            velocity_limit_sim=act.velocity_limit_sim,
+            stiffness=act.stiffness,
+            damping=act.damping,
+            armature=act.armature,
+            friction=act.friction,
+        )
+    return out
 
 
 @configclass
 class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
-    decimation = 4  # policy 50 Hz, physics 200 Hz
+    decimation = DECIMATION  # policy 50 Hz, physics 200 Hz
     episode_length_s = 20.0
     possible_agents = ["legs", "arms"]
     # placeholders: the env sets all three from the managers
@@ -431,7 +505,7 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     observation_spaces = {"legs": 1, "arms": 1}
     state_space = 1
 
-    sim: SimulationCfg = SimulationCfg(dt=0.005, render_interval=decimation)
+    sim: SimulationCfg = SimulationCfg(dt=SIM_DT, render_interval=decimation)
     scene: TerrainSceneCfg = TerrainSceneCfg(num_envs=4096, env_spacing=2.5)
     events: MarlEventCfg = MarlEventCfg()
     commands: MarlCommandsCfg = MarlCommandsCfg()
@@ -466,18 +540,36 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     # soft limits as a share of the hard range, over the asset's 0.9: the knee and ankle pitch may use more of their
     # range before dof_pos_limits charges
     soft_joint_pos_limit_factors: dict[str, float] = {".*_knee_joint": 0.95, ".*_ankle_pitch_joint": 0.95}
+    # None: targets apply on the step they are computed (every run up to feetodom_knee_200k)
+    action_delay_range: tuple[int, int] | None = ACTION_DELAY_RANGE
+    # True: action_delay_range counts physics substeps (finer steps); False: policy steps, as ALMI-Open
+    action_delay_substeps: bool = False
+    # None: train.py leaves skrl's running normalization (every run up to feetodom_knee_200k)
+    observation_scales: dict | None = OBSERVATION_SCALES
+    # False: PhysX's implicit drive, as every run up to feetodom_knee_200k (LocoManipMarlEnv puts the asset's
+    # actuators back before building the scene)
+    explicit_pd: bool = True
 
-    def __post_init__(self):
+    def sync_physics_rate(self):
+        """The sensor periods and render interval for sim.dt and decimation. __post_init__ runs before the command
+        line's overrides, so train.py and the env call this again: 'env.sim.dt=0.002 env.decimation=10' is enough."""
+        self.sim.render_interval = self.decimation
         # contacts every physics step (the gait-phase terms and leg odometry read them), the IMU too (its
         # finite-difference lin_acc divides by the physics dt), the height scan once per policy step
         self.scene.height_scanner.update_period = self.decimation * self.sim.dt
         self.scene.contact_forces.update_period = self.sim.dt
+        self.scene.contact_forces.history_length = self.decimation  # the last policy step's substeps, no older
         self.scene.imu.update_period = self.sim.dt
         # the self-contact sensors once per policy step: they are slow; a contact shorter than that can be missed
         for name in SELF_CONTACT_SENSOR_NAMES:
             sensor = getattr(self.scene, name)
             sensor.update_period = self.decimation * self.sim.dt
             sensor.history_length = 1
+
+    def __post_init__(self):
+        self.sync_physics_rate()
+        # explicit PD (every run up to feetodom_knee_200k: PhysX's implicit drive)
+        self.scene.robot = self.scene.robot.replace(actuators=explicit_pd(self.scene.robot.actuators))
         self.viewer.eye = (4.0, 4.0, 2.5)
         self.viewer.lookat = (0.0, 0.0, 1.0)
         # every joint target inside GOLEM's position e-stop range (written here so params/env.yaml records it)

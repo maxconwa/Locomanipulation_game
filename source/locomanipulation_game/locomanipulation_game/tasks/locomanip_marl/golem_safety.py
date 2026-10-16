@@ -134,7 +134,7 @@ class GolemEstopMonitor:
         which the motor doesn't produce)."""
         data, ids = self.robot.data, self.joint_ids
         error = data.joint_pos_target[:, ids] - data.joint_pos[:, ids]
-        return data.joint_stiffness[:, ids] * error - data.default_joint_damping[:, ids] * data.joint_vel[:, ids]
+        return data.default_joint_stiffness[:, ids] * error - data.default_joint_damping[:, ids] * data.joint_vel[:, ids]
 
     def tripped(self) -> torch.Tensor:
         return self.flags["velocity"] | self.flags["position"] | self.flags["torque"]

@@ -261,7 +261,7 @@ class golem_limits(ManagerTermBase):
             ratio = data.joint_vel[:, ids].abs() / self._dq_max
         else:
             error = data.joint_pos_target[:, ids] - data.joint_pos[:, ids]
-            torque = data.joint_stiffness[:, ids] * error - data.default_joint_damping[:, ids] * data.joint_vel[:, ids]
+            torque = data.default_joint_stiffness[:, ids] * error - data.default_joint_damping[:, ids] * data.joint_vel[:, ids]
             ratio = torque.abs() / self._tau_max
         if quantity.endswith("_l2"):
             return ratio.square().sum(dim=1)

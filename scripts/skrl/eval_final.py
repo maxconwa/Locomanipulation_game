@@ -42,7 +42,7 @@ app = AppLauncher(args).app
 import gymnasium as gym  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
-from skrl.utils.runner.torch import Runner  # noqa: E402
+from locomanipulation_game.tasks.locomanip_marl.recurrent import MarlRunner  # noqa: E402
 
 from isaaclab_rl.skrl import SkrlVecEnvWrapper  # noqa: E402
 from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry  # noqa: E402
@@ -81,7 +81,7 @@ agent_cfg["agent"]["experiment"]["checkpoint_interval"] = 0
 
 env = SkrlVecEnvWrapper(gym.make(args.task, cfg=cfg))
 base = env.unwrapped
-runner = Runner(env, agent_cfg)
+runner = MarlRunner(env, agent_cfg)
 runner.agent.load(checkpoint)
 runner.agent.enable_training_mode(False, apply_to_models=True)
 robot, scanner = base.scene["robot"], base.scene.sensors["height_scanner"]

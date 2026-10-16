@@ -29,7 +29,8 @@ from datetime import datetime  # noqa: E402
 
 import gymnasium as gym  # noqa: E402
 import torch  # noqa: E402
-from skrl.utils.runner.torch import Runner  # noqa: E402
+from skrl.resources.preprocessors.torch import RunningStandardScaler  # noqa: E402
+from locomanipulation_game.tasks.locomanip_marl.recurrent import MarlRunner  # noqa: E402
 
 from isaaclab.utils.io import dump_yaml  # noqa: E402
 from isaaclab_rl.skrl import SkrlVecEnvWrapper  # noqa: E402
@@ -102,6 +103,25 @@ def drop_value_preprocessors(agent, uids):
         print(f"[INFO] {uid}: no value preprocessor, the critic learns raw returns")
 
 
+def fix_observation_scales(agent, env):
+    """With env cfg.observation_scales, freeze each agent's observation and state scalers (skrl's
+    RunningStandardScaler) at mean 0 and variance 1/scale^2: the inputs are scaled by fixed constants, not normalized
+    by running statistics. The checkpoint keeps the scaler's format, so the export and the MuJoCo tools read it as
+    before. After loading a checkpoint, which would restore whatever statistics it saved."""
+    if not env.cfg.observation_scales:
+        return
+    state = env.state_scales()
+    for uid in agent.possible_agents:
+        for kind, scaler, scale in (("observation", agent._observation_preprocessor[uid], env.observation_scales(uid)),
+                                    ("state", agent._state_preprocessor[uid], state)):
+            if not isinstance(scaler, RunningStandardScaler) or scaler.running_mean.shape != scale.shape:
+                raise ValueError(f"{uid}: the {kind} preprocessor must be a RunningStandardScaler of {scale.shape}")
+            scaler.running_mean.zero_()
+            scaler.running_variance.copy_(scale.double().reciprocal().square())
+            scaler._parallel_variance = lambda *args, **kwargs: None
+        print(f"[INFO] {uid}: fixed observation scales, no running normalization")
+
+
 @hydra_task_config(args_cli.task, "skrl_mappo_cfg_entry_point")
 def main(env_cfg, agent_cfg: dict):
     if args_cli.num_envs is not None:
@@ -120,6 +140,8 @@ def main(env_cfg, agent_cfg: dict):
     agent_cfg["agent"]["experiment"]["experiment_name"] = run_name
     log_dir = os.path.join(log_root, run_name)
     print(f"[INFO] Logging to {log_dir}")
+    if hasattr(env_cfg, "sync_physics_rate"):
+        env_cfg.sync_physics_rate()  # after the overrides, so env.yaml records the sensor periods the run uses
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
     env_cfg.log_dir = log_dir
@@ -127,11 +149,12 @@ def main(env_cfg, agent_cfg: dict):
         env_cfg.estimator.checkpoint_path = estimator_checkpoint_for(args_cli.checkpoint)
 
     env = SkrlVecEnvWrapper(gym.make(args_cli.task, cfg=env_cfg))
-    runner = Runner(env, agent_cfg)
+    runner = MarlRunner(env, agent_cfg)
     drop_value_preprocessors(runner.agent, agent_cfg["no_value_preprocessor"])
     if args_cli.checkpoint:
         print(f"[INFO] Loading model checkpoint from: {args_cli.checkpoint}")
         runner.agent.load(os.path.abspath(args_cli.checkpoint))
+    fix_observation_scales(runner.agent, env.unwrapped)
     bound_log_std(runner.agent, agent_cfg["models"]["policy"], agent_cfg["log_std_bounds"])
     restrict_entropy(runner.agent, agent_cfg.get("entropy_action_dims", {}))
 

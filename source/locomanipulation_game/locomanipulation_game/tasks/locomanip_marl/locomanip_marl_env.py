@@ -3,10 +3,15 @@
 DirectMARLEnv owns the step loop, the scene and the event manager; this class builds the other managers and maps
 them onto the per-agent dicts:
 
-    actions:      one ActionManager, the agents' terms concatenated in possible_agents order (cfg.agent_action_terms)
+    actions:      one ActionManager, the agents' terms concatenated in possible_agents order (cfg.agent_action_terms);
+                  with cfg.action_delay_range each env's joint targets reach the robot 0-2 policy steps late
+                  (with cfg.action_delay_substeps, that many physics substeps late)
     observations: agent -> its observation group; the env state is both agents' groups plus `critic`
     rewards:      agent -> its own RewardManager, floored at 0, plus termination_penalty on terminating steps
     dones:        one TerminationManager, shared (one body, one episode)
+
+observation_scales / state_scales give, per agent, the fixed input scale of every observation dimension
+(cfg.observation_scales); scripts/skrl/train.py freezes the agents' skrl scalers at them.
 
 After every step it moves the arm command by the pelvis motion the learned estimator (odometry.py) reports, or with
 estimator.odometry "legs" by leg odometry (_leg_odometry), with estimator.vertical_from_feet / tilt_from_gravity its
@@ -19,6 +24,7 @@ cfg.golem_estop_ends_episode they end the episode whenever arm goals are on (alw
 
 from __future__ import annotations
 
+import math
 import os
 import torch
 from collections.abc import Sequence
@@ -35,6 +41,8 @@ from isaaclab.managers import (
 )
 from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_inv, quat_mul
 
+from locomanipulation_game.assets.h1_2 import H1_2_MAGPIE_CFG
+
 from .golem_safety import GolemEstopMonitor
 from .locomanip_marl_env_cfg import ARM_COMMAND, LocoManipMarlEnvCfg
 from .odometry import EstimatorTrainer, align_tilt, motion_to_transform, pelvis_motion, saved_history_frames
@@ -47,6 +55,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
     cfg: LocoManipMarlEnvCfg
 
     def __init__(self, cfg: LocoManipMarlEnvCfg, render_mode: str | None = None, **kwargs):
+        if not cfg.explicit_pd:
+            # cfg.__post_init__ made them explicit before any override could reach cfg.explicit_pd
+            cfg.scene.robot = cfg.scene.robot.replace(actuators=H1_2_MAGPIE_CFG.actuators)
+        cfg.sync_physics_rate()
         super().__init__(cfg, render_mode, **kwargs)
         self._set_soft_joint_limits()
 
@@ -128,6 +140,22 @@ class LocoManipMarlEnv(DirectMARLEnv):
 
         self._obs_buf: dict[str, torch.Tensor] = {}
 
+        # -- action delay: per action term, the last targets, newest first; per env, how many steps late they apply
+        self._delay_terms = [self.action_manager.get_term(name) for name in self.action_manager.active_terms]
+        self._target_history: list[torch.Tensor] = []
+        self._substep = 0
+        if self.cfg.action_delay_range is not None:
+            low, high = self.cfg.action_delay_range
+            self._delay_steps = torch.randint(low, high + 1, (self.num_envs,), device=self.device)
+            # with action_delay_substeps, a delay of d substeps reaches back ceil(d / decimation) policy steps
+            depth = -(-high // self.cfg.decimation) if self.cfg.action_delay_substeps else high
+            self._target_history = [
+                self._robot.data.joint_pos[:, term._joint_ids].unsqueeze(1).repeat(1, depth + 1, 1).clone()
+                for term in self._delay_terms
+            ]
+            unit = "physics substeps" if self.cfg.action_delay_substeps else "policy steps"
+            print(f"[INFO] Action delay: {low}-{high} {unit} per env, drawn at each reset")
+
     """
     DirectMARLEnv hooks.
     """
@@ -139,11 +167,28 @@ class LocoManipMarlEnv(DirectMARLEnv):
             # a NaN joint target hangs the PhysX solver
             raise RuntimeError(f"Non-finite actions at step {self.common_step_counter}")
         self.action_manager.process_action(joint_action.clamp(-self.cfg.clip_actions, self.cfg.clip_actions))
+        if self._target_history:
+            # the policies observe what they asked for (applied_actions); the robot gets it _delay_steps late
+            rows = torch.arange(self.num_envs, device=self.device)
+            for term, history in zip(self._delay_terms, self._target_history):
+                history[:] = history.roll(1, dims=1)
+                history[:, 0] = term.processed_actions
+                if not self.cfg.action_delay_substeps:
+                    term._processed_actions = history[rows, self._delay_steps]
+        self._substep = 0
 
     def _apply_action(self) -> None:
         if self.golem_monitor is not None:
             # once per physics substep: the state the previous substep left (mdp.golem_estop checks the last)
             self.golem_monitor.update()
+        if self._target_history and self.cfg.action_delay_substeps:
+            # substep k of this policy step applies the targets of ceil((d - k) / decimation) policy steps ago
+            back = (self._delay_steps - self._substep).clamp(min=0)
+            back = torch.div(back + self.cfg.decimation - 1, self.cfg.decimation, rounding_mode="floor")
+            rows = torch.arange(self.num_envs, device=self.device)
+            for term, history in zip(self._delay_terms, self._target_history):
+                term._processed_actions = history[rows, back]
+        self._substep += 1
         self.action_manager.apply_action()
 
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -193,6 +238,11 @@ class LocoManipMarlEnv(DirectMARLEnv):
         log = {}
         log.update(self.observation_manager.reset(env_ids))
         log.update(self.action_manager.reset(env_ids))
+        if self._target_history:
+            low, high = self.cfg.action_delay_range
+            self._delay_steps[env_ids] = torch.randint(low, high + 1, (len(env_ids),), device=self.device)
+            for term, history in zip(self._delay_terms, self._target_history):
+                history[env_ids] = self._robot.data.joint_pos[env_ids][:, term._joint_ids].unsqueeze(1)
         for agent, manager in self.reward_managers.items():
             for key, value in manager.reset(env_ids).items():
                 log[key.replace("Episode_Reward/", f"Episode_Reward/{agent}/", 1)] = value
@@ -205,6 +255,28 @@ class LocoManipMarlEnv(DirectMARLEnv):
             key: value if isinstance(value, torch.Tensor) else torch.tensor(float(value), device=self.device)
             for key, value in log.items()
         }
+
+    """
+    Fixed observation scales.
+    """
+
+    def observation_scales(self, group: str) -> torch.Tensor:
+        """Per dimension of an observation group, the scale cfg.observation_scales gives its term (1 by default): a
+        number, or one per component of the term (repeated over its history)."""
+        scales = self.cfg.observation_scales or {}
+        manager = self.observation_manager
+        parts = []
+        for name, dims in zip(manager.active_terms[group], manager.group_obs_term_dim[group]):
+            n = math.prod(dims)
+            scale = torch.as_tensor(scales.get(name, 1.0), dtype=torch.float, device=self.device).flatten()
+            if n % scale.numel():
+                raise ValueError(f"observation_scales[{name!r}]: {scale.numel()} values for {n} dimensions")
+            parts.append(scale.repeat(n // scale.numel()))
+        return torch.cat(parts)
+
+    def state_scales(self) -> torch.Tensor:
+        """observation_scales over the env state: both agents' groups, then the critic's (_get_states)."""
+        return torch.cat([self.observation_scales(g) for g in list(self.cfg.possible_agents) + ["critic"]])
 
     """
     Pelvis odometry.

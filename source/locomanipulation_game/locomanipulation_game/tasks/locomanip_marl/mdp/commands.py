@@ -112,8 +112,9 @@ class ModalVelocityCommand(UniformVelocityCommand):
 
     A resampled moving command is replaced, with probability pure_turn_prob, by a turn in place (|yaw rate| in
     pure_turn_speed, either sign), and with probability pure_lateral_prob by a sideways walk (|vy| in
-    pure_lateral_speed): uniform sampling almost never draws either. Logs the tracking error during navigation and
-    the yaw rate during arm goals.
+    pure_lateral_speed): uniform sampling almost never draws either. Logs the tracking error during navigation, the
+    cosine similarity between the commanded and the true base-frame xy velocity while a walk is commanded (|v_cmd| at
+    least min_cos_speed), and the yaw rate during arm goals.
     """
 
     cfg: ModalVelocityCommandCfg
@@ -123,6 +124,7 @@ class ModalVelocityCommand(UniformVelocityCommand):
         zeros = lambda: torch.zeros(self.num_envs, device=self.device)  # noqa: E731
         self._nav_steps, self._nav_err_xy, self._nav_err_yaw = zeros(), zeros(), zeros()
         self._arm_steps, self._arm_yaw_rate = zeros(), zeros()
+        self._walk_steps, self._walk_cos = zeros(), zeros()
 
     def _arm_mode(self) -> torch.Tensor:
         return self._env.command_manager.get_term(self.cfg.arm_command_name).arm_mode
@@ -155,6 +157,10 @@ class ModalVelocityCommand(UniformVelocityCommand):
         self._nav_err_yaw += torch.abs(self.vel_command_b[:, 2] - yaw_rate) * nav
         self._arm_steps += arm
         self._arm_yaw_rate += torch.abs(yaw_rate) * arm
+        cmd_xy, vel_xy = self.vel_command_b[:, :2], self.robot.data.root_lin_vel_b[:, :2]
+        walk = nav * (torch.norm(cmd_xy, dim=-1) >= self.cfg.min_cos_speed).float()
+        self._walk_steps += walk
+        self._walk_cos += torch.nn.functional.cosine_similarity(cmd_xy, vel_xy, dim=-1, eps=1e-6) * walk
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
         ids = slice(None) if env_ids is None else env_ids
@@ -162,7 +168,9 @@ class ModalVelocityCommand(UniformVelocityCommand):
         _add_weighted_mean(extras, "nav_error_vel_xy", self._nav_err_xy[ids], self._nav_steps[ids])
         _add_weighted_mean(extras, "nav_error_vel_yaw", self._nav_err_yaw[ids], self._nav_steps[ids])
         _add_weighted_mean(extras, "arm_goal_yaw_rate", self._arm_yaw_rate[ids], self._arm_steps[ids])
-        for buffer in (self._nav_steps, self._nav_err_xy, self._nav_err_yaw, self._arm_steps, self._arm_yaw_rate):
+        _add_weighted_mean(extras, "nav_cos_vel_xy", self._walk_cos[ids], self._walk_steps[ids])
+        for buffer in (self._nav_steps, self._nav_err_xy, self._nav_err_yaw, self._arm_steps, self._arm_yaw_rate,
+                       self._walk_steps, self._walk_cos):
             buffer[ids] = 0.0
         extras.update(super().reset(env_ids))
         return extras
@@ -174,6 +182,7 @@ class ModalVelocityCommandCfg(UniformVelocityCommandCfg):
     arm_command_name: str = MISSING
     pure_turn_prob: float = 0.0
     pure_turn_speed: tuple[float, float] = (0.2, 0.5)       # rad/s
+    min_cos_speed: float = 0.1  # m/s: the commanded xy speed from which nav_cos_vel_xy counts a step
     pure_lateral_prob: float = 0.0
     pure_lateral_speed: tuple[float, float] = (0.15, 0.3)   # m/s
 

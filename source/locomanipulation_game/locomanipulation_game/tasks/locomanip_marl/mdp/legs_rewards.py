@@ -98,12 +98,27 @@ def contact_no_vel(
 
 
 def feet_contact_forces(
-    env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, max_force: float = 700.0
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    max_force: float = 700.0,
+    peak_over_substeps: bool = False,
+    window: int = 1,
 ) -> torch.Tensor:
+    """Each foot's contact force above max_force, summed (N), at the policy step's last physics substep, as ALMI-Open
+    reads it (its contact tensor is refreshed once, after the decimation loop). Not the peak over the substeps:
+    at 500 Hz that caught every landing's spike, about 70x feetodom_knee_200k's penalty, and the legs stopped stepping
+    (lstm_run). peak_over_substeps: the peak over the sensor's history, as every run up to lstm_run; with window > 1,
+    the peak of the force averaged over that many consecutive substeps (a landing's impulse over a shorter dt reads
+    as a higher force: at 500 Hz a window matches the 200 Hz substep feetodom_knee_200k's crouch was learned with)."""
     sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    forces = sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
-    peak = forces.norm(dim=-1).max(dim=1)[0]
-    return torch.sum((peak - max_force).clip(min=0.0), dim=1)
+    if peak_over_substeps:
+        force = sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :].norm(dim=-1)
+        if window > 1:
+            force = force.unfold(1, window, 1).mean(dim=-1)  # (N, T - window + 1, B)
+        force = force.max(dim=1)[0]
+    else:
+        force = sensor.data.net_forces_w[:, sensor_cfg.body_ids, :].norm(dim=-1)
+    return torch.sum((force - max_force).clip(min=0.0), dim=1)
 
 
 def self_contacts(

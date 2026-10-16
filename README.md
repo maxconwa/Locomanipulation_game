@@ -120,6 +120,102 @@ observation or an action, so those checkpoints still load (a saved depth level a
   `golemlim_zrange_200k`'s legs took one update that spiked their value loss and raised falls from 1% to 6-10%.
 - **Falls cost 20, not 5** (`termination_penalty`). Both agents get it once, on the step the robot falls, after
   their rewards are floored at 0. Every run up to `golemlim_zrange_200k` used -5.
+- **Actors and critics are [128, 64, 32]** (`skrl_mappo_cfg.yaml`), down from [256, 128, 64]. `almisize_200k` tried
+  ALMI's 64-32 actors (critics unchanged): its arms tripped GOLEM's position e-stops 2.5x less, but its legs never
+  learned to squat (pelvis 2.6 cm below standing at 200k, against 19 cm). `play.py`, `deploy_parity.py` and
+  `eval_final.py` build their models from the yaml, so for an older checkpoint pass
+  `'agent.models.policy.network.0.layers=[256,128,64]' 'agent.models.value.network.0.layers=[256,128,64]'`; the
+  MuJoCo tools, the reach evaluation and `export_marl.py` read the sizes from the checkpoint.
+- **Trained as ALMI-Open trains its H1-2 policies**, for policies that stay smooth on the robot (the earlier ones
+  jittered on hardware):
+  - **Explicit PD.** The legs', feet's, torso's and arms' actuators are `IdealPDActuatorCfg`
+    (`explicit_pd`): the torque is computed every physics step and clipped at the effort limit, in place of PhysX's
+    implicit drive. The locked grippers stay implicit. The torque bounds and GOLEM's torque checks read the
+    configured gains (`default_joint_stiffness`), since explicit actuators zero the sim's. Physics runs at 0.005 s,
+    4 substeps per policy step (`SIM_DT`, `DECIMATION`). almitrain_200k to lstm_run ran ALMI-Open's 500 Hz
+    (0.002 s, 10 substeps) at about half the training speed; holding the default pose, the explicit PD jitters no
+    more at 200 Hz than at 500.
+  - **Action delay.** Each env's joint targets reach the robot 0-2 policy steps late, drawn at every reset
+    (`action_delay_range`); the policies observe what they asked for.
+  - **Fixed observation scales** (`observation_scales`): joint velocity x0.05, angular velocity x0.25, velocity
+    commands x(2, 2, 0.25), the critic's linear velocity x2, linear acceleration x0.1, everything else x1. `train.py`
+    freezes skrl's observation and state scalers at mean 0 and std 1/scale, so a checkpoint's scaler has the usual
+    format and the export, the MuJoCo tools and GOLEM's deploy node need no change.
+  - **Wider randomization** (`base_cfg.EventCfg`): friction 0.1-1.25 (was 0.6-1.2), pelvis, leg and torso link masses
+    x0.9-1.1, torso mass -3..+5 kg (was -2..+4), the pelvis's centre of mass shifted up to 10/10/20 cm, pushes of up
+    to 1 m/s every 10 s (was 0.4 m/s every 8-12 s).
+  - **Rough terrain** (`TERRAINS_ROUGH_CFG`): uniform bumps of +-0.5 cm on row 0 up to +-5.5 cm on row 9, with
+    envs starting on rows 0-5. An env goes down a row after a fall and up one after a 20 s episode whose mean
+    navigation velocity error was under 0.4 m/s (`mdp.terrain_levels_tracking`). almitrain_lstm_200k used ALMI-Open's
+    `terrain_levels_vel`, which promotes by distance from the start: our commands turn and stop for arm goals, so it
+    sank every env to row 0 as the tracking improved. All earlier runs trained on flat planes. The reach
+    evaluation and the Isaac tools build the env from this config, so they now run on it too.
+  - **LSTM actors** (`locomanip_marl/recurrent.py`, `models.policy.rnn` in the yaml): as ALMI-Open's
+    RNNActorMLPCritic, each actor runs its observations through one LSTM layer of 64; unlike it, a [256, 128, 64]
+    MLP then sees the LSTM's output concatenated with the raw observations (`rnn.skip_observations`). The critics
+    stay MLPs. skrl has no recurrent MAPPO, so `RecurrentMAPPO` adds skrl PPO_RNN's state handling to
+    MAPPO (each env's 24-step rollout is one training sequence from its stored first state, zeroed at episode ends),
+    and `MarlRunner` builds it; train, play, eval_final, deploy_parity and eval_sim2sim_walk use it. Earlier
+    MLP checkpoints load with `'~agent.models.policy.rnn'`, almitrain_lstm_200k's (no skip, [128, 64, 32]) with
+    `agent.models.policy.rnn.skip_observations=False 'agent.models.policy.network.0.layers=[128,64,32]'`.
+    `export_marl.py` exports an LSTM actor as `forward(obs, h, c) -> (action, h, c)`, which GOLEM's `lmg_deploy`
+    runs (`RecurrentTorchScriptNetwork`); `mujoco_evals/policy.py` and per-env state resets in the evaluation scripts
+    are not done yet.
+  - **Pushes on a curriculum** (`mdp.push_levels`, `mdp.push_by_level`; not ALMI-Open's, whose pushes are fixed):
+    each env has a push level 0-10 that starts at 0, goes down one after a fall and up one after a 20 s episode that
+    tracked its velocity commands (the terrain rows' rule above), and is pushed every 10 s at up to level/10 x 1 m/s.
+    Survival alone raised it at first, and lstm_run's robots climbed to 0.86 m/s by standing still. The Isaac
+    evaluations turn pushes off as before.
+  - **Kneeling is a fall** (`mdp.fell_or_knelt`): an episode also ends as a fall once the pelvis is under 0.55 m
+    above the ground (`MIN_PELVIS_HEIGHT`; the deepest crouches lower it about 25 cm). Under the harder pushes and
+    terrain, with only the tilt check, `almitrain_gtodom_200k` learned to kneel upright, its pelvis 60 cm down.
+  - **Foot contact force once per step** (`mdp.feet_contact_forces`): the force over 1400 N is read at the policy
+    step's last physics substep, as ALMI-Open reads it, not the peak over the substeps. At 500 Hz the peak caught
+    every landing's spike: the penalty was about 70x feetodom_knee_200k's in lstm_run, whose legs stopped stepping.
+
+### Explicit500 (10-15): what brought the crouch back
+
+lstm_run2, trained with everything above, walked tall and left low goals to the arms. Short ablations (40k steps,
+`logs/skrl/ablation_*`) rebuilt feetodom_knee_200k on today's code and added each change back one at a time. Its
+crouch needs the foot-contact penalty as the **peak over the substeps**, and dies with **fixed observation scales**
+(the wrist targets, gravity and joint angles reach the network 4-30x quieter than feetodom's running statistics),
+**explicit PD at 200 Hz** (5 ms torque holds), or a **0-40 ms action delay**; **ALMI-Open's randomization** and
+**rough terrain from the start** weaken it; the **LSTM** and the **push curriculum** keep it (the LSTM deepens it).
+Explicit PD at ALMI-Open's 500 Hz keeps it, and a 0-20 ms delay in 2 ms substeps keeps it with the best turning.
+
+`Explicit500` (`logs/skrl/locomanip_marl/2026-10-15_12-17-16_Explicit500`, agent_196800, exported to GOLEM's
+`lmg_deploy/policies/explicit500`) is these defaults with:
+
+```bash
+python scripts/skrl/train.py --headless --name Explicit500 \
+  env.commands.arm_targets.table_file=$PWD/logs/skrl/locomanip_marl/golemlim120k/arm_target_tables_v3.pt \
+  env.observation_scales=null env.explicit_pd=True env.sim.dt=0.002 env.decimation=10 \
+  env.action_delay_range=[0,10] env.action_delay_substeps=True \
+  env.rewards.legs.feet_contact_forces.params.peak_over_substeps=True env.rewards.legs.feet_contact_forces.params.window=3 \
+  env.terminations.fell.params.min_pelvis_height=-1.0 \
+  env.events.physics_material.params.static_friction_range=[0.6,1.2] env.events.physics_material.params.dynamic_friction_range=[0.4,0.9] \
+  env.events.physics_material.params.make_consistent=False env.events.scale_link_masses=null env.events.shift_pelvis_com=null \
+  env.events.add_torso_mass.params.mass_distribution_params=[-2.0,4.0] \
+  env.scene.terrain.max_init_terrain_level=0 env.scene.terrain.terrain_generator.sub_terrains.rough.height_at_0=0.0 \
+  env.curriculum.terrain_levels.params.gated=True
+```
+
+- **500 Hz physics** follows from `env.sim.dt` / `env.decimation` alone: `cfg.sync_physics_rate()` sets the sensor
+  periods and the contact history (train.py and the env call it after the overrides).
+- **Contact peak over 6 ms means** (`window=3`): at 500 Hz a landing's impulse reads as a higher force; the peak of
+  3-substep means matches the 200 Hz penalty the crouch was learned with (15.2 vs 15.0 N per step, same policy).
+- **Delay in physics substeps** (`action_delay_substeps`): 0-10 substeps, 0-20 ms in 2 ms steps.
+- **Rough terrain behind a gate** (`mdp.gated_terrain_levels`, `gated=True`): every robot starts on the flat row 0; rows
+  open one per 8k steps once falls are under 2%, over 70% of episodes track their commands, the arm depth level is
+  at least 4 and the pelvis drops at least 0.75x as far as the targets (it opened at 46k and reached row 9, +-5 cm,
+  at 112k).
+- **Tilt-only fall check** and feetodom's randomization, as feetodom_knee_200k.
+- Navigation logs `Metrics/base_velocity/nav_cos_vel_xy`, the cosine between the commanded and the true xy velocity.
+
+At 200k: pelvis 17 cm down for goals 23 cm low, arm depth 7.4, best error 4.5 cm, falls 1.1%, velocity error
+0.25 m/s and 0.83 rad/s (a right-turn bias of about 0.07 rad/s), and it steps at the gait clock when turning in place.
+In MuJoCo it reaches the low goals within 2 cm on true odometry, 5-12 cm on the learned estimator, whose drift
+gate stayed closed in training.
 
 ## Knee-bow test (`agent_scripts/`)
 

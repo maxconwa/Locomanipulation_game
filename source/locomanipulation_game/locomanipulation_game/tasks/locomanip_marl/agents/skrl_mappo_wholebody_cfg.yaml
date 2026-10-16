@@ -1,6 +1,6 @@
 # LocoManip-WholeBody-Direct-v0: skrl MAPPO with one agent, "whole", for all 26 joints, so everything but the split
 # matches skrl_mappo_cfg.yaml (the two-agent game). Its critic sees the env state (its observation plus privileged
-# information). Wider networks than each two-agent learner's [256, 128, 64]: the actor has 1.7x the two actors'
+# information). Wider networks than the two-agent learners' [256, 128, 64] of the paper runs: the actor has 1.7x the two actors'
 # parameters, actor and critic together 1.4x the two agents'.
 # https://skrl.readthedocs.io/en/latest/api/multi_agents/mappo.html
 

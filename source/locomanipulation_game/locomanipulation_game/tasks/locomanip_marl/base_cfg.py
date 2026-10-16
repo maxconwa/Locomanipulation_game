@@ -17,6 +17,9 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg, ImuCfg, RayCasterCfg, patterns
 from isaaclab.terrains import TerrainGeneratorCfg, TerrainImporterCfg
+from isaaclab.terrains.height_field import HfRandomUniformTerrainCfg
+from isaaclab.terrains.height_field.hf_terrains import random_uniform_terrain
+from isaaclab.terrains.height_field.utils import height_field_to_mesh
 from isaaclab.utils import configclass
 
 from locomanipulation_game.assets.h1_2 import (
@@ -28,7 +31,10 @@ from locomanipulation_game.assets.h1_2 import (
     HIP_YAW_ROLL_JOINT_NAMES,
     KNEE_LINK_NAMES,
     LOWER_JOINT_NAMES,
+    LOWER_LINK_NAMES,
+    PELVIS_LINK_NAME,
     STANDING_PELVIS_HEIGHT,
+    TORSO_LINK_NAME,
 )
 
 from . import mdp
@@ -36,9 +42,37 @@ from . import mdp
 HEIGHT_SCAN_RAISE = 20.0
 SELF_CONTACT_LINK_NAMES = COLLISION_LINK_NAMES[:-1]
 SELF_CONTACT_SENSOR_NAMES = [f"self_contact_{link}" for link in SELF_CONTACT_LINK_NAMES]
-CONTACT_HISTORY = 4 # >= env decimation: one slot per physics substep
+# one slot per physics substep of a policy step (= env decimation); almitrain_200k to lstm_run used 10 at 500 Hz,
+# lstm_run2 and the ablation_* runs kept 10 at 200 Hz, so the contact terms looked back 2.5 policy steps
+CONTACT_HISTORY = 4
 
-TERRAINS_FLAT_CFG = TerrainGeneratorCfg(
+
+@height_field_to_mesh
+def _rough_by_difficulty(difficulty: float, cfg: "RoughByDifficultyCfg"):
+    """Isaac Lab's random_uniform_terrain with the bumps scaled by the row's difficulty (it ignores difficulty)."""
+    height = cfg.height_at_0 + cfg.height_per_difficulty * difficulty
+    step = cfg.step_at_0 + cfg.step_per_difficulty * difficulty
+    return random_uniform_terrain.__wrapped__(difficulty, cfg.replace(noise_range=(-height, height), noise_step=step))
+
+
+@configclass
+class RoughByDifficultyCfg(HfRandomUniformTerrainCfg):
+    """ALMI-Open's only_rough terrain (legged_gym utils/terrain.py): heights uniform in +-(0.005 + 0.05 d) m on steps
+    of 0.005 + 0.005 d m, d the row's difficulty in [0, 1], drawn every 0.2 m."""
+
+    function = _rough_by_difficulty
+    noise_range: tuple[float, float] = (0.0, 0.0)  # set per difficulty
+    noise_step: float = 0.005
+    downsampled_scale: float = 0.2
+    height_at_0: float = 0.005
+    height_per_difficulty: float = 0.05
+    step_at_0: float = 0.005
+    step_per_difficulty: float = 0.005
+
+
+# Rows by difficulty: bumps from +-0.5 cm (row 0) to +-5.5 cm (row 9). Every run up to feetodom_knee_200k trained on
+# the same grid of flat planes.
+TERRAINS_ROUGH_CFG = TerrainGeneratorCfg(
     num_rows=10,
     num_cols=20,
     size=(8.0, 8.0),
@@ -48,8 +82,8 @@ TERRAINS_FLAT_CFG = TerrainGeneratorCfg(
     slope_threshold=0.75,
     use_cache=True,
     seed=0,
-    curriculum=True,          # rows by difficulty; every patch is the same flat plane
-    sub_terrains={"flat": terrain_gen.MeshPlaneTerrainCfg(proportion=1.0)},
+    curriculum=True,
+    sub_terrains={"rough": RoughByDifficultyCfg(proportion=1.0)},
 )
 
 
@@ -58,8 +92,8 @@ class TerrainSceneCfg(InteractiveSceneCfg):
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator",
-        terrain_generator=TERRAINS_FLAT_CFG,
-        max_init_terrain_level=0,   # start everyone flat; None means all levels
+        terrain_generator=TERRAINS_ROUGH_CFG,
+        max_init_terrain_level=5,   # as ALMI: start on rows 0-5; the terrain_levels curriculum moves envs up and down
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
@@ -246,6 +280,8 @@ class LowerRewardsCfg:
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FOOT_LINK_NAMES),
             "max_force": MAX_CONTACT_FORCE,
+            "peak_over_substeps": False,
+            "window": 1,
         },
     )
     self_collision = RewTerm(
@@ -257,15 +293,29 @@ class LowerRewardsCfg:
 
 @configclass
 class EventCfg:
+    """ALMI-Open's h1_2_lower domain randomization. Every run up to feetodom_knee_200k used friction 0.6-1.2 (dynamic
+    0.4-0.9), torso mass -2..+4 kg, no link-mass or centre-of-mass changes, pushes of 0.4 m/s every 8-12 s."""
+
     physics_material = EventTerm(
         func=mdp.randomize_rigid_body_material,
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "static_friction_range": (0.6, 1.2),
-            "dynamic_friction_range": (0.4, 0.9),
+            "static_friction_range": (0.1, 1.25),
+            "dynamic_friction_range": (0.1, 1.25),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
+            "make_consistent": True,  # dynamic <= static
+        },
+    )
+    # each body's mass x U(0.9, 1.1), before add_torso_mass
+    scale_link_masses = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=[PELVIS_LINK_NAME] + LOWER_LINK_NAMES + [TORSO_LINK_NAME]),
+            "mass_distribution_params": (0.9, 1.1),
+            "operation": "scale",
         },
     )
     add_torso_mass = EventTerm(
@@ -273,8 +323,16 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names="torso_link"),
-            "mass_distribution_params": (-2.0, 4.0),
+            "mass_distribution_params": (-3.0, 5.0),
             "operation": "add",
+        },
+    )
+    shift_pelvis_com = EventTerm(
+        func=mdp.randomize_rigid_body_com,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=PELVIS_LINK_NAME),
+            "com_range": {"x": (-0.1, 0.1), "y": (-0.1, 0.1), "z": (-0.2, 0.2)},
         },
     )
     reset_base = EventTerm(
@@ -305,8 +363,8 @@ class EventCfg:
     push_robot = EventTerm(
         func=mdp.push_by_setting_velocity,
         mode="interval",
-        interval_range_s=(8.0, 12.0),
-        params={"velocity_range": {"x": (-0.4, 0.4), "y": (-0.4, 0.4)}},
+        interval_range_s=(10.0, 10.0),
+        params={"velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)}},
     )
 
 

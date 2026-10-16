@@ -4,7 +4,14 @@
 
 seed: 42
 
-# Instantiated per agent with that agent's spaces.
+# Instantiated per agent with that agent's spaces. The actors are an LSTM (as ALMI-Open's, rnn below) then a
+# [256, 128, 64] MLP on the LSTM's output concatenated with the raw observations, the critics a [128, 64, 32] MLP;
+# built by recurrent.MarlRunner. Every run up to almitrain_noknee_200k had MLP actors: [256, 128, 64] actors and
+# critics up to feetodom_knee_200k, 64-32 actors in almisize_200k, 128-64-32 after; almitrain_lstm_200k's actors were
+# the LSTM then a [128, 64, 32] MLP on its output alone. play.py, deploy_parity.py and eval_final.py build from this
+# file, so for almitrain_lstm_200k's checkpoints pass 'agent.models.policy.rnn.skip_observations=False'
+# 'agent.models.policy.network.0.layers=[128,64,32]'; for the MLP runs' '~agent.models.policy.rnn' and their layers,
+# before almitrain 'agent.models.policy.network.0.layers=[256,128,64]' 'agent.models.value.network.0.layers=[256,128,64]'.
 models:
   separate: True
   policy:
@@ -14,6 +21,10 @@ models:
     min_log_std: -3.0
     max_log_std: 0.0
     initial_log_std: 0.0
+    rnn:                     # ALMI-Open's RNNActorMLPCritic: one LSTM layer of 64; trained on whole rollouts
+      hidden_size: 64
+      num_layers: 1
+      skip_observations: True  # the MLP also sees the raw observations, not only the LSTM's 64 outputs
     network:
       - name: net
         input: OBSERVATIONS
@@ -26,7 +37,7 @@ models:
     network:
       - name: net
         input: STATES
-        layers: [256, 128, 64]
+        layers: [128, 64, 32]
         activations: elu
     output: ONE
 
@@ -63,6 +74,7 @@ agent:
       kl_threshold: 0.02
       min_lr: 2.0e-04
       max_lr: 1.0e-02
+  # frozen at the env's fixed scales (cfg.observation_scales, train.py fix_observation_scales), not running statistics
   observation_preprocessor: RunningStandardScaler
   observation_preprocessor_kwargs: null
   state_preprocessor: RunningStandardScaler

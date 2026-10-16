@@ -23,7 +23,7 @@ import os  # noqa: E402
 
 import gymnasium as gym  # noqa: E402
 import torch  # noqa: E402
-from skrl.utils.runner.torch import Runner  # noqa: E402
+from locomanipulation_game.tasks.locomanip_marl.recurrent import MarlRunner  # noqa: E402
 
 from isaaclab_rl.skrl import SkrlVecEnvWrapper  # noqa: E402
 from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
@@ -45,7 +45,7 @@ def main(env_cfg, agent_cfg: dict):
     agent_cfg["agent"]["experiment"]["checkpoint_interval"] = 0
 
     env = SkrlVecEnvWrapper(gym.make(args_cli.task, cfg=env_cfg))
-    runner = Runner(env, agent_cfg)
+    runner = MarlRunner(env, agent_cfg)
     runner.agent.load(checkpoint)
     runner.agent.enable_training_mode(False, apply_to_models=True)
     obs, _ = env.reset()
