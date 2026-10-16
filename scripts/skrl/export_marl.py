@@ -1,19 +1,22 @@
-"""Export a MAPPO checkpoint of the legs+arms task for GOLEM's locomotion_game_deploy package.
+"""Export a MAPPO checkpoint of the legs+arms task for GOLEM's lmg_deploy package (locomotion_game_deploy before its rename).
 
 Writes into --out (a policies/<name> directory of the deploy package):
   legs.pt, arms.pt   TorchScript: skrl's observation scaler (RunningStandardScaler, eps 1e-8, clip +-5), the
                      policy MLP's mean, and the env's +-clip_actions clamp. Raw observation in, applied raw action out.
+                     An LSTM actor (recurrent.LSTMGaussianPolicy) exports as forward(obs, h, c) -> (action, h, c)
+                     with hidden_size and num_layers attributes; the deploy node carries h, c and zeroes them at reset.
   estimator.pt       TorchScript: the pelvis-motion estimator (input norm + MLP) saved with the checkpoint.
   export.yaml        per-checkpoint values the node loads over its template: the navigation rest pose (the run's
                      arm target table default_poses), target_limits (joint -> [low, high], the run's clip of every
                      joint target into GOLEM's position e-stop range; null for runs before it; the node must clip
-                     targets into it as the env did), odometry (the estimator's input window in frames, and
-                     vertical_from_feet: the node replaces the estimate's vertical motion with the lowest foot's, as
-                     the env and mujoco_sim.py do) and the source files.
+                     targets into it as the env did), odometry (mode learned, the estimator's input window in
+                     frames, and the run's vertical_from_feet and tilt_from_gravity: the node replaces the estimate's
+                     vertical motion with the feet's and its tilt with gravity's, as the env does), height_drop_obs
+                     (whether the actors take the height_drop input runs before golemlim had) and the source files.
 Needs only torch; no simulator.
 
     python scripts/skrl/export_marl.py --checkpoint logs/skrl/locomanip_marl/<run>/checkpoints/agent_<step>.pt \
-        --out <GOLEM>/core_ws/src/locomotion_game_deploy/policies/marl_golem
+        --out <GOLEM>/core_ws/src/lmg_deploy/policies/<policy>
 """
 
 import argparse
@@ -52,6 +55,29 @@ class Actor(nn.Module):
         return torch.clamp(self.net(z), -self.clip_actions, self.clip_actions)
 
 
+class RecurrentActor(nn.Module):
+    hidden_size: int
+    num_layers: int
+
+    def __init__(self, mean, var, lstm: nn.LSTM, layers: nn.Sequential, skip_observations: bool, epsilon: float,
+                 clip_obs: float, clip_actions: float):
+        super().__init__()
+        self.register_buffer("mean", mean.float())
+        self.register_buffer("std", torch.sqrt(var.float()))
+        self.lstm, self.net = lstm, layers
+        self.hidden_size, self.num_layers = lstm.hidden_size, lstm.num_layers
+        self.skip_observations = skip_observations
+        self.epsilon, self.clip_obs, self.clip_actions = epsilon, clip_obs, clip_actions
+
+    def forward(self, obs: torch.Tensor, h: torch.Tensor, c: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        z = torch.clamp((obs - self.mean) / (self.std + self.epsilon), -self.clip_obs, self.clip_obs)
+        out, (h, c) = self.lstm(z.unsqueeze(1), (h, c))
+        features = out.squeeze(1)
+        if self.skip_observations:
+            features = torch.cat([features, z], dim=-1)
+        return torch.clamp(self.net(features), -self.clip_actions, self.clip_actions), h, c
+
+
 class Estimator(nn.Module):
     def __init__(self, mean, var, layers: nn.Sequential):
         super().__init__()
@@ -82,13 +108,29 @@ ckpt_path = os.path.abspath(args.checkpoint)
 run_dir = os.path.dirname(os.path.dirname(ckpt_path))
 ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 os.makedirs(args.out, exist_ok=True)
+num_obs = {}
 for agent in ("legs", "arms"):
-    pre = ckpt[agent]["observation_preprocessor"]
-    actor = Actor(pre["running_mean"], pre["running_variance"], mlp(ckpt[agent]["policy"], "net_container"),
-                  1e-8, 5.0, args.clip_actions).eval()
-    scripted = torch.jit.script(actor)
-    scripted.save(os.path.join(args.out, f"{agent}.pt"))
-    print(f"{agent}: {pre['running_mean'].shape[0]} obs -> {actor.net[-1].out_features} actions")
+    pre, policy = ckpt[agent]["observation_preprocessor"], ckpt[agent]["policy"]
+    n = num_obs[agent] = pre["running_mean"].shape[0]
+    if "lstm.weight_ih_l0" in policy:
+        layers = sum(1 for k in policy if k.startswith("lstm.weight_ih_l"))
+        hidden = policy["lstm.weight_hh_l0"].shape[1]
+        lstm = nn.LSTM(policy["lstm.weight_ih_l0"].shape[1], hidden, num_layers=layers, batch_first=True)
+        lstm.load_state_dict({k[len("lstm."):]: v for k, v in policy.items() if k.startswith("lstm.")})
+        net = mlp(policy, "net")
+        actor = RecurrentActor(pre["running_mean"], pre["running_variance"], lstm, net,
+                               net[0].in_features == hidden + n, 1e-8, 5.0, args.clip_actions).eval()
+        kind = f"LSTM {layers}x{hidden}{' + skip' if actor.skip_observations else ''} -> "
+    else:
+        actor = Actor(pre["running_mean"], pre["running_variance"], mlp(policy, "net_container"),
+                      1e-8, 5.0, args.clip_actions).eval()
+        kind = ""
+    torch.jit.script(actor).save(os.path.join(args.out, f"{agent}.pt"))
+    print(f"{agent}: {n} obs -> {kind}{actor.net[-1].out_features} actions")
+# the legs' 95 inputs, or 96 with the height_drop input (always 0) that runs before golemlim had
+if num_obs["legs"] not in (95, 96):
+    raise ValueError(f"legs: {num_obs['legs']} observations; the deploy layout knows 95 and 96")
+height_drop_obs = num_obs["legs"] == 96
 
 step = re.search(r"_(\d+)\.pt$", ckpt_path)
 est_path = os.path.join(run_dir, "estimator", f"estimator_{step.group(1)}.pt") if step else None
@@ -100,16 +142,30 @@ torch.jit.script(estimator).save(os.path.join(args.out, "estimator.pt"))
 history_frames, rest = divmod(est["norm.mean"].shape[0] - 26, 75)  # 75 values per frame, then 26 actions
 print(f"estimator: {est['norm.mean'].shape[0]} inputs, {history_frames} frames ({est_path})")
 
-tables = sorted(glob.glob(os.path.join(run_dir, "arm_target_tables*.pt")))
+# the tables the run trained with: its env.yaml table_file (absolute, or in the run dir), else the newest in the run dir
+m = re.search(r"^\s*table_file: (\S+)$", Path(run_dir, "params", "env.yaml").read_text(), re.M)
+named = os.path.join(run_dir, m.group(1)) if m else None
+tables = [named] if named and os.path.isfile(named) else sorted(glob.glob(os.path.join(run_dir, "arm_target_tables*.pt")))
 rest = None
 if tables:
     data = torch.load(tables[-1], map_location="cpu", weights_only=False)
     rest = [[round(float(v), 6) for v in pose] for pose in data["default_poses"]]
 limits = read_target_limits(Path(run_dir))
+env_yaml = Path(run_dir, "params", "env.yaml").read_text()
+
+
+def env_flag(name: str) -> bool:
+    m = re.search(rf"^\s*{name}: (true|false)$", env_yaml, re.M)
+    return bool(m) and m.group(1) == "true"
+
+
 export = {
     "rest_pose": rest,
     "target_limits": {name: [round(low, 6), round(high, 6)] for name, (low, high) in limits.items()} if limits else None,
-    "odometry": {"history_frames": history_frames, "vertical_from_feet": True},
+    "odometry": {"mode": (re.search(r"^\s*odometry: (learned|legs)$", env_yaml, re.M) or [None, "learned"])[1],
+                 "history_frames": history_frames,
+                 "vertical_from_feet": env_flag("vertical_from_feet"), "tilt_from_gravity": env_flag("tilt_from_gravity")},
+    "height_drop_obs": height_drop_obs,
     "source": {"checkpoint": ckpt_path, "estimator": est_path, "target_tables": tables[-1] if tables else None,
                "task": args.task, "exported": datetime.now().isoformat(timespec="seconds")},
 }
