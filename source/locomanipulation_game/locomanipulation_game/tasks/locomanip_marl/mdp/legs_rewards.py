@@ -43,6 +43,11 @@ def gait_phase_sin(env: ManagerBasedRLEnv, command_name: str = "base_velocity") 
     return torch.sin(2.0 * math.pi * leg_phase(env, command_name))
 
 
+def gait_phase_cos(env: ManagerBasedRLEnv, command_name: str = "base_velocity") -> torch.Tensor:
+    """Observation term: cos of each leg's phase. Shape (num_envs, 2)."""
+    return torch.cos(2.0 * math.pi * leg_phase(env, command_name))
+
+
 
 
 def contact_matches_phase(

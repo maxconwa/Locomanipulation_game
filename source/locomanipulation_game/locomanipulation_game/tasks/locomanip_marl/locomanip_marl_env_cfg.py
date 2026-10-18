@@ -70,7 +70,6 @@ ARM_COMMAND = "arm_targets"
 TERRAIN_MAX_TRACKING_ERROR = 0.4  # m/s, an episode's mean navigation velocity error for a terrain row or push level up
 PUSH_LEVELS = 10  # the push curriculum's levels: level L pushes at up to L / PUSH_LEVELS x MAX_PUSH_SPEED
 MAX_PUSH_SPEED = 1.0  # m/s, ALMI-Open's fixed push
-MIN_PELVIS_HEIGHT = 0.55  # m above the ground: lower ends the episode as a fall (standing is STANDING_PELVIS_HEIGHT)
 ODOMETRY_HISTORY = 25  # frames in the estimator's window (0.5 s); every run up to golemlim_zrange_200k used 4
 
 # Each agent is charged for the self-contact pairs that include one of its links.
@@ -104,13 +103,6 @@ GOAL_BONUS = 5.0          # paid once per reached goal
 # lambda: each agent's reward includes this share of the other's command-following terms
 REWARD_SHARE = 0.5
 ARM_GOAL_HIP_POS_SCALE = 0.2  # the legs' hip yaw/roll deviation term during arm goals, as a share of its weight
-TRACKING_STD = 0.25       # velocity tracking kernel width, on the gait-cycle mean velocity
-# and fine kernels beside them, each tracking term's weight split evenly: Explicit500 crept 0.035 m/s past its forward
-# commands and turned 0.09 rad/s short of its yaw ones (Isaac and the real robot) at almost no cost under 0.25 alone
-TRACKING_STD_FINE_LIN = 0.1   # m/s
-TRACKING_STD_FINE_ANG = 0.2   # rad/s
-# arm targets changing per policy step during arm goals (mdp.arm_joint_target_rate_l2): against the reach jitter
-ARM_TARGET_RATE_WEIGHT = -20.0
 CLIP_ACTIONS = 10.0       # the env clamps every raw policy action to +-this
 TORQUE_HEADROOM = 0.85    # targets ask for at most this share of a joint's effort limit (the e-stop trips at 0.9)
 KNEE_VALGUS_MARGIN = 0.02  # m: each knee may sit this far inside its hip-ankle line before knee_valgus charges
@@ -140,18 +132,17 @@ class MarlCommandsCfg:
     # first: arm_targets zeroes and resamples it
     base_velocity = mdp.ModalVelocityCommandCfg(
         asset_name="robot",
-        resampling_time_range=(2.5, 10.0),
+        resampling_time_range=(10.0, 10.0),  # unitree_rl_gym's; Explicit500 and every run before it: 2.5-10 s
         rel_standing_envs=0.05,
         heading_command=False,  # a yaw rate, like a joystick
         debug_vis=True,
-        # Explicit500 and every run before it: vx +-0.7, vy +-0.3, wz +-0.5, pure turns 0.2-0.5, sideways 0.15-0.3
-        ranges=mdp.ModalVelocityCommandCfg.Ranges(lin_vel_x=(-0.4, 0.4), lin_vel_y=(-0.2, 0.2), ang_vel_z=(-0.4, 0.4)),
+        ranges=mdp.ModalVelocityCommandCfg.Ranges(lin_vel_x=(-0.7, 0.7), lin_vel_y=(-0.3, 0.3), ang_vel_z=(-0.5, 0.5)),
         arm_command_name=ARM_COMMAND,
         # uniform sampling almost never draws a turn in place or a pure sideways walk
         pure_turn_prob=0.2,
-        pure_turn_speed=(0.2, 0.4),
+        pure_turn_speed=(0.2, 0.5),
         pure_lateral_prob=0.2,
-        pure_lateral_speed=(0.15, 0.2),
+        pure_lateral_speed=(0.15, 0.3),
     )
     arm_targets = mdp.ArmTargetsCommandCfg(
         asset_name="robot",
@@ -230,6 +221,8 @@ class MarlObservationsCfg:
         joint_pos = _joints(mdp.joint_pos_rel, 0.01)
         joint_vel = _joints(mdp.joint_vel_rel, 1.5)
         gait_phase = ObsTerm(func=mdp.gait_phase_sin, params={"command_name": "base_velocity"})
+        # with the sin, each leg's phase without ambiguity (the legs' sins alone are negatives of each other)
+        gait_phase_cos = ObsTerm(func=mdp.gait_phase_cos, params={"command_name": "base_velocity"})
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -304,17 +297,22 @@ def _golem(joint_names: list[str], quantity: str, weight: float, margin: float =
 class LegsRewardsCfg(LowerRewardsCfg):
     """ALMI's legs reward (base_cfg.LowerRewardsCfg), changed for the shared body.
 
-    No term holds the pelvis height or the knees' bend: base_height and stand_still are gone. hip_pos (hip yaw and
+    Velocity tracking, alive, ang_vel_xy and base_height are unitree_rl_gym's H1-2 terms (per step, std 0.5; alive
+    0.15; ang_vel_xy -0.05; pelvis 1.0 m above the ground at -10), with the tracking weights doubled from theirs (lin
+    2.0, yaw 1.0; Tune3Track2: at their 1.0 and 0.5 the robot stood rather than walked under the -20 fall penalty, and
+    the arm goals' gate stayed shut to 23k steps instead of 17k). base_height counts only while the
+    robot learns to walk, the navigation-only warm start (LocoManipMarlEnv._set_walk_stage), so it never holds the
+    pelvis against the arm goals' crouch. Explicit500 and every run before it: no base height, tracking with std 0.25 on
+    the gait-cycle mean velocity (lin 2.0, yaw 1.5), alive 1.0, ang_vel_xy -0.5.
+    No term holds the knees' bend: stand_still is gone. hip_pos (hip yaw and
     roll at their defaults) and arm_goal_yaw_rate, as in run R, hold the pelvis's yaw against twisting; hip_pos is
     scaled to ARM_GOAL_HIP_POS_SCALE during arm goals. knee_valgus charges the knees falling inward, which paper05
     crouched on (hip yaw turned in to its limit, knees 13 cm apart over ankles 35 cm apart; agent_scripts/
     knee_bow_test.py). action_rate and self_collision count the legs only.
     feet_swing_clearance replaces feet_swing_height, which a dragging foot never pays. golem_* charge the measured
-    legs near GOLEM's e-stops: the deep squat rested hip yaw and ankle pitch on their stops. Velocity tracking scores the
-    gait-cycle mean velocity, so stepping in place to turn doesn't pay for its sway.
+    legs near GOLEM's e-stops: the deep squat rested hip yaw and ankle pitch on their stops.
     """
 
-    base_height = None
     stand_still = None
     feet_swing_height = None
     arm_goal_yaw_rate = RewTerm(
@@ -327,11 +325,11 @@ class LegsRewardsCfg(LowerRewardsCfg):
     )
     feet_swing_clearance = RewTerm(
         func=mdp.feet_swing_clearance,
-        weight=-50.0,  # Explicit500: -25; the real robot's steps rose less, a tenth of them under 3 cm
+        weight=-25.0,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=FOOT_LINK_NAMES, preserve_order=True),
             "rest_height": 0.045,  # the ankle's standing height
-            "lift_height": 0.055,  # Livox500's 0.075 was never reached and the legs crouched 19 cm instead
+            "lift_height": 0.055,  # Livox500's 0.075 (at -25) and Lift55x2's -50 weight both crouched
             "command_name": "base_velocity",
             "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
         },
@@ -348,22 +346,11 @@ class LegsRewardsCfg(LowerRewardsCfg):
     golem_velocity = _golem(LOWER_JOINT_NAMES, "velocity", -10.0, GOLEM_RATE_MARGIN)
     golem_torque = _golem(LOWER_JOINT_NAMES, "torque", -10.0, GOLEM_RATE_MARGIN)
 
-    # fine velocity kernels (TRACKING_STD_FINE_*), beside the coarse ones; weights set in __post_init__
-    track_lin_vel_xy_fine = RewTerm(func=mdp.track_velocity_avg_exp, weight=1.0, params={
-        "command_name": "base_velocity", "std": TRACKING_STD_FINE_LIN, "component": "lin_xy", "window_s": mdp.GAIT_PERIOD})
-    track_ang_vel_z_fine = RewTerm(func=mdp.track_velocity_avg_exp, weight=0.75, params={
-        "command_name": "base_velocity", "std": TRACKING_STD_FINE_ANG, "component": "ang_z", "window_s": mdp.GAIT_PERIOD})
-
     def __post_init__(self):
-        self.alive.weight = 1.0
-        # each tracking weight (lin 2.0, yaw 1.5 up to Explicit500) split evenly between the coarse and fine kernels
-        self.track_lin_vel_xy.weight = 1.0
-        self.track_ang_vel_z.weight = 0.75
-        # scored on the pelvis velocity averaged over one gait cycle (mdp.track_velocity_avg_exp)
-        for term, component in ((self.track_lin_vel_xy, "lin_xy"), (self.track_ang_vel_z, "ang_z")):
-            term.func = mdp.track_velocity_avg_exp
-            term.params = {"command_name": "base_velocity", "std": TRACKING_STD, "component": component,
-                           "window_s": mdp.GAIT_PERIOD}
+        # LowerRewardsCfg's per-step kernels (std ALMI_TRACKING_STD = 0.5) at twice unitree_rl_gym's H1-2 weights
+        self.track_lin_vel_xy.weight = 2.0
+        self.track_ang_vel_z.weight = 1.0
+        self.ang_vel_xy.weight = -0.05
         self.action_rate.func = mdp.action_term_rate_l2
         self.action_rate.params = {"action_name": LEGS_ACTION}
         self.self_collision.func = mdp.self_contacts_involving
@@ -409,11 +396,7 @@ class ArmsRewardsCfg:
     golem_velocity = _golem(ARM_JOINT_NAMES, "velocity", -10.0, GOLEM_RATE_MARGIN)
     golem_torque = _golem(ARM_JOINT_NAMES, "torque", -10.0, GOLEM_RATE_MARGIN)
     dof_acc = _arm_joints(mdp.joint_acc_l2, -2.5e-7)
-    # Explicit500: -0.01, and no target rate; its arms dithered at about 3.2 Hz while reaching
-    action_rate = RewTerm(func=mdp.action_term_rate_l2, weight=-0.1, params={"action_name": ARMS_ACTION})
-    target_rate = RewTerm(func=mdp.arm_joint_target_rate_l2, weight=ARM_TARGET_RATE_WEIGHT, params={
-        "asset_cfg": SceneEntityCfg("robot", joint_names=ARM_JOINT_NAMES, preserve_order=True),
-        "arm_command_name": ARM_COMMAND})
+    action_rate = RewTerm(func=mdp.action_term_rate_l2, weight=-0.01, params={"action_name": ARMS_ACTION})
     dof_pos_limits = _arm_joints(mdp.joint_pos_limits, -5.0)
     self_collision = RewTerm(
         func=mdp.self_contacts_involving, weight=-1.0, params={**_SELF_CONTACT_PARAMS, "own_links": ARMS_OWN_LINKS}
@@ -423,7 +406,7 @@ class ArmsRewardsCfg:
 # Each agent's command-following terms, which the other agent shares in.
 ARM_TRACKING_TERMS = ["left_ee_pos", "left_ee_pos_fine", "left_ee_quat",
                       "right_ee_pos", "right_ee_pos_fine", "right_ee_quat", "goal_reached"]
-LEG_TRACKING_TERMS = ["track_lin_vel_xy", "track_ang_vel_z", "track_lin_vel_xy_fine", "track_ang_vel_z_fine"]
+LEG_TRACKING_TERMS = ["track_lin_vel_xy", "track_ang_vel_z"]
 
 
 @configclass
@@ -477,7 +460,10 @@ class MarlEventCfg(EventCfg):
 @configclass
 class MarlTerminationsCfg(TerminationsCfg):
     # the deepest crouches lower the pelvis about 25 cm; kneeling lowers it about 60
-    fell = DoneTerm(func=mdp.fell_or_knelt, params={"limit_angle": 1.0, "min_pelvis_height": MIN_PELVIS_HEIGHT})
+    # unitree_rl_gym's: pelvis contact, |roll| > 0.8 or |pitch| > 1.0 rad. Explicit500 and every run before it:
+    # mdp.fell_or_knelt (tilt over 1.0 rad; the pelvis-height check was off in their launch overrides)
+    fell = DoneTerm(func=mdp.pelvis_contact_or_tilt, params={
+        "sensor_cfg": SceneEntityCfg("contact_forces", body_names="pelvis"), "max_roll": 0.8, "max_pitch": 1.0})
     golem_estop = DoneTerm(func=mdp.golem_estop)
 
 
@@ -554,8 +540,10 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     # added to both agents' rewards after the floor on the step a trip starts (from the end of the warm start), as
     # termination_penalty on a fall's. -20 (Livox500's second try) made falling the cheaper way out: about 1.8 trips per
     # 1000 steps cost -36 an episode against -20 for a fall that ends it, and 90% of episodes ended in falls from 8k to
-    # 20k steps
-    golem_estop_penalty: float = -5.0
+    # 20k steps. -5 kept UnitreeRew-style runs (alive 0.15) falling in ~91% of episodes for 15k steps after the arm goals
+    # started: trips at ~0.02 per step cost more than the floored reward paid; -1 (Tune2Trip1, Tune3Track2) let them
+    # recover in ~10k
+    golem_estop_penalty: float = -1.0
     curriculum: MarlCurriculumCfg = MarlCurriculumCfg()
     # the estimate moves the arm command, while training once the drift gate opens; the estimator fits the pelvis
     # motion during arm goals only; the vertical motion comes from the feet and the tilt from gravity instead
@@ -566,13 +554,27 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
         tilt_from_gravity=True,
         foot_body_names=FOOT_LINK_NAMES,
     )
-    # while training, episodes are navigation only until this share of episode ends are time-outs rather than falls
-    # (LocoManipMarlEnv._update_warm_start); then arm goals start
+    # while training, episodes are navigation only (the robot learning to walk, with base_height) until the robot walks:
+    # over the ending episodes (exponential means, warm_start_episode_decay per episode) falls under
+    # warm_start_max_fall_share and the share that tracked the velocity commands (a time-out with a mean navigation
+    # error under warm_start_max_tracking_error, as the terrain curriculum promotes) over warm_start_min_tracked_share
+    # (LocoManipMarlEnv._update_warm_start); then arm goals start and base_height stops. warm_start_max_fall_share None:
+    # until warm_start_timeout_share of the episode ends are time-outs (0.8, Explicit500 and every run before it)
     warm_start_timeout_share: float = 0.8
+    warm_start_max_fall_share: float | None = 0.02
+    warm_start_min_tracked_share: float = 0.7
+    warm_start_max_tracking_error: float = TERRAIN_MAX_TRACKING_ERROR
+    # and the walking episodes' velocity cos-sim to the command (nav_cos_vel_xy) at least this: standing scores ~0, and
+    # UnitreeRew walked at 0.5 by 12k and 0.63 by 20k (UnitreeFall20's gate, without it, opened at 4.6k on a robot that
+    # stood, and it never walked)
+    warm_start_min_cos: float = 0.5
+    warm_start_episode_decay: float = 0.999
     agent_action_terms: dict[str, list[str]] = AGENT_ACTION_TERMS
     clip_actions: float = CLIP_ACTIONS
-    # added after the rewards are floored at 0 on terminating (not timed-out) steps, i.e. falls; every run up to
-    # golemlim_zrange_200k used -5
+    # added after the rewards are floored at 0 on terminating (not timed-out) steps, i.e. falls. Every run up to
+    # golemlim_zrange_200k used -5, then -20. UnitreeRew's 0 (unitree_rl_gym's) made falling the way out of a reach:
+    # the floored reward during arm goals (~0.01-0.03 per step) was under the -5 trip penalty's mean cost (~0.02 per
+    # step), and a fall ends both, so the robot fell backwards in ~92% of episodes from the arm goals' start.
     termination_penalty: float = -20.0
     # soft limits as a share of the hard range, over the asset's 0.9: the knee and ankle pitch may use more of their
     # range before dof_pos_limits charges

@@ -6,13 +6,16 @@ import torch
 from typing import TYPE_CHECKING
 
 from isaaclab.envs.mdp import bad_orientation
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.sensors import ContactSensor
+from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi
 
 from .commands import ground_height
 
 if TYPE_CHECKING:
     from ..locomanip_marl_env import LocoManipMarlEnv
 
-__all__ = ["fell_or_knelt", "golem_estop"]
+__all__ = ["fell_or_knelt", "golem_estop", "pelvis_contact_or_tilt"]
 
 
 def fell_or_knelt(env: LocoManipMarlEnv, limit_angle: float, min_pelvis_height: float,
@@ -21,6 +24,16 @@ def fell_or_knelt(env: LocoManipMarlEnv, limit_angle: float, min_pelvis_height: 
     every ray missed). Tilt alone let almitrain_gtodom_200k kneel upright, its pelvis 60 cm down, through pushes."""
     height = env.scene["robot"].data.root_pos_w[:, 2] - ground_height(env.scene.sensors[sensor_name])
     return bad_orientation(env, limit_angle) | (height < min_pelvis_height)  # nan (no ground) compares False
+
+
+def pelvis_contact_or_tilt(env: LocoManipMarlEnv, sensor_cfg: SceneEntityCfg, max_roll: float,
+                           max_pitch: float) -> torch.Tensor:
+    """unitree_rl_gym's fall check (LeggedRobot.check_termination): a contact force over 1 N on sensor_cfg's bodies
+    (the pelvis) in this step's last substep, or the pelvis rolled past max_roll or pitched past max_pitch (rad)."""
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    contact = torch.any(sensor.data.net_forces_w[:, sensor_cfg.body_ids].norm(dim=-1) > 1.0, dim=1)
+    roll, pitch, _ = euler_xyz_from_quat(env.scene["robot"].data.root_quat_w)
+    return contact | (wrap_to_pi(roll).abs() > max_roll) | (wrap_to_pi(pitch).abs() > max_pitch)
 
 
 def golem_estop(env: LocoManipMarlEnv) -> torch.Tensor:

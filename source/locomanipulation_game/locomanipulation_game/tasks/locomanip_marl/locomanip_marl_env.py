@@ -18,8 +18,8 @@ After every step it moves the arm command by the pelvis motion the learned estim
 estimator.odometry "legs" by leg odometry (_leg_odometry), with estimator.vertical_from_feet / tilt_from_gravity its
 vertical motion and tilt from the feet and gravity (_from_feet_and_gravity), and fits the estimator to the true motion
 (with estimator.train_on_arm_goals_only, the motion during arm goals only). While training, episodes are navigation only
-until cfg.warm_start_timeout_share of them end in a time-out rather than a fall (_update_warm_start); then arm goals
-start. GolemEstopMonitor (golem_safety.py) checks GOLEM's e-stops at every physics substep and logs them; with
+until the robot walks (cfg.warm_start_*: few falls and most episodes tracking their commands; _update_warm_start); then
+arm goals start and the legs' base_height term stops (_set_walk_stage). GolemEstopMonitor (golem_safety.py) checks GOLEM's e-stops at every physics substep and logs them; with
 cfg.golem_estop_ends_episode they end the episode from the end of the warm start, in every mode (always outside training).
 """
 
@@ -45,6 +45,7 @@ from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_inv, quat_m
 from locomanipulation_game.assets.h1_2 import H1_2_MAGPIE_CFG
 
 from .golem_safety import GolemEstopMonitor
+from .mdp.curriculums import _tracked_episode
 from .locomanip_marl_env_cfg import ARM_COMMAND, LocoManipMarlEnvCfg
 from .odometry import EstimatorTrainer, align_tilt, motion_to_transform, pelvis_motion, saved_history_frames
 
@@ -86,6 +87,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
         # share passes cfg.warm_start_timeout_share and stay on. Outside training they are on from the start.
         self._ends = torch.tensor(0.0, device=self.device)
         self._time_outs = torch.tensor(0.0, device=self.device)
+        # and the walking gate's exponential means over the ending episodes: the share that fell, that tracked
+        self._walk_fell = torch.tensor(1.0, device=self.device)
+        self._walk_tracked = torch.tensor(0.0, device=self.device)
+        self._walk_cos = torch.tensor(0.0, device=self.device)
         self._warm_start_log: dict[str, torch.Tensor] = {}
         # GOLEM's e-stops (None: no e-stop checks)
         self.golem_monitor = (
@@ -115,6 +120,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
         # -- pelvis odometry
         self._arm_command = self.command_manager.get_term(ARM_COMMAND)
         self._arm_command.goals_enabled = not self.cfg.estimator.train
+        self._set_walk_stage()
         self.estimator = EstimatorTrainer(
             self.cfg.estimator, group_dims["odometry"][0] + self.action_manager.total_action_dim, self.num_envs,
             self.device, history_frames,
@@ -363,19 +369,58 @@ class LocoManipMarlEnv(DirectMARLEnv):
         return self.cfg.golem_estop_ends_episode and self._arm_command.goals_enabled
 
     def _update_warm_start(self, terminated: torch.Tensor, time_outs: torch.Tensor):
-        """Count this step's episode ends and the time-outs among them, both decayed by WARM_START_DECAY per step,
-        and start the arm goals once the time-out share reaches cfg.warm_start_timeout_share. An episode that ends
-        in a fall or out of bounds on its last step counts as a fall."""
+        """Start the arm goals once the robot walks: over the ending episodes (exponential means, decay
+        cfg.warm_start_episode_decay per episode) the share that fell is at most cfg.warm_start_max_fall_share and the
+        share that tracked their velocity commands (as the terrain curriculum promotes) at least
+        cfg.warm_start_min_tracked_share, and their velocity's mean cos-sim to the commanded one while walking is
+        commanded (nav_cos_vel_xy) at least cfg.warm_start_min_cos: the tracked share alone passed a robot that stood
+        (UnitreeFall20: its 0.33 m/s error is under the 0.4 limit). With warm_start_max_fall_share None: once the time-out share among the episode
+        ends, both counts decayed by WARM_START_DECAY per step, reaches cfg.warm_start_timeout_share; an episode that
+        ends in a fall or out of bounds on its last step counts as a fall. Runs before the resets, while the velocity
+        command still holds the ending episodes' tracking sums."""
+        cfg = self.cfg
         self._ends = WARM_START_DECAY * self._ends + (terminated | time_outs).sum()
         self._time_outs = WARM_START_DECAY * self._time_outs + (time_outs & ~terminated).sum()
         share = self._time_outs / self._ends.clamp(min=1.0)
+        ending = (terminated | time_outs).nonzero(as_tuple=False).flatten()
+        if len(ending):
+            tracked, fell = _tracked_episode(self, ending, "base_velocity", cfg.warm_start_max_tracking_error, "fell",
+                                             "time_out")
+            keep = cfg.warm_start_episode_decay ** len(ending)
+            self._walk_fell = keep * self._walk_fell + (1.0 - keep) * fell.float().mean()
+            self._walk_tracked = keep * self._walk_tracked + (1.0 - keep) * tracked.float().mean()
+            command = self.command_manager.get_term("base_velocity")
+            walked = command._walk_steps[ending] > 0
+            if walked.any():
+                cos = command._walk_cos[ending][walked].sum() / command._walk_steps[ending][walked].sum()
+                keep = cfg.warm_start_episode_decay ** int(walked.sum())
+                self._walk_cos = keep * self._walk_cos + (1.0 - keep) * cos
+        if cfg.warm_start_max_fall_share is None:
+            walks = share.item() >= cfg.warm_start_timeout_share
+        else:
+            walks = bool((self._walk_fell <= cfg.warm_start_max_fall_share)
+                         & (self._walk_tracked >= cfg.warm_start_min_tracked_share)
+                         & (self._walk_cos >= cfg.warm_start_min_cos))
         arm = self._arm_command
-        if not arm.goals_enabled and share.item() >= self.cfg.warm_start_timeout_share:
+        if not arm.goals_enabled and walks:
             arm.goals_enabled = True
-            print(f"[INFO] Warm start over at step {self.common_step_counter}: {share.item():.0%} of episodes time out;"
-                  f" arm goals start{', GOLEM e-stops end the episode' if self.estops_end_episodes else ''}")
+            self._set_walk_stage()
+            print(f"[INFO] Warm start over at step {self.common_step_counter}: {self._walk_fell.item():.1%} of episodes"
+                  f" fall, {self._walk_tracked.item():.0%} track, cos v {self._walk_cos.item():.2f},"
+                  f" {share.item():.0%} time out; arm goals start, base_height stops{', GOLEM e-stops end the episode' if self.estops_end_episodes else ''}")
         self._warm_start_log["Curriculum/warm_start_timeout_share"] = share
+        self._warm_start_log["Curriculum/warm_start_fell_share"] = self._walk_fell
+        self._warm_start_log["Curriculum/warm_start_tracked_share"] = self._walk_tracked
+        self._warm_start_log["Curriculum/warm_start_cos_vel_xy"] = self._walk_cos
         self._warm_start_log["Curriculum/arm_goals_enabled"] = torch.tensor(float(arm.goals_enabled), device=self.device)
+
+    def _set_walk_stage(self):
+        """The legs' base_height term (pelvis height above the ground) counts only while the robot learns to walk,
+        before the arm goals start: after that it would hold the pelvis up against their crouch. Outside training the
+        goals are on from the start, so it never counts."""
+        legs = self.reward_managers["legs"]
+        if self._arm_command.goals_enabled and "base_height" in legs.active_terms:
+            legs.get_term_cfg("base_height").weight = 0.0
 
     def _feet_in_pelvis(self) -> torch.Tensor:
         """Each foot's ankle-roll origin in the pelvis frame, (N, F, 3): on the robot, forward kinematics."""
