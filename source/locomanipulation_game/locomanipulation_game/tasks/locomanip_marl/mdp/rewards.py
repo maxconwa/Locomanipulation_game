@@ -266,3 +266,31 @@ class golem_limits(ManagerTermBase):
         if quantity.endswith("_l2"):
             return ratio.square().sum(dim=1)
         return (ratio - margin).clamp(min=0.0).sum(dim=1)
+
+
+class arm_joint_target_rate_l2(ManagerTermBase):
+    """Squared change of the arm joints' position targets since the last policy step, summed (rad^2), during arm goals.
+
+    The arms' target is the measured position plus the IK step plus the residual, so this charges the dithering the
+    action_rate term on the residual alone misses: Explicit500's arms oscillated at about 3.2 Hz while reaching (Isaac
+    and the real robot's reach bag, targets moving 0.03-0.05 rad per step against 0.007 while walking). Squared, it
+    charges a smooth reach (a few joints at ~0.02 rad/step) far less than that. Zero on an episode's first step.
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self._ids = env.scene[cfg.params["asset_cfg"].name].find_joints(cfg.params["asset_cfg"].joint_names, preserve_order=True)[0]
+        self._prev = torch.zeros(env.num_envs, len(self._ids), device=env.device)
+        self._fresh = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+
+    def reset(self, env_ids=None):
+        self._fresh[slice(None) if env_ids is None else env_ids] = True
+
+    def __call__(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, arm_command_name: str) -> torch.Tensor:
+        target = env.scene[asset_cfg.name].data.joint_pos_target[:, self._ids]
+        rate = torch.sum(torch.square(target - self._prev), dim=1)
+        rate = torch.where(self._fresh, torch.zeros_like(rate), rate)
+        self._prev[:] = target
+        self._fresh[:] = False
+        arm = env.command_manager.get_term(arm_command_name).arm_mode
+        return rate * arm.float()

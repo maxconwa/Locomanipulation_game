@@ -77,6 +77,8 @@ export_yaml = os.path.join(args.export, "export.yaml")
 if os.path.isfile(export_yaml):
     cfg.update(yaml.safe_load(open(export_yaml)) or {})
 names = cfg["joint_names"]
+if (cfg.get("imu") or {}).get("frame") == "livox_link":
+    cfg.setdefault("legs_odometry", {})["imu_frame"] = "livox_link"  # as marl_deploy_node: the attitude's frame
 odo = cfg.get("odometry")
 learned = odo == "learned" or (isinstance(odo, dict) and odo.get("mode", "learned") == "learned")
 extra = list(cfg.get("legs_odometry", {}).get("foot_frames", []))

@@ -147,6 +147,16 @@ def read_reward_share(run_dir: Path) -> float | None:
     return round(float(to_legs), 6)
 
 
+def read_imu(run_dir: Path) -> dict:
+    """The IMU a run trained with: {"frame": the robot body it sits on, "offset": [x, y, z] in it (m)}. Runs up to
+    Explicit500 read the torso's imu_link; from then on the head's Livox IMU (livox_link, base_cfg.LIVOX_IMU_OFFSET)."""
+    scene = _yaml_load_any((Path(run_dir) / "params" / "env.yaml").read_text()).get("scene", {})
+    imu = scene.get("imu") or {}
+    frame = str(imu.get("prim_path", "/imu_link")).rsplit("/", 1)[-1]
+    pos = ((imu.get("offset") or {}).get("pos")) or [0.0, 0.0, 0.0]
+    return {"frame": frame, "offset": [round(float(v), 6) for v in pos]}
+
+
 def read_target_limits(run_dir: Path) -> dict[str, tuple[float, float]] | None:
     """joint name -> (low, high) a run's action terms clipped every target into (GOLEM's position e-stop range,
     actions.*.joint_limits in params/env.yaml); None for runs without it, whose targets only kept to the URDF clip."""

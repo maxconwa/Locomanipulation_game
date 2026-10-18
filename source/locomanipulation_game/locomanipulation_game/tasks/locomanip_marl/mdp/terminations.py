@@ -36,6 +36,7 @@ def golem_estop(env: LocoManipMarlEnv) -> torch.Tensor:
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     monitor.update()
     tripped = monitor.tripped().clone()
+    env.golem_tripped = tripped  # for cfg.golem_estop_penalty (LocoManipMarlEnv._get_rewards)
     env.golem_log = monitor.log()
     monitor.clear()
     return tripped if env.estops_end_episodes else torch.zeros_like(tripped)

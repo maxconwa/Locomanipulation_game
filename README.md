@@ -217,6 +217,17 @@ At 200k: pelvis 17 cm down for goals 23 cm low, arm depth 7.4, best error 4.5 cm
 In MuJoCo it reaches the low goals within 2 cm on true odometry, 5-12 cm on the learned estimator, whose drift
 gate stayed closed in training.
 
+### The IMU is the head's Livox (10-16, after Explicit500)
+
+The policies' and the estimator's IMU (`scene.imu`) is the MID-360's IMU chip on the head: `livox_link`, the upright
+lidar frame (pitched about 14 deg), offset `base_cfg.LIVOX_IMU_OFFSET` (0.011, -0.02329, 0.04412) m, as GOLEM's
+`livox_imu_upright` publishes `/livox/imu`. At the default pose it reads gravity as (0.20, -0.04, -0.98) and 9.81 m/s^2.
+Every run up to Explicit500 read the torso's `imu_link`; play, evaluate or export one with
+`'env.scene.imu.prim_path={ENV_REGEX_NS}/Robot/imu_link' 'env.scene.imu.offset.pos=[0.0,0.0,0.0]'`. `export_marl.py`
+writes the run's IMU into export.yaml (`imu.frame`, `imu.offset`), and GOLEM's `lmg_deploy` then reads `/livox/imu`
+with FAST-LIO's attitude (`livox_attitude.py`) instead of `LowState`. The MuJoCo tools (`mujoco_evals/mujoco_sim.py`)
+still read the torso site: they evaluate torso-IMU runs only for now.
+
 ## Knee-bow test (`agent_scripts/`)
 
 ```bash

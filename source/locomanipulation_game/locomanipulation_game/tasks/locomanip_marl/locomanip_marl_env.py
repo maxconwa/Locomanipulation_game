@@ -7,7 +7,8 @@ them onto the per-agent dicts:
                   with cfg.action_delay_range each env's joint targets reach the robot 0-2 policy steps late
                   (with cfg.action_delay_substeps, that many physics substeps late)
     observations: agent -> its observation group; the env state is both agents' groups plus `critic`
-    rewards:      agent -> its own RewardManager, floored at 0, plus termination_penalty on terminating steps
+    rewards:      agent -> its own RewardManager, floored at 0, plus termination_penalty on terminating steps and
+                  golem_estop_penalty on the step a GOLEM e-stop trip starts
     dones:        one TerminationManager, shared (one body, one episode)
 
 observation_scales / state_scales give, per agent, the fixed input scale of every observation dimension
@@ -19,7 +20,7 @@ vertical motion and tilt from the feet and gravity (_from_feet_and_gravity), and
 (with estimator.train_on_arm_goals_only, the motion during arm goals only). While training, episodes are navigation only
 until cfg.warm_start_timeout_share of them end in a time-out rather than a fall (_update_warm_start); then arm goals
 start. GolemEstopMonitor (golem_safety.py) checks GOLEM's e-stops at every physics substep and logs them; with
-cfg.golem_estop_ends_episode they end the episode whenever arm goals are on (always outside training).
+cfg.golem_estop_ends_episode they end the episode from the end of the warm start, in every mode (always outside training).
 """
 
 from __future__ import annotations
@@ -91,6 +92,9 @@ class LocoManipMarlEnv(DirectMARLEnv):
             GolemEstopMonitor(self._robot, self.cfg.golem_estop, self.num_envs, self.device) if self.cfg.golem_estop else None
         )
         self.golem_log: dict[str, torch.Tensor] = {}
+        # this step's GOLEM e-stop trips (mdp.golem_estop) and the last step's, for the penalty on a trip's first step
+        self.golem_tripped = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._golem_tripped_prev = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         group_dims = self.observation_manager.group_obs_dim
         self.cfg.observation_spaces = {agent: group_dims[agent][0] for agent in self.cfg.possible_agents}
@@ -203,13 +207,19 @@ class LocoManipMarlEnv(DirectMARLEnv):
 
     def _get_rewards(self) -> dict[str, torch.Tensor]:
         terminated = self.termination_manager.terminated.float()
+        # a GOLEM e-stop trip costs golem_estop_penalty once, on its first step, after the floor as a fall's penalty does
+        # (from the end of the warm start, as the arm goals start, so the stepping it learns first isn't buried)
+        new_trip = self.golem_tripped & ~self._golem_tripped_prev
+        self._golem_tripped_prev = self.golem_tripped.clone()
+        trip_cost = self.cfg.golem_estop_penalty * new_trip.float() * float(self._arm_command.goals_enabled)
+        self.golem_log["Safety/trip_starts"] = new_trip.float().mean()
         rewards = {}
         for agent, manager in self.reward_managers.items():
             reward = manager.compute(dt=self.step_dt)
             if torch.isnan(reward).any():
                 bad = torch.isnan(manager._step_reward).any(dim=0).nonzero(as_tuple=True)[0].tolist()
                 raise RuntimeError(f"NaN in {agent} reward terms {[manager._term_names[i] for i in bad]}")
-            rewards[agent] = torch.clamp(reward, min=0.0) + self.cfg.termination_penalty * terminated
+            rewards[agent] = torch.clamp(reward, min=0.0) + self.cfg.termination_penalty * terminated + trip_cost
         return rewards
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
@@ -234,6 +244,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._fresh[env_ids] = True
         if self.golem_monitor is not None:
             self.golem_monitor.reset(env_ids)
+        self._golem_tripped_prev[env_ids] = False
 
         log = {}
         log.update(self.observation_manager.reset(env_ids))
@@ -346,8 +357,9 @@ class LocoManipMarlEnv(DirectMARLEnv):
 
     @property
     def estops_end_episodes(self) -> bool:
-        """With cfg.golem_estop_ends_episode, GOLEM's e-stops end the episode from the end of the warm start, as the
-        arm goals start (and outside training from the start), so a fresh policy's first steps don't end it."""
+        """With cfg.golem_estop_ends_episode, GOLEM's e-stops end the episode from the end of the warm start (as the
+        arm goals start; outside training from the start) in every mode, walking and arm goals alike, so a fresh
+        policy's first steps don't end it."""
         return self.cfg.golem_estop_ends_episode and self._arm_command.goals_enabled
 
     def _update_warm_start(self, terminated: torch.Tensor, time_outs: torch.Tensor):

@@ -12,7 +12,9 @@ Writes into --out (a policies/<name> directory of the deploy package):
                      targets into it as the env did), odometry (mode learned, the estimator's input window in
                      frames, and the run's vertical_from_feet and tilt_from_gravity: the node replaces the estimate's
                      vertical motion with the feet's and its tilt with gravity's, as the env does), height_drop_obs
-                     (whether the actors take the height_drop input runs before golemlim had) and the source files.
+                     (whether the actors take the height_drop input runs before golemlim had), imu (the body the
+                     run's IMU sat on and its offset: imu_link on the torso, or livox_link at the MID-360's chip) and
+                     the source files.
 Needs only torch; no simulator.
 
     python scripts/skrl/export_marl.py --checkpoint logs/skrl/locomanip_marl/<run>/checkpoints/agent_<step>.pt \
@@ -32,7 +34,7 @@ import torch.nn as nn
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from mujoco_evals.common import read_target_limits  # noqa: E402  (standard library and yaml only)
+from mujoco_evals.common import read_imu, read_target_limits  # noqa: E402  (standard library and yaml only)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", required=True)
@@ -166,6 +168,9 @@ export = {
                  "history_frames": history_frames,
                  "vertical_from_feet": env_flag("vertical_from_feet"), "tilt_from_gravity": env_flag("tilt_from_gravity")},
     "height_drop_obs": height_drop_obs,
+    # the IMU the policy and estimator read: the torso's imu_link (LowState.imu_state) or the head's Livox
+    # (livox_link: /livox/imu with FAST-LIO's attitude); the node refuses a config whose imu.source disagrees
+    "imu": read_imu(Path(run_dir)),
     "source": {"checkpoint": ckpt_path, "estimator": est_path, "target_tables": tables[-1] if tables else None,
                "task": args.task, "exported": datetime.now().isoformat(timespec="seconds")},
 }

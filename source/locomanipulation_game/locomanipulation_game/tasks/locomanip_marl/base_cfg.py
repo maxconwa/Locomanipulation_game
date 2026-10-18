@@ -45,6 +45,9 @@ SELF_CONTACT_SENSOR_NAMES = [f"self_contact_{link}" for link in SELF_CONTACT_LIN
 # one slot per physics substep of a policy step (= env decimation); almitrain_200k to lstm_run used 10 at 500 Hz,
 # lstm_run2 and the ablation_* runs kept 10 at 200 Hz, so the contact terms looked back 2.5 policy steps
 CONTACT_HISTORY = 4
+# The MID-360's IMU in its point-cloud frame is at (11.0, 23.29, -44.12) mm (Livox's spec; FAST-LIO mid360.yaml's
+# extrinsic_T is its inverse); the inverted mount's 180 deg roll flips y and z in the upright frame
+LIVOX_IMU_OFFSET = (0.011, -0.02329, 0.04412)
 
 
 @height_field_to_mesh
@@ -120,8 +123,12 @@ class TerrainSceneCfg(InteractiveSceneCfg):
         debug_vis=True,
         mesh_prim_paths=["/World/ground"],
     )
+    # The head's Livox MID-360 IMU (its chip, in livox_link: the upright lidar frame, the mount's 180 deg roll undone,
+    # as GOLEM's livox_imu_upright publishes /livox/imu). Every run up to Explicit500 read the torso's imu_link; replay
+    # one with 'env.scene.imu.prim_path={ENV_REGEX_NS}/Robot/imu_link' 'env.scene.imu.offset.pos=[0.0,0.0,0.0]'.
     imu = ImuCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/imu_link",
+        prim_path="{ENV_REGEX_NS}/Robot/livox_link",
+        offset=ImuCfg.OffsetCfg(pos=LIVOX_IMU_OFFSET),
         debug_vis=True,
     )
     def __post_init__(self):
