@@ -7,7 +7,9 @@ ratio, or |tau_est| above the URDF torque limit times its ratio. The action term
 position_envelope, GOLEM's edges (its target clip, or its position e-stop where tighter) tightened by GolemEstopCfg's
 position margins, so a target never asks for a position GOLEM would clip or e-stop at. GolemEstopMonitor checks the measured state against GOLEM's own position
 thresholds and its velocity and torque thresholds times GolemEstopCfg's margins, for the golem_estop term (logged; it
-ends the episode only with cfg.golem_estop_ends_episode). Torque is the motor's PD demand at the current state. The table is copied from GOLEM (core/joint_limits.py and config/relax_safety_split.yaml at commit 462c479).
+ends the episode only with cfg.golem_estop_ends_episode). Torque is the motor's PD demand at the current state. The table is copied from GOLEM (core/joint_limits.py and config/relax_safety_split.yaml at commit 462c479),
+with the ankle pitches' torque e-stop since raised from 60 to 95 Nm (ratio 1.58334) in both: Unitree's sport
+mode peaks at 93 Nm on the right ankle pitch and would trip 60 Nm in every one of its walking bags.
 """
 
 from __future__ import annotations
@@ -27,13 +29,13 @@ GOLEM_LIMITS = [
     ("left_hip_pitch_joint", -3.14, 2.5, 23.0, 200.0, 0.001, 0.0001, 1.0, 1.0),
     ("left_hip_roll_joint", -0.43, 3.14, 23.0, 200.0, 0.001, 0.0001, 1.0, 1.0),
     ("left_knee_joint", -0.12, 2.19, 14.0, 300.0, 0.001, 0.0001, 1.0, 1.0),
-    ("left_ankle_pitch_joint", -0.897334, 0.523598, 9.0, 60.0, 0.001, 0.0001, 3.0, 1.0),
+    ("left_ankle_pitch_joint", -0.897334, 0.523598, 9.0, 60.0, 0.001, 0.0001, 3.0, 1.58334),
     ("left_ankle_roll_joint", -0.261799, 0.261799, 9.0, 40.0, 0.001, 0.0001, 3.0, 1.0),
     ("right_hip_yaw_joint", -0.43, 0.43, 23.0, 200.0, 0.001, 0.0001, 1.0, 1.0),
     ("right_hip_pitch_joint", -3.14, 2.5, 23.0, 200.0, 0.001, 0.0001, 1.0, 1.0),
     ("right_hip_roll_joint", -3.14, 0.43, 23.0, 200.0, 0.001, 0.0001, 1.0, 1.0),
     ("right_knee_joint", -0.12, 2.19, 14.0, 300.0, 0.001, 0.0001, 1.0, 1.0),
-    ("right_ankle_pitch_joint", -0.897334, 0.523598, 9.0, 60.0, 0.001, 0.0001, 3.0, 1.0),
+    ("right_ankle_pitch_joint", -0.897334, 0.523598, 9.0, 60.0, 0.001, 0.0001, 3.0, 1.58334),
     ("right_ankle_roll_joint", -0.261799, 0.261799, 9.0, 40.0, 0.001, 0.0001, 3.0, 1.0),
     ("torso_joint", -2.35, 2.35, 23.0, 200.0, 0.001, 0.0001, 1.0, 1.0),
     ("left_shoulder_pitch_joint", -3.14, 1.57, 9.0, 40.0, 0.001, 0.0001, 1.0, 1.0),
