@@ -420,10 +420,11 @@ class LocoManipMarlEnv(DirectMARLEnv):
         arm = self._arm_command
         if not arm.goals_enabled and walks:
             arm.goals_enabled = True
+            arm.goals_enabled_at = self.common_step_counter  # the arm-goal share ramps up from here
             self._set_walk_stage()
             print(f"[INFO] Warm start over at step {self.common_step_counter}: {self._walk_fell.item():.1%} of episodes"
                   f" fall, {self._walk_tracked.item():.0%} track, cos v {self._walk_cos.item():.2f},"
-                  f" {share.item():.0%} time out; arm goals start, base_height stops{', GOLEM e-stops end the episode' if self.estops_end_episodes else ''}")
+                  f" {share.item():.0%} time out; arm goals start{'' if cfg.base_height_during_navigation else ', base_height stops'}{', GOLEM e-stops end the episode' if self.estops_end_episodes else ''}")
         self._warm_start_log["Curriculum/warm_start_timeout_share"] = share
         self._warm_start_log["Curriculum/warm_start_fell_share"] = self._walk_fell
         self._warm_start_log["Curriculum/warm_start_tracked_share"] = self._walk_tracked

@@ -25,6 +25,7 @@ def arm_target_levels(env: ManagerBasedRLEnv, env_ids: Sequence[int], command_na
         "fine_pos_std": torch.tensor(term.fine_pos_std, device=env.device),
         "rot_std": torch.tensor(term.rot_std, device=env.device),
         "kernel_window_share": term.kernel_window_share,
+        "arm_goal_prob": torch.tensor(term.arm_goal_prob if term.goals_enabled else 0.0, device=env.device),
     }
 
 

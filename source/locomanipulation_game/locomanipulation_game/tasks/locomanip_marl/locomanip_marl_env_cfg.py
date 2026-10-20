@@ -61,6 +61,7 @@ from .base_cfg import (
 )
 from .golem_safety import GOLEM_TARGET_CLIP, GolemEstopCfg, position_envelope
 from .odometry import PelvisEstimatorCfg
+from .passive_actuator import PassivePDActuatorCfg
 
 LEFT_ARM_JOINT_NAMES = ARM_JOINT_NAMES[:7]
 RIGHT_ARM_JOINT_NAMES = ARM_JOINT_NAMES[7:]
@@ -100,8 +101,11 @@ OBSERVATION_SCALES = {
 # Kept implicit: the grippers are locked open by stiff gains that an explicit PD at SIM_DT would not hold stably.
 IMPLICIT_ACTUATORS = ("grippers",)
 GOAL_BONUS = 5.0          # paid once per reached goal
-# lambda: each agent's reward includes this share of the other's command-following terms
-REWARD_SHARE = 0.5
+# lambda: each agent's reward includes this share of the other's command-following terms. The legs keep 0.5 of the
+# arms'; the arms take none of the legs' (every run up to Mid360: 0.5 both ways), whose cycle-mean yaw term had grown
+# to ~0.6/step and diluted the arms' own: YawTwist's settled wrist error 9.6 cm became Mid360's 15
+REWARD_SHARE_TO_LEGS = 0.5
+REWARD_SHARE_TO_ARMS = 0.0
 ARM_GOAL_HIP_POS_SCALE = 0.2  # the legs' hip yaw/roll deviation term during arm goals, as a share of its weight
 CLIP_ACTIONS = 10.0       # the env clamps every raw policy action to +-this
 TORQUE_HEADROOM = 0.85    # targets ask for at most this share of a joint's effort limit (the e-stop trips at 0.9)
@@ -126,6 +130,14 @@ ROT_STDS = (0.5, 0.4, 0.3, 0.22, 0.16, 0.12, 0.08)               # rad
 # The MID-360 IMU (base_cfg scene.imu at livox_imu_link). Its gyro is low-passed against the head's 20 Hz resonance
 # (the headshake), as GOLEM's deploy does; its mount and accelerometer bias are drawn per env at each reset.
 GYRO_LOWPASS_HZ = 8.0
+# Joint passive dynamics, per env and joint (mdp.randomize_joint_passive_dynamics), tightly around GOLEM's Robocasa
+# MJCF (CL_Assets robosuite_assets h1_2 robot.xml: damping 10, frictionloss 0.2, armature 0.1 on every joint). OFF
+# (JOINT_PASSIVE_DYNAMICS): Explicit500, trained without them (explicit PD, armature 0.01), walked in Robocasa and on
+# the robot; JointDyn200k (10-19, stopped at 28k) learned to walk far slower with them.
+JOINT_PASSIVE_DYNAMICS = False
+JOINT_DAMPING_RANGE = (8.0, 12.0)     # N m s/rad
+JOINT_FRICTION_RANGE = (0.15, 0.25)   # N m
+JOINT_ARMATURE_RANGE = (0.08, 0.12)   # kg m^2
 IMU_MOUNT_PITCH_DEG = 1.5
 IMU_MOUNT_ROLL_DEG = 0.75
 IMU_MOUNT_YAW_DEG = 0.75
@@ -134,11 +146,15 @@ IMU_ACC_BIAS_G = 0.01
 # unitree_rl_gym's std 0.5, under which standing still against a 0.4 m/s command keeps 53% of the linear reward
 # (Tune3Track2 and Carry walked at a third of the command or less); narrowed as the navigation errors fall.
 LIN_VEL_STDS = (0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1)  # m/s
-ANG_VEL_STDS = (0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1)  # rad/s
+# SmoothYaw on: the yaw kernel starts wide, so the gait's twist (~1.2 rad/s early) still leaves it a slope
+ANG_VEL_STDS = (1.5, 1.0, 0.7, 0.5, 0.4, 0.3, 0.2)  # rad/s
 # The yaw tracking term and its kernel's judge read the yaw rate averaged over one gait cycle: on the instantaneous
 # rate the step's twist (about +-0.45 rad/s RMS) is as large as a turn command, and no run up to SmoothYawNavH turned
 # the commanded way much above chance (eval_ablation). Explicit500 tracked on the cycle mean too. 0: instantaneous.
 YAW_TRACKING_WINDOW_S = 0.8  # s, legs_rewards.GAIT_PERIOD
+# The linear term and its judge too, from 10-19: within a stride the pelvis sways sideways and surges, so after the
+# arm goals start the instantaneous error stayed over its 0.25 kernel and the kernel never narrowed again.
+VEL_TRACKING_WINDOW_S = 0.8
 # ... and the twist inside the cycle is charged apart (mdp.yaw_twist_l2): about -0.2 per second at SmoothYawNavH's
 # 0.42 rad/s RMS, -1.4 at YawMean's 1.2
 YAW_TWIST_WEIGHT = -1.0
@@ -165,6 +181,7 @@ class MarlCommandsCfg:
         lin_vel_stds=LIN_VEL_STDS,
         ang_vel_stds=ANG_VEL_STDS,
         yaw_window_s=YAW_TRACKING_WINDOW_S,
+        lin_window_s=VEL_TRACKING_WINDOW_S,
     )
     arm_targets = mdp.ArmTargetsCommandCfg(
         asset_name="robot",
@@ -375,8 +392,9 @@ class LegsRewardsCfg(LowerRewardsCfg):
         # LowerRewardsCfg's per-step kernels at twice unitree_rl_gym's H1-2 weights, their stds annealed from its 0.5 by
         # the velocity command's kernel curriculum (LIN_VEL_STDS, ANG_VEL_STDS); the arms' shared copies follow
         self.track_lin_vel_xy.weight = 2.0
-        self.track_lin_vel_xy.func = mdp.track_lin_vel_xy_exp_annealed
-        self.track_lin_vel_xy.params = {"command_name": "base_velocity"}
+        self.track_lin_vel_xy.func = mdp.track_lin_vel_xy_avg_exp_annealed
+        self.track_lin_vel_xy.params = {"command_name": "base_velocity", "component": "lin_xy",
+                                        "window_s": VEL_TRACKING_WINDOW_S}
         self.track_ang_vel_z.weight = 1.0
         self.track_ang_vel_z.func = mdp.track_ang_vel_z_avg_exp_annealed
         self.track_ang_vel_z.params = {"command_name": "base_velocity", "component": "ang_z",
@@ -431,10 +449,11 @@ class ArmsRewardsCfg:
     golem_velocity = _golem(ARM_JOINT_NAMES, "velocity", -10.0, GOLEM_RATE_MARGIN)
     golem_torque = _golem(ARM_JOINT_NAMES, "torque", -10.0, GOLEM_RATE_MARGIN)
     dof_acc = _arm_joints(mdp.joint_acc_l2, -2.5e-7)
-    action_rate = RewTerm(func=mdp.action_term_rate_l2, weight=-0.01, params={"action_name": ARMS_ACTION})
+    # Smooth (10-19): -0.1 here and target_rate -20 halved the arms' settled jitter (eval: 0.038 -> 0.019 rad/step)
+    action_rate = RewTerm(func=mdp.action_term_rate_l2, weight=-0.1, params={"action_name": ARMS_ACTION})
     # arm joint targets changing per policy step during arm goals, against the reach jitter (Livox500: -20, with
     # action_rate -0.1); off since Tune3Track2, whose settled wrists still moved ~0.4 m/s (eval_ablation)
-    target_rate = RewTerm(func=mdp.arm_joint_target_rate_l2, weight=0.0, params={
+    target_rate = RewTerm(func=mdp.arm_joint_target_rate_l2, weight=-20.0, params={
         "asset_cfg": SceneEntityCfg("robot", joint_names=ARM_JOINT_NAMES, preserve_order=True),
         "arm_command_name": ARM_COMMAND})
     dof_pos_limits = _arm_joints(mdp.joint_pos_limits, -5.0)
@@ -458,10 +477,11 @@ class MarlRewardsCfg:
         # logged as Episode_Reward/legs/arms_<term> and Episode_Reward/arms/legs_<term>
         for name in ARM_TRACKING_TERMS:
             term: RewTerm = getattr(self.arms, name)
-            setattr(self.legs, f"arms_{name}", term.replace(weight=REWARD_SHARE * term.weight))
-        for name in LEG_TRACKING_TERMS:
-            term = getattr(self.legs, name)
-            setattr(self.arms, f"legs_{name}", term.replace(weight=REWARD_SHARE * term.weight))
+            setattr(self.legs, f"arms_{name}", term.replace(weight=REWARD_SHARE_TO_LEGS * term.weight))
+        if REWARD_SHARE_TO_ARMS:
+            for name in LEG_TRACKING_TERMS:
+                term = getattr(self.legs, name)
+                setattr(self.arms, f"legs_{name}", term.replace(weight=REWARD_SHARE_TO_ARMS * term.weight))
 
 
 @configclass
@@ -478,6 +498,11 @@ class MarlEventCfg(EventCfg):
     imu_mount = EventTerm(func=mdp.randomize_imu_mount, mode="reset", params={
         "roll_deg": IMU_MOUNT_ROLL_DEG, "pitch_deg": IMU_MOUNT_PITCH_DEG, "yaw_deg": IMU_MOUNT_YAW_DEG,
         "acc_bias_g": IMU_ACC_BIAS_G})
+    # joint damping, dry friction and armature around GOLEM's Robocasa MJCF (every joint: 10 N m s/rad, 0.2 N m,
+    # 0.1 kg m^2), where Mid360, trained without, barely stepped
+    joint_dynamics = EventTerm(func=mdp.randomize_joint_passive_dynamics, mode="startup", params={
+        "damping_range": JOINT_DAMPING_RANGE, "friction_range": JOINT_FRICTION_RANGE,
+        "armature_range": JOINT_ARMATURE_RANGE}) if JOINT_PASSIVE_DYNAMICS else None
     massless_frames = EventTerm(
         func=mdp.randomize_rigid_body_mass,
         mode="startup",
@@ -539,7 +564,7 @@ def explicit_pd(actuators: dict) -> dict:
         if name in IMPLICIT_ACTUATORS or not isinstance(act, ImplicitActuatorCfg):
             out[name] = act
             continue
-        out[name] = IdealPDActuatorCfg(
+        out[name] = (PassivePDActuatorCfg if JOINT_PASSIVE_DYNAMICS else IdealPDActuatorCfg)(
             joint_names_expr=act.joint_names_expr,
             effort_limit=act.effort_limit_sim,
             effort_limit_sim=act.effort_limit_sim,  # the torque bounds read it (mdp.actions.torque_bounds)
@@ -615,10 +640,10 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     # and the walking episodes' velocity cos-sim to the command (nav_cos_vel_xy) at least this: standing scores ~0, and
     # UnitreeRew walked at 0.5 by 12k and 0.63 by 20k (UnitreeFall20's gate, without it, opened at 4.6k on a robot that
     # stood, and it never walked)
-    warm_start_min_cos: float = 0.5
+    warm_start_min_cos: float = 0.75  # Mid360/YawTwistGate: 0.5 let goals start on a gait that then collapsed
     # keep the legs' base_height term after the warm start, while navigating (never during arm goals): Smooth's
     # walking pelvis sank 3 -> 11 cm once the goals started and nothing held it
-    base_height_during_navigation: bool = False
+    base_height_during_navigation: bool = True
     warm_start_episode_decay: float = 0.999
     agent_action_terms: dict[str, list[str]] = AGENT_ACTION_TERMS
     clip_actions: float = CLIP_ACTIONS

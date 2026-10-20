@@ -121,7 +121,7 @@ class ModalVelocityCommand(UniformVelocityCommand):
     **Kernels.** The annealed velocity-tracking rewards read lin_vel_std and ang_vel_std, each one stage of
     cfg.lin_vel_stds / cfg.ang_vel_stds for all envs, judged apart (_judge_kernels). A navigation segment, one velocity
     command held outside arm goals, ends at the next resample, arm goal or reset; it hits the linear kernel when its
-    mean xy error is under lin_vel_std (judged only if it commanded a walk, |v_xy| >= min_cos_speed) and the yaw kernel
+    mean xy error (the xy velocity averaged over lin_window_s) is under lin_vel_std (judged only if it commanded a walk, |v_xy| >= min_cos_speed) and the yaw kernel
     when its mean yaw-rate error is under ang_vel_std (only if it commanded a turn, |w_z| >= min_cos_speed), the yaw
     rate averaged over the last yaw_window_s (one gait cycle cancels the step's twist, which on the instantaneous rate
     swamps a turn command; 0: instantaneous). A segment
@@ -148,6 +148,11 @@ class ModalVelocityCommand(UniformVelocityCommand):
         self._yaw_samples = torch.zeros(self.num_envs, self._yaw_window, device=self.device)
         self._yaw_count = zeros()
         self._yaw_slot = 0
+        self._lin_window = max(int(round(cfg.lin_window_s / env.step_dt)), 1)
+        self._lin_samples = torch.zeros(self.num_envs, self._lin_window, 2, device=self.device)
+        self._lin_count = zeros()
+        self._lin_slot = 0
+        self._nav_err_xy_avg = zeros()
         self._nav_err_yaw_avg = zeros()
         self._seg_cmd = torch.zeros(self.num_envs, 3, device=self.device)
         self.lin_kernel_stage = 0
@@ -249,7 +254,12 @@ class ModalVelocityCommand(UniformVelocityCommand):
         if len(started) > 0:
             self._end_segments(started)
         self._seg_steps += nav
-        self._seg_err_xy += torch.norm(cmd_xy - vel_xy, dim=-1) * nav
+        self._lin_samples[:, self._lin_slot] = vel_xy
+        self._lin_slot = (self._lin_slot + 1) % self._lin_window
+        self._lin_count = torch.clamp(self._lin_count + 1.0, max=self._lin_window)
+        lin_avg_err = torch.norm(cmd_xy - self._lin_samples.sum(dim=1) / self._lin_count.unsqueeze(-1), dim=-1)
+        self._seg_err_xy += lin_avg_err * nav
+        self._nav_err_xy_avg += lin_avg_err * nav
         self._yaw_samples[:, self._yaw_slot] = yaw_rate
         self._yaw_slot = (self._yaw_slot + 1) % self._yaw_window
         self._yaw_count = torch.clamp(self._yaw_count + 1.0, max=self._yaw_window)
@@ -271,16 +281,20 @@ class ModalVelocityCommand(UniformVelocityCommand):
         self._end_segments(ended, None if terminated is None else terminated[ended])
         self._yaw_samples[ended] = 0.0
         self._yaw_count[ended] = 0.0
+        self._lin_samples[ended] = 0.0
+        self._lin_count[ended] = 0.0
         extras = {}
         _add_weighted_mean(extras, "nav_error_vel_xy", self._nav_err_xy[ids], self._nav_steps[ids])
         _add_weighted_mean(extras, "nav_error_vel_yaw", self._nav_err_yaw[ids], self._nav_steps[ids])
         _add_weighted_mean(extras, "nav_error_vel_yaw_avg", self._nav_err_yaw_avg[ids], self._nav_steps[ids])
+        _add_weighted_mean(extras, "nav_error_vel_xy_avg", self._nav_err_xy_avg[ids], self._nav_steps[ids])
         _add_weighted_mean(extras, "arm_goal_yaw_rate", self._arm_yaw_rate[ids], self._arm_steps[ids])
         _add_weighted_mean(extras, "nav_cos_vel_xy", self._walk_cos[ids], self._walk_steps[ids])
         _add_weighted_mean(extras, "carry_error_vel_xy", self._carry_err_xy[ids], self._carry_steps[ids])
         _add_weighted_mean(extras, "carry_error_vel_yaw", self._carry_err_yaw[ids], self._carry_steps[ids])
         _add_weighted_mean(extras, "carry_cos_vel_xy", self._carry_walk_cos[ids], self._carry_walk_steps[ids])
-        for buffer in (self._nav_steps, self._nav_err_xy, self._nav_err_yaw, self._nav_err_yaw_avg, self._arm_steps, self._arm_yaw_rate,
+        for buffer in (self._nav_steps, self._nav_err_xy, self._nav_err_yaw, self._nav_err_yaw_avg, self._nav_err_xy_avg,
+                       self._arm_steps, self._arm_yaw_rate,
                        self._walk_steps, self._walk_cos, self._carry_steps, self._carry_err_xy, self._carry_err_yaw,
                        self._carry_walk_steps, self._carry_walk_cos):
             buffer[ids] = 0.0
@@ -306,6 +320,8 @@ class ModalVelocityCommandCfg(UniformVelocityCommandCfg):
     yaw_window_s: float = 0.0
     """s: the yaw kernel is judged on the yaw rate averaged over this window (and nav_error_vel_yaw_avg logs it); 0:
     the instantaneous rate."""
+    lin_window_s: float = 0.0
+    """s: the same for the linear kernel and the xy velocity (nav_error_vel_xy_avg)."""
     kernel_window_segments: int = 20000
     """Judged navigation segments (all envs) per window, each kernel apart."""
     kernel_promote_share: float = 0.5
@@ -366,6 +382,7 @@ class ArmTargetsCommand(CommandTerm):
 
         # -- goal state
         self.goals_enabled = False  # set by the env
+        self.goals_enabled_at: int | None = None  # the env step the warm start ended (training only): the ramp's start
         self.arm_mode = flags()
         self.carrying = flags()  # navigation with a table pose, not the rest pose
         self.anchor_w = torch.zeros(shape, device=self.device)  # arm goal: world-fixed targets
@@ -785,7 +802,7 @@ class ArmTargetsCommand(CommandTerm):
         env_ids = torch.as_tensor(env_ids, device=self.device)
         n = len(env_ids)
         velocity = self._env.command_manager.get_term(self.cfg.velocity_command_name)
-        arm_goal = (torch.rand(n, device=self.device) < self.cfg.arm_goal_prob) & self.goals_enabled
+        arm_goal = (torch.rand(n, device=self.device) < self.arm_goal_prob) & self.goals_enabled
         self.arm_mode[env_ids] = arm_goal
         self.carrying[env_ids] = False
         self.goal_best_error[env_ids] = float("inf")
@@ -854,6 +871,16 @@ class ArmTargetsCommand(CommandTerm):
             rows.append(table[pick.clamp(max=len(table) - 1)])
         return torch.stack(rows, dim=1)
 
+    @property
+    def arm_goal_prob(self) -> float:
+        """The share of tasks that are arm goals: cfg.arm_goal_prob, ramped linearly from cfg.arm_goal_ramp_start over
+        cfg.arm_goal_ramp_steps env steps after the warm start ends (outside training, or resumed: no ramp)."""
+        cfg = self.cfg
+        if self.goals_enabled_at is None or cfg.arm_goal_ramp_steps <= 0:
+            return cfg.arm_goal_prob
+        frac = min(1.0, (self._env.common_step_counter - self.goals_enabled_at) / cfg.arm_goal_ramp_steps)
+        return cfg.arm_goal_ramp_start + frac * (cfg.arm_goal_prob - cfg.arm_goal_ramp_start)
+
     def _update_command(self):
         pass
 
@@ -915,6 +942,11 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     # -- tasks
     arm_goal_prob: float = 0.5
     """Once goals are enabled, the share of tasks that are arm goals."""
+    arm_goal_ramp_start: float = 0.1
+    arm_goal_ramp_steps: int = 10000
+    """env steps: after the warm start the arm-goal share ramps from arm_goal_ramp_start to arm_goal_prob over these
+    (0: at once, as every run before 10-19, whose falls then spiked to 85-99% and whose walking never fully
+    recovered)."""
     nav_time_range: tuple[float, float] = (4.0, 8.0)
     """s: a navigation task's duration."""
     carry_prob: float = 0.0

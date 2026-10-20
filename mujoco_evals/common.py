@@ -129,8 +129,9 @@ def _yaml_load_any(text: str):
 def read_reward_share(run_dir: Path) -> float | None:
     """lambda of a run from its params/env.yaml: the legs' weight on arms_left_ee_pos over the arms' own weight.
 
-    The task applies one scalar REWARD_SHARE in both directions (locomanip_marl_env_cfg.MarlRewardsCfg); the two
-    directions are read separately and must agree.
+    Runs up to Mid360 applied one REWARD_SHARE in both directions; from 10-19 the arms take none of the legs' terms
+    (REWARD_SHARE_TO_ARMS 0: no legs_* terms in the arms' rewards). Both directions are read, and an asymmetric run
+    reports the legs' one.
     """
     path = Path(run_dir) / "params" / "env.yaml"
     if not path.is_file():
@@ -139,7 +140,8 @@ def read_reward_share(run_dir: Path) -> float | None:
     rewards = cfg.get("rewards", {})
     try:
         to_legs = rewards["legs"]["arms_left_ee_pos"]["weight"] / rewards["arms"]["left_ee_pos"]["weight"]
-        to_arms = rewards["arms"]["legs_track_lin_vel_xy"]["weight"] / rewards["legs"]["track_lin_vel_xy"]["weight"]
+        shared = rewards["arms"].get("legs_track_lin_vel_xy")
+        to_arms = shared["weight"] / rewards["legs"]["track_lin_vel_xy"]["weight"] if shared else 0.0
     except (KeyError, TypeError, ZeroDivisionError):
         return None
     if abs(to_legs - to_arms) > 1e-6:

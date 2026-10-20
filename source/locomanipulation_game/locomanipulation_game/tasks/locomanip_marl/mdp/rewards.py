@@ -146,6 +146,15 @@ class yaw_twist_l2(ManagerTermBase):
         return torch.square(yaw_rate - self._samples.sum(dim=1) / self._count)
 
 
+class track_lin_vel_xy_avg_exp_annealed(track_velocity_avg_exp):
+    """track_velocity_avg_exp on the xy velocity (component "lin_xy"), with the velocity command's current lin_vel_std
+    (its tracking-kernel curriculum)."""
+
+    def __call__(self, env: ManagerBasedRLEnv, command_name: str, component: str, window_s: float) -> torch.Tensor:
+        std = env.command_manager.get_term(command_name).lin_vel_std
+        return super().__call__(env, command_name, std, component, window_s)
+
+
 class track_ang_vel_z_avg_exp_annealed(track_velocity_avg_exp):
     """track_velocity_avg_exp on the yaw rate (component "ang_z"), with the velocity command's current ang_vel_std
     (its tracking-kernel curriculum)."""
