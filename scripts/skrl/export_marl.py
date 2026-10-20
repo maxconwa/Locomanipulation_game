@@ -12,7 +12,8 @@ Writes into --out (a policies/<name> directory of the deploy package):
                      targets into it as the env did), odometry (mode learned, the estimator's input window in
                      frames, and the run's vertical_from_feet and tilt_from_gravity: the node replaces the estimate's
                      vertical motion with the feet's and its tilt with gravity's, as the env does), height_drop_obs
-                     (whether the actors take the height_drop input runs before golemlim had), imu (the body the
+                     (whether the actors take the height_drop input runs before golemlim had), gait_phase_cos
+                     (whether they observe each leg's phase cos after its sin, from Tune3Track2 on), imu (the body the
                      run's IMU sat on and its offset: imu_link on the torso, or livox_link at the MID-360's chip) and
                      the source files.
 Needs only torch; no simulator.
@@ -34,7 +35,7 @@ import torch.nn as nn
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from mujoco_evals.common import read_imu, read_target_limits  # noqa: E402  (standard library and yaml only)
+from mujoco_evals.common import _yaml_load_any, read_imu, read_target_limits  # noqa: E402  (standard library and yaml only)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", required=True)
@@ -129,10 +130,14 @@ for agent in ("legs", "arms"):
         kind = ""
     torch.jit.script(actor).save(os.path.join(args.out, f"{agent}.pt"))
     print(f"{agent}: {n} obs -> {kind}{actor.net[-1].out_features} actions")
-# the legs' 95 inputs, or 96 with the height_drop input (always 0) that runs before golemlim had
-if num_obs["legs"] not in (95, 96):
-    raise ValueError(f"legs: {num_obs['legs']} observations; the deploy layout knows 95 and 96")
-height_drop_obs = num_obs["legs"] == 96
+# the legs' 95 inputs, + 1 with the height_drop input (always 0) that runs before golemlim had, + 2 with each leg's
+# gait phase cos (the run's observations name gait_phase_cos)
+legs_terms = (_yaml_load_any(Path(run_dir, "params", "env.yaml").read_text()).get("observations") or {}).get("legs") or {}
+gait_phase_cos = "gait_phase_cos" in legs_terms
+height_drop_obs = num_obs["legs"] - 2 * gait_phase_cos == 96
+if num_obs["legs"] - 2 * gait_phase_cos not in (95, 96) or num_obs["arms"] - num_obs["legs"] != 28:
+    raise ValueError(f"legs {num_obs['legs']}, arms {num_obs['arms']} observations (gait_phase_cos {gait_phase_cos}); "
+                     "the deploy layout knows legs 95 or 96, + 2 with gait_phase_cos, and arms 28 more")
 
 step = re.search(r"_(\d+)\.pt$", ckpt_path)
 est_path = os.path.join(run_dir, "estimator", f"estimator_{step.group(1)}.pt") if step else None
@@ -168,8 +173,11 @@ export = {
                  "history_frames": history_frames,
                  "vertical_from_feet": env_flag("vertical_from_feet"), "tilt_from_gravity": env_flag("tilt_from_gravity")},
     "height_drop_obs": height_drop_obs,
-    # the IMU the policy and estimator read: the torso's imu_link (LowState.imu_state) or the head's Livox
-    # (livox_link: /livox/imu with FAST-LIO's attitude); the node refuses a config whose imu.source disagrees
+    # the actors observe each leg's gait phase cos after its sin (lmg_deploy controller: legs 97, arms 125)
+    "gait_phase_cos": gait_phase_cos,
+    # the IMU the policy and estimator read: the torso's imu_link (LowState.imu_state) or the head's MID-360
+    # (livox_link, or from the 10-19 update its chip frame livox_imu_link), and gyro_lowpass_hz when the gyro was
+    # low-passed (the deploy filters only when the key is present)
     "imu": read_imu(Path(run_dir)),
     "source": {"checkpoint": ckpt_path, "estimator": est_path, "target_tables": tables[-1] if tables else None,
                "task": args.task, "exported": datetime.now().isoformat(timespec="seconds")},

@@ -1,7 +1,8 @@
 """Commands for the two-agent task: navigation OR an arm goal, never both.
 
 At every command event ArmTargetsCommand gives an env either navigation (the velocity command is live, each wrist
-holds its rest pose in the pelvis frame) or, once the env's warm start is over, an arm goal (zero velocity, a wrist
+holds a pose fixed in the pelvis frame: its rest pose, or once the warm start is over and with probability carry_prob
+a standing-reachable table pose) or, once the env's warm start is over, an arm goal (zero velocity, a wrist
 pose per arm from a table of standing-reachable poses, lowered by the depth curriculum and fixed in the world). The
 policies see the arm command in the pelvis frame, exact at the event and then moved by the pelvis motion the env's
 odometry reports (apply_pelvis_motion); rewards, reach detection and the curriculum use the true world target.
@@ -114,7 +115,19 @@ class ModalVelocityCommand(UniformVelocityCommand):
     pure_turn_speed, either sign), and with probability pure_lateral_prob by a sideways walk (|vy| in
     pure_lateral_speed): uniform sampling almost never draws either. Logs the tracking error during navigation, the
     cosine similarity between the commanded and the true base-frame xy velocity while a walk is commanded (|v_cmd| at
-    least min_cos_speed), and the yaw rate during arm goals.
+    least min_cos_speed), and the yaw rate during arm goals; carry_* are the navigation ones over the steps that carry
+    a table pose (ArmTargetsCommand.carrying).
+
+    **Kernels.** The annealed velocity-tracking rewards read lin_vel_std and ang_vel_std, each one stage of
+    cfg.lin_vel_stds / cfg.ang_vel_stds for all envs, judged apart (_judge_kernels). A navigation segment, one velocity
+    command held outside arm goals, ends at the next resample, arm goal or reset; it hits the linear kernel when its
+    mean xy error is under lin_vel_std (judged only if it commanded a walk, |v_xy| >= min_cos_speed) and the yaw kernel
+    when its mean yaw-rate error is under ang_vel_std (only if it commanded a turn, |w_z| >= min_cos_speed), the yaw
+    rate averaged over the last yaw_window_s (one gait cycle cancels the step's twist, which on the instantaneous rate
+    swamps a turn command; 0: instantaneous). A segment
+    ended by a fall misses. After every kernel_window_segments judged segments the stage narrows when at least
+    kernel_promote_share hit and widens below kernel_demote_share: the kernels follow the error down, so standing still
+    against a walk command stops paying.
     """
 
     cfg: ModalVelocityCommandCfg
@@ -125,11 +138,80 @@ class ModalVelocityCommand(UniformVelocityCommand):
         self._nav_steps, self._nav_err_xy, self._nav_err_yaw = zeros(), zeros(), zeros()
         self._arm_steps, self._arm_yaw_rate = zeros(), zeros()
         self._walk_steps, self._walk_cos = zeros(), zeros()
+        self._carry_steps, self._carry_err_xy, self._carry_err_yaw = zeros(), zeros(), zeros()
+        self._carry_walk_steps, self._carry_walk_cos = zeros(), zeros()
+        # -- tracking-kernel curriculum: per-env sums over the current navigation segment
+        if not cfg.lin_vel_stds or not cfg.ang_vel_stds:
+            raise ValueError("lin_vel_stds and ang_vel_stds need at least one stage")
+        self._seg_steps, self._seg_err_xy, self._seg_err_yaw = zeros(), zeros(), zeros()
+        self._yaw_window = max(int(round(cfg.yaw_window_s / env.step_dt)), 1)
+        self._yaw_samples = torch.zeros(self.num_envs, self._yaw_window, device=self.device)
+        self._yaw_count = zeros()
+        self._yaw_slot = 0
+        self._nav_err_yaw_avg = zeros()
+        self._seg_cmd = torch.zeros(self.num_envs, 3, device=self.device)
+        self.lin_kernel_stage = 0
+        self.ang_kernel_stage = 0
+        self._kernel_counts = {k: torch.zeros(2, device=self.device) for k in ("lin", "ang")}  # hits, judged
+        self.lin_kernel_window_share = torch.tensor(float("nan"), device=self.device)
+        self.ang_kernel_window_share = torch.tensor(float("nan"), device=self.device)
+
+    @property
+    def lin_vel_std(self) -> float:
+        return self.cfg.lin_vel_stds[self.lin_kernel_stage]
+
+    @property
+    def ang_vel_std(self) -> float:
+        return self.cfg.ang_vel_stds[self.ang_kernel_stage]
+
+    def _end_segments(self, env_ids: torch.Tensor, fell: torch.Tensor | None = None):
+        """Judge the navigation segments of env_ids that had steps, then clear their sums."""
+        steps = self._seg_steps[env_ids]
+        had = steps > 0
+        if fell is None:
+            fell = torch.zeros_like(had)
+        cmd = self._seg_cmd[env_ids]
+        min_speed = self.cfg.min_cos_speed
+        for key, err, commanded, std in (
+            ("lin", self._seg_err_xy, torch.norm(cmd[:, :2], dim=-1) >= min_speed, self.lin_vel_std),
+            ("ang", self._seg_err_yaw, torch.abs(cmd[:, 2]) >= min_speed, self.ang_vel_std),
+        ):
+            judged = had & commanded
+            hit = judged & ~fell & (err[env_ids] / steps.clamp(min=1.0) < std)
+            self._kernel_counts[key] += torch.stack([hit.sum(), judged.sum()]).float()
+        self._seg_steps[env_ids] = 0.0
+        self._seg_err_xy[env_ids] = 0.0
+        self._seg_err_yaw[env_ids] = 0.0
+        self._judge_kernels()
+
+    def _judge_kernels(self):
+        cfg = self.cfg
+        for key, stds in (("lin", cfg.lin_vel_stds), ("ang", cfg.ang_vel_stds)):
+            counts = self._kernel_counts[key]
+            if len(stds) < 2 or counts[1].item() < cfg.kernel_window_segments:
+                continue
+            share = counts[0] / counts[1]
+            stage = getattr(self, f"{key}_kernel_stage")
+            if share.item() >= cfg.kernel_promote_share and stage < len(stds) - 1:
+                stage += 1
+            elif share.item() < cfg.kernel_demote_share and stage > 0:
+                stage -= 1
+            setattr(self, f"{key}_kernel_stage", stage)
+            setattr(self, f"{key}_kernel_window_share", share)
+            counts.zero_()
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return {"lin_kernel_stage": torch.tensor(self.lin_kernel_stage), "ang_kernel_stage": torch.tensor(self.ang_kernel_stage)}
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]):
+        self.lin_kernel_stage = min(max(int(state.get("lin_kernel_stage", 0)), 0), len(self.cfg.lin_vel_stds) - 1)
+        self.ang_kernel_stage = min(max(int(state.get("ang_kernel_stage", 0)), 0), len(self.cfg.ang_vel_stds) - 1)
 
     def _arm_mode(self) -> torch.Tensor:
         return self._env.command_manager.get_term(self.cfg.arm_command_name).arm_mode
 
     def _resample_command(self, env_ids: Sequence[int]):
+        self._end_segments(torch.as_tensor(env_ids, device=self.device))
         super()._resample_command(env_ids)
         ids = torch.as_tensor(env_ids, device=self.device)
         ids = ids[~self.is_standing_env[ids]]
@@ -160,17 +242,47 @@ class ModalVelocityCommand(UniformVelocityCommand):
         cmd_xy, vel_xy = self.vel_command_b[:, :2], self.robot.data.root_lin_vel_b[:, :2]
         walk = nav * (torch.norm(cmd_xy, dim=-1) >= self.cfg.min_cos_speed).float()
         self._walk_steps += walk
-        self._walk_cos += torch.nn.functional.cosine_similarity(cmd_xy, vel_xy, dim=-1, eps=1e-6) * walk
+        cos = torch.nn.functional.cosine_similarity(cmd_xy, vel_xy, dim=-1, eps=1e-6)
+        self._walk_cos += cos * walk
+        # a navigation segment ends when an arm goal starts
+        started = torch.nonzero((arm > 0.5) & (self._seg_steps > 0)).flatten()
+        if len(started) > 0:
+            self._end_segments(started)
+        self._seg_steps += nav
+        self._seg_err_xy += torch.norm(cmd_xy - vel_xy, dim=-1) * nav
+        self._yaw_samples[:, self._yaw_slot] = yaw_rate
+        self._yaw_slot = (self._yaw_slot + 1) % self._yaw_window
+        self._yaw_count = torch.clamp(self._yaw_count + 1.0, max=self._yaw_window)
+        yaw_avg_err = torch.abs(self.vel_command_b[:, 2] - self._yaw_samples.sum(dim=1) / self._yaw_count)
+        self._seg_err_yaw += yaw_avg_err * nav
+        self._nav_err_yaw_avg += yaw_avg_err * nav
+        self._seg_cmd = torch.where(nav.unsqueeze(-1) > 0.5, self.vel_command_b, self._seg_cmd)
+        carry = self._env.command_manager.get_term(self.cfg.arm_command_name).carrying.float()
+        self._carry_steps += nav * carry
+        self._carry_err_xy += torch.norm(cmd_xy - vel_xy, dim=-1) * nav * carry
+        self._carry_err_yaw += torch.abs(self.vel_command_b[:, 2] - yaw_rate) * nav * carry
+        self._carry_walk_steps += walk * carry
+        self._carry_walk_cos += cos * walk * carry
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
         ids = slice(None) if env_ids is None else env_ids
+        ended = torch.arange(self.num_envs, device=self.device)[ids]
+        terminated = getattr(getattr(self._env, "termination_manager", None), "terminated", None)
+        self._end_segments(ended, None if terminated is None else terminated[ended])
+        self._yaw_samples[ended] = 0.0
+        self._yaw_count[ended] = 0.0
         extras = {}
         _add_weighted_mean(extras, "nav_error_vel_xy", self._nav_err_xy[ids], self._nav_steps[ids])
         _add_weighted_mean(extras, "nav_error_vel_yaw", self._nav_err_yaw[ids], self._nav_steps[ids])
+        _add_weighted_mean(extras, "nav_error_vel_yaw_avg", self._nav_err_yaw_avg[ids], self._nav_steps[ids])
         _add_weighted_mean(extras, "arm_goal_yaw_rate", self._arm_yaw_rate[ids], self._arm_steps[ids])
         _add_weighted_mean(extras, "nav_cos_vel_xy", self._walk_cos[ids], self._walk_steps[ids])
-        for buffer in (self._nav_steps, self._nav_err_xy, self._nav_err_yaw, self._arm_steps, self._arm_yaw_rate,
-                       self._walk_steps, self._walk_cos):
+        _add_weighted_mean(extras, "carry_error_vel_xy", self._carry_err_xy[ids], self._carry_steps[ids])
+        _add_weighted_mean(extras, "carry_error_vel_yaw", self._carry_err_yaw[ids], self._carry_steps[ids])
+        _add_weighted_mean(extras, "carry_cos_vel_xy", self._carry_walk_cos[ids], self._carry_walk_steps[ids])
+        for buffer in (self._nav_steps, self._nav_err_xy, self._nav_err_yaw, self._nav_err_yaw_avg, self._arm_steps, self._arm_yaw_rate,
+                       self._walk_steps, self._walk_cos, self._carry_steps, self._carry_err_xy, self._carry_err_yaw,
+                       self._carry_walk_steps, self._carry_walk_cos):
             buffer[ids] = 0.0
         extras.update(super().reset(env_ids))
         return extras
@@ -185,6 +297,19 @@ class ModalVelocityCommandCfg(UniformVelocityCommandCfg):
     min_cos_speed: float = 0.1  # m/s: the commanded xy speed from which nav_cos_vel_xy counts a step
     pure_lateral_prob: float = 0.0
     pure_lateral_speed: tuple[float, float] = (0.15, 0.3)   # m/s
+    # -- tracking-kernel curriculum (ModalVelocityCommand._judge_kernels): the annealed tracking terms' stds per stage,
+    # narrowest last. One stage: fixed kernels.
+    lin_vel_stds: tuple[float, ...] = (0.5,)
+    """m/s: the xy velocity kernel."""
+    ang_vel_stds: tuple[float, ...] = (0.5,)
+    """rad/s: the yaw-rate kernel."""
+    yaw_window_s: float = 0.0
+    """s: the yaw kernel is judged on the yaw rate averaged over this window (and nav_error_vel_yaw_avg logs it); 0:
+    the instantaneous rate."""
+    kernel_window_segments: int = 20000
+    """Judged navigation segments (all envs) per window, each kernel apart."""
+    kernel_promote_share: float = 0.5
+    kernel_demote_share: float = 0.25
 
 
 class ArmTargetsCommand(CommandTerm):
@@ -192,8 +317,10 @@ class ArmTargetsCommand(CommandTerm):
 
     **Events.** Reset or the timer running out. Once goals_enabled (the env sets it when its warm start ends), the
     next task is an arm goal with probability arm_goal_prob, lasting resampling_time_range; otherwise navigation for
-    nav_time_range, with a fresh velocity command. During navigation each wrist holds its rest pose, the wrist pose
-    at the default joint angles in the pelvis frame. During an arm goal the velocity command is zero
+    nav_time_range, with a fresh velocity command. During navigation each wrist holds a pose fixed in the pelvis frame
+    (carry_b): its rest pose, the wrist pose at the default joint angles, or once goals are enabled and with
+    probability carry_prob (carrying) a table pose drawn as a goal at depth level 0 would be, never lowered: crouching
+    can't bring a pelvis-frame target closer. During an arm goal the velocity command is zero
     (ModalVelocityCommand).
 
     **Goals.** The tables hold collision-free wrist poses at random arm joint angles with the robot standing, in the
@@ -240,6 +367,7 @@ class ArmTargetsCommand(CommandTerm):
         # -- goal state
         self.goals_enabled = False  # set by the env
         self.arm_mode = flags()
+        self.carrying = flags()  # navigation with a table pose, not the rest pose
         self.anchor_w = torch.zeros(shape, device=self.device)  # arm goal: world-fixed targets
         self.believed_b = torch.zeros(shape, device=self.device)  # what the policies see
         self.shadow_b = torch.zeros(shape, device=self.device)  # moved by the estimate, always
@@ -281,6 +409,7 @@ class ArmTargetsCommand(CommandTerm):
         # per-episode sums for the mode-split metrics, logged as weighted means by reset()
         self._goal_steps, self._goal_pos_err, self._goal_rot_err = zeros(), zeros(), zeros()
         self._rest_steps, self._rest_pos_err = zeros(), zeros()
+        self._carry_steps, self._carry_pos_err, self._carry_rot_err = zeros(), zeros(), zeros()
         self._crouch_n, self._crouch_t, self._crouch_p = zeros(), zeros(), zeros()
         self._nav_n, self._nav_p = zeros(), zeros()
         self._best_err_sum, self._best_err_n = zeros(), zeros()
@@ -308,12 +437,15 @@ class ArmTargetsCommand(CommandTerm):
             raise ValueError("z_min must stay below z_max at every depth level")
         # (num_arms, 7): the wrist poses at the default joint angles, the navigation rest pose
         self.rest_pose_b = torch.stack(data["default_poses"])
+        # navigation: the pelvis-frame pose each wrist holds, the rest pose or a carried table pose
+        self.carry_b = self.rest_pose_b.unsqueeze(0).repeat(self.num_envs, 1, 1)
 
     def __str__(self) -> str:
         cfg = self.cfg
         msg = "ArmTargetsCommand:\n"
         msg += f"\tBodies: {cfg.body_names}\n"
         msg += f"\tArm goal probability once enabled: {cfg.arm_goal_prob}, navigation {cfg.nav_time_range} s\n"
+        msg += f"\tNavigation carrying a table pose once enabled: {cfg.carry_prob}\n"
         msg += (f"\tGoal heights: U[z_min, {cfg.z_max}] m, z_min = {cfg.z_min_start} - {cfg.depth_per_level} k_d m,"
                 f" k_d 0..{cfg.levels}\n")
         for arm, table in enumerate(self._tables):
@@ -338,10 +470,9 @@ class ArmTargetsCommand(CommandTerm):
         return origin, yaw_quat(self.robot.data.root_quat_w)
 
     def targets_w(self) -> torch.Tensor:
-        """True targets in world, (num_envs, num_arms, 7): the anchor for an arm goal, the rest pose otherwise."""
-        rest = self.rest_pose_b.unsqueeze(0).expand(self.num_envs, -1, -1)
-        rest_w = _apply(self.robot.data.root_pos_w, self.robot.data.root_quat_w, rest)
-        return torch.where(self.arm_mode.view(-1, 1, 1), self.anchor_w, rest_w)
+        """True targets in world, (num_envs, num_arms, 7): the anchor for an arm goal, carry_b on the pelvis otherwise."""
+        carry_w = _apply(self.robot.data.root_pos_w, self.robot.data.root_quat_w, self.carry_b)
+        return torch.where(self.arm_mode.view(-1, 1, 1), self.anchor_w, carry_w)
 
     def true_targets_in_root(self) -> torch.Tensor:
         """True targets in the pelvis frame, (num_envs, num_arms, 7), qw >= 0. Privileged: the critic's."""
@@ -389,12 +520,14 @@ class ArmTargetsCommand(CommandTerm):
         _add_weighted_mean(extras, "goal_position_error", self._goal_pos_err[ids], self._goal_steps[ids])
         _add_weighted_mean(extras, "goal_orientation_error", self._goal_rot_err[ids], self._goal_steps[ids])
         _add_weighted_mean(extras, "rest_position_error", self._rest_pos_err[ids], self._rest_steps[ids])
+        _add_weighted_mean(extras, "carry_position_error", self._carry_pos_err[ids], self._carry_steps[ids])
+        _add_weighted_mean(extras, "carry_orientation_error", self._carry_rot_err[ids], self._carry_steps[ids])
         _add_weighted_mean(extras, "target_drop", self._crouch_t[ids], self._crouch_n[ids])
         _add_weighted_mean(extras, "pelvis_drop", self._crouch_p[ids], self._crouch_n[ids])
         _add_weighted_mean(extras, "nav_pelvis_drop", self._nav_p[ids], self._nav_n[ids])
         _add_weighted_mean(extras, "goal_best_error", self._best_err_sum[ids], self._best_err_n[ids])
         for buffer in (self._goal_steps, self._goal_pos_err, self._goal_rot_err, self._rest_steps, self._rest_pos_err,
-                       self._crouch_n, self._crouch_t, self._crouch_p, self._nav_n, self._nav_p, self._best_err_sum,
+                       self._carry_steps, self._carry_pos_err, self._carry_rot_err, self._crouch_n, self._crouch_t, self._crouch_p, self._nav_n, self._nav_p, self._best_err_sum,
                        self._best_err_n):
             buffer[ids] = 0.0
         self.invalidate_errors()
@@ -599,8 +732,13 @@ class ArmTargetsCommand(CommandTerm):
         self._goal_steps += arm
         self._goal_pos_err += pos_error.mean(dim=1) * arm
         self._goal_rot_err += rot_error.mean(dim=1) * arm
-        self._rest_steps += 1.0 - arm
-        self._rest_pos_err += pos_error.mean(dim=1) * (1.0 - arm)
+        carry = self.carrying.float()
+        rest = (1.0 - arm) * (1.0 - carry)
+        self._rest_steps += rest
+        self._rest_pos_err += pos_error.mean(dim=1) * rest
+        self._carry_steps += carry
+        self._carry_pos_err += pos_error.mean(dim=1) * carry
+        self._carry_rot_err += rot_error.mean(dim=1) * carry
         ground = ground_height(self.scanner)
         counted = arm * torch.isfinite(ground).float()
         pelvis_drop = torch.nan_to_num(self.cfg.standing_height - (self.robot.data.root_pos_w[:, 2] - ground), nan=0.0)
@@ -649,6 +787,7 @@ class ArmTargetsCommand(CommandTerm):
         velocity = self._env.command_manager.get_term(self.cfg.velocity_command_name)
         arm_goal = (torch.rand(n, device=self.device) < self.cfg.arm_goal_prob) & self.goals_enabled
         self.arm_mode[env_ids] = arm_goal
+        self.carrying[env_ids] = False
         self.goal_best_error[env_ids] = float("inf")
         self.goal_best_rot_error[env_ids] = float("inf")
         self.goal_reached[env_ids] = False
@@ -658,11 +797,22 @@ class ArmTargetsCommand(CommandTerm):
         self.needs_crouch[env_ids] = False
         self.use_estimate[env_ids] = torch.rand(n, device=self.device) < self.estimate_prob
 
-        # -- navigation: the rest pose in the pelvis frame, a fresh velocity command
+        # -- navigation: the rest pose or a carried table pose (depth level 0, never lowered) in the pelvis frame,
+        # a fresh velocity command
         nav_ids = env_ids[~arm_goal]
         if len(nav_ids) > 0:
-            self.believed_b[nav_ids] = self.rest_pose_b
-            self.shadow_b[nav_ids] = self.rest_pose_b
+            self.carry_b[nav_ids] = self.rest_pose_b
+            carry_ids = nav_ids[:0]
+            if self.cfg.carry_prob > 0.0 and self.goals_enabled:
+                carry_ids = nav_ids[torch.rand(len(nav_ids), device=self.device) < self.cfg.carry_prob]
+            if len(carry_ids) > 0:
+                k = len(carry_ids)
+                height = self.cfg.z_min_start + torch.rand(k, device=self.device) * (self.cfg.z_max - self.cfg.z_min_start)
+                source = (height - self.cfg.standing_height).clamp(min=self._lowest_source)
+                self.carry_b[carry_ids] = self._draw_rows(source)
+                self.carrying[carry_ids] = True
+            self.believed_b[nav_ids] = self.carry_b[nav_ids]
+            self.shadow_b[nav_ids] = self.carry_b[nav_ids]
             self.time_left[nav_ids] = torch.empty(len(nav_ids), device=self.device).uniform_(*self.cfg.nav_time_range)
             velocity._resample(nav_ids)
 
@@ -676,13 +826,7 @@ class ArmTargetsCommand(CommandTerm):
         height = z_min + torch.rand(m, device=self.device) * (cfg.z_max - z_min)
         height_s = height - cfg.standing_height  # in the standing frame
         source = height_s.clamp(min=self._lowest_source)
-        rows = []
-        for table, z in zip(self._sorted_tables, self._sorted_z):
-            lo = torch.searchsorted(z, source - cfg.arm_height_spread)
-            hi = torch.searchsorted(z, source + cfg.arm_height_spread, right=True)
-            pick = lo + (torch.rand(m, device=self.device) * (hi - lo)).long().clamp(max=(hi - lo - 1).clamp(min=0))
-            rows.append(table[pick.clamp(max=len(table) - 1)])
-        targets_s = torch.stack(rows, dim=1)
+        targets_s = self._draw_rows(source)
         drop = source - height_s
         targets_s[..., 2] -= drop.unsqueeze(1)
         self.target_drop[arm_ids] = drop
@@ -700,29 +844,43 @@ class ArmTargetsCommand(CommandTerm):
         self.shadow_b[arm_ids] = self.believed_b[arm_ids]
         velocity.vel_command_b[arm_ids] = 0.0
 
+    def _draw_rows(self, source: torch.Tensor) -> torch.Tensor:
+        """(len(source), num_arms, 7): per arm a table row within arm_height_spread of source (pelvis-frame height)."""
+        rows = []
+        for table, z in zip(self._sorted_tables, self._sorted_z):
+            lo = torch.searchsorted(z, source - self.cfg.arm_height_spread)
+            hi = torch.searchsorted(z, source + self.cfg.arm_height_spread, right=True)
+            pick = lo + (torch.rand(len(source), device=self.device) * (hi - lo)).long().clamp(max=(hi - lo - 1).clamp(min=0))
+            rows.append(table[pick.clamp(max=len(table) - 1)])
+        return torch.stack(rows, dim=1)
+
     def _update_command(self):
         pass
 
     def _set_debug_vis_impl(self, debug_vis: bool):
-        if debug_vis and not hasattr(self, "goal_pose_visualizer"):
-            self.goal_pose_visualizer = VisualizationMarkers(self.cfg.goal_pose_visualizer_cfg)
-            self.believed_pose_visualizer = VisualizationMarkers(self.cfg.believed_pose_visualizer_cfg)
-            self.current_pose_visualizer = VisualizationMarkers(self.cfg.current_pose_visualizer_cfg)
-        if hasattr(self, "goal_pose_visualizer"):
-            for marker in (self.goal_pose_visualizer, self.believed_pose_visualizer, self.current_pose_visualizer):
-                marker.set_visibility(debug_vis)
+        # one marker set per arm and kind: with both arms' poses in one point instancer, Isaac rendered the second
+        # instance as stray lines ("FabricManager::initializePointInstancer mismatched prototypes")
+        if debug_vis and not hasattr(self, "pose_visualizers"):
+            self.pose_visualizers = [
+                [VisualizationMarkers(cfg.replace(prim_path=f"{cfg.prim_path}_{arm}")) for arm in range(len(self.cfg.body_names))]
+                for cfg in (self.cfg.goal_pose_visualizer_cfg, self.cfg.believed_pose_visualizer_cfg,
+                            self.cfg.current_pose_visualizer_cfg)
+            ]
+        if hasattr(self, "pose_visualizers"):
+            for markers in self.pose_visualizers:
+                for marker in markers:
+                    marker.set_visibility(debug_vis)
 
     def _debug_vis_callback(self, event):
         # the robot can be de-initialized while the callback is still subscribed
         if not self.robot.is_initialized:
             return
         root_pos, root_quat = self.robot.data.root_pos_w, self.robot.data.root_quat_w
-        targets_w = self.targets_w().reshape(-1, 7)
-        self.goal_pose_visualizer.visualize(targets_w[:, :3], targets_w[:, 3:])
-        believed_w = _apply(root_pos, root_quat, self.believed_b).reshape(-1, 7)
-        self.believed_pose_visualizer.visualize(believed_w[:, :3], believed_w[:, 3:])
-        body_pose_w = self.robot.data.body_link_pose_w[:, self.body_ids].reshape(-1, 7)
-        self.current_pose_visualizer.visualize(body_pose_w[:, :3], body_pose_w[:, 3:])
+        poses = (self.targets_w(), _apply(root_pos, root_quat, self.believed_b),
+                 self.robot.data.body_link_pose_w[:, self.body_ids])
+        for markers, pose in zip(self.pose_visualizers, poses):
+            for arm, marker in enumerate(markers):
+                marker.visualize(pose[:, arm, :3], pose[:, arm, 3:])
 
 
 def _frame_marker(prim_path: str, scale: float = 0.1) -> VisualizationMarkersCfg:
@@ -759,6 +917,9 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     """Once goals are enabled, the share of tasks that are arm goals."""
     nav_time_range: tuple[float, float] = (4.0, 8.0)
     """s: a navigation task's duration."""
+    carry_prob: float = 0.0
+    """Once goals are enabled, the share of navigation tasks whose wrists carry a table pose (height U[z_min_start,
+    z_max], never lowered) fixed in the pelvis frame instead of the rest pose. 0: always the rest pose."""
     reach_pos_tol: float = 0.05
     reach_rot_tol: float = 0.35
     reach_hold_s: float = 1.0

@@ -121,6 +121,40 @@ class track_velocity_avg_exp(ManagerTermBase):
         return torch.exp(-torch.sum(torch.square(command - mean), dim=1) / std**2)
 
 
+class yaw_twist_l2(ManagerTermBase):
+    """Squared gap between the pelvis yaw rate and its mean over the last window_s (rad^2/s^2): the twist within a
+    gait cycle. Tracking the cycle-mean yaw rate leaves it free, and YawMean twisted at 1.2 rad/s RMS (its walking
+    and its wrists collapsed); on the instantaneous rate the tracking kernel had held it near 0.45."""
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self._window = max(int(round(cfg.params["window_s"] / env.step_dt)), 1)
+        self._samples = torch.zeros(env.num_envs, self._window, device=env.device)
+        self._count = torch.zeros(env.num_envs, device=env.device)
+        self._slot = 0
+
+    def reset(self, env_ids=None):
+        ids = slice(None) if env_ids is None else env_ids
+        self._samples[ids] = 0.0
+        self._count[ids] = 0.0
+
+    def __call__(self, env: ManagerBasedRLEnv, window_s: float) -> torch.Tensor:
+        yaw_rate = env.scene["robot"].data.root_ang_vel_b[:, 2]
+        self._samples[:, self._slot] = yaw_rate
+        self._slot = (self._slot + 1) % self._window
+        self._count = torch.clamp(self._count + 1.0, max=self._window)
+        return torch.square(yaw_rate - self._samples.sum(dim=1) / self._count)
+
+
+class track_ang_vel_z_avg_exp_annealed(track_velocity_avg_exp):
+    """track_velocity_avg_exp on the yaw rate (component "ang_z"), with the velocity command's current ang_vel_std
+    (its tracking-kernel curriculum)."""
+
+    def __call__(self, env: ManagerBasedRLEnv, command_name: str, component: str, window_s: float) -> torch.Tensor:
+        std = env.command_manager.get_term(command_name).ang_vel_std
+        return super().__call__(env, command_name, std, component, window_s)
+
+
 def arm_target_pos_exp(env: ManagerBasedRLEnv, command_name: str, arm: int, std: float) -> torch.Tensor:
     """exp(-d^2 / std^2) on one arm's wrist position error."""
     pos_error, _ = env.command_manager.get_term(command_name).errors()
@@ -141,6 +175,30 @@ def arm_target_pos_exp_annealed(env: ManagerBasedRLEnv, command_name: str, arm: 
 def arm_target_quat_exp_annealed(env: ManagerBasedRLEnv, command_name: str, arm: int) -> torch.Tensor:
     """arm_target_quat_exp with the command's current rot_std (its tracking-kernel curriculum)."""
     return arm_target_quat_exp(env, command_name, arm, env.command_manager.get_term(command_name).rot_std)
+
+
+def base_height_l2_navigation(
+    env: ManagerBasedRLEnv, target_height: float, arm_command_name: str, sensor_cfg: SceneEntityCfg | None = None
+) -> torch.Tensor:
+    """Isaac Lab's base_height_l2, outside arm goals only: their crouch is free, a crouch while walking is not."""
+    from isaaclab.envs.mdp import base_height_l2
+
+    arm = env.command_manager.get_term(arm_command_name).arm_mode
+    return base_height_l2(env, target_height, sensor_cfg=sensor_cfg) * (~arm).float()
+
+
+def track_lin_vel_xy_exp_annealed(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """Isaac Lab's track_lin_vel_xy_exp with the velocity command's current lin_vel_std (its tracking-kernel curriculum)."""
+    from isaaclab.envs.mdp import track_lin_vel_xy_exp
+
+    return track_lin_vel_xy_exp(env, env.command_manager.get_term(command_name).lin_vel_std, command_name)
+
+
+def track_ang_vel_z_exp_annealed(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """Isaac Lab's track_ang_vel_z_exp with the velocity command's current ang_vel_std."""
+    from isaaclab.envs.mdp import track_ang_vel_z_exp
+
+    return track_ang_vel_z_exp(env, env.command_manager.get_term(command_name).ang_vel_std, command_name)
 
 
 def arm_goal_reached(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:

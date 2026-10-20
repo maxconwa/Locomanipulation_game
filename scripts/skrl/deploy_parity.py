@@ -9,7 +9,8 @@ command, velocity command, gait clock, last actions, residual filter), and compa
   odometry       the deploy leg odometry (IMU attitude + feet within stance_height of the lowest) vs the true
                  pelvis motion over each arm-goal step (m/s, rad/s); with learned odometry, the deploy estimator
                  input (window term by term + actions) and its motion after vertical_from_feet / tilt_from_gravity
-                 vs the env's, and vs the true motion
+                 vs the env's, and vs the true motion. lmg_deploy from GOLEM 8d1eddd on takes its odometry from SLAM
+                 (FAST-LIO) and has no estimator: then odometry isn't compared
 and writes the worst differences per term to <out>/parity.json. The env runs the checkpoint's physics (sim dt,
 decimation, explicit PD from its params/env.yaml) without the action delay, sensor noise or pushes; LSTM actors are
 stepped alongside skrl's and both are reset when the episode ends.
@@ -77,20 +78,29 @@ export_yaml = os.path.join(args.export, "export.yaml")
 if os.path.isfile(export_yaml):
     cfg.update(yaml.safe_load(open(export_yaml)) or {})
 names = cfg["joint_names"]
-if (cfg.get("imu") or {}).get("frame") == "livox_link":
-    cfg.setdefault("legs_odometry", {})["imu_frame"] = "livox_link"  # as marl_deploy_node: the attitude's frame
+IMU_FRAME = (cfg.get("imu") or {}).get("frame")
+if IMU_FRAME in ("livox_link", "livox_imu_link"):
+    cfg.setdefault("legs_odometry", {})["imu_frame"] = IMU_FRAME  # as marl_deploy_node: the attitude's frame
+# lmg_deploy from GOLEM 8d1eddd: the arm goals ride on SLAM odometry; no leg odometry or estimator in the controller
+SLAM = not hasattr(MarlController, "_leg_odometry")
 odo = cfg.get("odometry")
-learned = odo == "learned" or (isinstance(odo, dict) and odo.get("mode", "learned") == "learned")
+learned = not SLAM and (odo == "learned" or (isinstance(odo, dict) and odo.get("mode", "learned") == "learned"))
 extra = list(cfg.get("legs_odometry", {}).get("foot_frames", []))
 imu_frame = cfg.get("legs_odometry", {}).get("imu_frame", "pelvis")
 if imu_frame != "pelvis":
     extra.append(imu_frame)
+if SLAM:
+    extra.append(cfg["slam_frame"])
+extra = list(dict.fromkeys(extra))
 kin = ArmKinematics(args.urdf, names, cfg["arms"]["ee_frames"], [names[ARM_START:ARM_START + 7], names[ARM_START + 7:]],
                     extra_frames=extra)
 legs_net = load_network(os.path.join(args.export, cfg["legs"]["policy"]), cfg["legs"]["num_obs"], cfg["legs"]["num_actions"])
 arms_net = load_network(os.path.join(args.export, cfg["arms"]["policy"]), cfg["arms"]["num_obs"], cfg["arms"]["num_actions"])
-est_net = TorchScriptNetwork(os.path.join(args.export, cfg["estimator"]["path"]), cfg["estimator"]["num_inputs"], 6)
-ctrl = MarlController(cfg, kin, legs_net, arms_net, est_net)
+if SLAM:
+    ctrl = MarlController(cfg, kin, legs_net, arms_net)
+else:
+    est_net = TorchScriptNetwork(os.path.join(args.export, cfg["estimator"]["path"]), cfg["estimator"]["num_inputs"], 6)
+    ctrl = MarlController(cfg, kin, legs_net, arms_net, est_net)
 
 RUN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(args.checkpoint)))
 out_dir = args.out or os.path.join(args.export, "parity")
@@ -103,6 +113,14 @@ env_cfg.decimation = int(re.search(r"^decimation: (\d+)$", run_env, re.M).group(
 m = re.search(r"^explicit_pd: (true|false)$", run_env, re.M)
 env_cfg.explicit_pd = m is None or m.group(1) == "true"  # runs before the field: explicit from almitrain on
 env_cfg.events.push_robot = None
+# the IMU the run trained with (export.yaml imu), unperturbed: the deploy reads the same sensor
+_IMU_PRIMS = {"livox_imu_link": "livox_link/livox_imu_link"}
+if IMU_FRAME:
+    env_cfg.scene.imu.prim_path = "{ENV_REGEX_NS}/Robot/" + _IMU_PRIMS.get(IMU_FRAME, IMU_FRAME)
+    env_cfg.scene.imu.offset.pos = tuple((cfg.get("imu") or {}).get("offset") or (0.0, 0.0, 0.0))
+env_cfg.events.imu_mount = None
+GYRO_HZ = float((cfg.get("imu") or {}).get("gyro_lowpass_hz", 0.0))
+env_cfg.gyro_lowpass_hz = GYRO_HZ or None
 m = re.search(r"^\s*table_file: (\S+)$", run_env, re.M)
 if m:
     env_cfg.commands.arm_targets.table_file = m.group(1)  # the tables the run trained with (absolute or in RUN_DIR)
@@ -160,11 +178,44 @@ if learned:
         base._from_feet_and_gravity = from_feet_and_gravity
 
 
+class DeployGyro:
+    """With gyro_lowpass_hz, the env's filter wrapped: env 0's raw IMU samples also go through lmg_deploy's own
+    GyroLowpass (as marl_deploy_node filters /livox/imu), whose output the controller gets as RobotState.gyro; the
+    two filters are compared every sample (gyro_lowpass in the report)."""
+
+    def __init__(self, env_filter):
+        self.inner = env_filter
+        self.deploy = importlib.import_module(f"{PKG}.livox_imu").GyroLowpass(GYRO_HZ)
+        self.value = None
+
+    @property
+    def output(self):
+        return self.inner.output
+
+    def reset(self, env_ids=None):
+        self.inner.reset(env_ids)
+        if env_ids is None or 0 in torch.as_tensor(env_ids).tolist():
+            self.deploy._x = None  # restarts at (u, 0) on the next sample, as after a dropout
+
+    def __call__(self, u):
+        out = self.inner(u)
+        self.value = self.deploy(u[0].double().cpu().numpy(), base.physics_dt)
+        worst["imu/gyro_lowpass"] = max(worst.get("imu/gyro_lowpass", 0.0), float(np.abs(self.value - out[0].double().cpu().numpy()).max()))
+        return out
+
+
+deploy_gyro = None
+if GYRO_HZ:
+    deploy_gyro = DeployGyro(base.gyro_lowpass)
+    base.gyro_lowpass = deploy_gyro
+
+
 def env_state(i: int = 0) -> RobotState:
     d = robot.data
+    gyro = deploy_gyro.value if deploy_gyro is not None and deploy_gyro.value is not None else imu.data.ang_vel_b[i].double().cpu().numpy()
     return RobotState(q=d.joint_pos[i, ids].double().cpu().numpy(), dq=d.joint_vel[i, ids].double().cpu().numpy(),
                       tau=d.applied_torque[i, ids].double().cpu().numpy(), quat=imu.data.quat_w[i].double().cpu().numpy(),
-                      gyro=imu.data.ang_vel_b[i].double().cpu().numpy(), acc=imu.data.lin_acc_b[i].double().cpu().numpy())
+                      gyro=gyro, acc=imu.data.lin_acc_b[i].double().cpu().numpy())
 
 
 def sync(i: int = 0):
@@ -260,8 +311,10 @@ for step in range(args.steps):
                 worst["estimator/motion_pos"] = max(worst["estimator/motion_pos"], float(np.abs(motion[0] - cap["motion"][0]).max()))
                 rot = np.linalg.norm(aa(qmul(qconj(cap["motion"][1]), motion[1])))
                 worst["estimator/motion_rot"] = max(worst["estimator/motion_rot"], float(rot))
-    else:
+    elif not SLAM:
         motion = ctrl._leg_odometry(new_state)
+    else:
+        motion = None
     if motion is not None and not done and bool(arm.arm_mode[0]) and prev_root is not None:
         pos0, quat0 = root
         pos1, quat1 = robot.data.root_pos_w[0], robot.data.root_quat_w[0]
@@ -280,7 +333,7 @@ for step in range(args.steps):
     prev_root = root
 
 result = {"checkpoint": args.checkpoint, "export": args.export, "steps": args.steps,
-          "odometry": "learned" if learned else "legs",
+          "odometry": "slam (not compared)" if SLAM else "learned" if learned else "legs",
           "physics": {"dt": env_cfg.sim.dt, "decimation": env_cfg.decimation, "explicit_pd": env_cfg.explicit_pd},
           "worst_abs_diff": {k: round(v, 6) for k, v in worst.items()},
           "odometry_error_arm_goals": {"lin_m_per_s_p50_p90": [round(float(v), 4) for v in np.percentile(odo_lin, [50, 90])] if odo_lin else None,

@@ -123,6 +123,25 @@ GOLEM_RATE_MARGIN = 0.8
 # so the fine term still has a slope at their ~9 cm closest approach.
 FINE_POS_STDS = (0.10, 0.07, 0.05, 0.035, 0.025, 0.018, 0.012)  # m
 ROT_STDS = (0.5, 0.4, 0.3, 0.22, 0.16, 0.12, 0.08)               # rad
+# The MID-360 IMU (base_cfg scene.imu at livox_imu_link). Its gyro is low-passed against the head's 20 Hz resonance
+# (the headshake), as GOLEM's deploy does; its mount and accelerometer bias are drawn per env at each reset.
+GYRO_LOWPASS_HZ = 8.0
+IMU_MOUNT_PITCH_DEG = 1.5
+IMU_MOUNT_ROLL_DEG = 0.75
+IMU_MOUNT_YAW_DEG = 0.75
+IMU_ACC_BIAS_G = 0.01
+# The velocity-tracking kernels' curriculum (ModalVelocityCommand._judge_kernels), the same way: stage 0 is
+# unitree_rl_gym's std 0.5, under which standing still against a 0.4 m/s command keeps 53% of the linear reward
+# (Tune3Track2 and Carry walked at a third of the command or less); narrowed as the navigation errors fall.
+LIN_VEL_STDS = (0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1)  # m/s
+ANG_VEL_STDS = (0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1)  # rad/s
+# The yaw tracking term and its kernel's judge read the yaw rate averaged over one gait cycle: on the instantaneous
+# rate the step's twist (about +-0.45 rad/s RMS) is as large as a turn command, and no run up to SmoothYawNavH turned
+# the commanded way much above chance (eval_ablation). Explicit500 tracked on the cycle mean too. 0: instantaneous.
+YAW_TRACKING_WINDOW_S = 0.8  # s, legs_rewards.GAIT_PERIOD
+# ... and the twist inside the cycle is charged apart (mdp.yaw_twist_l2): about -0.2 per second at SmoothYawNavH's
+# 0.42 rad/s RMS, -1.4 at YawMean's 1.2
+YAW_TWIST_WEIGHT = -1.0
 # knee_valgus's bodies: hip, knee, ankle per leg, left then right
 VALGUS_LINK_NAMES = [f"{side}_{link}_link" for side in ("left", "right") for link in ("hip_roll", "knee", "ankle_pitch")]
 
@@ -143,6 +162,9 @@ class MarlCommandsCfg:
         pure_turn_speed=(0.2, 0.5),
         pure_lateral_prob=0.2,
         pure_lateral_speed=(0.15, 0.3),
+        lin_vel_stds=LIN_VEL_STDS,
+        ang_vel_stds=ANG_VEL_STDS,
+        yaw_window_s=YAW_TRACKING_WINDOW_S,
     )
     arm_targets = mdp.ArmTargetsCommandCfg(
         asset_name="robot",
@@ -212,8 +234,10 @@ class MarlObservationsCfg:
     class ProprioCfg(ObsGroup):
         """What both actors see. The deploy controller builds the same vector, term by term."""
 
-        base_lin_acc = _imu(mdp.imu_lin_acc, 0.5)
-        base_ang_vel = _imu(mdp.imu_ang_vel, 0.2)
+        # the accelerometer with its drawn bias, the gyro low-passed as the deploy does, noise after (the env's
+        # randomize_imu_mount and gyro_lowpass); projected gravity raw
+        base_lin_acc = _imu(mdp.imu_lin_acc_biased, 0.5)
+        base_ang_vel = _imu(mdp.imu_ang_vel_lowpass, 0.2)
         projected_gravity = _imu(mdp.imu_projected_gravity, 0.05)
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
         arm_goal = ObsTerm(func=mdp.arm_goal_active, params={"command_name": ARM_COMMAND})
@@ -260,8 +284,8 @@ class MarlObservationsCfg:
         """The pelvis-motion estimator's input, not a policy input: sensor-level noise, ODOMETRY_HISTORY frames up
         to the step's end. Leg torques say which foot carries the robot."""
 
-        base_lin_acc = _imu(mdp.imu_lin_acc, 0.05, **_HISTORY)
-        base_ang_vel = _imu(mdp.imu_ang_vel, 0.02, **_HISTORY)
+        base_lin_acc = _imu(mdp.imu_lin_acc_biased, 0.05, **_HISTORY)
+        base_ang_vel = _imu(mdp.imu_ang_vel_lowpass, 0.02, **_HISTORY)
         projected_gravity = _imu(mdp.imu_projected_gravity, 0.005, **_HISTORY)
         joint_pos = _joints(mdp.joint_pos_rel, 0.001, **_HISTORY)
         joint_vel = _joints(mdp.joint_vel_rel, 0.05, **_HISTORY)
@@ -345,16 +369,27 @@ class LegsRewardsCfg(LowerRewardsCfg):
                              ".*_ankle_roll_joint": GOLEM_ANKLE_ROLL_POSITION_MARGIN})
     golem_velocity = _golem(LOWER_JOINT_NAMES, "velocity", -10.0, GOLEM_RATE_MARGIN)
     golem_torque = _golem(LOWER_JOINT_NAMES, "torque", -10.0, GOLEM_RATE_MARGIN)
+    yaw_twist = RewTerm(func=mdp.yaw_twist_l2, weight=YAW_TWIST_WEIGHT, params={"window_s": YAW_TRACKING_WINDOW_S})
 
     def __post_init__(self):
-        # LowerRewardsCfg's per-step kernels (std ALMI_TRACKING_STD = 0.5) at twice unitree_rl_gym's H1-2 weights
+        # LowerRewardsCfg's per-step kernels at twice unitree_rl_gym's H1-2 weights, their stds annealed from its 0.5 by
+        # the velocity command's kernel curriculum (LIN_VEL_STDS, ANG_VEL_STDS); the arms' shared copies follow
         self.track_lin_vel_xy.weight = 2.0
+        self.track_lin_vel_xy.func = mdp.track_lin_vel_xy_exp_annealed
+        self.track_lin_vel_xy.params = {"command_name": "base_velocity"}
         self.track_ang_vel_z.weight = 1.0
+        self.track_ang_vel_z.func = mdp.track_ang_vel_z_avg_exp_annealed
+        self.track_ang_vel_z.params = {"command_name": "base_velocity", "component": "ang_z",
+                                       "window_s": YAW_TRACKING_WINDOW_S}
         self.ang_vel_xy.weight = -0.05
         self.action_rate.func = mdp.action_term_rate_l2
         self.action_rate.params = {"action_name": LEGS_ACTION}
         self.self_collision.func = mdp.self_contacts_involving
         self.self_collision.params = {**_SELF_CONTACT_PARAMS, "own_links": LEGS_OWN_LINKS}
+        # outside arm goals only; LocoManipMarlEnv._set_walk_stage turns it off at the end of the warm start unless
+        # base_height_during_navigation
+        self.base_height.func = mdp.base_height_l2_navigation
+        self.base_height.params = {**self.base_height.params, "arm_command_name": ARM_COMMAND}
         self.hip_pos.func = mdp.joint_deviation_l2_modal
         self.hip_pos.params = {**self.hip_pos.params, "arm_command_name": ARM_COMMAND,
                                "arm_goal_scale": ARM_GOAL_HIP_POS_SCALE}
@@ -397,6 +432,11 @@ class ArmsRewardsCfg:
     golem_torque = _golem(ARM_JOINT_NAMES, "torque", -10.0, GOLEM_RATE_MARGIN)
     dof_acc = _arm_joints(mdp.joint_acc_l2, -2.5e-7)
     action_rate = RewTerm(func=mdp.action_term_rate_l2, weight=-0.01, params={"action_name": ARMS_ACTION})
+    # arm joint targets changing per policy step during arm goals, against the reach jitter (Livox500: -20, with
+    # action_rate -0.1); off since Tune3Track2, whose settled wrists still moved ~0.4 m/s (eval_ablation)
+    target_rate = RewTerm(func=mdp.arm_joint_target_rate_l2, weight=0.0, params={
+        "asset_cfg": SceneEntityCfg("robot", joint_names=ARM_JOINT_NAMES, preserve_order=True),
+        "arm_command_name": ARM_COMMAND})
     dof_pos_limits = _arm_joints(mdp.joint_pos_limits, -5.0)
     self_collision = RewTerm(
         func=mdp.self_contacts_involving, weight=-1.0, params={**_SELF_CONTACT_PARAMS, "own_links": ARMS_OWN_LINKS}
@@ -434,6 +474,10 @@ class MarlEventCfg(EventCfg):
         interval_range_s=(10.0, 10.0),
         params={"num_levels": PUSH_LEVELS, "max_speed": MAX_PUSH_SPEED, "fixed": False},
     )
+    # the MID-360 chip's mount, beyond what ed592de measured, and its accelerometer's horizontal bias, per env at reset
+    imu_mount = EventTerm(func=mdp.randomize_imu_mount, mode="reset", params={
+        "roll_deg": IMU_MOUNT_ROLL_DEG, "pitch_deg": IMU_MOUNT_PITCH_DEG, "yaw_deg": IMU_MOUNT_YAW_DEG,
+        "acc_bias_g": IMU_ACC_BIAS_G})
     massless_frames = EventTerm(
         func=mdp.randomize_rigid_body_mass,
         mode="startup",
@@ -484,6 +528,7 @@ class MarlCurriculumCfg:
         "max_error": TERRAIN_MAX_TRACKING_ERROR,
     })
     arm_target_levels = CurrTerm(func=mdp.arm_target_levels, params={"command_name": ARM_COMMAND})
+    velocity_kernels = CurrTerm(func=mdp.velocity_kernels, params={"command_name": "base_velocity"})
 
 
 def explicit_pd(actuators: dict) -> dict:
@@ -544,6 +589,9 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     # started: trips at ~0.02 per step cost more than the floored reward paid; -1 (Tune2Trip1, Tune3Track2) let them
     # recover in ~10k
     golem_estop_penalty: float = -1.0
+    # Hz: the policy's gyro low-pass (imu_filter.GyroLowpass, lmg_deploy's from 556a9e7; export.yaml imu.gyro_lowpass_hz
+    # tells the deploy to apply it). None: the raw rate, as every run before the 10-19 MID-360 update.
+    gyro_lowpass_hz: float | None = GYRO_LOWPASS_HZ
     curriculum: MarlCurriculumCfg = MarlCurriculumCfg()
     # the estimate moves the arm command, while training once the drift gate opens; the estimator fits the pelvis
     # motion during arm goals only; the vertical motion comes from the feet and the tilt from gravity instead
@@ -568,6 +616,9 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     # UnitreeRew walked at 0.5 by 12k and 0.63 by 20k (UnitreeFall20's gate, without it, opened at 4.6k on a robot that
     # stood, and it never walked)
     warm_start_min_cos: float = 0.5
+    # keep the legs' base_height term after the warm start, while navigating (never during arm goals): Smooth's
+    # walking pelvis sank 3 -> 11 cm once the goals started and nothing held it
+    base_height_during_navigation: bool = False
     warm_start_episode_decay: float = 0.999
     agent_action_terms: dict[str, list[str]] = AGENT_ACTION_TERMS
     clip_actions: float = CLIP_ACTIONS

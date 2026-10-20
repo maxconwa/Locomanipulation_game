@@ -45,6 +45,7 @@ from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_inv, quat_m
 from locomanipulation_game.assets.h1_2 import H1_2_MAGPIE_CFG
 
 from .golem_safety import GolemEstopMonitor
+from .imu_filter import GyroLowpass
 from .mdp.curriculums import _tracked_episode
 from .locomanip_marl_env_cfg import ARM_COMMAND, LocoManipMarlEnvCfg
 from .odometry import EstimatorTrainer, align_tilt, motion_to_transform, pelvis_motion, saved_history_frames
@@ -166,6 +167,13 @@ class LocoManipMarlEnv(DirectMARLEnv):
             unit = "physics substeps" if self.cfg.action_delay_substeps else "policy steps"
             print(f"[INFO] Action delay: {low}-{high} {unit} per env, drawn at each reset")
 
+        # -- the policy's gyro low-pass (mdp.imu_ang_vel_lowpass reads its output): one sample per physics substep,
+        # the IMU's rate, as the deploy filters /livox/imu
+        self.gyro_lowpass = None
+        if self.cfg.gyro_lowpass_hz:
+            self.gyro_lowpass = GyroLowpass(self.cfg.gyro_lowpass_hz, self.physics_dt, self.num_envs, self.device)
+            print(f"[INFO] Gyro low-pass: {self.cfg.gyro_lowpass_hz:g} Hz Butterworth at {1.0 / self.physics_dt:.0f} Hz")
+
     """
     DirectMARLEnv hooks.
     """
@@ -188,6 +196,9 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._substep = 0
 
     def _apply_action(self) -> None:
+        if self.gyro_lowpass is not None and self._substep > 0:
+            # the IMU sample the previous substep left; the step's last one is taken in _get_observations
+            self.gyro_lowpass(self.scene["imu"].data.ang_vel_b)
         if self.golem_monitor is not None:
             # once per physics substep: the state the previous substep left (mdp.golem_estop checks the last)
             self.golem_monitor.update()
@@ -229,6 +240,9 @@ class LocoManipMarlEnv(DirectMARLEnv):
         return rewards
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
+        if self.gyro_lowpass is not None:
+            # the last substep's IMU sample (after a reset, the refreshed reading the filter restarts from)
+            self.gyro_lowpass(self.scene["imu"].data.ang_vel_b)
         self._update_odometry()
         self.command_manager.compute(dt=self.step_dt)
         groups = list(self.cfg.possible_agents) + ["critic"]
@@ -248,6 +262,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
         super()._reset_idx(env_ids)  # scene, reset events, episode_length_buf
         self._refresh_sensors_after_reset(env_ids)
         self._fresh[env_ids] = True
+        if self.gyro_lowpass is not None:
+            self.gyro_lowpass.reset(env_ids)
         if self.golem_monitor is not None:
             self.golem_monitor.reset(env_ids)
         self._golem_tripped_prev[env_ids] = False
@@ -417,9 +433,11 @@ class LocoManipMarlEnv(DirectMARLEnv):
     def _set_walk_stage(self):
         """The legs' base_height term (pelvis height above the ground) counts only while the robot learns to walk,
         before the arm goals start: after that it would hold the pelvis up against their crouch. Outside training the
-        goals are on from the start, so it never counts."""
+        goals are on from the start, so it never counts. With cfg.base_height_during_navigation it stays on (it never
+        counts during arm goals: mdp.base_height_l2_navigation)."""
         legs = self.reward_managers["legs"]
-        if self._arm_command.goals_enabled and "base_height" in legs.active_terms:
+        if (self._arm_command.goals_enabled and "base_height" in legs.active_terms
+                and not self.cfg.base_height_during_navigation):
             legs.get_term_cfg("base_height").weight = 0.0
 
     def _feet_in_pelvis(self) -> torch.Tensor:
@@ -526,6 +544,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
         terrain = self.scene.terrain
         env_state = {
             "arm_targets": self._arm_command.state_dict(),
+            "base_velocity": self.command_manager.get_term("base_velocity").state_dict(),
             "terrain_levels": terrain.terrain_levels.clone(),
             "terrain_types": terrain.terrain_types.clone(),
             "goal_drift_ema": self._goal_drift_ema.clone(),
@@ -537,6 +556,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
     def _load_env_state(self, state: dict):
         """Curriculum levels, terrain tiles, the drift gate and the end of the warm start saved by _save_estimator."""
         self._arm_command.load_state_dict(state["arm_targets"])
+        # runs saved before the velocity kernel curriculum have none: stage 0
+        self.command_manager.get_term("base_velocity").load_state_dict(state.get("base_velocity", {}))
         terrain = self.scene.terrain
         levels = state["terrain_levels"].to(self.device)
         if len(levels) == self.num_envs:
@@ -549,7 +570,9 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._arm_command.goals_enabled |= state["arm_goals_enabled"]
         print(
             f"[INFO] Restored curriculum: depth level mean {self._arm_command.level.float().mean().item():.2f},"
-            f" drift gate {self._goal_drift_ema.item():.3f}, arm goals {self._arm_command.goals_enabled}"
+            f" drift gate {self._goal_drift_ema.item():.3f}, arm goals {self._arm_command.goals_enabled},"
+            f" velocity kernel stages lin {state.get('base_velocity', {}).get('lin_kernel_stage', 0)}"
+            f" ang {state.get('base_velocity', {}).get('ang_kernel_stage', 0)}"
         )
 
     """

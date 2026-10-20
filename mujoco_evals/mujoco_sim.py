@@ -17,7 +17,9 @@ odometry.py at marl-direct 72171c7):
                           plus the residual low-passed at 3 Hz
                           times 0.2, with the same two bounds
     PD                    tau = kp (target - q) - kd qd, clipped to the effort limit: the Isaac actuator gains
-    observations          legs 95 / arms 123 values, term by term in the cfg's order (see LEGS_TERMS / ARMS_TERMS)
+    observations          legs 95 / arms 123 values, term by term in the cfg's order (see LEGS_TERMS / ARMS_TERMS);
+                          with gyro_lowpass_hz the gyro through GyroLowpass, sampled at every MuJoCo step (the
+                          Isaac env's imu_filter.GyroLowpass at every physics substep, lmg_deploy's on /livox/imu)
 
 Joint limits for the target bounds are the URDF's (as Isaac imported them, and as GOLEM's safety layer clips); the
 MJCF's own ranges act as the physical stops.
@@ -135,6 +137,35 @@ def xyzw(pose):
 
 # ---------------------------------------------------------------- the sim
 
+class GyroLowpass:
+    """lmg_deploy.livox_imu.GyroLowpass (GOLEM 556a9e7): per axis, a 2nd-order Butterworth at cutoff_hz, exact ZOH
+    discretization over each sample's dt, started (and restarted by reset) at x = (u, 0)."""
+
+    ZETA = 1.0 / math.sqrt(2.0)
+
+    def __init__(self, cutoff_hz: float):
+        w = 2.0 * math.pi * float(cutoff_hz)
+        self._a = np.array([[0.0, 1.0], [-w * w, -2.0 * self.ZETA * w]])
+        self._b = np.array([0.0, w * w])
+        self._sigma, self._wd, self._w2 = self.ZETA * w, w * math.sqrt(1.0 - self.ZETA ** 2), w * w
+        self._x = None
+
+    def reset(self):
+        self._x = None
+
+    def __call__(self, u: np.ndarray, dt: float) -> np.ndarray:
+        u = np.asarray(u, dtype=np.float64)
+        if self._x is None:
+            self._x = np.stack([u, np.zeros_like(u)])
+            return u.copy()
+        e, c, sn = math.exp(-self._sigma * dt), math.cos(self._wd * dt), math.sin(self._wd * dt)
+        k = self._sigma / self._wd
+        ad = e * np.array([[c + k * sn, sn / self._wd], [-self._w2 * sn / self._wd, c - k * sn]])
+        bd = np.linalg.solve(self._a, (ad - np.eye(2)) @ self._b)
+        self._x = ad @ self._x + np.outer(bd, u)
+        return self._x[0].copy()
+
+
 class MarlMujoco:
     """One H1-2 in MuJoCo driven by a checkpoint's actors (legs and arms, or one whole-body actor) and its pelvis
     estimator."""
@@ -147,7 +178,7 @@ class MarlMujoco:
     def __init__(self, actors: dict, estimator: torch.nn.Module | None, physics: str = "robocasa",
                  assets: Path = C.DEFAULT_ASSETS, rest_pose_b: np.ndarray | None = None,
                  model: mujoco.MjModel | None = None, target_limits: dict[str, tuple[float, float]] | None = None,
-                 vertical_from_feet: bool = True, tilt_from_gravity: bool = True):
+                 vertical_from_feet: bool = True, tilt_from_gravity: bool = True, gyro_lowpass_hz: float = 0.0):
         # model: the CL_Assets MJCF compiled with extra bodies that leave the robot untouched (human_control.py's
         # target markers); default the MJCF as it is
         self.m = model if model is not None else mujoco.MjModel.from_xml_path(str(mjcf_path(assets)))
@@ -195,6 +226,8 @@ class MarlMujoco:
         self.rest_b = np.asarray(rest_pose_b, float) if rest_pose_b is not None else None
         self.rng = np.random.default_rng(0)
         self.total_mass = float(m.body_subtreemass[self.pelvis])
+        self.gyro_lowpass = GyroLowpass(gyro_lowpass_hz) if gyro_lowpass_hz else None
+        self._gyro = None
 
     # -- state
     def reset(self, rng: np.random.Generator):
@@ -224,6 +257,9 @@ class MarlMujoco:
         self._prev_root = (d.qpos[0:3].copy(), d.qpos[3:7].copy())
         self._prev_heights = self._feet_heights()
         self._hist = None
+        if self.gyro_lowpass is not None:
+            self.gyro_lowpass.reset()
+            self._gyro = self.gyro_lowpass(self._raw_gyro(), m.opt.timestep)
         self._update_odometry(first=True)
 
     # -- kinematics in the pelvis frame
@@ -234,10 +270,13 @@ class MarlMujoco:
         p, q = self.root()
         return np.stack([relative(p, q, np.r_[self.d.xpos[w], self.d.xquat[w]]) for w in self.wrists])
 
+    def _raw_gyro(self) -> np.ndarray:
+        return self.d.sensordata[self.s_gyro:self.s_gyro + 3].copy()
+
     def imu(self):
         d = self.d
         acc = d.sensordata[self.s_acc:self.s_acc + 3].copy()
-        gyro = d.sensordata[self.s_gyro:self.s_gyro + 3].copy()
+        gyro = self._raw_gyro() if self.gyro_lowpass is None else self._gyro.copy()
         R = d.site_xmat[self.imu_site].reshape(3, 3)
         grav = R.T @ np.array([0.0, 0.0, -1.0])
         return acc, gyro, grav
@@ -291,6 +330,8 @@ class MarlMujoco:
             tau = self.pd_torque(self.applied)
             self.d.ctrl[self.act_id] = tau
             mujoco.mj_step(self.m, self.d)
+            if self.gyro_lowpass is not None:
+                self._gyro = self.gyro_lowpass(self._raw_gyro(), self.m.opt.timestep)
         self.last_tau = self.pd_torque(self.applied)
 
     # -- odometry: the learned pelvis estimator moves the believed command

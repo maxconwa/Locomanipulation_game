@@ -148,13 +148,19 @@ def read_reward_share(run_dir: Path) -> float | None:
 
 
 def read_imu(run_dir: Path) -> dict:
-    """The IMU a run trained with: {"frame": the robot body it sits on, "offset": [x, y, z] in it (m)}. Runs up to
-    Explicit500 read the torso's imu_link; from then on the head's Livox IMU (livox_link, base_cfg.LIVOX_IMU_OFFSET)."""
-    scene = _yaml_load_any((Path(run_dir) / "params" / "env.yaml").read_text()).get("scene", {})
-    imu = scene.get("imu") or {}
+    """The IMU a run trained with: {"frame": the robot frame it sits on, "offset": [x, y, z] in it (m)}, plus
+    "gyro_lowpass_hz" when the policy read its gyro through the low-pass (imu_filter.GyroLowpass; lmg_deploy applies
+    it only when the key is present). Runs up to Explicit500 read the torso's imu_link; Livox500 to the 10-19
+    ablations livox_link with the chip's offset at the old 13.76 deg mount; from the 10-19 MID-360 update the chip
+    frame livox_imu_link (CL_Assets ed592de), no offset, the gyro at 8 Hz."""
+    env = _yaml_load_any((Path(run_dir) / "params" / "env.yaml").read_text())
+    imu = (env.get("scene") or {}).get("imu") or {}
     frame = str(imu.get("prim_path", "/imu_link")).rsplit("/", 1)[-1]
     pos = ((imu.get("offset") or {}).get("pos")) or [0.0, 0.0, 0.0]
-    return {"frame": frame, "offset": [round(float(v), 6) for v in pos]}
+    out = {"frame": frame, "offset": [round(float(v), 6) for v in pos]}
+    if env.get("gyro_lowpass_hz"):
+        out["gyro_lowpass_hz"] = float(env["gyro_lowpass_hz"])
+    return out
 
 
 def read_target_limits(run_dir: Path) -> dict[str, tuple[float, float]] | None:

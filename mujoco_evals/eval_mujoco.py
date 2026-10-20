@@ -44,7 +44,8 @@ def _init(args):
     if args["odometry"] == "learned":
         est_path = _estimator_for(args["checkpoint"])
     sim = MarlMujoco(load_actors(args["checkpoint"]), load_estimator(est_path), physics=args["physics"],
-                     rest_pose_b=rest, target_limits=C.read_target_limits(Path(args["checkpoint"]).parent.parent))
+                     rest_pose_b=rest, target_limits=C.read_target_limits(Path(args["checkpoint"]).parent.parent),
+                     gyro_lowpass_hz=C.read_imu(Path(args["checkpoint"]).parent.parent).get("gyro_lowpass_hz", 0.0))
     _W.update(sim=sim, args=args, est_path=est_path)
 
 

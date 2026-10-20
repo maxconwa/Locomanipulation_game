@@ -110,8 +110,8 @@ class IKResidualArmAction(JointPositionAction):
     """Arm joint targets: one damped-least-squares IK step toward the arm command, plus the policy's residual.
 
     Each policy step and arm, Isaac Lab's DifferentialIKController steps the arm from its measured joint angles
-    toward the command the policies see (ArmTargetsCommand.believed_b, pelvis frame), capped at max_ik_step rad
-    per joint. The policy's action, low-passed at residual_cutoff_hz (one-pole, per policy step) and times scale,
+    toward the command the policies see (ArmTargetsCommand.believed_b, pelvis frame), times ik_gain and capped at
+    max_ik_step rad per joint. The policy's action, low-passed at residual_cutoff_hz (one-pole, per policy step) and times scale,
     is added in joint space. The policy observes the filtered residual.
     """
 
@@ -141,7 +141,7 @@ class IKResidualArmAction(JointPositionAction):
         self._filter_alpha = 1.0 - math.exp(-2.0 * math.pi * cfg.residual_cutoff_hz * env.step_dt)
         self._residual = torch.zeros_like(self._raw_actions)  # the filtered residual, action units
         print(f"[INFO] {type(self).__name__}: IK on {cfg.body_names}, damping {cfg.ik_damping}, step cap"
-              f" {cfg.max_ik_step} rad, residual scale {cfg.scale}, bounds +- {cfg.target_margin} rad past the limits"
+              f" {cfg.max_ik_step} rad, gain {cfg.ik_gain}, residual scale {cfg.scale}, bounds +- {cfg.target_margin} rad past the limits"
               f"{' and joint_limits' if cfg.joint_limits else ''}, residual low-pass {cfg.residual_cutoff_hz} Hz"
               f" (alpha {self._filter_alpha:.3f}): " + ", ".join(
                   f"{n} [{lo:.3f}, {hi:.3f}]" for n, lo, hi in zip(self._joint_names, self._lower[0].tolist(), self._upper[0].tolist())))
@@ -173,7 +173,7 @@ class IKResidualArmAction(JointPositionAction):
             jac = torch.cat([torch.bmm(to_root, jac[:, :3]), torch.bmm(to_root, jac[:, 3:])], dim=1)
             self._ik[arm].set_command(command[:, arm])
             q_arm = q[:, cols]
-            step = self._ik[arm].compute(ee_pos, ee_quat, jac, q_arm) - q_arm
+            step = (self._ik[arm].compute(ee_pos, ee_quat, jac, q_arm) - q_arm) * self.cfg.ik_gain
             ik[:, cols] = ik[:, cols] + step.clamp(-self.cfg.max_ik_step, self.cfg.max_ik_step)
         target = ik + self._residual * self._scale
         bounded = torch.maximum(torch.minimum(target, self._upper), self._lower)
@@ -205,6 +205,9 @@ class IKResidualArmActionCfg(JointPositionActionCfg):
     """Damped-least-squares lambda."""
     max_ik_step: float = 0.1
     """rad per joint per policy step."""
+    ik_gain: float = 1.0
+    """Share of the IK step taken per policy step: 1 jumps the target the whole way from the measured angles, which
+    with the PD lag and the action delay can overshoot into a dither."""
     residual_cutoff_hz: float = MISSING
     target_margin: float = MISSING
     joint_limits: dict[str, tuple[float, float]] | None = None
