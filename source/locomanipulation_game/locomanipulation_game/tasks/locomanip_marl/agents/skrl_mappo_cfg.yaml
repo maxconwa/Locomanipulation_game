@@ -25,6 +25,8 @@ models:
       hidden_size: 64
       num_layers: 1
       skip_observations: True  # the MLP also sees the raw observations, not only the LSTM's 64 outputs
+      normalize_hidden: False  # True: the LSTM's output h scaled to unit length after every step (recurrent.py)
+      cell_cap: 0.0            # s > 0: the cell state squashed after every step, c <- s tanh(c / s) (recurrent.py)
     network:
       - name: net
         input: OBSERVATIONS

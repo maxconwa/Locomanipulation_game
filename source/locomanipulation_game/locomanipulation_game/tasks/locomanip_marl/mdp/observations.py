@@ -63,6 +63,15 @@ def body_pose_in_root_xyzw(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) ->
     return torch.cat(poses, dim=-1)
 
 
+def joint_vel_rel_lagged(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """joint_vel_rel as the robot's LowState reports it: with cfg.joint_vel_obs_lag_ms, the env's per-env late joint
+    velocity on cfg.joint_vel_obs_lag_joints (LocoManipMarlEnv.lagged_joint_vel); otherwise the current one."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    lagged = getattr(env, "lagged_joint_vel", None)
+    dq = asset.data.joint_vel if lagged is None else lagged()
+    return dq[:, asset_cfg.joint_ids] - asset.data.default_joint_vel[:, asset_cfg.joint_ids]
+
+
 def applied_action(env: ManagerBasedRLEnv, action_name: str) -> torch.Tensor:
     """The agent's last action as its action term applied it, in action units."""
     return env.action_manager.get_term(action_name).applied_actions

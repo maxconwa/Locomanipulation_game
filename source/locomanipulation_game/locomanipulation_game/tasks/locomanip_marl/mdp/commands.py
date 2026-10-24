@@ -229,6 +229,18 @@ class ModalVelocityCommand(UniformVelocityCommand):
             sign = torch.where(torch.rand(len(sub), device=self.device) < 0.5, -1.0, 1.0)
             self.vel_command_b[sub] = 0.0
             self.vel_command_b[sub, axis] = sign * torch.empty(len(sub), device=self.device).uniform_(*speed)
+        if self.cfg.small_command_prob > 0.0:
+            # some standing envs get a command under the gait clock's standing threshold instead of exactly 0, as a
+            # planner's first and last commands are: the clock still stands, but the policy sees it
+            ids = torch.as_tensor(env_ids, device=self.device)
+            standing = ids[self.is_standing_env[ids]]
+            small = standing[torch.rand(len(standing), device=self.device) < self.cfg.small_command_prob]
+            if len(small) > 0:
+                direction = torch.randn(len(small), 3, device=self.device)
+                direction /= direction.norm(dim=1, keepdim=True).clamp(min=1e-6)
+                norm = torch.empty(len(small), 1, device=self.device).uniform_(*self.cfg.small_command_norm)
+                self.vel_command_b[small] = direction * norm
+                self.is_standing_env[small] = False
 
     def _update_command(self):
         super()._update_command()
@@ -311,6 +323,10 @@ class ModalVelocityCommandCfg(UniformVelocityCommandCfg):
     min_cos_speed: float = 0.1  # m/s: the commanded xy speed from which nav_cos_vel_xy counts a step
     pure_lateral_prob: float = 0.0
     pure_lateral_speed: tuple[float, float] = (0.15, 0.3)   # m/s
+    small_command_prob: float = 0.0
+    """Share of the standing envs whose command is a small one (norm in small_command_norm) instead of 0."""
+    small_command_norm: tuple[float, float] = (0.02, 0.095)
+    """Norm of (vx, vy, wz) for those: under legs_rewards.ZERO_CMD_EPS, so the gait clock stands."""
     # -- tracking-kernel curriculum (ModalVelocityCommand._judge_kernels): the annealed tracking terms' stds per stage,
     # narrowest last. One stage: fixed kernels.
     lin_vel_stds: tuple[float, ...] = (0.5,)
