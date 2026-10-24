@@ -129,11 +129,18 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._arm_command = self.command_manager.get_term(ARM_COMMAND)
         self._arm_command.goals_enabled = not self.cfg.estimator.train
         self._set_walk_stage()
-        self.estimator = EstimatorTrainer(
-            self.cfg.estimator, group_dims["odometry"][0] + self.action_manager.total_action_dim, self.num_envs,
-            self.device, history_frames,
-        )
-        print(f"[INFO] Pelvis estimator: {self.estimator.model}")
+        # estimator.odometry "truth": no estimator, the arm command moves by the true pelvis motion (on the robot,
+        # FAST-LIO's), training and evaluating alike
+        self._true_odometry = self.cfg.estimator.odometry == "truth"
+        self.estimator = None
+        if not self._true_odometry:
+            self.estimator = EstimatorTrainer(
+                self.cfg.estimator, group_dims["odometry"][0] + self.action_manager.total_action_dim, self.num_envs,
+                self.device, history_frames,
+            )
+            print(f"[INFO] Pelvis estimator: {self.estimator.model}")
+        else:
+            print("[INFO] Pelvis odometry: true motion, no estimator")
         self._have_prev = False
         self._prev_root_pos = torch.zeros(self.num_envs, 3, device=self.device)
         self._prev_root_quat = torch.zeros(self.num_envs, 4, device=self.device)
@@ -143,8 +150,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._goal_drift_ema = torch.tensor(1.0, device=self.device)
         self._estimator_log: dict[str, torch.Tensor] = {}
         self._legs = self.cfg.estimator.odometry == "legs"
-        self._vertical = self.cfg.estimator.vertical_from_feet
-        self._tilt = self.cfg.estimator.tilt_from_gravity
+        self._vertical = self.cfg.estimator.vertical_from_feet and not self._true_odometry
+        self._tilt = self.cfg.estimator.tilt_from_gravity and not self._true_odometry
         if self._legs or self._vertical:
             feet = self.cfg.estimator.foot_body_names
             self._foot_ids = self._robot.find_bodies(feet, preserve_order=True)[0]
@@ -153,8 +160,12 @@ class LocoManipMarlEnv(DirectMARLEnv):
             self._contact_sensor = self.scene.sensors[self.cfg.estimator.contact_sensor_name]
             self._foot_sensor_ids = self._contact_sensor.find_bodies(feet, preserve_order=True)[0]
         if self.cfg.estimator.checkpoint_path:
-            print(f"[INFO] Pelvis estimator file: {self.cfg.estimator.checkpoint_path}")
-            self._load_env_state(self.estimator.load(self.cfg.estimator.checkpoint_path))
+            path = self.cfg.estimator.checkpoint_path
+            print(f"[INFO] Pelvis estimator file: {path}")
+            if self.estimator is not None:
+                self._load_env_state(self.estimator.load(path))
+            else:   # the curriculum state only (a learned run's file has it too)
+                self._load_env_state(torch.load(path, map_location=self.device, weights_only=False)["env_state"])
 
         self._obs_buf: dict[str, torch.Tensor] = {}
 
@@ -370,8 +381,11 @@ class LocoManipMarlEnv(DirectMARLEnv):
         drift_gate, and never with estimator.true_odometry_while_training.
 
         Runs after resets: reset envs are skipped (their previous sample is from the old episode) and get an exact
-        command from the command manager anyway.
+        command from the command manager anyway. With estimator.odometry "truth", the true motion moves every goal.
         """
+        if self._true_odometry:
+            self._true_odometry_step()
+            return
         odometry_obs = self.observation_manager.compute_group("odometry", update_history=True)
         root_pos = self._robot.data.root_pos_w.clone()
         root_quat = self._robot.data.root_quat_w.clone()
@@ -425,6 +439,26 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._estimator_log["Estimator/estimate_prob"] = arm.estimate_prob
         self._estimator_log["Estimator/goal_drift"] = self._goal_drift_ema
         self._estimator_log["Estimator/gate_open"] = gate_open
+
+    def _true_odometry_step(self):
+        """_update_odometry without an estimator: the arm command follows the true pelvis motion; the curriculum
+        state is still saved every estimator.save_every steps (_save_estimator), for resuming and evaluating."""
+        root_pos = self._robot.data.root_pos_w.clone()
+        root_quat = self._robot.data.root_quat_w.clone()
+        if self._have_prev:
+            true = motion_to_transform(
+                pelvis_motion(self._prev_root_pos, self._prev_root_quat, root_pos, root_quat, self.step_dt), self.step_dt)
+            self._arm_command.apply_pelvis_motion(estimated=true, true=true, env_mask=~self._fresh)
+        self._have_prev = True
+        self._prev_root_pos, self._prev_root_quat = root_pos, root_quat
+        self._fresh[:] = False
+        arm = self._arm_command
+        arm.ended_goal_drift_sum.zero_()
+        arm.ended_goal_count.zero_()
+        arm.estimate_prob = torch.tensor(0.0, device=self.device)
+        cfg = self.cfg.estimator
+        if cfg.train and self.common_step_counter % cfg.save_every == 0 and getattr(self.cfg, "log_dir", None):
+            self._save_estimator()
 
     @property
     def estops_end_episodes(self) -> bool:
@@ -594,7 +628,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
         (4 frames before that was saved), so older runs still load."""
         terms = [t for t in vars(self.cfg.observations.odometry).values() if isinstance(t, ObservationTermCfg)]
         path = self.cfg.estimator.checkpoint_path
-        if path:
+        if path and self.cfg.estimator.odometry != "truth":
             frames = saved_history_frames(path)
             if frames != terms[0].history_length:
                 print(f"[INFO] Odometry window: {frames} frames, as {path} was trained")
@@ -651,8 +685,13 @@ class LocoManipMarlEnv(DirectMARLEnv):
             "goal_drift_ema": self._goal_drift_ema.clone(),
             "arm_goals_enabled": self._arm_command.goals_enabled,
         }
-        self.estimator.save(os.path.join(directory, f"estimator_{self.common_step_counter}.pt"), env_state)
-        self.estimator.save(os.path.join(directory, "estimator_latest.pt"), env_state)
+        for name in (f"estimator_{self.common_step_counter}.pt", "estimator_latest.pt"):
+            path = os.path.join(directory, name)
+            if self.estimator is not None:
+                self.estimator.save(path, env_state)
+            else:   # the curriculum state alone: the env and the eval scripts find it where an estimator's would be
+                os.makedirs(directory, exist_ok=True)
+                torch.save({"env_state": env_state}, path)
 
     def _load_env_state(self, state: dict):
         """Curriculum levels, terrain tiles, the drift gate and the end of the warm start saved by _save_estimator."""

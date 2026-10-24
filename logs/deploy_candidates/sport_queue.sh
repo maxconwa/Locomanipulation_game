@@ -25,7 +25,7 @@ if [ -n "${SMOKE:-}" ]; then
   ITERATIONS=$SMOKE
   SEEDS=(42)
   # the arm goals start at 600 steps whatever the gate says, so the switch-on path runs too
-  EXTRA=(agent.agent.experiment.directory=sport_smoke env.warm_start_deadline_steps=600)
+  EXTRA=(agent.agent.experiment.directory=sport_smoke env.warm_start_deadline_steps=600 env.estimator.save_every=480)
 fi
 
 # Kept from the deploy queue (queue.sh): capped LSTM cell, episodes drawn from an exponential (mean 90 s, cap 300 s),
@@ -69,14 +69,15 @@ SPORT=(
 # 0.973 / 0.835 / 0.945 / 0.056 / 0.068, without pushes or randomization; training's numbers will sit below it.
 # To change a threshold while it trains: <run>/warm_start_gate.yaml, e.g. "warm_start_min_sport_cos: 0.85".
 GATE=(env.warm_start_sport_gate=True env.warm_start_deadline_steps=240000)
+# No pelvis estimator (user, 10-24): the arm goals move by the true pelvis motion, as FAST-LIO moves them on the robot;
+# the env still saves its curriculum state under estimator/ every save_every steps. (The first Sport100Hz_s42 trained
+# one, 0.5 s window, for 7k steps.)
+ODOMETRY=(env.estimator.odometry=truth)
 # 100 Hz policy, physics 500 Hz (decimation 5; the 0-20 ms action delay and the contact window count 2 ms substeps,
 # so they stay as they were). What counted policy steps now counts the same seconds:
 #  - rollouts 24 -> 48 (0.48 s), discount 0.99 -> 0.995 and GAE lambda 0.95 -> 0.975 (0.99^0.5, 0.95^0.5)
 #  - the arm-goal ramp 10k -> 20k steps (0.1 -> 0.5, the default: the slower 30k ramp did not stop seed 42's crash),
 #    the terrain gate's row interval 8000 -> 16000, checkpoints and estimator saves every 9600
-#  - the estimator's input window 25 frames -> 0.5 s (50 frames); its buffer 100 -> 50 steps, the windowed loss
-#    50 -> 50 steps and a fit every 25 steps (each step still in two fits): at 100 steps the doubled input filled the
-#    GPU to 23.8 of 24.5 GB in the smoke test
 #  - the arm IK step per policy step 0.1 -> 0.05 rad
 #  - the rate penalties on raw actions x4 (a smooth trajectory's step-to-step change halves, squared), and x the mean
 #    squared change of each term's action scale (the same joint-target change costs what it did): legs action_rate
@@ -88,7 +89,6 @@ HZ100=(
   agent.agent.rollouts=48 agent.agent.discount_factor=0.995 agent.agent.gae_lambda=0.975
   env.commands.arm_targets.arm_goal_ramp_steps=20000 env.curriculum.terrain_levels.params.steps_per_row=16000
   agent.agent.experiment.checkpoint_interval=9600 env.estimator.save_every=9600
-  env.odometry_history_s=0.5 env.estimator.buffer_steps=50 env.estimator.window_steps=50 env.estimator.train_every=25
   env.actions.arm_pos.max_ik_step=0.05
   env.rewards.legs.action_rate.weight=-0.025 env.rewards.legs.ankle_action_rate.weight=-0.05
   env.rewards.arms.action_rate.weight=-0.89 env.rewards.arms.target_rate.weight=-80.0
@@ -103,7 +103,7 @@ for seed in "${SEEDS[@]}"; do
   log=$OUT/$name.train.log
   note "$name: training (seed $seed, $ITERATIONS updates of 48)"
   python scripts/skrl/train.py --headless --name "$name" --seed "$seed" --max_iterations "$ITERATIONS" \
-    "${KEPT[@]}" "${SPORT[@]}" "${GATE[@]}" "${HZ100[@]}" "${EXTRA[@]}" > "$log" 2>&1
+    "${KEPT[@]}" "${SPORT[@]}" "${GATE[@]}" "${ODOMETRY[@]}" "${HZ100[@]}" "${EXTRA[@]}" > "$log" 2>&1
   code=$?
   run=$(grep -o "Logging to /[^ ]*/[^ ]*_$name" "$log" | head -1 | sed 's/^Logging to //')
   kernels=$(grep -c "fail to launch kernel" "$log")

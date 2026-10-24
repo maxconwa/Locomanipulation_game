@@ -166,11 +166,15 @@ step = re.search(r"_(\d+)\.pt$", ckpt_path)
 est_path = os.path.join(run_dir, "estimator", f"estimator_{step.group(1)}.pt") if step else None
 if not est_path or not os.path.isfile(est_path):
     est_path = sorted(glob.glob(os.path.join(run_dir, "estimator", "estimator_*.pt")), key=os.path.getmtime)[-1]
-est = torch.load(est_path, map_location="cpu", weights_only=False)["model"]
-estimator = Estimator(est["norm.mean"], est["norm.var"], mlp(est, "net")).eval()
-torch.jit.script(estimator).save(os.path.join(args.out, "estimator.pt"))
-history_frames, rest = divmod(est["norm.mean"].shape[0] - 26, 75)  # 75 values per frame, then 26 actions
-print(f"estimator: {est['norm.mean'].shape[0]} inputs, {history_frames} frames ({est_path})")
+est = torch.load(est_path, map_location="cpu", weights_only=False).get("model")
+if est is not None:
+    estimator = Estimator(est["norm.mean"], est["norm.var"], mlp(est, "net")).eval()
+    torch.jit.script(estimator).save(os.path.join(args.out, "estimator.pt"))
+    history_frames, rest = divmod(est["norm.mean"].shape[0] - 26, 75)  # 75 values per frame, then 26 actions
+    print(f"estimator: {est['norm.mean'].shape[0]} inputs, {history_frames} frames ({est_path})")
+else:   # estimator.odometry "truth": the run trained none (its file holds the curriculum state only)
+    history_frames = None
+    print(f"estimator: none, the run moved its arm goals by the true pelvis motion ({est_path})")
 
 # the tables the run trained with: its env.yaml table_file (absolute, or in the run dir), else the newest in the run dir
 m = re.search(r"^\s*table_file: (\S+)$", Path(run_dir, "params", "env.yaml").read_text(), re.M)
@@ -192,7 +196,7 @@ def env_flag(name: str) -> bool:
 export = {
     "rest_pose": rest,
     "target_limits": {name: [round(low, 6), round(high, 6)] for name, (low, high) in limits.items()} if limits else None,
-    "odometry": {"mode": (re.search(r"^\s*odometry: (learned|legs)$", env_yaml, re.M) or [None, "learned"])[1],
+    "odometry": {"mode": (re.search(r"^\s*odometry: (learned|legs|truth)$", env_yaml, re.M) or [None, "learned"])[1],
                  "history_frames": history_frames,
                  "vertical_from_feet": env_flag("vertical_from_feet"), "tilt_from_gravity": env_flag("tilt_from_gravity")},
     "height_drop_obs": height_drop_obs,
@@ -209,4 +213,4 @@ export = {
 }
 with open(os.path.join(args.out, "export.yaml"), "w") as f:
     yaml.safe_dump(export, f, sort_keys=False)
-print(f"wrote {args.out}: legs.pt arms.pt estimator.pt export.yaml")
+print(f"wrote {args.out}: legs.pt arms.pt{' estimator.pt' if est is not None else ''} export.yaml")

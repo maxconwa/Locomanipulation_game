@@ -220,7 +220,9 @@ def estimator_checkpoint_for(agent_checkpoint: str) -> str | None:
 @configclass
 class PelvisEstimatorCfg:
     odometry: str = "learned"
-    """What moves the arm command: "learned" (the estimator) or "legs" (attitude and a planted foot)."""
+    """What moves the arm command: "learned" (the estimator), "legs" (attitude and a planted foot) or "truth" (the true
+    pelvis motion and no estimator at all, as the deploy's FAST-LIO odometry stands in for it; the env still saves
+    its curriculum state under estimator/)."""
     foot_body_names: list[str] | None = None
     """The feet, as robot bodies (and, for odometry "legs", contact-sensor bodies): odometry "legs" and
     vertical_from_feet need them."""
