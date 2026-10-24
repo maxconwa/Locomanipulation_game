@@ -18,11 +18,16 @@ source ~/anaconda3/etc/profile.d/conda.sh
 
 ITERATIONS=12500   # x 24 = 300,000 env steps
 FINAL=300000
-# cap: no slow latch can charge (bag 1); 60 s episodes + motor randomization down to 0.75 strength: the failure
-# study's robust pair, widened to bag 2's weak-motor drift; load balance: both bags' lopsided stance; gait 0.70 s:
+# cap: no slow latch can charge (bag 1); long episodes + motor randomization (strength 0.85-1.15): the failure
+# study's robust pair; gait 0.70 s:
 # the sport-mode ablations' one tracking win; gate 0.03 + small commands: bag 1 failed on a small command after a
 # stand; arm goals ramped 0.05 -> 0.5 over 30k steps: every LSTM run crashed at the switch-on; warm-start fall
 # gate scaled to the drawn episode lengths.
+# 10-24 03:40, restarted: DeployRand300k_s42 (strength 0.75-1.15 and load balance -2.0, both beyond the synthesis
+# report) stood at a 1.2 rad knee by 48k and still sinking (pelvis 2.9 -> 7.8 cm low, 8k -> 48k; Mid360v2 0.84, the
+# report's check is 0.9 or less), and the failure study found the load-balance term deepens the weak-motor crouch.
+# Now the report's 0.85-1.15 and no load balance; seed 43 also doubles base_height (-10 -> -20), the straighter-stance
+# lever neither study tried (the capped run stood at 1.05 rad).
 # Episode lengths (10-24): drawn per episode from an exponential, mean 90 s, at least 2 s, capped at 300 s
 # (episode_length_s), so no network can learn when its episode ends (the robot never resets; the failure study saw
 # behaviour change at the 20 s end, and the arms train without time-out bootstrapping); the motor draw repeats every
@@ -31,8 +36,7 @@ FINAL=300000
 OVERRIDES=(
   agent.models.policy.rnn.cell_cap=1.0
   env.episode_length_s=300.0 env.episode_length_mean_s=90.0 "env.actuator_redraw_interval_s=[20.0,30.0]"
-  "env.events.actuator_scales.params.gain_range=[0.8,1.2]" "env.events.actuator_scales.params.strength_range=[0.75,1.15]"
-  env.rewards.legs.stand_load_balance.weight=-2.0
+  "env.events.actuator_scales.params.gain_range=[0.8,1.2]" "env.events.actuator_scales.params.strength_range=[0.85,1.15]"
   env.gait_period=0.7
   env.zero_cmd_eps=0.03 env.commands.base_velocity.small_command_prob=0.2
   env.commands.arm_targets.arm_goal_ramp_start=0.05 env.commands.arm_targets.arm_goal_ramp_steps=30000
@@ -64,13 +68,15 @@ cpu_checks() {  # $1 name, $2 export dir
   note "$name: CPU checks done (stress: logs/hw_stress_mujoco/$name*, replay: $OUT/$name/replay_*)"
 }
 
+declare -A NAMES=([42]=Deploy300k_s42 [43]=Deploy300kStand_s43)
+declare -A EXTRA=([42]="" [43]="env.rewards.legs.base_height.weight=-20.0")
 for seed in 42 43; do
-  name=DeployRand300k_s$seed
+  name=${NAMES[$seed]}
   log=$OUT/$name.train.log
   conda activate env_isaaclab
   note "$name: training (seed $seed, $ITERATIONS updates)"
   python scripts/skrl/train.py --headless --name "$name" --seed "$seed" --max_iterations "$ITERATIONS" \
-    "${OVERRIDES[@]}" > "$log" 2>&1
+    "${OVERRIDES[@]}" ${EXTRA[$seed]} > "$log" 2>&1
   code=$?
   run=$(grep -o "Logging to /[^ ]*locomanip_marl/[^ ]*_$name" "$log" | head -1 | sed 's/^Logging to //')
   kernels=$(grep -c "fail to launch kernel" "$log")
