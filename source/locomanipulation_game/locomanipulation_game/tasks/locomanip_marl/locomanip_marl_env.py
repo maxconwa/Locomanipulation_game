@@ -97,6 +97,9 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._walk_tracked = torch.tensor(0.0, device=self.device)
         self._walk_cos = torch.tensor(0.0, device=self.device)
         self._warm_start_log: dict[str, torch.Tensor] = {}
+        # the sport-mode gate (cfg.warm_start_sport_gate): consecutive passing checks, and the last check's metrics
+        self._sport_streak = 0
+        self._sport_metrics: dict[str, float] = {}
         # GOLEM's e-stops (None: no e-stop checks)
         self.golem_monitor = (
             GolemEstopMonitor(self._robot, self.cfg.golem_estop, self.num_envs, self.device) if self.cfg.golem_estop else None
@@ -459,23 +462,74 @@ class LocoManipMarlEnv(DirectMARLEnv):
                 self._walk_cos = keep * self._walk_cos + (1.0 - keep) * cos
         if cfg.warm_start_max_fall_share is None:
             walks = share.item() >= cfg.warm_start_timeout_share
+        elif cfg.warm_start_sport_gate:
+            sport = self._sport_gate()  # every check, so the metrics are logged before and after the goals start
+            walks = bool(self._walk_fell <= cfg.warm_start_max_fall_share) and sport
         else:
             walks = bool((self._walk_fell <= cfg.warm_start_max_fall_share)
                          & (self._walk_tracked >= cfg.warm_start_min_tracked_share)
                          & (self._walk_cos >= cfg.warm_start_min_cos))
         arm = self._arm_command
-        if not arm.goals_enabled and walks:
+        deadline = 0 < cfg.warm_start_deadline_steps <= self.common_step_counter
+        if not arm.goals_enabled and (walks or deadline):
             arm.goals_enabled = True
             arm.goals_enabled_at = self.common_step_counter  # the arm-goal share ramps up from here
             self._set_walk_stage()
-            print(f"[INFO] Warm start over at step {self.common_step_counter}: {self._walk_fell.item():.1%} of episodes"
+            sport = ", ".join(f"{k} {v:.3f}" for k, v in self._sport_metrics.items() if not k.startswith("n_"))
+            print(f"[INFO] Warm start over at step {self.common_step_counter}{' (deadline)' if not walks else ''}:"
+                  f" {self._walk_fell.item():.1%} of episodes"
                   f" fall, {self._walk_tracked.item():.0%} track, cos v {self._walk_cos.item():.2f},"
-                  f" {share.item():.0%} time out; arm goals start{'' if cfg.base_height_during_navigation else ', base_height stops'}{', GOLEM e-stops end the episode' if self.estops_end_episodes else ''}")
+                  f" {share.item():.0%} time out{'; sport ' + sport if sport else ''}; arm goals start{'' if cfg.base_height_during_navigation else ', base_height stops'}{', GOLEM e-stops end the episode' if self.estops_end_episodes else ''}")
         self._warm_start_log["Curriculum/warm_start_timeout_share"] = share
         self._warm_start_log["Curriculum/warm_start_fell_share"] = self._walk_fell
         self._warm_start_log["Curriculum/warm_start_tracked_share"] = self._walk_tracked
         self._warm_start_log["Curriculum/warm_start_cos_vel_xy"] = self._walk_cos
         self._warm_start_log["Curriculum/arm_goals_enabled"] = torch.tensor(float(arm.goals_enabled), device=self.device)
+
+    def _sport_gate(self) -> bool:
+        """Every cfg.warm_start_sport_every steps, the velocity command's sport-mode metrics (training's own
+        navigation, ModalVelocityCommand.sport_metrics) against the cfg.warm_start_* thresholds; True once
+        cfg.warm_start_sport_checks checks in a row have passed. The thresholds can be changed while training: a
+        warm_start_gate.yaml in the run's log dir, read at each check, overrides any of the cfg's warm_start_* fields
+        it names (the arm goals still start only once)."""
+        cfg = self.cfg
+        if self.common_step_counter % cfg.warm_start_sport_every:
+            return self._sport_streak >= cfg.warm_start_sport_checks
+        self._read_gate_overrides()
+        m = self.command_manager.get_term("base_velocity").sport_metrics()
+        self._sport_metrics = m
+        for key, value in m.items():
+            self._warm_start_log[f"Metrics/sport/{key}"] = torch.tensor(value, device=self.device)
+        passes = (m["turn_sense"] >= cfg.warm_start_min_turn_sense
+                  and cfg.warm_start_speed_ratio_range[0] <= m["speed_ratio"] <= cfg.warm_start_speed_ratio_range[1]
+                  and cfg.warm_start_turn_ratio_range[0] <= m["turn_ratio"] <= cfg.warm_start_turn_ratio_range[1]
+                  and m["cos"] >= cfg.warm_start_min_sport_cos
+                  and m["ang_err"] <= cfg.warm_start_max_ang_err
+                  and m["lin_err"] <= cfg.warm_start_max_lin_err)  # nan compares False
+        self._sport_streak = self._sport_streak + 1 if passes else 0
+        self._warm_start_log["Curriculum/sport_gate_streak"] = torch.tensor(float(self._sport_streak), device=self.device)
+        return self._sport_streak >= cfg.warm_start_sport_checks
+
+    def _read_gate_overrides(self):
+        log_dir = getattr(self.cfg, "log_dir", None)
+        path = os.path.join(log_dir, "warm_start_gate.yaml") if log_dir else None
+        if not path or not os.path.isfile(path):
+            return
+        import yaml
+
+        try:
+            values = yaml.safe_load(open(path)) or {}
+        except yaml.YAMLError as error:
+            print(f"[WARN] {path}: {error}")
+            return
+        for key, value in values.items():
+            if not key.startswith("warm_start_") or not hasattr(self.cfg, key):
+                print(f"[WARN] {path}: no cfg field {key}")
+                continue
+            value = tuple(value) if isinstance(value, list) else value
+            if getattr(self.cfg, key) != value:
+                print(f"[INFO] Warm start gate: {key} {getattr(self.cfg, key)} -> {value} ({path})")
+                setattr(self.cfg, key, value)
 
     def _set_walk_stage(self):
         """The legs' base_height term (pelvis height above the ground) counts only while the robot learns to walk,

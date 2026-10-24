@@ -50,11 +50,14 @@ from locomanipulation_game.assets.h1_2 import (
     COLLISION_LINK_NAMES,
     FINGER_LINK_NAMES,
     FOOT_LINK_NAMES,
+    LEG_POSES,
     LOWER_JOINT_NAMES,
     LOWER_LINK_NAMES,
     PD_GAINS,
     PELVIS_LINK_NAME,
+    SPORT_MODE_PELVIS_HEIGHT,
     STANDING_PELVIS_HEIGHT,
+    gain_matched_scales,
     with_gains,
 )
 
@@ -176,6 +179,8 @@ VEL_TRACKING_WINDOW_S = 0.8
 # ... and the twist inside the cycle is charged apart (mdp.yaw_twist_l2): about -0.2 per second at SmoothYawNavH's
 # 0.42 rad/s RMS, -1.4 at YawMean's 1.2
 YAW_TWIST_WEIGHT = -1.0
+# posture's joints: the sagittal ones, which set the stance height (hip yaw and roll have hip_pos)
+POSTURE_JOINT_NAMES = [f"{side}_{joint}_joint" for side in ("left", "right") for joint in ("hip_pitch", "knee", "ankle_pitch")]
 # knee_valgus's bodies: hip, knee, ankle per leg, left then right
 VALGUS_LINK_NAMES = [f"{side}_{link}_link" for side in ("left", "right") for link in ("hip_roll", "knee", "ankle_pitch")]
 
@@ -407,6 +412,10 @@ class LegsRewardsCfg(LowerRewardsCfg):
     golem_velocity = _golem(LOWER_JOINT_NAMES, "velocity", -10.0, GOLEM_RATE_MARGIN)
     golem_torque = _golem(LOWER_JOINT_NAMES, "torque", -10.0, GOLEM_RATE_MARGIN)
     yaw_twist = RewTerm(func=mdp.yaw_twist_l2, weight=YAW_TWIST_WEIGHT, params={"window_s": YAW_TRACKING_WINDOW_S})
+    # the sagittal joints' gait-cycle mean against the default pose, outside arm goals; off (0) by default
+    posture = RewTerm(func=mdp.joint_mean_deviation_l2, weight=0.0, params={
+        "asset_cfg": SceneEntityCfg("robot", joint_names=POSTURE_JOINT_NAMES, preserve_order=True),
+        "window_s": VEL_TRACKING_WINDOW_S, "arm_command_name": ARM_COMMAND})
     # the feet's load split while standing in navigation; off (0) by default
     stand_load_balance = RewTerm(func=mdp.stand_load_imbalance, weight=0.0, params={
         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FOOT_LINK_NAMES, preserve_order=True),
@@ -590,7 +599,7 @@ class MarlCurriculumCfg:
     # as terrain_levels: down after a fall, up after a time-out that tracked the velocity commands
     push_levels = CurrTerm(func=mdp.push_levels, params={
         "num_levels": PUSH_LEVELS, "max_speed": MAX_PUSH_SPEED, "command_name": "base_velocity",
-        "max_error": TERRAIN_MAX_TRACKING_ERROR,
+        "max_error": TERRAIN_MAX_TRACKING_ERROR, "seconds_per_level": 0.0,
     })
     arm_target_levels = CurrTerm(func=mdp.arm_target_levels, params={"command_name": ARM_COMMAND})
     velocity_kernels = CurrTerm(func=mdp.velocity_kernels, params={"command_name": "base_velocity"})
@@ -731,6 +740,31 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     """s: the motors' kp/kd and strength (events.actuator_scales) drawn again every U(interval) s within an episode,
     so long episodes still cover the randomization; None: at reset only."""
 
+    # -- sport-mode copies (10-24); each default is the behaviour before them
+    retune_action_scales: bool = False
+    """Both action terms' scales per joint, matched to pd_gains so an action unit asks for the torque it did at the
+    nominal gains (assets/h1_2.py gain_matched_scales); False: the scales as given."""
+    default_leg_pose: str = "default"
+    """The legs' default joint angles, the legs' action offset and posture's target: "default" (assets/h1_2.py
+    _INIT_STATE, knee 0.5 rad) or "sport" (SPORT_MODE_LEG_POSE, sport mode's stance, knee 0.70 rad), which also lowers
+    base_height's target and the spawn height to that stance's pelvis height."""
+    odometry_history_s: float = 0.0
+    """s: the estimator's window in seconds, ODOMETRY_HISTORY frames at the policy rate; 0: ODOMETRY_HISTORY frames."""
+    # The arm goals' gate on sport-mode tracking (LocoManipMarlEnv._sport_gate): instead of the walking cos and the
+    # tracked share, the sport-mode scorecard's numbers measured on training's own navigation
+    # (ModalVelocityCommand.sport_metrics), with the fall share as before. Each check every warm_start_sport_every
+    # steps; the goals start after warm_start_sport_checks passes in a row, or at warm_start_deadline_steps (0: none).
+    warm_start_sport_gate: bool = False
+    warm_start_min_turn_sense: float = 0.95
+    warm_start_speed_ratio_range: tuple[float, float] = (0.85, 1.15)
+    warm_start_turn_ratio_range: tuple[float, float] = (0.75, 1.25)
+    warm_start_min_sport_cos: float = 0.9
+    warm_start_max_ang_err: float = 0.1
+    warm_start_max_lin_err: float = 0.12
+    warm_start_sport_every: int = 100
+    warm_start_sport_checks: int = 3
+    warm_start_deadline_steps: int = 0
+
     @property
     def policy_dt(self) -> float:
         return self.decimation * self.sim.dt
@@ -758,6 +792,25 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
             self.events.actuator_scales_redraw = EventTerm(
                 func=mdp.randomize_actuator_scales, mode="interval",
                 interval_range_s=tuple(self.actuator_redraw_interval_s), params=dict(self.events.actuator_scales.params))
+        # once: a scale already per joint was matched by an earlier call
+        if self.retune_action_scales:
+            for term in (self.actions.joint_pos, self.actions.arm_pos):
+                if isinstance(term.scale, (int, float)):
+                    term.scale = gain_matched_scales(term.joint_names, float(term.scale), PD_GAINS[self.pd_gains])
+        if self.default_leg_pose not in LEG_POSES:
+            raise ValueError(f"default_leg_pose {self.default_leg_pose!r}: one of {list(LEG_POSES)}")
+        if self.default_leg_pose != "default":
+            init = self.scene.robot.init_state
+            height = SPORT_MODE_PELVIS_HEIGHT
+            self.scene.robot = self.scene.robot.replace(init_state=init.replace(
+                joint_pos={**init.joint_pos, **LEG_POSES[self.default_leg_pose]}, pos=(*init.pos[:2], height)))
+            if getattr(self.rewards, "legs", None) is not None and "target_height" in self.rewards.legs.base_height.params:
+                self.rewards.legs.base_height.params["target_height"] = height
+        if self.odometry_history_s > 0:
+            frames = max(int(round(self.odometry_history_s / self.policy_dt)), 1)
+            for term in vars(self.observations.odometry).values():
+                if isinstance(term, ObsTerm):
+                    term.history_length = frames
 
     def sync_physics_rate(self):
         """The sensor periods and render interval for sim.dt and decimation. __post_init__ runs before the command

@@ -146,6 +146,40 @@ class yaw_twist_l2(ManagerTermBase):
         return torch.square(yaw_rate - self._samples.sum(dim=1) / self._count)
 
 
+class joint_mean_deviation_l2(ManagerTermBase):
+    """Squared gap between asset_cfg's joint angles averaged over the last window_s (one gait cycle) and their
+    defaults, summed over the joints, outside arm goals (rad^2). Standing it holds the default pose; walking, the
+    cycle's mean, so the swing itself is free. Sport mode's cycle mean while walking sits within 0.04 rad of its
+    standing pose (assets/h1_2.py SPORT_MODE_LEG_POSE). Seed 42 of the 10-24 deploy runs sank from a 0.9 to a 1.2 rad
+    knee after its arm goals started, with base_height on in navigation: the pelvis height alone let the crouch
+    through on bent ankles."""
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        robot = env.scene[asset_cfg.name]
+        self._ids = robot.find_joints(asset_cfg.joint_names, preserve_order=True)[0]
+        self._window = max(int(round(cfg.params["window_s"] / env.step_dt)), 1)
+        self._samples = torch.zeros(env.num_envs, self._window, len(self._ids), device=env.device)
+        self._count = torch.zeros(env.num_envs, device=env.device)
+        self._slot = 0
+
+    def reset(self, env_ids=None):
+        ids = slice(None) if env_ids is None else env_ids
+        self._samples[ids] = 0.0
+        self._count[ids] = 0.0
+
+    def __call__(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, window_s: float,
+                 arm_command_name: str) -> torch.Tensor:
+        data = env.scene[asset_cfg.name].data
+        self._samples[:, self._slot] = data.joint_pos[:, self._ids] - data.default_joint_pos[:, self._ids]
+        self._slot = (self._slot + 1) % self._window
+        self._count = torch.clamp(self._count + 1.0, max=self._window)
+        mean = self._samples.sum(dim=1) / self._count.unsqueeze(1)
+        arm = env.command_manager.get_term(arm_command_name).arm_mode
+        return torch.sum(torch.square(mean), dim=1) * (~arm).float()
+
+
 class track_lin_vel_xy_avg_exp_annealed(track_velocity_avg_exp):
     """track_velocity_avg_exp on the xy velocity (component "lin_xy"), with the velocity command's current lin_vel_std
     (its tracking-kernel curriculum)."""

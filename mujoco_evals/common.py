@@ -204,9 +204,28 @@ def read_deploy_settings(run_dir: Path) -> dict:
                 value = value[0]
             gains[key].append(float(value))
     velocity = env["commands"]["base_velocity"]
+
+    def matching(table, joint):
+        hits = [v for e, v in table.items() if re.fullmatch(e, joint)]
+        if len(hits) != 1:
+            raise ValueError(f"{joint}: {len(hits)} entries in {list(table)}")
+        return float(hits[0])
+
+    # the default pose (the legs' action offset) and each action term's scale per joint: a dict when the run matched
+    # its scales to its gains (env retune_action_scales), which lmg_deploy does not read yet (it takes legs.action_scale
+    # and arms.residual_scale, one number each)
+    pose = {"default_joint_pos": [matching(env["scene"]["robot"]["init_state"]["joint_pos"], j) for j in names]}
+    actions = env.get("actions", {})
+    for term, key in (("joint_pos", "leg_action_scales"), ("arm_pos", "arm_residual_scales")):
+        scale = (actions.get(term) or {}).get("scale")
+        if isinstance(scale, dict):
+            pose[key] = [matching(scale, j) for j in actions[term]["joint_names"]]
+    if (actions.get("arm_pos") or {}).get("max_ik_step") is not None:
+        pose["max_ik_step"] = float(actions["arm_pos"]["max_ik_step"])
     return {
         "control_dt": round(float(env["decimation"]) * float(env["sim"]["dt"]), 6),
         **gains,
+        **pose,
         "gait_period": float(env.get("gait_period", 0.8)),
         "zero_cmd_eps": float(env.get("zero_cmd_eps", 0.1)),
         "command_ranges": {axis: [float(v) for v in velocity["ranges"][axis]]

@@ -131,15 +131,22 @@ def _push_levels(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 def push_levels(env: ManagerBasedRLEnv, env_ids: Sequence[int], num_levels: int, max_speed: float,
                 command_name: str, max_error: float, fall_term: str = "fell",
-                time_out_term: str = "time_out") -> dict[str, torch.Tensor]:
+                time_out_term: str = "time_out", seconds_per_level: float = 0.0) -> dict[str, torch.Tensor]:
     """At episode end, as terrain_levels_tracking: an env's push level goes down one after an episode that ended in
     fall_term and up one after a time-out that tracked its velocity commands (mean navigation error under max_error,
     m/s), within [0, num_levels]; otherwise it stays. push_by_level pushes it at up to level / num_levels x max_speed.
-    Survival alone used to raise it, and lstm_run's robots climbed to 0.86 m/s standing still. Logs the mean level,
-    push and the shares promoted and demoted."""
+    Survival alone used to raise it, and lstm_run's robots climbed to 0.86 m/s standing still. With seconds_per_level,
+    a tracked time-out goes up one level per seconds_per_level of its length (at least one), so the pace in sim time
+    does not depend on the episode length: DeployRand300k_s42's 90 s mean episodes climbed 4.5 times slower than the
+    20 s episodes before them, and its arm-goal gate waited on the pushes. Logs the mean level, push and the shares
+    promoted and demoted."""
     level = _push_levels(env)
     move_up, fell = _tracked_episode(env, env_ids, command_name, max_error, fall_term, time_out_term)
-    level[env_ids] = (level[env_ids] + move_up.long() - fell.long()).clamp(0, num_levels)
+    up = move_up.long()
+    if seconds_per_level > 0:
+        seconds = env.episode_length_buf[env_ids].float() * env.step_dt  # read before the reset clears it
+        up = up * torch.floor(seconds / seconds_per_level).long().clamp(min=1)
+    level[env_ids] = (level[env_ids] + up - fell.long()).clamp(0, num_levels)
     return {"push_level": level.float().mean(), "max_push_speed": level.float().mean() * max_speed / num_levels,
             "promoted": move_up.float().mean(), "demoted": fell.float().mean()}
 
@@ -154,6 +161,10 @@ def push_by_level(env: ManagerBasedRLEnv, env_ids: torch.Tensor, num_levels: int
         speed = torch.full((len(env_ids),), max_speed, device=asset.device)
     else:
         speed = _push_levels(env)[env_ids].float() * (max_speed / num_levels)
+    # each env's last real push (level above 0), which the velocity command's sport-mode metrics leave out
+    if not hasattr(env, "last_push_step"):
+        env.last_push_step = torch.full((env.num_envs,), -(10**9), dtype=torch.long, device=env.device)
+    env.last_push_step[env_ids[speed > 0]] = env.common_step_counter
     vel_w = asset.data.root_vel_w[env_ids]
     vel_w[:, :2] += (2.0 * torch.rand(len(env_ids), 2, device=asset.device) - 1.0) * speed.unsqueeze(1)
     asset.write_root_velocity_to_sim(vel_w, env_ids=env_ids)

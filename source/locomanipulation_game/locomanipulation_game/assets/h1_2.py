@@ -244,7 +244,22 @@ SPORT_MODE_GAINS = {
     "feet": {".*_ankle_pitch_joint": (80.0, 1.5), ".*_ankle_roll_joint": (40.0, 0.4)},
     "torso": {"torso_joint": (600.0, 6.0)},
 }
-PD_GAINS = {"default": {}, "sport": SPORT_MODE_GAINS}
+# and its arm gains, from the same /lowcmd (shoulder pitch, roll, yaw; elbow; wrists)
+SPORT_MODE_ARM_GAINS = {
+    "arms": {".*_shoulder_pitch_joint": (250.0, 6.0), ".*_shoulder_roll_joint": (400.0, 10.0),
+             ".*_shoulder_yaw_joint": (80.0, 2.0), ".*_elbow_joint": (80.0, 2.0), ".*_wrist_.*_joint": (20.0, 0.5)},
+}
+PD_GAINS = {"default": {}, "sport": SPORT_MODE_GAINS, "sport_all": {**SPORT_MODE_GAINS, **SPORT_MODE_ARM_GAINS}}
+
+# Sport mode's standing leg pose: hip pitch and knee are the measured angles' medians over its 4 min of standing in
+# the sport-mode bags, both legs averaged (L/R hip pitch -0.381/-0.369, knee 0.694/0.700; hip yaw and roll about 0).
+# The ankle pitch puts the foot flat under a level pelvis (hip + knee + ankle = 0, as _INIT_STATE): sport mode stands
+# level (0.2 deg levelled pitch), and its measured ankles (-0.364/-0.432) would tilt the foot 4 deg, an offset of
+# the real ankle reading. Walking, its gait-cycle mean is close: knee 0.74, hip pitch -0.39. Its pelvis then stands
+# this high, 2.26 cm under STANDING_PELVIS_HEIGHT (forward kinematics on CL_Assets' h1_2 MJCF).
+SPORT_MODE_LEG_POSE = {".*_hip_pitch_joint": -0.375, ".*_knee_joint": 0.697, ".*_ankle_pitch_joint": -0.322}
+SPORT_MODE_PELVIS_HEIGHT = 0.9798
+LEG_POSES = {"default": {}, "sport": SPORT_MODE_LEG_POSE}
 
 
 def with_gains(actuators: dict, gains: dict) -> dict:
@@ -261,4 +276,34 @@ def with_gains(actuators: dict, gains: dict) -> dict:
                 raise ValueError(f"{group}: joint {joint} matches {hits} of the gains {list(table)}")
         out[group] = act.replace(stiffness={expr: kp for expr, (kp, _) in table.items()},
                                  damping={expr: kd for expr, (_, kd) in table.items()})
+    return out
+
+
+def nominal_stiffness(joint: str) -> float:
+    """The joint's stiffness in _ACTUATORS (Nm/rad)."""
+    import re
+
+    for act in _ACTUATORS.values():
+        if any(re.fullmatch(expr, joint) for expr in act.joint_names_expr):
+            kp = act.stiffness
+            if isinstance(kp, dict):
+                kp = [v for expr, v in kp.items() if re.fullmatch(expr, joint)][0]
+            return float(kp)
+    raise ValueError(f"{joint}: in no actuator group")
+
+
+def gain_matched_scales(joint_names: list[str], scale: float, gains: dict) -> dict[str, float]:
+    """Per joint, an action scale that asks for the same torque per action unit at gains (a PD_GAINS table) as scale
+    does at the nominal gains: scale x nominal kp / kp. Joints gains does not name keep scale. Sport mode's gains
+    with the nominal scale marched in place (the sport-mode ablations' gains run): the same action asked for up to
+    twice the torque."""
+    import re
+
+    out = {}
+    for joint in joint_names:
+        nominal = kp = nominal_stiffness(joint)
+        for table in gains.values():
+            hits = [k for expr, (k, _) in table.items() if re.fullmatch(expr, joint)]
+            kp = hits[0] if hits else kp
+        out[joint] = scale * nominal / kp
     return out

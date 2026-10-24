@@ -32,6 +32,8 @@ from isaaclab.utils.math import (
     yaw_quat,
 )
 
+from .legs_rewards import standing_command
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
@@ -131,6 +133,15 @@ class ModalVelocityCommand(UniformVelocityCommand):
     kernel_promote_share hit and widens below kernel_demote_share: the kernels follow the error down, so standing still
     against a walk command stops paying.
 
+    **Sport-mode metrics.** The sport-mode scorecard's tracking numbers (scripts/skrl/scorecard_metrics.py), measured
+    on training's own navigation: the velocity and the command each averaged over lin_window_s (one stride), a sample
+    every sport_metric_stride steps per env once the window is full, sport_settle_s after a resample or reset and the
+    window plus sport_settle_s after a push, while a command is given (|vx| or |vy| or |wz| over 0.05). The last
+    sport_metric_samples samples of each kind are kept (sport_metrics): linear and angular error over all of them;
+    cos and the speed ratio (median) where |v_cmd| >= 0.1; turn sense and the turn ratio (median) where |w_cmd| >= 0.1.
+    The scorecard fits each controller's lag and filter instead of leaving the transients out, and runs without
+    pushes or randomization. Also logged: the mean knee angle while standing and while walking in navigation.
+
     **Filter.** With command_filter_tau > 0, `command` (what the observations, the tracking rewards, the gait clock and
     the metrics read) is vel_command_b, the sampled command, through a first-order low-pass with that time constant,
     stepped once per policy step (_update_command) and zeroed at reset. During arm goals both are zero at once.
@@ -169,6 +180,15 @@ class ModalVelocityCommand(UniformVelocityCommand):
         # -- the command low-pass: one step of tau per policy step
         self.vel_command_filtered = torch.zeros_like(self.vel_command_b)
         self._filter_alpha = 1.0 - math.exp(-env.step_dt / cfg.command_filter_tau) if cfg.command_filter_tau > 0 else 1.0
+        # -- sport-mode metrics: the command over the linear window, steps since the last resample, the sample rings
+        self._cmd_samples = torch.zeros(self.num_envs, self._lin_window, 3, device=self.device)
+        self._since_cmd = zeros()
+        self._settle_steps = int(round(cfg.sport_settle_s / env.step_dt))
+        self._env_ids = torch.arange(self.num_envs, device=self.device)
+        self._rings = {key: [torch.zeros(cfg.sport_metric_samples, 2, device=self.device), 0, 0]
+                       for key in ("all", "lin", "ang")}
+        self._knee_ids = self.robot.find_joints(".*_knee_joint")[0]
+        self._stand_steps, self._stand_knee, self._move_steps, self._move_knee = zeros(), zeros(), zeros(), zeros()
 
     @property
     def command(self) -> torch.Tensor:
@@ -231,6 +251,7 @@ class ModalVelocityCommand(UniformVelocityCommand):
 
     def _resample_command(self, env_ids: Sequence[int]):
         self._end_segments(torch.as_tensor(env_ids, device=self.device))
+        self._since_cmd[env_ids] = 0.0
         super()._resample_command(env_ids)
         ids = torch.as_tensor(env_ids, device=self.device)
         ids = ids[~self.is_standing_env[ids]]
@@ -292,6 +313,7 @@ class ModalVelocityCommand(UniformVelocityCommand):
             self._end_segments(started)
         self._seg_steps += nav
         self._lin_samples[:, self._lin_slot] = vel_xy
+        self._cmd_samples[:, self._lin_slot] = command
         self._lin_slot = (self._lin_slot + 1) % self._lin_window
         self._lin_count = torch.clamp(self._lin_count + 1.0, max=self._lin_window)
         lin_avg_err = torch.norm(cmd_xy - self._lin_samples.sum(dim=1) / self._lin_count.unsqueeze(-1), dim=-1)
@@ -304,12 +326,77 @@ class ModalVelocityCommand(UniformVelocityCommand):
         self._seg_err_yaw += yaw_avg_err * nav
         self._nav_err_yaw_avg += yaw_avg_err * nav
         self._seg_cmd = torch.where(nav.unsqueeze(-1) > 0.5, command, self._seg_cmd)
+        self._since_cmd += 1.0
+        self._add_sport_samples(nav > 0.5)
+        knee = self.robot.data.joint_pos[:, self._knee_ids].mean(dim=1)
+        standing = standing_command(self._env, command).float() * nav
+        self._stand_steps += standing
+        self._stand_knee += knee * standing
+        self._move_steps += nav - standing
+        self._move_knee += knee * (nav - standing)
         carry = self._env.command_manager.get_term(self.cfg.arm_command_name).carrying.float()
         self._carry_steps += nav * carry
         self._carry_err_xy += torch.norm(cmd_xy - vel_xy, dim=-1) * nav * carry
         self._carry_err_yaw += torch.abs(command[:, 2] - yaw_rate) * nav * carry
         self._carry_walk_steps += walk * carry
         self._carry_walk_cos += cos * walk * carry
+
+    def _add_sport_samples(self, nav: torch.Tensor):
+        """One step's sport-mode metric samples (the class docstring's Sport-mode metrics), after this step's
+        velocity and command went into the windows."""
+        cfg, env = self.cfg, self._env
+        step = env.common_step_counter
+        count = self._lin_count.clamp(min=1.0).unsqueeze(-1)
+        cmd = self._cmd_samples.sum(dim=1) / count
+        vel = self._lin_samples.sum(dim=1) / count
+        yaw = self._yaw_samples.sum(dim=1) / self._yaw_count.clamp(min=1.0)
+        valid = nav & (self._lin_count >= self._lin_window) & (self._yaw_count >= self._yaw_window)
+        valid &= self._since_cmd >= self._settle_steps
+        valid &= (self._env_ids + step) % cfg.sport_metric_stride == 0
+        last_push = getattr(env, "last_push_step", None)
+        if last_push is not None:
+            valid &= (step - last_push) >= self._lin_window + self._settle_steps
+        valid &= (cmd[:, :2].abs().max(dim=1).values > 0.05) | (cmd[:, 2].abs() > 0.05)
+        if not valid.any():
+            return
+        cmd, vel, yaw = cmd[valid], vel[valid], yaw[valid]
+        self._ring_add("all", torch.stack([torch.norm(vel - cmd[:, :2], dim=-1), (yaw - cmd[:, 2]).abs()], dim=-1))
+        speed = torch.norm(cmd[:, :2], dim=-1)
+        lin = speed >= 0.1
+        if lin.any():
+            cos = torch.nn.functional.cosine_similarity(cmd[lin, :2], vel[lin], dim=-1, eps=1e-6)
+            self._ring_add("lin", torch.stack([cos, torch.norm(vel[lin], dim=-1) / speed[lin]], dim=-1))
+        ang = cmd[:, 2].abs() >= 0.1
+        if ang.any():
+            w = cmd[ang, 2]
+            self._ring_add("ang", torch.stack([yaw[ang] / w, (torch.sign(yaw[ang]) == torch.sign(w)).float()], dim=-1))
+
+    def _ring_add(self, key: str, rows: torch.Tensor):
+        ring = self._rings[key]
+        buffer, slot, filled = ring
+        size = len(buffer)
+        rows = rows[-size:]
+        buffer[(slot + torch.arange(len(rows), device=self.device)) % size] = rows
+        ring[1] = (slot + len(rows)) % size
+        ring[2] = min(filled + len(rows), size)
+
+    def sport_metrics(self, min_samples: int = 2000) -> dict[str, float]:
+        """The sport-mode metrics over the kept samples (nan where a kind has fewer than min_samples): turn_sense,
+        speed_ratio, turn_ratio, cos, ang_err, lin_err, as the scorecard names them, and each kind's sample count."""
+        out = {}
+        for key, names in (("all", ("lin_err", "ang_err")), ("lin", ("cos", "speed_ratio")),
+                           ("ang", ("turn_ratio", "turn_sense"))):
+            buffer, _, filled = self._rings[key]
+            out[f"n_{key}"] = float(filled)
+            data = buffer[:filled]
+            for col, name in enumerate(names):
+                if filled < min_samples:
+                    out[name] = float("nan")
+                elif name in ("speed_ratio", "turn_ratio"):
+                    out[name] = data[:, col].median().item()
+                else:
+                    out[name] = data[:, col].mean().item()
+        return out
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
         ids = slice(None) if env_ids is None else env_ids
@@ -330,11 +417,15 @@ class ModalVelocityCommand(UniformVelocityCommand):
         _add_weighted_mean(extras, "carry_error_vel_xy", self._carry_err_xy[ids], self._carry_steps[ids])
         _add_weighted_mean(extras, "carry_error_vel_yaw", self._carry_err_yaw[ids], self._carry_steps[ids])
         _add_weighted_mean(extras, "carry_cos_vel_xy", self._carry_walk_cos[ids], self._carry_walk_steps[ids])
+        _add_weighted_mean(extras, "stand_knee", self._stand_knee[ids], self._stand_steps[ids])
+        _add_weighted_mean(extras, "walk_knee", self._move_knee[ids], self._move_steps[ids])
         for buffer in (self._nav_steps, self._nav_err_xy, self._nav_err_yaw, self._nav_err_yaw_avg, self._nav_err_xy_avg,
                        self._arm_steps, self._arm_yaw_rate,
                        self._walk_steps, self._walk_cos, self._carry_steps, self._carry_err_xy, self._carry_err_yaw,
-                       self._carry_walk_steps, self._carry_walk_cos):
+                       self._carry_walk_steps, self._carry_walk_cos,
+                       self._stand_steps, self._stand_knee, self._move_steps, self._move_knee, self._since_cmd):
             buffer[ids] = 0.0
+        self._cmd_samples[ended] = 0.0
         extras.update(super().reset(env_ids))
         self.vel_command_filtered[ended] = 0.0
         return extras
@@ -360,6 +451,12 @@ class ModalVelocityCommandCfg(UniformVelocityCommandCfg):
     it with zero_cmd_eps, or some of them walk."""
     command_filter_tau: float = 0.0
     """s: the first-order low-pass on the command the policies and rewards see (`command`); 0: none."""
+    sport_metric_samples: int = 2**18
+    """Samples kept per kind for the sport-mode metrics (ModalVelocityCommand.sport_metrics)."""
+    sport_metric_stride: int = 8
+    """A sample from each env every this many steps (staggered over the envs)."""
+    sport_settle_s: float = 1.0
+    """s: left out after a resample or reset, and (plus the window) after a push."""
     # -- tracking-kernel curriculum (ModalVelocityCommand._judge_kernels): the annealed tracking terms' stds per stage,
     # narrowest last. One stage: fixed kernels.
     lin_vel_stds: tuple[float, ...] = (0.5,)
