@@ -22,18 +22,23 @@ FINAL=300000
 # study's robust pair, widened to bag 2's weak-motor drift; load balance: both bags' lopsided stance; gait 0.70 s:
 # the sport-mode ablations' one tracking win; gate 0.03 + small commands: bag 1 failed on a small command after a
 # stand; arm goals ramped 0.05 -> 0.5 over 30k steps: every LSTM run crashed at the switch-on; warm-start fall
-# gate 6% for 60 s episodes
+# gate scaled to the drawn episode lengths.
+# Episode lengths (10-24): drawn per episode from an exponential, mean 90 s, at least 2 s, capped at 300 s
+# (episode_length_s), so no network can learn when its episode ends (the robot never resets; the failure study saw
+# behaviour change at the 20 s end, and the arms train without time-out bootstrapping); the motor draw repeats every
+# 20-30 s so long episodes keep the randomization. Warm-start fall gate: 6% of 60 s episodes is about 0.001 falls/s;
+# with exponential lengths of mean 90 s that is a fall share of 0.001 / (0.001 + 1/90) = 8%
 OVERRIDES=(
   agent.models.policy.rnn.cell_cap=1.0
-  env.episode_length_s=60.0
+  env.episode_length_s=300.0 env.episode_length_mean_s=90.0 "env.actuator_redraw_interval_s=[20.0,30.0]"
   "env.events.actuator_scales.params.gain_range=[0.8,1.2]" "env.events.actuator_scales.params.strength_range=[0.75,1.15]"
   env.rewards.legs.stand_load_balance.weight=-2.0
   env.gait_period=0.7
   env.zero_cmd_eps=0.03 env.commands.base_velocity.small_command_prob=0.2
   env.commands.arm_targets.arm_goal_ramp_start=0.05 env.commands.arm_targets.arm_goal_ramp_steps=30000
-  env.warm_start_max_fall_share=0.06
+  env.warm_start_max_fall_share=0.08
 )
-# the scorecard with the motors nominal, as Mid360v2's 0.988 / 0.973 / 0.835 / 0.945 / 0.056 / 0.068 was scored
+# the scorecard (one long episode: it zeroes episode_length_mean_s) with the motors nominal, as Mid360v2's 0.988 / 0.973 / 0.835 / 0.945 / 0.056 / 0.068 was scored
 NOMINAL_MOTORS=("env.events.actuator_scales.params.gain_range=[1.0,1.0]" "env.events.actuator_scales.params.strength_range=[1.0,1.0]")
 GOLEM_POLICIES=$HOME/GOLEM/core_ws/src/lmg_deploy/policies
 BAGS=$HOME/bags/mid360v2_failure_2026-10-20
@@ -60,7 +65,7 @@ cpu_checks() {  # $1 name, $2 export dir
 }
 
 for seed in 42 43; do
-  name=DeployCap300k_s$seed
+  name=DeployRand300k_s$seed
   log=$OUT/$name.train.log
   conda activate env_isaaclab
   note "$name: training (seed $seed, $ITERATIONS updates)"

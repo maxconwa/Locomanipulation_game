@@ -64,6 +64,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
         cfg.sync_derived()
         super().__init__(cfg, render_mode, **kwargs)
         self._set_soft_joint_limits()
+        # each episode's own length in policy steps (cfg.episode_length_mean_s; mdp.episode_limit_reached), drawn at
+        # its reset; None: every episode max_episode_length (episode_length_mean_s 0)
+        self.episode_limit = (torch.full((self.num_envs,), self.max_episode_length, device=self.device)
+                              if cfg.episode_length_mean_s > 0 else None)
 
         # After super() has started the sim, in ManagerBasedRLEnv.load_managers' order: observations read commands
         # and actions, rewards read terminations.
@@ -279,6 +283,11 @@ class LocoManipMarlEnv(DirectMARLEnv):
         # ManagerBasedRLEnv._reset_idx's order: curriculum before the scene reset, managers after
         self.curriculum_manager.compute(env_ids=env_ids)
         super()._reset_idx(env_ids)  # scene, reset events, episode_length_buf
+        if self.episode_limit is not None:
+            ids = torch.as_tensor(env_ids, device=self.device)
+            seconds = torch.empty(len(ids), device=self.device).exponential_(1.0 / self.cfg.episode_length_mean_s)
+            steps = torch.ceil(seconds.clamp(min=self.cfg.episode_length_min_s) / self.step_dt)
+            self.episode_limit[ids] = steps.clamp(max=self.max_episode_length).long()
         self._refresh_sensors_after_reset(env_ids)
         self._fresh[env_ids] = True
         if self.gyro_lowpass is not None:

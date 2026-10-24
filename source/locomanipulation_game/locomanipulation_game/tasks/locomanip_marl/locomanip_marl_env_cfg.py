@@ -533,6 +533,9 @@ class MarlEventCfg(EventCfg):
     # the motors' kp/kd and strength per env and joint at each reset; nominal (1, 1) by default
     actuator_scales = EventTerm(func=mdp.randomize_actuator_scales, mode="reset", params={
         "gain_range": (1.0, 1.0), "strength_range": (1.0, 1.0)})
+    # the same draw again every LocoManipMarlEnvCfg.actuator_redraw_interval_s within an episode (sync_derived fills it
+    # in); None: drawn at reset only
+    actuator_scales_redraw: EventTerm | None = None
     massless_frames = EventTerm(
         func=mdp.randomize_rigid_body_mass,
         mode="startup",
@@ -569,6 +572,8 @@ class MarlTerminationsCfg(TerminationsCfg):
     fell = DoneTerm(func=mdp.pelvis_contact_or_tilt, params={
         "sensor_cfg": SceneEntityCfg("contact_forces", body_names="pelvis"), "max_roll": 0.8, "max_pitch": 1.0})
     golem_estop = DoneTerm(func=mdp.golem_estop)
+    # Isaac Lab's time_out, or with LocoManipMarlEnvCfg.episode_length_mean_s each episode's own drawn length
+    time_out = DoneTerm(func=mdp.episode_limit_reached, time_out=True)
 
 
 @configclass
@@ -717,6 +722,14 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     pd_gains: str = "default"
     """The legs', feet's and torso's PD gains: "default" (assets/h1_2.py _ACTUATORS) or "sport" (SPORT_MODE_GAINS,
     Unitree's sport mode). The arms keep theirs. Exported with the policy (export_marl.py kp / kd)."""
+    episode_length_mean_s: float = 0.0
+    """s: each episode's length drawn at its reset from an exponential with this mean, at least episode_length_min_s
+    and at most episode_length_s (the cap; LocoManipMarlEnv.episode_limit). Memoryless, so no policy or value can learn
+    when its episode will end (the arms train without time-out bootstrapping). 0: every episode episode_length_s."""
+    episode_length_min_s: float = 2.0
+    actuator_redraw_interval_s: tuple[float, float] | None = None
+    """s: the motors' kp/kd and strength (events.actuator_scales) drawn again every U(interval) s within an episode,
+    so long episodes still cover the randomization; None: at reset only."""
 
     @property
     def policy_dt(self) -> float:
@@ -725,7 +738,7 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     def sync_derived(self):
         """Everything that follows from other fields, for the values after the command line's overrides
         (__post_init__ runs before them, so train.py and the env call this again): the physics-rate settings, the
-        gait-cycle tracking windows, the per-goal bonus at the policy rate, and the PD gains."""
+        gait-cycle tracking windows, the per-goal bonus at the policy rate, the PD gains, and the motors' redraw."""
         self.sync_physics_rate()
         rewards = [getattr(self.rewards, group) for group in vars(self.rewards) if not group.startswith("_")]
         for group in rewards:
@@ -741,6 +754,10 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
         if self.pd_gains not in PD_GAINS:
             raise ValueError(f"pd_gains {self.pd_gains!r}: one of {list(PD_GAINS)}")
         self.scene.robot = self.scene.robot.replace(actuators=with_gains(self.scene.robot.actuators, PD_GAINS[self.pd_gains]))
+        if self.actuator_redraw_interval_s is not None:
+            self.events.actuator_scales_redraw = EventTerm(
+                func=mdp.randomize_actuator_scales, mode="interval",
+                interval_range_s=tuple(self.actuator_redraw_interval_s), params=dict(self.events.actuator_scales.params))
 
     def sync_physics_rate(self):
         """The sensor periods and render interval for sim.dt and decimation. __post_init__ runs before the command

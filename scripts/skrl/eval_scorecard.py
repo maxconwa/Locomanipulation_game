@@ -185,6 +185,7 @@ def main(env_cfg, agent_cfg: dict):
     env_cfg.estimator.train = False
     env_cfg.estimator.checkpoint_path = estimator_checkpoint_for(checkpoint)
     env_cfg.episode_length_s = 1.0e4
+    env_cfg.episode_length_mean_s = 0.0  # a run trained on drawn episode lengths: one long episode here
     env_cfg.events.push_robot = None
     arm_cfg, vel_cfg = env_cfg.commands.arm_targets, env_cfg.commands.base_velocity
     arm_cfg.arm_goal_prob, arm_cfg.carry_prob = 0.0, 0.0
