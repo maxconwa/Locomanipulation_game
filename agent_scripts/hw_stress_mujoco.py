@@ -11,7 +11,7 @@ Mid360 policies need and the perturbations:
 Per job (one condition, profile, plant and seed) one robot for --seconds; jobs run in parallel processes.
 
     python agent_scripts/hw_stress_mujoco.py --export <policies/name> --label <name> [--seeds 8] [--plants robocasa,isaac]
-        [--conditions ...] [--profiles zero,small] [--workers 24]
+        [--conditions ...] [--profiles zero,small,small60] [--workers 24]
 
 Writes logs/hw_stress_mujoco/<label>/summary.json and summary.md. Any python with mujoco, torch, numpy and pyyaml.
 """
@@ -242,6 +242,9 @@ class StressMujoco(MarlMujoco):
 
 
 def command(t: float, profile: str) -> np.ndarray:
+    if profile == "small60":
+        # bag 1's trigger after a long stand: zero for 60 s, then the small profile's command
+        t, profile = t - 50.0, "small"
     if profile == "zero" or t < 10.0:
         return np.zeros(3)
     vx = 0.04 if t < 12.0 else 0.04 + (0.3 - 0.04) * min((t - 12.0) / 2.0, 1.0)
