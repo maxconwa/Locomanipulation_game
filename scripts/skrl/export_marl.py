@@ -17,7 +17,10 @@ Writes into --out (a policies/<name> directory of the deploy package):
                      run's IMU sat on and its offset: imu_link on the torso, or livox_link at the MID-360's chip),
                      the deploy template's per-run keys as the run trained them (common.read_deploy_settings:
                      control_dt, kp, kd, gait_period, zero_cmd_eps, command_ranges; and command_filter_tau, the command
-                     low-pass the deploy does not apply yet) and the source files.
+                     low-pass the deploy does not apply yet) and the source files. An actor trained with
+                     rnn.normalize_hidden (a normalize_hidden_flag buffer in its state dict) scales h to unit length
+                     after every step, as in training; one trained with rnn.cell_cap s (a cell_cap_value buffer)
+                     squashes its cell state, c <- s tanh(c / s).
 Needs only torch; no simulator.
 
     python scripts/skrl/export_marl.py --checkpoint logs/skrl/locomanip_marl/<run>/checkpoints/agent_<step>.pt \
@@ -68,20 +71,29 @@ class Actor(nn.Module):
 class RecurrentActor(nn.Module):
     hidden_size: int
     num_layers: int
+    normalize_hidden: bool
+    cell_cap: float
 
     def __init__(self, mean, var, lstm: nn.LSTM, layers: nn.Sequential, skip_observations: bool, epsilon: float,
-                 clip_obs: float, clip_actions: float):
+                 clip_obs: float, clip_actions: float, normalize_hidden: bool = False, cell_cap: float = 0.0):
         super().__init__()
         self.register_buffer("mean", mean.float())
         self.register_buffer("std", torch.sqrt(var.float()))
         self.lstm, self.net = lstm, layers
         self.hidden_size, self.num_layers = lstm.hidden_size, lstm.num_layers
         self.skip_observations = skip_observations
+        self.normalize_hidden = normalize_hidden
+        self.cell_cap = float(cell_cap)
         self.epsilon, self.clip_obs, self.clip_actions = epsilon, clip_obs, clip_actions
 
     def forward(self, obs: torch.Tensor, h: torch.Tensor, c: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         z = torch.clamp((obs - self.mean) / (self.std + self.epsilon), -self.clip_obs, self.clip_obs)
         out, (h, c) = self.lstm(z.unsqueeze(1), (h, c))
+        if self.normalize_hidden:
+            h = torch.nn.functional.normalize(h, dim=-1, eps=1e-6)
+            out = h[-1].unsqueeze(1)
+        if self.cell_cap > 0.0:
+            c = self.cell_cap * torch.tanh(c / self.cell_cap)
         features = out.squeeze(1)
         if self.skip_observations:
             features = torch.cat([features, z], dim=-1)
@@ -129,8 +141,12 @@ for agent in ("legs", "arms"):
         lstm.load_state_dict({k[len("lstm."):]: v for k, v in policy.items() if k.startswith("lstm.")})
         net = mlp(policy, "net")
         actor = RecurrentActor(pre["running_mean"], pre["running_variance"], lstm, net,
-                               net[0].in_features == hidden + n, 1e-8, 5.0, args.clip_actions).eval()
-        kind = f"LSTM {layers}x{hidden}{' + skip' if actor.skip_observations else ''} -> "
+                               net[0].in_features == hidden + n, 1e-8, 5.0, args.clip_actions,
+                               normalize_hidden="normalize_hidden_flag" in policy,
+                               cell_cap=float(policy["cell_cap_value"][0]) if "cell_cap_value" in policy else 0.0).eval()
+        kind = (f"LSTM {layers}x{hidden}{' + skip' if actor.skip_observations else ''}"
+                f"{' (unit h)' if actor.normalize_hidden else ''}"
+                f"{f' (c capped at {actor.cell_cap:g})' if actor.cell_cap > 0 else ''} -> ")
     else:
         actor = Actor(pre["running_mean"], pre["running_variance"], mlp(policy, "net_container"),
                       1e-8, 5.0, args.clip_actions).eval()

@@ -279,7 +279,8 @@ class MarlObservationsCfg:
         arm_goal = ObsTerm(func=mdp.arm_goal_active, params={"command_name": ARM_COMMAND})
         ee_targets = ObsTerm(func=mdp.arm_targets_in_root_xyzw, params={"command_name": ARM_COMMAND})
         joint_pos = _joints(mdp.joint_pos_rel, 0.01)
-        joint_vel = _joints(mdp.joint_vel_rel, 1.5)
+        # LowState's dq, late by the env's joint_vel_obs_lag_ms where set (the current one otherwise)
+        joint_vel = _joints(mdp.joint_vel_rel_lagged, 1.5)
         gait_phase = ObsTerm(func=mdp.gait_phase_sin, params={"command_name": "base_velocity"})
         # with the sin, each leg's phase without ambiguity (the legs' sins alone are negatives of each other)
         gait_phase_cos = ObsTerm(func=mdp.gait_phase_cos, params={"command_name": "base_velocity"})
@@ -406,6 +407,10 @@ class LegsRewardsCfg(LowerRewardsCfg):
     golem_velocity = _golem(LOWER_JOINT_NAMES, "velocity", -10.0, GOLEM_RATE_MARGIN)
     golem_torque = _golem(LOWER_JOINT_NAMES, "torque", -10.0, GOLEM_RATE_MARGIN)
     yaw_twist = RewTerm(func=mdp.yaw_twist_l2, weight=YAW_TWIST_WEIGHT, params={"window_s": YAW_TRACKING_WINDOW_S})
+    # the feet's load split while standing in navigation; off (0) by default
+    stand_load_balance = RewTerm(func=mdp.stand_load_imbalance, weight=0.0, params={
+        "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FOOT_LINK_NAMES, preserve_order=True),
+        "command_name": "base_velocity", "arm_command_name": ARM_COMMAND})
 
     def __post_init__(self):
         # LowerRewardsCfg's per-step kernels at twice unitree_rl_gym's H1-2 weights, their stds annealed from its 0.5 by
@@ -525,6 +530,9 @@ class MarlEventCfg(EventCfg):
     joint_dynamics = EventTerm(func=mdp.randomize_joint_passive_dynamics, mode="startup", params={
         "damping_range": JOINT_DAMPING_RANGE, "friction_range": JOINT_FRICTION_RANGE,
         "armature_range": JOINT_ARMATURE_RANGE}) if JOINT_PASSIVE_DYNAMICS else None
+    # the motors' kp/kd and strength per env and joint at each reset; nominal (1, 1) by default
+    actuator_scales = EventTerm(func=mdp.randomize_actuator_scales, mode="reset", params={
+        "gain_range": (1.0, 1.0), "strength_range": (1.0, 1.0)})
     massless_frames = EventTerm(
         func=mdp.randomize_rigid_body_mass,
         mode="startup",
@@ -686,6 +694,11 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     action_delay_range: tuple[int, int] | None = ACTION_DELAY_RANGE
     # True: action_delay_range counts physics substeps (finer steps); False: policy steps, as ALMI-Open
     action_delay_substeps: bool = ACTION_DELAY_SUBSTEPS
+    # ms: the actors' observed joint velocity on joint_vel_obs_lag_joints is this late, drawn per env at each reset in
+    # physics substeps (the real H1-2's LowState dq lags d(q)/dt by about 12 ms on hip pitch and knee, 0 on the
+    # ankles, whose state passes Unitree's parallel-linkage conversion). None: no lag
+    joint_vel_obs_lag_ms: tuple[float, float] | None = None
+    joint_vel_obs_lag_joints: list[str] = [".*_hip_.*_joint", ".*_knee_joint"]
     # None: train.py leaves skrl's running normalization (Explicit500 on, and every run up to feetodom_knee_200k);
     # OBSERVATION_SCALES: fixed scales (almitrain_200k to lstm_run2)
     observation_scales: dict | None = None

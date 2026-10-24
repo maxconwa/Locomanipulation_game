@@ -16,7 +16,7 @@ from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 
 from ..golem_safety import GOLEM_LIMITS
 from .commands import ground_height
-from .legs_rewards import STANCE_THRESHOLD, joint_deviation_l2, leg_phase
+from .legs_rewards import STANCE_THRESHOLD, joint_deviation_l2, leg_phase, standing_command
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -220,6 +220,22 @@ def yaw_rate_l2_during_arm_goal(env: ManagerBasedRLEnv, arm_command_name: str) -
     """Squared pelvis yaw rate during an arm goal: turning moves the world-fixed targets in the pelvis frame."""
     yaw_rate = env.scene["robot"].data.root_ang_vel_b[:, 2]
     return torch.square(yaw_rate) * env.command_manager.get_term(arm_command_name).arm_mode
+
+
+def stand_load_imbalance(
+    env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, command_name: str, arm_command_name: str, min_load: float = 50.0
+) -> torch.Tensor:
+    """((F_left - F_right) / (F_left + F_right))^2 of the two feet's vertical contact forces while the robot stands
+    in navigation (velocity command under the gait clock's zero_cmd_eps, no arm goal) with both feet carrying at
+    least min_load N together; 0 otherwise. Mid360v2 stood with 70-85% of its weight on one leg, in sim and on the
+    robot, leaving one ankle pitch to balance it."""
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    fz = sensor.data.net_forces_w[:, sensor_cfg.body_ids, 2].clamp(min=0.0)
+    total = fz.sum(dim=1)
+    imbalance = (fz[:, 0] - fz[:, 1]) / total.clamp(min=1.0)
+    cmd = env.command_manager.get_command(command_name)
+    standing = standing_command(env, cmd) & ~env.command_manager.get_term(arm_command_name).arm_mode
+    return torch.square(imbalance) * (standing & (total > min_load)).float()
 
 
 def joint_deviation_l2_modal(

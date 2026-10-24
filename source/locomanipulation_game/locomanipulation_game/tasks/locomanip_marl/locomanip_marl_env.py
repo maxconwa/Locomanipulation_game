@@ -167,6 +167,21 @@ class LocoManipMarlEnv(DirectMARLEnv):
             unit = "physics substeps" if self.cfg.action_delay_substeps else "policy steps"
             print(f"[INFO] Action delay: {low}-{high} {unit} per env, drawn at each reset")
 
+        # -- the observed joint velocity's lag (cfg.joint_vel_obs_lag_ms): the state after each physics substep, newest
+        # last; mdp.joint_vel_rel_lagged reads lagged_joint_vel
+        self._dq_ring = None
+        if self.cfg.joint_vel_obs_lag_ms is not None:
+            low_ms, high_ms = self.cfg.joint_vel_obs_lag_ms
+            self._dq_lag_range = (int(round(low_ms / 1000 / self.physics_dt)), int(round(high_ms / 1000 / self.physics_dt)))
+            self._dq_lag_ids = torch.as_tensor(
+                self._robot.find_joints(self.cfg.joint_vel_obs_lag_joints)[0], device=self.device)
+            depth = self._dq_lag_range[1] + 1
+            self._dq_ring = self._robot.data.joint_vel.unsqueeze(0).repeat(depth, 1, 1).clone()
+            self._dq_slot = 0
+            self._dq_lag = torch.randint(self._dq_lag_range[0], self._dq_lag_range[1] + 1, (self.num_envs,), device=self.device)
+            print(f"[INFO] Joint velocity observation lag: {low_ms:g}-{high_ms:g} ms ({self._dq_lag_range} substeps) on"
+                  f" {self.cfg.joint_vel_obs_lag_joints}")
+
         # -- the policy's gyro low-pass (mdp.imu_ang_vel_lowpass reads its output): one sample per physics substep,
         # the IMU's rate, as the deploy filters /livox/imu
         self.gyro_lowpass = None
@@ -196,6 +211,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._substep = 0
 
     def _apply_action(self) -> None:
+        if self._dq_ring is not None:
+            # the state the previous substep left
+            self._dq_ring[self._dq_slot % len(self._dq_ring)] = self._robot.data.joint_vel
+            self._dq_slot += 1
         if self.gyro_lowpass is not None and self._substep > 0:
             # the IMU sample the previous substep left; the step's last one is taken in _get_observations
             self.gyro_lowpass(self.scene["imu"].data.ang_vel_b)
@@ -264,6 +283,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._fresh[env_ids] = True
         if self.gyro_lowpass is not None:
             self.gyro_lowpass.reset(env_ids)
+        if self._dq_ring is not None:
+            low, high = self._dq_lag_range
+            self._dq_lag[env_ids] = torch.randint(low, high + 1, (len(env_ids),), device=self.device)
+            self._dq_ring[:, env_ids] = self._robot.data.joint_vel[env_ids].unsqueeze(0)
         if self.golem_monitor is not None:
             self.golem_monitor.reset(env_ids)
         self._golem_tripped_prev[env_ids] = False
@@ -288,6 +311,20 @@ class LocoManipMarlEnv(DirectMARLEnv):
             key: value if isinstance(value, torch.Tensor) else torch.tensor(float(value), device=self.device)
             for key, value in log.items()
         }
+
+    def lagged_joint_vel(self) -> torch.Tensor:
+        """Joint velocity (num_envs, joints) with cfg.joint_vel_obs_lag_joints _dq_lag physics substeps late (the
+        current state for a lag of 0, and for every joint without cfg.joint_vel_obs_lag_ms)."""
+        dq = self.scene["robot"].data.joint_vel
+        if getattr(self, "_dq_ring", None) is None:
+            return dq
+        depth = len(self._dq_ring)
+        slot = (self._dq_slot - self._dq_lag) % depth  # lag k: pushed k substeps before now; the ring's newest is 1
+        old = self._dq_ring[slot, torch.arange(self.num_envs, device=self.device)]
+        out = dq.clone()
+        ids = self._dq_lag_ids
+        out[:, ids] = torch.where((self._dq_lag > 0).unsqueeze(1), old[:, ids], dq[:, ids])
+        return out
 
     """
     Fixed observation scales.
