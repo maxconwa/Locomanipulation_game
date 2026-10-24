@@ -137,7 +137,12 @@ class Replayer:
         trim = np.radians(args.imu_trim_deg) if self.deployed else np.zeros(3)
         self.mount = imu_mount_quat(*trim) if np.any(trim) else None
         self.slam_time = None
-        self.targets, self.attitude_source = [], []
+        self.targets, self.attitude_source, self.times = [], [], []
+        # a policy at another rate than the node's ticks (the sport-mode runs' 100 Hz) steps on its own clock, on
+        # the latest /lowstate (replay)
+        self.dt = float(cfg["control_dt"])
+        self.own_clock = False
+        self.next_t: float | None = None
 
     def on_imu(self, stamp, gyro, acc):
         self.livox.update(stamp, gyro, acc)
@@ -190,6 +195,7 @@ class Replayer:
         if self.attitude is not None and not self.attitude.calibrated:
             self.attitude.calibrate()   # joined mid-episode: level at the first still second
         self.targets.append(self.ctrl.step(self.robot_state(msg, now)).q)
+        self.times.append(now)
 
 
 def read_bag(bag: str):
@@ -212,9 +218,14 @@ def stamp(msg) -> float:
 
 
 def replay(players: list[Replayer], steps_offset: int = 0, max_seconds: float = 0.0):
-    """Steps every player at the node's publish ticks after engage. Returns the tick times, the recorded leg targets
-    per tick, the bag's command per tick, its events and whether it joined mid-episode."""
+    """Steps every player at the node's publish ticks after engage; a player whose control_dt differs from the
+    node's (the deployed policy's, else the first player's) steps on its own clock instead, from the engage tick
+    on, at the latest /lowstate. Returns the tick times, the recorded leg targets per tick, the bag's command per
+    tick, its events and whether it joined mid-episode."""
     lowstate, ticks, recorded, cmds, events = None, [], [], [], []
+    node_dt = next((p.dt for p in players if p.name == args.deployed), players[0].dt)
+    for p in players:
+        p.own_clock = abs(p.dt - node_dt) > 1e-9
     default = np.asarray(players[0].cfg["default_joint_pos"])[:NUM_LEGS]
     engaged, cmd, last_target, mid_episode, last_estop = False, np.zeros(3), None, False, None
     history = collections.deque(maxlen=args.lowstate_lag + 1)
@@ -222,6 +233,10 @@ def replay(players: list[Replayer], steps_offset: int = 0, max_seconds: float = 
         if topic == "/lowstate":
             history.append(msg)
             lowstate = history[max(0, len(history) - 1 - args.lowstate_lag)]
+            for p in players:
+                while engaged and p.own_clock and p.next_t is not None and t >= p.next_t:
+                    p.step(lowstate, t)
+                    p.next_t += p.dt
         elif topic == "/livox/imu":
             w, a = msg.angular_velocity, msg.linear_acceleration
             for p in players:
@@ -272,6 +287,11 @@ def replay(players: list[Replayer], steps_offset: int = 0, max_seconds: float = 
                     last_target, prev_lowstate, prev_t = target, lowstate, t
                     continue
             for p in players:
+                if p.own_clock:
+                    if p.next_t is None:   # its first step, on the engage tick
+                        p.step(lowstate, t)
+                        p.next_t = t + p.dt
+                    continue
                 p.step(lowstate, t)
                 if p.name == args.deployed and not args.free_running:
                     # the legs observe the target the node sent (mdp.applied_action), not the replay's: the inputs
@@ -286,9 +306,10 @@ def replay(players: list[Replayer], steps_offset: int = 0, max_seconds: float = 
     return np.array(ticks), np.array(recorded), np.array(cmds), events, mid_episode
 
 
-def sim_reference(folder: str, cmds: np.ndarray, seeds: int):
-    """c and z in MuJoCo (nominal plant, Isaac joint dynamics) driven by the bag's own velocity command, one per
-    policy step, from a zero LSTM state on its feet. Also returns each seed's fall time (None: stood)."""
+def sim_reference(folder: str, cmds: np.ndarray, seeds: int, tick_t: np.ndarray):
+    """c and z in MuJoCo (nominal plant, Isaac joint dynamics) driven by the bag's own velocity command (cmds at the
+    tick times tick_t, s from engage, held between ticks; the sim steps at the policy's own control_dt), from a zero
+    LSTM state on its feet. Also returns each seed's fall time (None: stood)."""
     sys.path.insert(0, str(REPO / "agent_scripts"))
     sys.path.insert(0, str(REPO))
     import hw_stress_mujoco as H
@@ -326,12 +347,14 @@ def sim_reference(folder: str, cmds: np.ndarray, seeds: int):
         sim.reset(rng)
         obs = sim.observations()
         fell = None
+        dt = sim.policy_dt
         with torch.no_grad():
-            for k, cmd in enumerate(cmds):
-                sim.vel_cmd = np.asarray(cmd, dtype=np.float64)
+            for k in range(int(tick_t[-1] / dt) + 1):
+                tick = max(int(np.searchsorted(tick_t, k * dt, side="right")) - 1, 0)
+                sim.vel_cmd = np.asarray(cmds[tick], dtype=np.float64)
                 obs = sim.step(obs)
                 if sim.tilt() > H.FALL_TILT or sim.root()[0][2] < H.FALL_HEIGHT:
-                    fell = k * H.DT
+                    fell = k * dt
                     break
         falls.append(fell)
         print(f"[replay] sim seed {seed}: {len(actors['legs'].cs)} steps, "
@@ -397,6 +420,8 @@ def main():
         info = {"attitude": {s: p.attitude_source.count(s) for s in set(p.attitude_source)}}
         targets = np.array(p.targets)
         npz[f"{p.name}_legs_target"] = targets[:, :NUM_LEGS]
+        pt = np.array(p.times) - ticks[0]   # this policy's step times (the ticks', unless on its own clock)
+        npz[f"{p.name}_t"] = pt
         if p.name == args.deployed:
             err = np.abs(targets[:, :NUM_LEGS] - recorded)
             info["target_check"] = {}
@@ -410,12 +435,12 @@ def main():
                            f"{np.median(e):.2e}, p99 {np.percentile(e, 99):.2e}, max {e.max():.2e} rad.", ""]
         ref = None
         if args.sim_seeds > 0:
-            ref = sim_reference(dict(specs)[p.name], cmds, args.sim_seeds)
+            ref = sim_reference(dict(specs)[p.name], cmds, args.sim_seeds, t)
             info["sim_falls"] = ref["falls"]
             md += [f"MuJoCo on the bag's commands, {args.sim_seeds} seeds: "
                    + ", ".join("stood" if f is None else f"fell at {f:.1f} s" for f in ref["falls"]) + ".", ""]
         # a replay joined mid-episode starts from a zero LSTM state: judge c only once it has had 10 s to fill
-        judged = t >= (10.0 if mid_episode else 0.0)
+        judged = pt >= (10.0 if mid_episode else 0.0)
         md += [f"## {p.name}", "", "| actor | max \\|c\\| real | max \\|c\\| sim | steps with a unit outside sim range "
                "| max \\|z\\| real (group) | steps with any \\|z\\| > 5 | max \\|z\\| sim | steps with an input past "
                "sim's |", "|---|---|---|---|---|---|---|---|"]
@@ -427,7 +452,7 @@ def main():
             zmax = np.abs(z).max(axis=0)
             worst = int(zmax.argmax())
             row = {"max_abs_c": float(np.abs(c).max()) if c.size else None,
-                   "mean_abs_c_last_5s": float(np.abs(c[t >= t[-1] - 5]).mean()) if c.size else None,
+                   "mean_abs_c_last_5s": float(np.abs(c[pt >= pt[-1] - 5]).mean()) if c.size else None,
                    "max_abs_z": float(zmax.max()), "max_abs_z_input": [worst, names[worst]],
                    "steps_any_z_over_5": float((np.abs(z) > 5).any(axis=1).mean()),
                    "z_over_5_by_group": {g: float((np.abs(z[:, [i for i, n in enumerate(names) if n == g]]) > 5)

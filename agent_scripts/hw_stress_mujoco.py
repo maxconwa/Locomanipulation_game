@@ -81,7 +81,7 @@ KNEE_IDX = [ALL_NAMES.index(n) for n in ("left_knee_joint", "right_knee_joint")]
 FALL_TILT, FALL_HEIGHT = 0.8, 0.55
 FLOOR_MARGIN, FLOOR_HOLD_S = 0.1, 0.5
 STAND_WINDOW = (2.0, 10.0)
-DT = C.POLICY_DT
+DT = C.POLICY_DT   # the template's 50 Hz; a run's own policy step is its sim's policy_dt (export.yaml control_dt)
 
 
 class Recurrent:
@@ -121,8 +121,9 @@ class StressMujoco(MarlMujoco):
         model.body_mass[torso] += f["torso_kg"]
         rest = np.array(deploy["rest_pose"], float)
         limits = {k: tuple(v) for k, v in (deploy.get("target_limits") or {}).items()}
+        # the run's control rate, gains, default pose, action scales, IK step and command filter (MarlMujoco settings)
         super().__init__(actors, None, physics=physics, rest_pose_b=rest, model=model, target_limits=limits,
-                         gyro_lowpass_hz=imu.get("gyro_lowpass_hz") or 0.0)
+                         gyro_lowpass_hz=imu.get("gyro_lowpass_hz") or 0.0, settings=deploy)
         m = self.m
         if self.head:
             sens = lambda n: m.sensor_adr[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SENSOR, n)]  # noqa: E731
@@ -200,10 +201,10 @@ class StressMujoco(MarlMujoco):
         self.last_tau = self.pd_torque(self.applied)
 
     def gait(self):
-        if np.linalg.norm(self.vel_cmd) < self.zero_cmd_eps:
+        if np.linalg.norm(self.observed_cmd()) < self.zero_cmd_eps:
             phase = np.zeros(2)
         else:
-            p = (self.steps * DT % self.gait_period) / self.gait_period
+            p = (self.steps * self.policy_dt % self.gait_period) / self.gait_period
             phase = np.array([p, (p + 0.5) % 1.0])
         return np.sin(2 * math.pi * phase), np.cos(2 * math.pi * phase)
 
@@ -216,10 +217,10 @@ class StressMujoco(MarlMujoco):
         u = lambda x, s: x + r.uniform(-s, s, np.shape(x))  # noqa: E731
         believed = np.concatenate([xyzw(b) for b in self.believed])
         sin, cos = self.gait()
-        common = [u(acc, n["lin_acc"]), u(gyro, n["ang_vel"]), u(grav, n["grav"]), self.vel_cmd,
+        common = [u(acc, n["lin_acc"]), u(gyro, n["ang_vel"]), u(grav, n["grav"]), self.observed_cmd(),
                   np.array([1.0 if self.arm_mode else 0.0]), believed, u(q - self.default, n["jpos"]),
                   u(qd, n["jvel"]), sin] + ([cos] if self.gait_cos else [])
-        legs_applied = (self.applied[self.leg_idx] - self.default[self.leg_idx]) / 0.25
+        legs_applied = (self.applied[self.leg_idx] - self.default[self.leg_idx]) / self.leg_scale
         cur = self.wrist_poses_b()
         wrist_pose = np.concatenate([xyzw(np.r_[c[:3], qunique(c[3:])]) for c in cur])
         errs = np.concatenate([np.r_[b[:3] - c[:3], axis_angle(qmul(b[3:], qconj(c[3:])))]
@@ -260,6 +261,7 @@ def run_job(job):
     rng = np.random.default_rng(seed)
     sim = StressMujoco(actors, f, deploy, plant, rng)
     sim.reset(rng)
+    DT = sim.policy_dt
     obs = sim.observations()
     for a, net in actors.items():
         if net.net.mean.numel() != len(obs[a]):
