@@ -61,7 +61,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
         if not cfg.explicit_pd:
             # cfg.__post_init__ made them explicit before any override could reach cfg.explicit_pd
             cfg.scene.robot = cfg.scene.robot.replace(actuators=H1_2_MAGPIE_CFG.actuators)
-        cfg.sync_physics_rate()
+        cfg.sync_derived()
         super().__init__(cfg, render_mode, **kwargs)
         self._set_soft_joint_limits()
 

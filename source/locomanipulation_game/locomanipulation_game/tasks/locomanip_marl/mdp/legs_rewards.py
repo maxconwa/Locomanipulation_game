@@ -17,20 +17,26 @@ if TYPE_CHECKING:
 
 
 # --- gait clock (ALMI h1_2_lower_env.py, ~line 500) ---
-GAIT_PERIOD = 0.8          # seconds per full stride
+# The stride period and the stand/walk gate are the env cfg's gait_period (s per full stride) and zero_cmd_eps (a
+# command norm over vx, vy, wz below it counts as "standing"), so a CLI override reaches them.
 STANCE_THRESHOLD = 0.55    # phase below this is stance
-ZERO_CMD_EPS = 0.1         # command norm below this counts as "standing"
+
+
+def standing_command(env: ManagerBasedRLEnv, cmd: torch.Tensor) -> torch.Tensor:
+    """Per env, whether the command's norm over (vx, vy, wz) is under the env's zero_cmd_eps."""
+    return torch.norm(cmd[:, :3], dim=1) < env.cfg.zero_cmd_eps
 
 
 def leg_phase(env: ManagerBasedRLEnv, command_name: str = "base_velocity") -> torch.Tensor:
     cmd = env.command_manager.get_command(command_name)
-    standing = torch.norm(cmd[:, :3], dim=1) < ZERO_CMD_EPS
+    standing_ = standing_command(env, cmd)
+    period = env.cfg.gait_period
 
     t = env.episode_length_buf * env.step_dt
     phase = torch.where(
-        standing, torch.zeros_like(t, dtype=torch.float), (t % GAIT_PERIOD) / GAIT_PERIOD
+        standing_, torch.zeros_like(t, dtype=torch.float), (t % period) / period
     )
-    offset = torch.where(standing, 0.0, 0.5)
+    offset = torch.where(standing_, 0.0, 0.5)
 
     return torch.stack([phase, (phase + offset) % 1.0], dim=-1)
 
@@ -160,20 +166,20 @@ def stand_still(
 ) -> torch.Tensor:
     asset: Articulation = env.scene[asset_cfg.name]
     cmd = env.command_manager.get_command(command_name)
-    standing = torch.norm(cmd[:, :3], dim=1) < ZERO_CMD_EPS
+    standing_ = standing_command(env, cmd)
 
     dev = (
         asset.data.joint_pos[:, asset_cfg.joint_ids]
         - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
     )
-    return torch.sum(torch.abs(dev), dim=1) * standing
+    return torch.sum(torch.abs(dev), dim=1) * standing_
 
 
 def stance_base_vel(env: ManagerBasedRLEnv, command_name: str = "base_velocity") -> torch.Tensor:
     asset: Articulation = env.scene["robot"]
     cmd = env.command_manager.get_command(command_name)
-    standing = torch.norm(cmd[:, :3], dim=1) < ZERO_CMD_EPS
-    return torch.sum(torch.square(asset.data.root_lin_vel_b[:, :2]), dim=1) * standing
+    standing_ = standing_command(env, cmd)
+    return torch.sum(torch.square(asset.data.root_lin_vel_b[:, :2]), dim=1) * standing_
 
 
 

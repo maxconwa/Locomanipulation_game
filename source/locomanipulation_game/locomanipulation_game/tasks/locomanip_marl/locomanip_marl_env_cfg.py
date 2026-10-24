@@ -14,15 +14,21 @@ are checked and logged (golem_safety.py). Each agent pays for its measured joint
 torso_joint belongs to neither agent: its actuator holds it at default.
 
 As ALMI-Open trains its H1-2 policies: explicit PD (the torque computed every physics step and clipped at the
-effort limit, IdealPDActuatorCfg, not PhysX's implicit drive; at 200 Hz, where ALMI-Open's runs at 500), joint targets 0-2 policy steps late
-(action_delay_range), fixed observation scales in place of running normalization (observation_scales), its friction,
-mass, centre-of-mass and push randomization (base_cfg.EventCfg), and its rough terrain with a terrain-level curriculum.
+effort limit, IdealPDActuatorCfg, not PhysX's implicit drive) at its 500 Hz, its friction and push randomization
+(base_cfg.EventCfg), and its rough terrain with a terrain-level curriculum. The defaults are Explicit500's and
+Mid360v2's training (README): joint targets 0-20 ms late in 2 ms substeps (action_delay_range, action_delay_substeps),
+skrl's running normalization (observation_scales None), no link-mass or pelvis centre-of-mass randomization, torso
+mass -2..+4 kg, the foot-contact penalty on the peak of a 3-substep mean, and terrain rows above 0 only once the gate
+opens (terrain_levels gated). Up to 2026-10-20 the defaults were ALMI-Open's (200 Hz physics, a 0-2 policy-step delay,
+fixed observation scales, its mass and centre-of-mass randomization, terrain rows 0-5 from the start), and every run
+from Explicit500 on overrode them on the command line.
 Unlike ALMI-Open, the pushes ramp up per env on a push-level curriculum, and both an env's push level and its terrain
 row go down after a fall and up after an episode that tracked its velocity commands (mdp.push_levels,
 mdp.terrain_levels_tracking); the terrain not by distance walked.
 """
 
 import math
+import os
 
 from isaaclab.actuators import IdealPDActuatorCfg, ImplicitActuatorCfg
 from isaaclab.envs import DirectMARLEnvCfg
@@ -46,8 +52,10 @@ from locomanipulation_game.assets.h1_2 import (
     FOOT_LINK_NAMES,
     LOWER_JOINT_NAMES,
     LOWER_LINK_NAMES,
+    PD_GAINS,
     PELVIS_LINK_NAME,
     STANDING_PELVIS_HEIGHT,
+    with_gains,
 )
 
 from . import mdp
@@ -83,14 +91,18 @@ ARMS_ACTION = "arm_pos"
 # concatenates the agents' actions into the ActionManager's vector.
 AGENT_ACTION_TERMS = {"legs": [LEGS_ACTION], "arms": [ARMS_ACTION]}
 
-# physics 200 Hz, as every run up to feetodom_knee_200k; almitrain_200k to lstm_run ran ALMI-Open's 500 Hz (0.002, 10)
-SIM_DT = 0.005
-DECIMATION = 4
-POLICY_DT = 0.02          # DECIMATION x SIM_DT; reward weights are per second
-# Each env's joint targets reach the robot this many policy steps late, drawn at every reset (ALMI-Open's 0-2)
-ACTION_DELAY_RANGE = (0, 2)
+# physics 500 Hz, ALMI-Open's, as almitrain_200k to lstm_run and Explicit500 on; every run up to feetodom_knee_200k,
+# lstm_run2 and the ablation_* runs: 200 Hz (0.005, 4)
+SIM_DT = 0.002
+DECIMATION = 10
+POLICY_DT = 0.02          # DECIMATION x SIM_DT; reward weights are per second (sync_derived rescales goal_reached)
+# Each env's joint targets reach the robot this many physics substeps late (0-20 ms), drawn at every reset
+# (ACTION_DELAY_SUBSTEPS); ALMI-Open's, and the default before Explicit500: 0-2 policy steps
+ACTION_DELAY_RANGE = (0, 10)
+ACTION_DELAY_SUBSTEPS = True
 # Fixed input scales, ALMI-Open's (legged_gym obs_scales and commands_scale) where it has the term: skrl's scalers are
 # frozen at mean 0 and std 1/scale (train.py), in place of running normalization. Terms not listed are scaled by 1.
+# Not the default (observation_scales None): the crouch died with them (README, Explicit500).
 OBSERVATION_SCALES = {
     "base_ang_vel": 0.25,
     "joint_vel": 0.05,
@@ -101,6 +113,12 @@ OBSERVATION_SCALES = {
 # Kept implicit: the grippers are locked open by stiff gains that an explicit PD at SIM_DT would not hold stably.
 IMPLICIT_ACTUATORS = ("grippers",)
 GOAL_BONUS = 5.0          # paid once per reached goal
+# The arm goals' tables (ArmTargetsCommandCfg.table_file): golemlim120k's, which every run from Explicit500 on loaded,
+# when this checkout has it; otherwise each run builds its own into its log dir
+_GOLEMLIM120K_TABLES = os.path.join(os.path.dirname(os.path.abspath(__file__)), *[".."] * 5, "logs", "skrl",
+                                    "locomanip_marl", "golemlim120k", "arm_target_tables_v3.pt")
+ARM_TARGET_TABLE = (os.path.normpath(_GOLEMLIM120K_TABLES) if os.path.isfile(_GOLEMLIM120K_TABLES)
+                    else "arm_target_tables_v3.pt")
 # lambda: each agent's reward includes this share of the other's command-following terms. The legs keep 0.5 of the
 # arms'; the arms take none of the legs' (every run up to Mid360: 0.5 both ways), whose cycle-mean yaw term had grown
 # to ~0.6/step and diluted the arms' own: YawTwist's settled wrist error 9.6 cm became Mid360's 15
@@ -151,7 +169,7 @@ ANG_VEL_STDS = (1.5, 1.0, 0.7, 0.5, 0.4, 0.3, 0.2)  # rad/s
 # The yaw tracking term and its kernel's judge read the yaw rate averaged over one gait cycle: on the instantaneous
 # rate the step's twist (about +-0.45 rad/s RMS) is as large as a turn command, and no run up to SmoothYawNavH turned
 # the commanded way much above chance (eval_ablation). Explicit500 tracked on the cycle mean too. 0: instantaneous.
-YAW_TRACKING_WINDOW_S = 0.8  # s, legs_rewards.GAIT_PERIOD
+YAW_TRACKING_WINDOW_S = 0.8  # s, one gait period; sync_derived sets every window_s to the cfg's gait_period
 # The linear term and its judge too, from 10-19: within a stride the pelvis sways sideways and surges, so after the
 # arm goals start the instantaneous error stayed over its 0.25 kernel and the kernel never narrowed again.
 VEL_TRACKING_WINDOW_S = 0.8
@@ -196,6 +214,7 @@ class MarlCommandsCfg:
         resampling_time_range=(4.0, 4.0),
         fine_pos_stds=FINE_POS_STDS,
         rot_stds=ROT_STDS,
+        table_file=ARM_TARGET_TABLE,
         debug_vis=True,
     )
 
@@ -411,6 +430,9 @@ class LegsRewardsCfg(LowerRewardsCfg):
         self.hip_pos.func = mdp.joint_deviation_l2_modal
         self.hip_pos.params = {**self.hip_pos.params, "arm_command_name": ARM_COMMAND,
                                "arm_goal_scale": ARM_GOAL_HIP_POS_SCALE}
+        # the peak over the substeps of the force averaged over 3 (6 ms, about one 200 Hz substep), as Explicit500 on:
+        # the crouch needs it (README); ALMI-Open's last-substep force was the default before
+        self.feet_contact_forces.params = {**self.feet_contact_forces.params, "peak_over_substeps": True, "window": 3}
 
 
 def _arm_tracking_annealed(arm: int, func) -> RewTerm:
@@ -511,6 +533,11 @@ class MarlEventCfg(EventCfg):
     )
 
     def __post_init__(self):
+        # Explicit500's and Mid360v2's randomization, not ALMI-Open's (the default before 2026-10-20): no link-mass
+        # or pelvis centre-of-mass changes, torso mass -2..+4 kg; friction stays ALMI-Open's 0.1-1.25
+        self.scale_link_masses = None
+        self.shift_pelvis_com = None
+        self.add_torso_mass.params = {**self.add_torso_mass.params, "mass_distribution_params": (-2.0, 4.0)}
         # resets on the ground, near still, joints near default
         self.reset_base.params = {
             **self.reset_base.params,
@@ -541,10 +568,10 @@ class MarlCurriculumCfg:
     # down a row after a fall, up one after a time-out that tracked the velocity commands (not ALMI-Open's
     # terrain_levels_vel, which demoted almitrain_lstm_200k's robots to the easiest row as they tracked better)
     # gated: rows above 0 only after navigation is robust and the crouch has emerged, one more every steps_per_row
-    # steps (Explicit500); not gated, as every run before it
+    # steps (Explicit500 on); not gated, as every run before it
     terrain_levels = CurrTerm(func=mdp.gated_terrain_levels, params={
         "command_name": "base_velocity", "max_error": TERRAIN_MAX_TRACKING_ERROR, "arm_command_name": ARM_COMMAND,
-        "gated": False, "max_fall_share": 0.02, "min_tracked_share": 0.7, "min_depth_level": 4.0,
+        "gated": True, "max_fall_share": 0.02, "min_tracked_share": 0.7, "min_depth_level": 4.0,
         "min_crouch_ratio": 0.75, "steps_per_row": 8000,
     })
     # as terrain_levels: down after a fall, up after a time-out that tracked the velocity commands
@@ -580,7 +607,7 @@ def explicit_pd(actuators: dict) -> dict:
 
 @configclass
 class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
-    decimation = DECIMATION  # policy 50 Hz, physics 200 Hz
+    decimation = DECIMATION  # policy 50 Hz, physics 500 Hz
     episode_length_s = 20.0
     possible_agents = ["legs", "arms"]
     # placeholders: the env sets all three from the managers
@@ -658,16 +685,54 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     # None: targets apply on the step they are computed (every run up to feetodom_knee_200k)
     action_delay_range: tuple[int, int] | None = ACTION_DELAY_RANGE
     # True: action_delay_range counts physics substeps (finer steps); False: policy steps, as ALMI-Open
-    action_delay_substeps: bool = False
-    # None: train.py leaves skrl's running normalization (every run up to feetodom_knee_200k)
-    observation_scales: dict | None = OBSERVATION_SCALES
+    action_delay_substeps: bool = ACTION_DELAY_SUBSTEPS
+    # None: train.py leaves skrl's running normalization (Explicit500 on, and every run up to feetodom_knee_200k);
+    # OBSERVATION_SCALES: fixed scales (almitrain_200k to lstm_run2)
+    observation_scales: dict | None = None
     # False: PhysX's implicit drive, as every run up to feetodom_knee_200k (LocoManipMarlEnv puts the asset's
     # actuators back before building the scene)
     explicit_pd: bool = True
 
+    # -- sport-mode ablation switches (docs/experiments/sportmode_ablations.md); each default is the behaviour before
+    # them. sync_derived carries them into the fields that depend on them.
+    gait_period: float = 0.8
+    """s per full stride of the gait clock (mdp.leg_phase); the cycle-mean tracking windows (every reward term's
+    window_s and the velocity command's yaw_window_s / lin_window_s) follow it."""
+    zero_cmd_eps: float = 0.1
+    """The stand/walk gate: a command whose norm over (vx, vy, wz) is under this counts as standing (gait phase 0,
+    stance_base_vel and stand_still)."""
+    pd_gains: str = "default"
+    """The legs', feet's and torso's PD gains: "default" (assets/h1_2.py _ACTUATORS) or "sport" (SPORT_MODE_GAINS,
+    Unitree's sport mode). The arms keep theirs. Exported with the policy (export_marl.py kp / kd)."""
+
+    @property
+    def policy_dt(self) -> float:
+        return self.decimation * self.sim.dt
+
+    def sync_derived(self):
+        """Everything that follows from other fields, for the values after the command line's overrides
+        (__post_init__ runs before them, so train.py and the env call this again): the physics-rate settings, the
+        gait-cycle tracking windows, the per-goal bonus at the policy rate, and the PD gains."""
+        self.sync_physics_rate()
+        rewards = [getattr(self.rewards, group) for group in vars(self.rewards) if not group.startswith("_")]
+        for group in rewards:
+            for term in vars(group).values():
+                if isinstance(term, RewTerm) and "window_s" in (term.params or {}):
+                    term.params["window_s"] = self.gait_period
+                # weights are per second: GOAL_BONUS (shared: x REWARD_SHARE_TO_LEGS) once per reached goal
+                if isinstance(term, RewTerm) and getattr(term.func, "__name__", "") == "arm_goal_reached":
+                    share = REWARD_SHARE_TO_LEGS if group is getattr(self.rewards, "legs", None) else 1.0
+                    term.weight = share * GOAL_BONUS / self.policy_dt
+        self.commands.base_velocity.yaw_window_s = self.gait_period
+        self.commands.base_velocity.lin_window_s = self.gait_period
+        if self.pd_gains not in PD_GAINS:
+            raise ValueError(f"pd_gains {self.pd_gains!r}: one of {list(PD_GAINS)}")
+        self.scene.robot = self.scene.robot.replace(actuators=with_gains(self.scene.robot.actuators, PD_GAINS[self.pd_gains]))
+
     def sync_physics_rate(self):
         """The sensor periods and render interval for sim.dt and decimation. __post_init__ runs before the command
-        line's overrides, so train.py and the env call this again: 'env.sim.dt=0.002 env.decimation=10' is enough."""
+        line's overrides, so train.py and the env call this again (through sync_derived): 'env.sim.dt=0.002
+        env.decimation=10' is enough."""
         self.sim.render_interval = self.decimation
         # contacts every physics step (the gait-phase terms and leg odometry read them), the IMU too (its
         # finite-difference lin_acc divides by the physics dt), the height scan once per policy step
@@ -682,9 +747,9 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
             sensor.history_length = 1
 
     def __post_init__(self):
-        self.sync_physics_rate()
         # explicit PD (every run up to feetodom_knee_200k: PhysX's implicit drive)
         self.scene.robot = self.scene.robot.replace(actuators=explicit_pd(self.scene.robot.actuators))
+        self.sync_derived()
         self.viewer.eye = (4.0, 4.0, 2.5)
         self.viewer.lookat = (0.0, 0.0, 1.0)
         # every joint target inside GOLEM's position e-stop range (written here so params/env.yaml records it)

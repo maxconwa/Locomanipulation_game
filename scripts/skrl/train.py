@@ -3,7 +3,9 @@
     python scripts/skrl/train.py --headless [--max_iterations 3800] [--name <run>] [--checkpoint <run>/checkpoints/agent_<N>.pt]
 
 --checkpoint resumes the agents and the env's pelvis estimator and curriculum state saved beside them. Arguments
-after these are Hydra overrides of the env and agent configs (env.<field>=..., agent.<field>=...).
+after these are Hydra overrides of the env and agent configs (env.<field>=..., agent.<field>=...); they are saved to
+<run>/params/hydra_overrides.txt, one per line, for the evaluation scripts. When the run's last step is not a
+checkpoint step, a last checkpoint (and estimator) is saved at the end.
 """
 
 import argparse
@@ -140,10 +142,12 @@ def main(env_cfg, agent_cfg: dict):
     agent_cfg["agent"]["experiment"]["experiment_name"] = run_name
     log_dir = os.path.join(log_root, run_name)
     print(f"[INFO] Logging to {log_dir}")
-    if hasattr(env_cfg, "sync_physics_rate"):
-        env_cfg.sync_physics_rate()  # after the overrides, so env.yaml records the sensor periods the run uses
+    if hasattr(env_cfg, "sync_derived"):
+        env_cfg.sync_derived()  # after the overrides, so env.yaml records the sensor periods, windows and gains the run uses
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+    with open(os.path.join(log_dir, "params", "hydra_overrides.txt"), "w") as f:
+        f.writelines(f"{arg}\n" for arg in hydra_args)
     env_cfg.log_dir = log_dir
     if args_cli.checkpoint:
         env_cfg.estimator.checkpoint_path = estimator_checkpoint_for(args_cli.checkpoint)
@@ -161,6 +165,11 @@ def main(env_cfg, agent_cfg: dict):
     start_time = time.time()
     runner.run()
     print(f"Training time: {round(time.time() - start_time, 2)} seconds")
+    timesteps, interval = agent_cfg["trainer"]["timesteps"], agent_cfg["agent"]["experiment"]["checkpoint_interval"]
+    if interval > 0 and timesteps % interval:
+        runner.agent.write_checkpoint(timestep=timesteps, timesteps=timesteps)
+        env.unwrapped._save_estimator()
+        print(f"[INFO] Saved the last checkpoint, agent_{timesteps}.pt")
     env.close()
 
 

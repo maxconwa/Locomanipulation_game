@@ -179,6 +179,42 @@ def read_target_limits(run_dir: Path) -> dict[str, tuple[float, float]] | None:
     return limits or None
 
 
+def read_deploy_settings(run_dir: Path) -> dict:
+    """What a run trained with that GOLEM's lmg_deploy reads from its policy yaml, under the template's keys
+    (config/policy_template.yaml; marl_deploy_node.py lets export.yaml override them), from params/env.yaml:
+    control_dt (decimation x sim dt), kp and kd per joint in the policies' joint order (the actuators' stiffness and
+    damping), gait_period, zero_cmd_eps and command_ranges; and command_filter_tau, the first-order low-pass on the
+    velocity command in s (0: none), which lmg_deploy does not apply yet. Runs before a field had its default."""
+    import re
+
+    env = _yaml_load_any((Path(run_dir) / "params" / "env.yaml").read_text())
+    names = env["observations"]["legs"]["joint_pos"]["params"]["asset_cfg"]["joint_names"]
+    gains = {"kp": [], "kd": []}
+    actuators = env["scene"]["robot"]["actuators"]
+    for joint in names:
+        group = [a for a in actuators.values() if any(re.fullmatch(e, joint) for e in a["joint_names_expr"])]
+        if len(group) != 1:
+            raise ValueError(f"{joint}: in {len(group)} actuator groups")
+        for key, field in (("kp", "stiffness"), ("kd", "damping")):
+            value = group[0][field]
+            if isinstance(value, dict):
+                value = [v for e, v in value.items() if re.fullmatch(e, joint)]
+                if len(value) != 1:
+                    raise ValueError(f"{joint}: {len(value)} {field} entries")
+                value = value[0]
+            gains[key].append(float(value))
+    velocity = env["commands"]["base_velocity"]
+    return {
+        "control_dt": round(float(env["decimation"]) * float(env["sim"]["dt"]), 6),
+        **gains,
+        "gait_period": float(env.get("gait_period", 0.8)),
+        "zero_cmd_eps": float(env.get("zero_cmd_eps", 0.1)),
+        "command_ranges": {axis: [float(v) for v in velocity["ranges"][axis]]
+                           for axis in ("lin_vel_x", "lin_vel_y", "ang_vel_z")},
+        "command_filter_tau": float(velocity.get("command_filter_tau", 0.0)),
+    }
+
+
 def write_csv(path: Path, rows: list[dict], columns: list[str] | None = None):
     path.parent.mkdir(parents=True, exist_ok=True)
     columns = columns or list(dict.fromkeys(k for r in rows for k in r))

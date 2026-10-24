@@ -235,3 +235,30 @@ H1_2_MAGPIE_CFG = ArticulationCfg(
     soft_joint_pos_limit_factor=0.9,
     actuators=_ACTUATORS,
 )
+
+# Unitree's sport mode (h1_ai_sport 1.2.0.0) on our H1-2, read from its /lowcmd in the 2026-10-19 sport-mode bags:
+# per actuator group, joint regex -> (stiffness Nm/rad, damping Nm s/rad). Legs, feet and torso only; the arms keep
+# _ACTUATORS' gains. The env cfg's pd_gains="sport" swaps them in (with_gains).
+SPORT_MODE_GAINS = {
+    "legs": {".*_hip_.*_joint": (250.0, 6.5), ".*_knee_joint": (400.0, 10.0)},
+    "feet": {".*_ankle_pitch_joint": (80.0, 1.5), ".*_ankle_roll_joint": (40.0, 0.4)},
+    "torso": {"torso_joint": (600.0, 6.0)},
+}
+PD_GAINS = {"default": {}, "sport": SPORT_MODE_GAINS}
+
+
+def with_gains(actuators: dict, gains: dict) -> dict:
+    """actuators with the stiffness and damping of each group gains names replaced by its (stiffness, damping) per
+    joint regex; every joint of such a group must match exactly one regex. Other groups and fields are kept."""
+    import re
+
+    out = dict(actuators)
+    for group, table in gains.items():
+        act = actuators[group]
+        for joint in act.joint_names_expr:
+            hits = [expr for expr in table if re.fullmatch(expr, joint)]
+            if len(hits) != 1:
+                raise ValueError(f"{group}: joint {joint} matches {hits} of the gains {list(table)}")
+        out[group] = act.replace(stiffness={expr: kp for expr, (kp, _) in table.items()},
+                                 damping={expr: kd for expr, (_, kd) in table.items()})
+    return out

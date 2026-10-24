@@ -14,8 +14,10 @@ Writes into --out (a policies/<name> directory of the deploy package):
                      vertical motion with the feet's and its tilt with gravity's, as the env does), height_drop_obs
                      (whether the actors take the height_drop input runs before golemlim had), gait_phase_cos
                      (whether they observe each leg's phase cos after its sin, from Tune3Track2 on), imu (the body the
-                     run's IMU sat on and its offset: imu_link on the torso, or livox_link at the MID-360's chip) and
-                     the source files.
+                     run's IMU sat on and its offset: imu_link on the torso, or livox_link at the MID-360's chip),
+                     the deploy template's per-run keys as the run trained them (common.read_deploy_settings:
+                     control_dt, kp, kd, gait_period, zero_cmd_eps, command_ranges; and command_filter_tau, the command
+                     low-pass the deploy does not apply yet) and the source files.
 Needs only torch; no simulator.
 
     python scripts/skrl/export_marl.py --checkpoint logs/skrl/locomanip_marl/<run>/checkpoints/agent_<step>.pt \
@@ -35,7 +37,12 @@ import torch.nn as nn
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from mujoco_evals.common import _yaml_load_any, read_imu, read_target_limits  # noqa: E402  (standard library and yaml only)
+from mujoco_evals.common import (  # noqa: E402  (standard library and yaml only)
+    _yaml_load_any,
+    read_deploy_settings,
+    read_imu,
+    read_target_limits,
+)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", required=True)
@@ -179,6 +186,8 @@ export = {
     # (livox_link, or from the 10-19 update its chip frame livox_imu_link), and gyro_lowpass_hz when the gyro was
     # low-passed (the deploy filters only when the key is present)
     "imu": read_imu(Path(run_dir)),
+    # control rate, PD gains, gait clock, stand gate, command ranges and filter: the template's keys, as trained
+    **read_deploy_settings(Path(run_dir)),
     "source": {"checkpoint": ckpt_path, "estimator": est_path, "target_tables": tables[-1] if tables else None,
                "task": args.task, "exported": datetime.now().isoformat(timespec="seconds")},
 }

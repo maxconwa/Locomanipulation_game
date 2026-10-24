@@ -44,7 +44,8 @@ SELF_CONTACT_LINK_NAMES = COLLISION_LINK_NAMES[:-1]
 SELF_CONTACT_SENSOR_NAMES = [f"self_contact_{link}" for link in SELF_CONTACT_LINK_NAMES]
 # one slot per physics substep of a policy step (= env decimation); almitrain_200k to lstm_run used 10 at 500 Hz,
 # lstm_run2 and the ablation_* runs kept 10 at 200 Hz, so the contact terms looked back 2.5 policy steps
-CONTACT_HISTORY = 4
+# (LocoManipMarlEnvCfg.sync_physics_rate sets it to the decimation in any case)
+CONTACT_HISTORY = 10
 
 
 @height_field_to_mesh
@@ -57,14 +58,15 @@ def _rough_by_difficulty(difficulty: float, cfg: "RoughByDifficultyCfg"):
 
 @configclass
 class RoughByDifficultyCfg(HfRandomUniformTerrainCfg):
-    """ALMI-Open's only_rough terrain (legged_gym utils/terrain.py): heights uniform in +-(0.005 + 0.05 d) m on steps
-    of 0.005 + 0.005 d m, d the row's difficulty in [0, 1], drawn every 0.2 m."""
+    """ALMI-Open's only_rough terrain (legged_gym utils/terrain.py): heights uniform in +-(height_at_0 + 0.05 d) m
+    (ALMI-Open's height_at_0: 0.005) on steps of 0.005 + 0.005 d m, d the row's difficulty in [0, 1], drawn every
+    0.2 m."""
 
     function = _rough_by_difficulty
     noise_range: tuple[float, float] = (0.0, 0.0)  # set per difficulty
     noise_step: float = 0.005
     downsampled_scale: float = 0.2
-    height_at_0: float = 0.005
+    height_at_0: float = 0.0  # row 0 flat, as Explicit500 on; ALMI-Open's, and the default before 2026-10-20: 0.005
     height_per_difficulty: float = 0.05
     step_at_0: float = 0.005
     step_per_difficulty: float = 0.005
@@ -93,7 +95,9 @@ class TerrainSceneCfg(InteractiveSceneCfg):
         prim_path="/World/ground",
         terrain_type="generator",
         terrain_generator=TERRAINS_ROUGH_CFG,
-        max_init_terrain_level=5,   # as ALMI: start on rows 0-5; the terrain_levels curriculum moves envs up and down
+        # every env starts on row 0, as Explicit500 on; the terrain_levels curriculum moves envs up and down (ALMI-Open,
+        # and the default before 2026-10-20: rows 0-5 from the start)
+        max_init_terrain_level=0,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",

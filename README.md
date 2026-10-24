@@ -184,23 +184,25 @@ crouch needs the foot-contact penalty as the **peak over the substeps**, and die
 Explicit PD at ALMI-Open's 500 Hz keeps it, and a 0-20 ms delay in 2 ms substeps keeps it with the best turning.
 
 `Explicit500` (`logs/skrl/locomanip_marl/2026-10-15_12-17-16_Explicit500`, agent_196800, exported to GOLEM's
-`lmg_deploy/policies/explicit500`) is these defaults with:
+`lmg_deploy/policies/explicit500`) was trained with the overrides below on that day's defaults. Since 2026-10-20 they
+are the defaults (`locomanip_marl_env_cfg.py`, `base_cfg.py`): Mid360v2's `params/env.yaml` is what a bare
+`python scripts/skrl/train.py --headless` builds. Explicit500 also set two that today's code doesn't take: friction
+0.6-1.2 / 0.4-0.9 without `make_consistent` (Mid360v2 and the defaults: 0.1-1.25), and
+`env.terminations.fell.params.min_pelvis_height=-1.0` (the fall check has been unitree_rl_gym's since Tune3Track2).
+Before 2026-10-20 the defaults were ALMI-Open's, and a run on them needs the old values back:
 
 ```bash
-python scripts/skrl/train.py --headless --name Explicit500 \
-  env.commands.arm_targets.table_file=$PWD/logs/skrl/locomanip_marl/golemlim120k/arm_target_tables_v3.pt \
-  env.observation_scales=null env.explicit_pd=True env.sim.dt=0.002 env.decimation=10 \
-  env.action_delay_range=[0,10] env.action_delay_substeps=True \
-  env.rewards.legs.feet_contact_forces.params.peak_over_substeps=True env.rewards.legs.feet_contact_forces.params.window=3 \
-  env.terminations.fell.params.min_pelvis_height=-1.0 \
-  env.events.physics_material.params.static_friction_range=[0.6,1.2] env.events.physics_material.params.dynamic_friction_range=[0.4,0.9] \
-  env.events.physics_material.params.make_consistent=False env.events.scale_link_masses=null env.events.shift_pelvis_com=null \
-  env.events.add_torso_mass.params.mass_distribution_params=[-2.0,4.0] \
-  env.scene.terrain.max_init_terrain_level=0 env.scene.terrain.terrain_generator.sub_terrains.rough.height_at_0=0.0 \
-  env.curriculum.terrain_levels.params.gated=True
+# the pre-2026-10-20 defaults (ALMI-Open's): 200 Hz, a 0-2 policy-step delay, fixed observation scales, its randomization
+python scripts/skrl/train.py --headless --name <name> \
+  env.sim.dt=0.005 env.decimation=4 env.action_delay_range=[0,2] env.action_delay_substeps=False \
+  env.rewards.legs.feet_contact_forces.params.peak_over_substeps=False env.rewards.legs.feet_contact_forces.params.window=1 \
+  env.scene.terrain.max_init_terrain_level=5 env.scene.terrain.terrain_generator.sub_terrains.rough.height_at_0=0.005 \
+  env.curriculum.terrain_levels.params.gated=False env.commands.arm_targets.table_file=arm_target_tables_v3.pt
+# plus, in code: observation_scales=OBSERVATION_SCALES and base_cfg.EventCfg's scale_link_masses, shift_pelvis_com
+# and add_torso_mass (-3..+5 kg), which MarlEventCfg now turns off
 ```
 
-- **500 Hz physics** follows from `env.sim.dt` / `env.decimation` alone: `cfg.sync_physics_rate()` sets the sensor
+- **500 Hz physics**: `env.sim.dt` / `env.decimation` alone change it; `cfg.sync_physics_rate()` sets the sensor
   periods and the contact history (train.py and the env call it after the overrides).
 - **Contact peak over 6 ms means** (`window=3`): at 500 Hz a landing's impulse reads as a higher force; the peak of
   3-substep means matches the 200 Hz penalty the crouch was learned with (15.2 vs 15.0 N per step, same policy).

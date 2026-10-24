@@ -10,6 +10,7 @@ odometry reports (apply_pelvis_motion); rewards, reach detection and the curricu
 
 from __future__ import annotations
 
+import math
 import os
 import torch
 from collections.abc import Sequence
@@ -112,8 +113,9 @@ class ModalVelocityCommand(UniformVelocityCommand):
     """UniformVelocityCommand that is zero during arm goals.
 
     A resampled moving command is replaced, with probability pure_turn_prob, by a turn in place (|yaw rate| in
-    pure_turn_speed, either sign), and with probability pure_lateral_prob by a sideways walk (|vy| in
-    pure_lateral_speed): uniform sampling almost never draws either. Logs the tracking error during navigation, the
+    pure_turn_speed, either sign), with probability pure_lateral_prob by a sideways walk (|vy| in
+    pure_lateral_speed): uniform sampling almost never draws either; and with probability small_command_prob by a
+    small command, norm over (vx, vy, wz) in small_command_norm in a random direction, near the stand/walk gate. Logs the tracking error during navigation, the
     cosine similarity between the commanded and the true base-frame xy velocity while a walk is commanded (|v_cmd| at
     least min_cos_speed), and the yaw rate during arm goals; carry_* are the navigation ones over the steps that carry
     a table pose (ArmTargetsCommand.carrying).
@@ -128,6 +130,10 @@ class ModalVelocityCommand(UniformVelocityCommand):
     ended by a fall misses. After every kernel_window_segments judged segments the stage narrows when at least
     kernel_promote_share hit and widens below kernel_demote_share: the kernels follow the error down, so standing still
     against a walk command stops paying.
+
+    **Filter.** With command_filter_tau > 0, `command` (what the observations, the tracking rewards, the gait clock and
+    the metrics read) is vel_command_b, the sampled command, through a first-order low-pass with that time constant,
+    stepped once per policy step (_update_command) and zeroed at reset. During arm goals both are zero at once.
     """
 
     cfg: ModalVelocityCommandCfg
@@ -160,6 +166,14 @@ class ModalVelocityCommand(UniformVelocityCommand):
         self._kernel_counts = {k: torch.zeros(2, device=self.device) for k in ("lin", "ang")}  # hits, judged
         self.lin_kernel_window_share = torch.tensor(float("nan"), device=self.device)
         self.ang_kernel_window_share = torch.tensor(float("nan"), device=self.device)
+        # -- the command low-pass: one step of tau per policy step
+        self.vel_command_filtered = torch.zeros_like(self.vel_command_b)
+        self._filter_alpha = 1.0 - math.exp(-env.step_dt / cfg.command_filter_tau) if cfg.command_filter_tau > 0 else 1.0
+
+    @property
+    def command(self) -> torch.Tensor:
+        """The command the policies and rewards see: the filtered one with command_filter_tau, else the sampled one."""
+        return self.vel_command_filtered if self.cfg.command_filter_tau > 0 else self.vel_command_b
 
     @property
     def lin_vel_std(self) -> float:
@@ -221,30 +235,41 @@ class ModalVelocityCommand(UniformVelocityCommand):
         ids = torch.as_tensor(env_ids, device=self.device)
         ids = ids[~self.is_standing_env[ids]]
         u = torch.rand(len(ids), device=self.device)
-        turn = ids[u < self.cfg.pure_turn_prob]
-        lateral = ids[(u >= self.cfg.pure_turn_prob) & (u < self.cfg.pure_turn_prob + self.cfg.pure_lateral_prob)]
+        p_turn, p_lateral, p_small = self.cfg.pure_turn_prob, self.cfg.pure_lateral_prob, self.cfg.small_command_prob
+        turn = ids[u < p_turn]
+        lateral = ids[(u >= p_turn) & (u < p_turn + p_lateral)]
         for sub, axis, speed in ((turn, 2, self.cfg.pure_turn_speed), (lateral, 1, self.cfg.pure_lateral_speed)):
             if len(sub) == 0:
                 continue
             sign = torch.where(torch.rand(len(sub), device=self.device) < 0.5, -1.0, 1.0)
             self.vel_command_b[sub] = 0.0
             self.vel_command_b[sub, axis] = sign * torch.empty(len(sub), device=self.device).uniform_(*speed)
+        small = ids[(u >= p_turn + p_lateral) & (u < p_turn + p_lateral + p_small)]
+        if len(small) > 0:
+            direction = torch.nn.functional.normalize(torch.randn(len(small), 3, device=self.device), dim=-1)
+            norm = torch.empty(len(small), 1, device=self.device).uniform_(*self.cfg.small_command_norm)
+            self.vel_command_b[small] = direction * norm
 
     def _update_command(self):
         super()._update_command()
-        self.vel_command_b[self._arm_mode()] = 0.0
+        arm = self._arm_mode()
+        self.vel_command_b[arm] = 0.0
+        if self.cfg.command_filter_tau > 0:
+            self.vel_command_filtered += self._filter_alpha * (self.vel_command_b - self.vel_command_filtered)
+            self.vel_command_filtered[arm] = 0.0
 
     def _update_metrics(self):
         super()._update_metrics()
         arm = self._arm_mode().float()
         nav = 1.0 - arm
         yaw_rate = self.robot.data.root_ang_vel_b[:, 2]
+        command = self.command
         self._nav_steps += nav
-        self._nav_err_xy += torch.norm(self.vel_command_b[:, :2] - self.robot.data.root_lin_vel_b[:, :2], dim=-1) * nav
-        self._nav_err_yaw += torch.abs(self.vel_command_b[:, 2] - yaw_rate) * nav
+        self._nav_err_xy += torch.norm(command[:, :2] - self.robot.data.root_lin_vel_b[:, :2], dim=-1) * nav
+        self._nav_err_yaw += torch.abs(command[:, 2] - yaw_rate) * nav
         self._arm_steps += arm
         self._arm_yaw_rate += torch.abs(yaw_rate) * arm
-        cmd_xy, vel_xy = self.vel_command_b[:, :2], self.robot.data.root_lin_vel_b[:, :2]
+        cmd_xy, vel_xy = command[:, :2], self.robot.data.root_lin_vel_b[:, :2]
         walk = nav * (torch.norm(cmd_xy, dim=-1) >= self.cfg.min_cos_speed).float()
         self._walk_steps += walk
         cos = torch.nn.functional.cosine_similarity(cmd_xy, vel_xy, dim=-1, eps=1e-6)
@@ -263,14 +288,14 @@ class ModalVelocityCommand(UniformVelocityCommand):
         self._yaw_samples[:, self._yaw_slot] = yaw_rate
         self._yaw_slot = (self._yaw_slot + 1) % self._yaw_window
         self._yaw_count = torch.clamp(self._yaw_count + 1.0, max=self._yaw_window)
-        yaw_avg_err = torch.abs(self.vel_command_b[:, 2] - self._yaw_samples.sum(dim=1) / self._yaw_count)
+        yaw_avg_err = torch.abs(command[:, 2] - self._yaw_samples.sum(dim=1) / self._yaw_count)
         self._seg_err_yaw += yaw_avg_err * nav
         self._nav_err_yaw_avg += yaw_avg_err * nav
-        self._seg_cmd = torch.where(nav.unsqueeze(-1) > 0.5, self.vel_command_b, self._seg_cmd)
+        self._seg_cmd = torch.where(nav.unsqueeze(-1) > 0.5, command, self._seg_cmd)
         carry = self._env.command_manager.get_term(self.cfg.arm_command_name).carrying.float()
         self._carry_steps += nav * carry
         self._carry_err_xy += torch.norm(cmd_xy - vel_xy, dim=-1) * nav * carry
-        self._carry_err_yaw += torch.abs(self.vel_command_b[:, 2] - yaw_rate) * nav * carry
+        self._carry_err_yaw += torch.abs(command[:, 2] - yaw_rate) * nav * carry
         self._carry_walk_steps += walk * carry
         self._carry_walk_cos += cos * walk * carry
 
@@ -299,6 +324,7 @@ class ModalVelocityCommand(UniformVelocityCommand):
                        self._carry_walk_steps, self._carry_walk_cos):
             buffer[ids] = 0.0
         extras.update(super().reset(env_ids))
+        self.vel_command_filtered[ended] = 0.0
         return extras
 
 
@@ -311,6 +337,11 @@ class ModalVelocityCommandCfg(UniformVelocityCommandCfg):
     min_cos_speed: float = 0.1  # m/s: the commanded xy speed from which nav_cos_vel_xy counts a step
     pure_lateral_prob: float = 0.0
     pure_lateral_speed: tuple[float, float] = (0.15, 0.3)   # m/s
+    small_command_prob: float = 0.0
+    """Share of moving commands drawn small: norm over (vx, vy, wz) in small_command_norm, a random direction."""
+    small_command_norm: tuple[float, float] = (0.05, 0.15)
+    command_filter_tau: float = 0.0
+    """s: the first-order low-pass on the command the policies and rewards see (`command`); 0: none."""
     # -- tracking-kernel curriculum (ModalVelocityCommand._judge_kernels): the annealed tracking terms' stds per stage,
     # narrowest last. One stage: fixed kernels.
     lin_vel_stds: tuple[float, ...] = (0.5,)
@@ -860,6 +891,7 @@ class ArmTargetsCommand(CommandTerm):
         )
         self.shadow_b[arm_ids] = self.believed_b[arm_ids]
         velocity.vel_command_b[arm_ids] = 0.0
+        velocity.vel_command_filtered[arm_ids] = 0.0
 
     def _draw_rows(self, source: torch.Tensor) -> torch.Tensor:
         """(len(source), num_arms, 7): per arm a table row within arm_height_spread of source (pelvis-frame height)."""
