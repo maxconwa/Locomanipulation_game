@@ -1,6 +1,14 @@
 # Sport-mode ablations for the legs policy (100k-step runs)
 
-2026-10-20 to 10-23, branch marl-direct (uncommitted). Goal: make the H1-2 legs policy follow velocity commands as well
+> **A record, not the recipe.** These ablations ran on the 50 Hz Mid360v2 setup before the 2026-10-25 cleanup; the
+> tags, scripts and switches they name are gone (`pre-cleanup` tag). Their lessons are in the current defaults: the
+> 0.70 s stride; sport mode's gains with action scales matched to them (the gains run without them marched in place);
+> the 100 Hz policy with every step-counted setting converted to seconds (hz100 collapsed without); the command
+> low-pass without the 1-3 s resampling (cmd broke the velocity curriculum); the stand/walk gate. GOLEM's lmg_deploy
+> now applies all of them (GOLEM 83aefce).
+
+
+2026-10-20 to 10-23, branch marl-direct (commit 1ff665b). Goal: make the H1-2 legs policy follow velocity commands as well
 as Unitree's sport mode (h1_ai_sport, recorded in the sport-mode bags). Each run trains LocoManip-Marl-Direct-v0 for
 100,008 env steps with one change against base, and is scored at the final checkpoint (agent_100008) and at 50.4k
 (agent_50400) with `scripts/skrl/eval_scorecard.py`.
@@ -23,8 +31,8 @@ Rebuild the tables: `python scripts/sportmode_summary.py --out <file>` (status: 
     67k steps: training falls reached 99% and never recovered.
 - Every run finished with exit 0 and no "fail to launch kernel" in any training or eval log.
 
-Recommended 200k run: base + gait070, two seeds. Add gate if the deploy wants sport mode's stand/walk behaviour
-(details under Recommendation).
+The recommendation then was a 200k run of base + gait070 (two seeds), plus the gate if the deploy wanted sport
+mode's stand/walk behaviour; the note above says where that went.
 
 ## Setup
 
@@ -245,39 +253,6 @@ The window fix did not slow the curriculum enough. The linear kernel stage at 20
 promotion test much more easily than 10 s segments, or the window does not count what was assumed. That is not
 checked here. Either way, change 2 as tested does not train well in 100k steps, and its curriculum interaction needs
 fixing before it is tried again.
-
-## Recommendation for the 200k run
-
-Base + gait070 (`env.gait_period=0.7`), two seeds (42, 43). That is the only change that improved every metric at
-both checkpoints. Optional additions, each as its own seed pair if the budget allows:
-
-- **+ gate** (`env.zero_cmd_eps=0.03 env.commands.base_velocity.small_command_prob=0.2`), if the deploy should step
-  on small commands as sport mode does; on the robot Explicit500 did not step for 28% of commanded time. It costs no
-  target beyond noise.
-- **+ yaw at a lower weight** (e.g. 1.5 instead of 2.0), to keep its turn gains without the linear loss seen at 100k.
-- Leave out **cmd**: neither kernel pace trained it well. Its curriculum interaction needs fixing first (see cmd_tw and combo_tw).
-- Leave out gains (needs an action-scale retune first) and hz100 (needs the step-counted settings converted to
-  seconds first; see above).
-
-## GOLEM lmg_deploy changes needed (not made)
-
-GOLEM was not touched. For a policy trained with these switches, the deploy needs:
-
-1. **Command filter** (change 2): a first-order low-pass on the velocity command in the `velocity_command` path before
-   the observation, with τ = `command_filter_tau` (0.5 s) at the control rate. Reset it to the current command when
-   the policy engages, and hold it at zero in arm mode. Training filters both the observation and the reward command,
-   so feeding the raw joystick would be a train/deploy mismatch.
-2. **Gains from the export** (change 6): export.yaml already carries the per-joint kp/kd the run trained with
-   (`scripts/skrl/export_marl.py`, via `common.read_deploy_settings`). lmg_deploy must apply them to LowCmd instead of
-   its template's table, or a sport-gain policy runs on base gains and the reverse.
-3. **100 Hz loop** (change 7): a `control_hz` launch parameter (or export.yaml's `control_dt`) driving the policy
-   timer at 100 Hz, with the observation history, action delay and gyro low-pass at the matching dt.
-4. **The other export.yaml keys**: export.yaml already writes `gait_period`, `zero_cmd_eps`, `command_ranges`,
-   `control_dt` and `command_filter_tau`. The node must use them: the gait clock's phase rate (0.70 s for gait070),
-   the stand/walk threshold (0.03 for gate) and the joystick clip to the trained ranges (wider for range). Today the
-   deploy does not apply `command_filter_tau` at all (item 1).
-
-gait070 alone needs only item 4's `gait_period` to be honoured by the node's gait clock.
 
 ## Method notes
 

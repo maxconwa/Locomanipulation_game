@@ -1,97 +1,23 @@
-# C++
-**/cmake-build*/
-**/build*/
-**/*.so
-**/*.log*
-
-# Omniverse
-**/*.dmp
-**/.thumbs
-
-# No USD files allowed in the repo
-**/*.usd
-**/*.usda
-**/*.usdc
-**/*.usdz
-
 # Python
 .DS_Store
 **/*.egg-info/
 **/__pycache__/
 **/.pytest_cache/
 **/*.pyc
-**/*.pb
+**/*.log*
 
-# Docker/Singularity
-**/*.sif
-docker/cluster/exports/
-docker/.container.cfg
+# No USD files in the repo (the robot comes from the CL_Assets submodule)
+**/*.usd
+**/*.usda
+**/*.usdc
+**/*.usdz
 
-# IDE
+# IDE (the top-level .vscode is tracked)
 **/.idea/
 **/.vscode/
-# Don't ignore the top-level .vscode directory as it is
-# used to configure VS Code settings
 !.vscode
 
-# Outputs
-**/output/*
-**/outputs/*
-**/videos/*
-**/wandb/*
-**/.neptune/*
-docker/artifacts/
-*.tmp
-
-# Doc Outputs
-**/docs/_build/*
-**/generated/*
-
-# Isaac-Sim packman
-_isaac_sim*
-_repo
-_build
-.lastformat
-
-# RL-Games
-**/runs/*
+# Outputs: training runs, evaluations and exports under logs/, Hydra's outputs/
 **/logs/*
-**/recordings/*
-
-# Pre-Trained Checkpoints
-/.pretrained_checkpoints/
-
-# Teleop Recorded Dataset
-/datasets/
-
-# Tests
-tests/
-
-# Docker history
-.isaac-lab-docker-history
-
-# TacSL sensor
-**/tactile_record/*
-**/gelsight_r15_data/*
-# paper/: the manuscript lives on Overleaf and stays untracked; the reach evaluation's code and its section are tracked
-paper/*
-!paper/reach/
-!paper/20261008-experiments_reach.tex
-# logs/reach/: what the reach evaluation writes. The goal grid, figures, LaTeX macros, page and the page's equation
-# cache are tracked; the trials, summaries and curves (results/), the figures' plotted data and the render metadata
-# stay local
-!logs/reach/
-logs/reach/results/*
-# except the published runs' learned-odometry trials (lambda 1, 0.5, 0) and the whole-body baseline's (paperwb) trials
-# and training curve
-!logs/reach/results/whole/
-!logs/reach/results/l1/
-!logs/reach/results/l0.5/
-!logs/reach/results/l0/
-logs/reach/results/*/*trueodom*/
-!logs/reach/results/curves/
-logs/reach/results/curves/*
-!logs/reach/results/curves/whole_train.csv
-logs/reach/figures/data/
-logs/reach/figures/render/*.json
-logs/reach/goals/*.pt
+**/outputs/*
+*.tmp

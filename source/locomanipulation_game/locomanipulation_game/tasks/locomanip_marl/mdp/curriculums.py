@@ -55,39 +55,25 @@ def _tracked_episode(env: ManagerBasedRLEnv, env_ids: Sequence[int], command_nam
     return timed_out & ~fell & (steps > 0) & (error < max_error), fell
 
 
-def terrain_levels_tracking(env: ManagerBasedRLEnv, env_ids: Sequence[int], command_name: str, max_error: float,
-                            fall_term: str = "fell", time_out_term: str = "time_out") -> dict[str, torch.Tensor]:
-    """At episode end, an env moves down a terrain row after an episode that ended in fall_term, and up one after a
-    time-out whose mean velocity tracking error while navigating (command_name's per-env sums, read before its reset)
-    was under max_error (m/s); otherwise it stays, as after an e-stop or an episode with no navigation. In place of
-    terrain_levels_vel, which wants the robot to end far from its start: ours turn every few seconds and stop for arm
-    goals, so it demoted the robots that tracked best. Robots past the last row go to a random one (TerrainImporter)."""
-    terrain = env.scene.terrain
-    move_up, fell = _tracked_episode(env, env_ids, command_name, max_error, fall_term, time_out_term)
-    terrain.update_env_origins(env_ids, move_up, fell)
-    return {"terrain_level": terrain.terrain_levels.float().mean(), "promoted": move_up.float().mean(),
-            "demoted": fell.float().mean()}
-
-
 def gated_terrain_levels(env: ManagerBasedRLEnv, env_ids: Sequence[int], command_name: str, max_error: float,
-                         arm_command_name: str, gated: bool = True, max_fall_share: float = 0.02, min_tracked_share: float = 0.7,
-                         min_depth_level: float = 4.0, min_crouch_ratio: float = 0.75, steps_per_row: int = 8000,
+                         arm_command_name: str, max_fall_share: float = 0.02, min_tracked_share: float = 0.7,
+                         min_depth_level: float = 4.0, min_crouch_ratio: float = 0.75, steps_per_row: int = 16000,
                          episode_decay: float = 0.999, fall_term: str = "fell",
                          time_out_term: str = "time_out") -> dict[str, torch.Tensor]:
-    """terrain_levels_tracking under a ceiling that starts at row 0 and rises slowly once navigation is robust and the
-    crouch has emerged; the robots start on row 0 (max_init_terrain_level 0), the flattest.
+    """At episode end an env moves down a terrain row after a fall and up one after a time-out that tracked its
+    velocity commands (mean navigation error under max_error, m/s), under a ceiling that starts at row 0 (flat, where
+    every robot starts: max_init_terrain_level 0) and rises slowly once navigation is robust and the crouch has
+    emerged. Not terrain_levels_vel, which wants the robot to end far from its start: ours turn every few seconds and
+    stop for arm goals.
 
     Over the ending episodes, exponential means with decay episode_decay per episode: the share that fell and the
     share that tracked their velocity commands (as terrain_levels_tracking promotes); over the arm goals' steps, the
     pelvis drop and the target drop (arm_command_name's metrics). The gate wants falls under max_fall_share, tracked
     over min_tracked_share, the arm depth level's mean at least min_depth_level and the pelvis dropping at least
-    min_crouch_ratio x as far as the targets (the legs helping the arms; nothing rewards a pelvis height). It opens
-    once, raising the ceiling to row 1, then one row more every steps_per_row policy steps while the gate's conditions
-    still hold; a row up is never forced, each env still has to earn it. Logs the ceiling and the gate's inputs.
-    Not gated: terrain_levels_tracking (no ceiling)."""
+    min_crouch_ratio x as far as the targets during arm goals (the legs helping the arms). It opens once, raising the
+    ceiling to row 1, then one row more every steps_per_row policy steps while the gate's conditions still hold; a
+    row up is never forced, each env still has to earn it. Logs the ceiling and the gate's inputs."""
     terrain = env.scene.terrain
-    if not gated:
-        return terrain_levels_tracking(env, env_ids, command_name, max_error, fall_term, time_out_term)
     if not hasattr(env, "terrain_gate"):
         zero = lambda: torch.zeros((), device=env.device)  # noqa: E731
         env.terrain_gate = {"fell": torch.ones((), device=env.device), "tracked": zero(), "pelvis": zero(),
@@ -131,36 +117,29 @@ def _push_levels(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 def push_levels(env: ManagerBasedRLEnv, env_ids: Sequence[int], num_levels: int, max_speed: float,
                 command_name: str, max_error: float, fall_term: str = "fell",
-                time_out_term: str = "time_out", seconds_per_level: float = 0.0) -> dict[str, torch.Tensor]:
-    """At episode end, as terrain_levels_tracking: an env's push level goes down one after an episode that ended in
-    fall_term and up one after a time-out that tracked its velocity commands (mean navigation error under max_error,
-    m/s), within [0, num_levels]; otherwise it stays. push_by_level pushes it at up to level / num_levels x max_speed.
-    Survival alone used to raise it, and lstm_run's robots climbed to 0.86 m/s standing still. With seconds_per_level,
-    a tracked time-out goes up one level per seconds_per_level of its length (at least one), so the pace in sim time
-    does not depend on the episode length: DeployRand300k_s42's 90 s mean episodes climbed 4.5 times slower than the
-    20 s episodes before them, and its arm-goal gate waited on the pushes. Logs the mean level, push and the shares
-    promoted and demoted."""
+                time_out_term: str = "time_out", seconds_per_level: float = 20.0) -> dict[str, torch.Tensor]:
+    """At episode end, as the terrain rows: an env's push level goes down one after an episode that ended in
+    fall_term, and up one per seconds_per_level of its length (at least one) after a time-out that tracked its
+    velocity commands (mean navigation error under max_error, m/s), within [0, num_levels]; otherwise it stays.
+    push_by_level pushes it at up to level / num_levels x max_speed. Counting seconds keeps the pace in sim time
+    whatever the episode lengths (one level per episode climbed 4.5 times slower on 90 s episodes than on 20 s ones);
+    tracking, not survival alone (robots once climbed to 0.86 m/s pushes standing still). Logs the mean level, push
+    and the shares promoted and demoted."""
     level = _push_levels(env)
     move_up, fell = _tracked_episode(env, env_ids, command_name, max_error, fall_term, time_out_term)
-    up = move_up.long()
-    if seconds_per_level > 0:
-        seconds = env.episode_length_buf[env_ids].float() * env.step_dt  # read before the reset clears it
-        up = up * torch.floor(seconds / seconds_per_level).long().clamp(min=1)
+    seconds = env.episode_length_buf[env_ids].float() * env.step_dt  # read before the reset clears it
+    up = move_up.long() * torch.floor(seconds / seconds_per_level).long().clamp(min=1)
     level[env_ids] = (level[env_ids] + up - fell.long()).clamp(0, num_levels)
     return {"push_level": level.float().mean(), "max_push_speed": level.float().mean() * max_speed / num_levels,
             "promoted": move_up.float().mean(), "demoted": fell.float().mean()}
 
 
 def push_by_level(env: ManagerBasedRLEnv, env_ids: torch.Tensor, num_levels: int, max_speed: float,
-                  fixed: bool = False, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
+                  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
     """push_by_setting_velocity with each env's own range: x and y velocity changes uniform in
-    +-level / num_levels x max_speed (m/s), the level from push_levels. With fixed, +-max_speed for every env whatever
-    its level (every run up to feetodom_knee_200k: 0.4 m/s every 8-12 s)."""
+    +-level / num_levels x max_speed (m/s), the level from push_levels."""
     asset = env.scene[asset_cfg.name]
-    if fixed:
-        speed = torch.full((len(env_ids),), max_speed, device=asset.device)
-    else:
-        speed = _push_levels(env)[env_ids].float() * (max_speed / num_levels)
+    speed = _push_levels(env)[env_ids].float() * (max_speed / num_levels)
     # each env's last real push (level above 0), which the velocity command's sport-mode metrics leave out
     if not hasattr(env, "last_push_step"):
         env.last_push_step = torch.full((env.num_envs,), -(10**9), dtype=torch.long, device=env.device)

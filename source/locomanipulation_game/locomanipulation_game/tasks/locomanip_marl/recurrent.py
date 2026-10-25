@@ -30,12 +30,9 @@ _ACTIVATIONS = {"elu": nn.ELU, "relu": nn.ReLU, "tanh": nn.Tanh}
 class LSTMGaussianPolicy(GaussianMixin, Model):
     """observations -> LSTM -> MLP (layers, activation) -> mean actions, with a state-independent log std parameter.
     With skip_observations the MLP's input is the LSTM's output concatenated with the raw observations. With
-    normalize_hidden (one layer only) the LSTM's output h is scaled to unit length after every step, both what the MLP
-    sees and the h carried to the next step; the cell state c is left as it is. Such a policy carries a
-    `normalize_hidden_flag` buffer in its state dict, which export_marl.py reads to do the same in the exported actor.
-    With cell_cap s > 0 the cell state is squashed after every step, c <- s tanh(c / s), so it stays inside (-s, s)
-    and cannot grow without bound over a long run (Mid360v2's mean |c| rose from 4 to 11 over a 180 s stand); h keeps
-    its usual o tanh(c). Such a policy carries a `cell_cap_value` buffer, which export_marl.py reads.
+    cell_cap s > 0 the cell state is squashed after every step, c <- s tanh(c / s), so it stays inside (-s, s) and
+    cannot grow without bound over a long run (an uncapped policy's mean |c| rose from 4 to 11 over a 180 s stand);
+    h keeps its usual o tanh(c). Such a policy carries a `cell_cap_value` buffer, which export_marl.py reads.
 
     Inputs carry the LSTM state as inputs["rnn"] = [h, c]. Without "terminated" in the inputs (acting) the LSTM takes
     one step from it. With them (an update) the observations are sequences of sequence_length steps, the state is each
@@ -43,8 +40,7 @@ class LSTMGaussianPolicy(GaussianMixin, Model):
     """
 
     def __init__(self, *, observation_space, state_space, action_space, device, num_envs: int, sequence_length: int,
-                 hidden_size: int = 64, num_layers: int = 1, skip_observations: bool = False,
-                 normalize_hidden: bool = False, cell_cap: float = 0.0,
+                 hidden_size: int = 64, num_layers: int = 1, skip_observations: bool = False, cell_cap: float = 0.0,
                  layers: list[int] = (), activation: str = "elu",
                  clip_actions: bool = False, clip_log_std: bool = True, min_log_std: float = -20.0,
                  max_log_std: float = 2.0, initial_log_std: float = 0.0):
@@ -56,12 +52,6 @@ class LSTMGaussianPolicy(GaussianMixin, Model):
         self.hidden_size, self.num_layers = hidden_size, num_layers
         self.skip_observations = skip_observations
         self.lstm = nn.LSTM(self.num_observations, hidden_size, num_layers, batch_first=True)
-        self.normalize_hidden = normalize_hidden
-        if normalize_hidden:
-            if num_layers != 1:
-                raise ValueError("normalize_hidden needs a one-layer LSTM (its output is then its h)")
-            # only in these checkpoints, so older ones load as before; export_marl.py reads it
-            self.register_buffer("normalize_hidden_flag", torch.ones(1))
         self.cell_cap = float(cell_cap)
         if self.cell_cap > 0.0:
             self.register_buffer("cell_cap_value", torch.tensor([self.cell_cap]))
@@ -89,9 +79,6 @@ class LSTMGaussianPolicy(GaussianMixin, Model):
             outputs = []
             for t in range(length):
                 out, (h, c) = self.lstm(steps[:, t : t + 1], (h, c))
-                if self.normalize_hidden:
-                    h = F.normalize(h, dim=-1, eps=1e-6)
-                    out = h[-1].unsqueeze(1)
                 if self.cell_cap > 0.0:
                     c = self.cell_cap * torch.tanh(c / self.cell_cap)
                 outputs.append(out)
@@ -100,9 +87,6 @@ class LSTMGaussianPolicy(GaussianMixin, Model):
             features = torch.cat(outputs, dim=1).reshape(-1, self.hidden_size)
         else:
             out, (h, c) = self.lstm(observations.unsqueeze(1), (h, c))
-            if self.normalize_hidden:
-                h = F.normalize(h, dim=-1, eps=1e-6)
-                out = h[-1].unsqueeze(1)
             if self.cell_cap > 0.0:
                 c = self.cell_cap * torch.tanh(c / self.cell_cap)
             features = out.squeeze(1)
@@ -339,7 +323,6 @@ class MarlRunner(Runner):
                 sequence_length=cfg["agent"]["rollouts"], hidden_size=self._rnn_cfg["hidden_size"],
                 num_layers=self._rnn_cfg["num_layers"],
                 skip_observations=self._rnn_cfg.get("skip_observations", False),
-                normalize_hidden=self._rnn_cfg.get("normalize_hidden", False),
                 cell_cap=self._rnn_cfg.get("cell_cap", 0.0),
                 layers=network["layers"], activation=network["activations"],
                 clip_actions=policy_cfg["clip_actions"], clip_log_std=policy_cfg["clip_log_std"],

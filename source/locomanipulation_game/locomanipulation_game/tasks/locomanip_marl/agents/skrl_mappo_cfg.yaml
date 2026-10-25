@@ -6,12 +6,7 @@ seed: 42
 
 # Instantiated per agent with that agent's spaces. The actors are an LSTM (as ALMI-Open's, rnn below) then a
 # [256, 128, 64] MLP on the LSTM's output concatenated with the raw observations, the critics a [128, 64, 32] MLP;
-# built by recurrent.MarlRunner. Every run up to almitrain_noknee_200k had MLP actors: [256, 128, 64] actors and
-# critics up to feetodom_knee_200k, 64-32 actors in almisize_200k, 128-64-32 after; almitrain_lstm_200k's actors were
-# the LSTM then a [128, 64, 32] MLP on its output alone. play.py, deploy_parity.py and eval_final.py build from this
-# file, so for almitrain_lstm_200k's checkpoints pass 'agent.models.policy.rnn.skip_observations=False'
-# 'agent.models.policy.network.0.layers=[128,64,32]'; for the MLP runs' '~agent.models.policy.rnn' and their layers,
-# before almitrain 'agent.models.policy.network.0.layers=[256,128,64]' 'agent.models.value.network.0.layers=[256,128,64]'.
+# built by recurrent.MarlRunner.
 models:
   separate: True
   policy:
@@ -25,8 +20,9 @@ models:
       hidden_size: 64
       num_layers: 1
       skip_observations: True  # the MLP also sees the raw observations, not only the LSTM's 64 outputs
-      normalize_hidden: False  # True: the LSTM's output h scaled to unit length after every step (recurrent.py)
-      cell_cap: 0.0            # s > 0: the cell state squashed after every step, c <- s tanh(c / s) (recurrent.py)
+      # the cell state squashed after every step, c <- s tanh(c / s) (recurrent.py): no slow latch can build up (an
+      # uncapped policy's cell grew over minutes on the robot and drifted its stance)
+      cell_cap: 1.0
     network:
       - name: net
         input: OBSERVATIONS
@@ -58,15 +54,15 @@ memory:
 
 agent:
   class: MAPPO
-  rollouts: 24
+  rollouts: 48              # 0.48 s at 100 Hz
   learning_epochs: 5
   mini_batches: 4
-  discount_factor: 0.99
-  gae_lambda: 0.95
+  discount_factor: 0.995    # 0.99 and 0.95 at 50 Hz: the same horizon in seconds
+  gae_lambda: 0.975
   learning_rate: 1.0e-03
   learning_rate_scheduler: KLAdaptiveLR
-  # The legs adapt to half the arms' KL and may go lower: golemlim_zrange_200k's legs took one update at ~187k steps
-  # that spiked their value loss and raised falls from 1% to 6-10%.
+  # The legs adapt to half the arms' KL and may go lower: one large legs update once spiked their value loss and
+  # raised falls from 1% to 6-10%.
   learning_rate_scheduler_kwargs:
     legs:
       kl_threshold: 0.01
@@ -76,7 +72,6 @@ agent:
       kl_threshold: 0.02
       min_lr: 2.0e-04
       max_lr: 1.0e-02
-  # frozen at the env's fixed scales (cfg.observation_scales, train.py fix_observation_scales), not running statistics
   observation_preprocessor: RunningStandardScaler
   observation_preprocessor_kwargs: null
   state_preprocessor: RunningStandardScaler
@@ -104,11 +99,11 @@ agent:
   experiment:
     directory: "locomanip_marl"
     experiment_name: ""
-    write_interval: 24        # timesteps: one TensorBoard point per update
-    checkpoint_interval: 4800 # timesteps: every 200 updates
+    write_interval: 48        # timesteps: one TensorBoard point per update
+    checkpoint_interval: 9600 # timesteps: every 200 updates
     store_separately: False
 
 trainer:
   class: SequentialTrainer
-  timesteps: 200016          # 8334 updates x 24 rollouts (200k steps)
+  timesteps: 600000          # 12500 updates x 48 rollouts (6000 s per env at 100 Hz); train.py --max_iterations sets it
   environment_info: log

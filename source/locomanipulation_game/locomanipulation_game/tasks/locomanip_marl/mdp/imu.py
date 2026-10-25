@@ -1,4 +1,4 @@
-"""The head IMU's terms: the low-passed gyro and the biased accelerometer the policies and the estimator read, and the
+"""The head IMU's terms: the low-passed gyro and the biased accelerometer the policies read, and the
 per-env mount and bias randomization.
 
 The IMU is the MID-360's chip, scene["imu"] at livox_link/livox_imu_link (CL_Assets ed592de: the measured mount,

@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """
-Python module serving as a project/extension template.
+The two-agent loco-manipulation task (tasks/locomanip_marl) and the H1-2 asset (assets/h1_2.py).
 """
 
 # Register Gym environments.

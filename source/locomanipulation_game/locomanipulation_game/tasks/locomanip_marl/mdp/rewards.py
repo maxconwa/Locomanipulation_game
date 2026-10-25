@@ -10,13 +10,14 @@ import re
 import torch
 from typing import TYPE_CHECKING
 
+from isaaclab.envs.mdp import base_height_l2
 from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 
 from ..golem_safety import GOLEM_LIMITS
 from .commands import ground_height
-from .legs_rewards import STANCE_THRESHOLD, joint_deviation_l2, leg_phase, standing_command
+from .legs_rewards import STANCE_THRESHOLD, joint_deviation_l2, leg_phase
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -85,18 +86,14 @@ class self_contacts_involving(ManagerTermBase):
         return count
 
 
-class track_velocity_avg_exp(ManagerTermBase):
-    """exp(-err^2 / std^2) of the velocity command against the pelvis velocity averaged over the last window_s.
+class _CycleMean(ManagerTermBase):
+    """Base for terms that read a quantity's mean over each env's last gait cycle (the env cfg's gait_period): within
+    a stride the pelvis sways, surges and twists about as much as a small command asks for, so only the cycle mean
+    shows the motion the command asks for."""
 
-    component "lin_xy": (vx, vy) in the pelvis frame; "ang_z": the yaw rate. A step sways and twists the pelvis
-    within the gait cycle, so on the instantaneous velocity standing still under a small command pays about as
-    much as following it. Averaged over one gait cycle, only the motion the command asks for counts.
-    """
-
-    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv, dims: int):
         super().__init__(cfg, env)
-        self._window = max(int(round(cfg.params["window_s"] / env.step_dt)), 1)
-        dims = 2 if cfg.params["component"] == "lin_xy" else 1
+        self._window = max(int(round(env.cfg.gait_period / env.step_dt)), 1)
         self._samples = torch.zeros(env.num_envs, self._window, dims, device=env.device)
         self._count = torch.zeros(env.num_envs, device=env.device)
         self._slot = 0
@@ -106,96 +103,61 @@ class track_velocity_avg_exp(ManagerTermBase):
         self._samples[ids] = 0.0
         self._count[ids] = 0.0
 
-    def __call__(
-        self, env: ManagerBasedRLEnv, command_name: str, std: float, component: str, window_s: float
-    ) -> torch.Tensor:
-        data = env.scene["robot"].data
-        if component == "lin_xy":
-            velocity, command = data.root_lin_vel_b[:, :2], env.command_manager.get_command(command_name)[:, :2]
-        else:
-            velocity, command = data.root_ang_vel_b[:, 2:3], env.command_manager.get_command(command_name)[:, 2:3]
-        self._samples[:, self._slot] = velocity
+    def _push(self, x: torch.Tensor) -> torch.Tensor:
+        """Add this step's (num_envs, dims) sample; returns the mean over the window so far."""
+        self._samples[:, self._slot] = x
         self._slot = (self._slot + 1) % self._window
         self._count = torch.clamp(self._count + 1.0, max=self._window)
-        mean = self._samples.sum(dim=1) / self._count.unsqueeze(1)
+        return self._samples.sum(dim=1) / self._count.unsqueeze(1)
+
+
+class track_velocity_cycle_exp(_CycleMean):
+    """exp(-err^2 / std^2) of the velocity command against the pelvis velocity's gait-cycle mean. component "lin_xy":
+    (vx, vy) in the pelvis frame, std the command's lin_vel_std; "ang_z": the yaw rate, std its ang_vel_std (the
+    command's tracking-kernel curriculum)."""
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env, 2 if cfg.params["component"] == "lin_xy" else 1)
+
+    def __call__(self, env: ManagerBasedRLEnv, command_name: str, component: str) -> torch.Tensor:
+        data, term = env.scene["robot"].data, env.command_manager.get_term(command_name)
+        if component == "lin_xy":
+            velocity, command, std = data.root_lin_vel_b[:, :2], term.command[:, :2], term.lin_vel_std
+        else:
+            velocity, command, std = data.root_ang_vel_b[:, 2:3], term.command[:, 2:3], term.ang_vel_std
+        mean = self._push(velocity)
         return torch.exp(-torch.sum(torch.square(command - mean), dim=1) / std**2)
 
 
-class yaw_twist_l2(ManagerTermBase):
-    """Squared gap between the pelvis yaw rate and its mean over the last window_s (rad^2/s^2): the twist within a
-    gait cycle. Tracking the cycle-mean yaw rate leaves it free, and YawMean twisted at 1.2 rad/s RMS (its walking
-    and its wrists collapsed); on the instantaneous rate the tracking kernel had held it near 0.45."""
+class yaw_twist_l2(_CycleMean):
+    """Squared gap between the pelvis yaw rate and its gait-cycle mean (rad^2/s^2): the twist within a stride, which
+    tracking the cycle-mean yaw rate leaves free (a policy without it twisted at 1.2 rad/s RMS)."""
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
-        super().__init__(cfg, env)
-        self._window = max(int(round(cfg.params["window_s"] / env.step_dt)), 1)
-        self._samples = torch.zeros(env.num_envs, self._window, device=env.device)
-        self._count = torch.zeros(env.num_envs, device=env.device)
-        self._slot = 0
+        super().__init__(cfg, env, 1)
 
-    def reset(self, env_ids=None):
-        ids = slice(None) if env_ids is None else env_ids
-        self._samples[ids] = 0.0
-        self._count[ids] = 0.0
-
-    def __call__(self, env: ManagerBasedRLEnv, window_s: float) -> torch.Tensor:
-        yaw_rate = env.scene["robot"].data.root_ang_vel_b[:, 2]
-        self._samples[:, self._slot] = yaw_rate
-        self._slot = (self._slot + 1) % self._window
-        self._count = torch.clamp(self._count + 1.0, max=self._window)
-        return torch.square(yaw_rate - self._samples.sum(dim=1) / self._count)
+    def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:
+        yaw_rate = env.scene["robot"].data.root_ang_vel_b[:, 2:3]
+        return torch.square(yaw_rate - self._push(yaw_rate)).squeeze(1)
 
 
-class joint_mean_deviation_l2(ManagerTermBase):
-    """Squared gap between asset_cfg's joint angles averaged over the last window_s (one gait cycle) and their
-    defaults, summed over the joints, outside arm goals (rad^2). Standing it holds the default pose; walking, the
-    cycle's mean, so the swing itself is free. Sport mode's cycle mean while walking sits within 0.04 rad of its
-    standing pose (assets/h1_2.py SPORT_MODE_LEG_POSE). Seed 42 of the 10-24 deploy runs sank from a 0.9 to a 1.2 rad
-    knee after its arm goals started, with base_height on in navigation: the pelvis height alone let the crouch
-    through on bent ankles."""
+class joint_mean_deviation_l2(_CycleMean):
+    """Squared gap between asset_cfg's joint angles' gait-cycle mean and their defaults, summed over the joints,
+    outside arm goals (rad^2). Standing it holds the default pose (sport mode's stance); walking, the cycle mean, so
+    the swing itself is free: sport mode's cycle mean while walking sits within 0.04 rad of its stance. Without it the
+    stance sank from a 0.9 to a 1.2 rad knee once arm goals started, base_height on in navigation notwithstanding:
+    the pelvis height alone let the crouch through on bent ankles."""
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
-        super().__init__(cfg, env)
         asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
-        robot = env.scene[asset_cfg.name]
-        self._ids = robot.find_joints(asset_cfg.joint_names, preserve_order=True)[0]
-        self._window = max(int(round(cfg.params["window_s"] / env.step_dt)), 1)
-        self._samples = torch.zeros(env.num_envs, self._window, len(self._ids), device=env.device)
-        self._count = torch.zeros(env.num_envs, device=env.device)
-        self._slot = 0
+        self._ids = env.scene[asset_cfg.name].find_joints(asset_cfg.joint_names, preserve_order=True)[0]
+        super().__init__(cfg, env, len(self._ids))
 
-    def reset(self, env_ids=None):
-        ids = slice(None) if env_ids is None else env_ids
-        self._samples[ids] = 0.0
-        self._count[ids] = 0.0
-
-    def __call__(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, window_s: float,
-                 arm_command_name: str) -> torch.Tensor:
+    def __call__(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, arm_command_name: str) -> torch.Tensor:
         data = env.scene[asset_cfg.name].data
-        self._samples[:, self._slot] = data.joint_pos[:, self._ids] - data.default_joint_pos[:, self._ids]
-        self._slot = (self._slot + 1) % self._window
-        self._count = torch.clamp(self._count + 1.0, max=self._window)
-        mean = self._samples.sum(dim=1) / self._count.unsqueeze(1)
+        mean = self._push(data.joint_pos[:, self._ids] - data.default_joint_pos[:, self._ids])
         arm = env.command_manager.get_term(arm_command_name).arm_mode
         return torch.sum(torch.square(mean), dim=1) * (~arm).float()
-
-
-class track_lin_vel_xy_avg_exp_annealed(track_velocity_avg_exp):
-    """track_velocity_avg_exp on the xy velocity (component "lin_xy"), with the velocity command's current lin_vel_std
-    (its tracking-kernel curriculum)."""
-
-    def __call__(self, env: ManagerBasedRLEnv, command_name: str, component: str, window_s: float) -> torch.Tensor:
-        std = env.command_manager.get_term(command_name).lin_vel_std
-        return super().__call__(env, command_name, std, component, window_s)
-
-
-class track_ang_vel_z_avg_exp_annealed(track_velocity_avg_exp):
-    """track_velocity_avg_exp on the yaw rate (component "ang_z"), with the velocity command's current ang_vel_std
-    (its tracking-kernel curriculum)."""
-
-    def __call__(self, env: ManagerBasedRLEnv, command_name: str, component: str, window_s: float) -> torch.Tensor:
-        std = env.command_manager.get_term(command_name).ang_vel_std
-        return super().__call__(env, command_name, std, component, window_s)
 
 
 def arm_target_pos_exp(env: ManagerBasedRLEnv, command_name: str, arm: int, std: float) -> torch.Tensor:
@@ -204,44 +166,25 @@ def arm_target_pos_exp(env: ManagerBasedRLEnv, command_name: str, arm: int, std:
     return torch.exp(-pos_error[:, arm].square() / std**2)
 
 
-def arm_target_quat_exp(env: ManagerBasedRLEnv, command_name: str, arm: int, std: float) -> torch.Tensor:
-    """exp(-theta^2 / std^2) on one arm's wrist rotation error, std in radians."""
-    _, rot_error = env.command_manager.get_term(command_name).errors()
-    return torch.exp(-rot_error[:, arm].square() / std**2)
-
-
 def arm_target_pos_exp_annealed(env: ManagerBasedRLEnv, command_name: str, arm: int) -> torch.Tensor:
     """arm_target_pos_exp with the command's current fine_pos_std (its tracking-kernel curriculum)."""
     return arm_target_pos_exp(env, command_name, arm, env.command_manager.get_term(command_name).fine_pos_std)
 
 
 def arm_target_quat_exp_annealed(env: ManagerBasedRLEnv, command_name: str, arm: int) -> torch.Tensor:
-    """arm_target_quat_exp with the command's current rot_std (its tracking-kernel curriculum)."""
-    return arm_target_quat_exp(env, command_name, arm, env.command_manager.get_term(command_name).rot_std)
+    """exp(-theta^2 / std^2) on one arm's wrist rotation error (rad), std the command's current rot_std (its
+    tracking-kernel curriculum)."""
+    term = env.command_manager.get_term(command_name)
+    _, rot_error = term.errors()
+    return torch.exp(-rot_error[:, arm].square() / term.rot_std**2)
 
 
 def base_height_l2_navigation(
     env: ManagerBasedRLEnv, target_height: float, arm_command_name: str, sensor_cfg: SceneEntityCfg | None = None
 ) -> torch.Tensor:
     """Isaac Lab's base_height_l2, outside arm goals only: their crouch is free, a crouch while walking is not."""
-    from isaaclab.envs.mdp import base_height_l2
-
     arm = env.command_manager.get_term(arm_command_name).arm_mode
     return base_height_l2(env, target_height, sensor_cfg=sensor_cfg) * (~arm).float()
-
-
-def track_lin_vel_xy_exp_annealed(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
-    """Isaac Lab's track_lin_vel_xy_exp with the velocity command's current lin_vel_std (its tracking-kernel curriculum)."""
-    from isaaclab.envs.mdp import track_lin_vel_xy_exp
-
-    return track_lin_vel_xy_exp(env, env.command_manager.get_term(command_name).lin_vel_std, command_name)
-
-
-def track_ang_vel_z_exp_annealed(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
-    """Isaac Lab's track_ang_vel_z_exp with the velocity command's current ang_vel_std."""
-    from isaaclab.envs.mdp import track_ang_vel_z_exp
-
-    return track_ang_vel_z_exp(env, env.command_manager.get_term(command_name).ang_vel_std, command_name)
 
 
 def arm_goal_reached(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
@@ -254,22 +197,6 @@ def yaw_rate_l2_during_arm_goal(env: ManagerBasedRLEnv, arm_command_name: str) -
     """Squared pelvis yaw rate during an arm goal: turning moves the world-fixed targets in the pelvis frame."""
     yaw_rate = env.scene["robot"].data.root_ang_vel_b[:, 2]
     return torch.square(yaw_rate) * env.command_manager.get_term(arm_command_name).arm_mode
-
-
-def stand_load_imbalance(
-    env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, command_name: str, arm_command_name: str, min_load: float = 50.0
-) -> torch.Tensor:
-    """((F_left - F_right) / (F_left + F_right))^2 of the two feet's vertical contact forces while the robot stands
-    in navigation (velocity command under the gait clock's zero_cmd_eps, no arm goal) with both feet carrying at
-    least min_load N together; 0 otherwise. Mid360v2 stood with 70-85% of its weight on one leg, in sim and on the
-    robot, leaving one ankle pitch to balance it."""
-    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    fz = sensor.data.net_forces_w[:, sensor_cfg.body_ids, 2].clamp(min=0.0)
-    total = fz.sum(dim=1)
-    imbalance = (fz[:, 0] - fz[:, 1]) / total.clamp(min=1.0)
-    cmd = env.command_manager.get_command(command_name)
-    standing = standing_command(env, cmd) & ~env.command_manager.get_term(arm_command_name).arm_mode
-    return torch.square(imbalance) * (standing & (total > min_load)).float()
 
 
 def joint_deviation_l2_modal(
@@ -389,9 +316,9 @@ class arm_joint_target_rate_l2(ManagerTermBase):
     """Squared change of the arm joints' position targets since the last policy step, summed (rad^2), during arm goals.
 
     The arms' target is the measured position plus the IK step plus the residual, so this charges the dithering the
-    action_rate term on the residual alone misses: Explicit500's arms oscillated at about 3.2 Hz while reaching (Isaac
-    and the real robot's reach bag, targets moving 0.03-0.05 rad per step against 0.007 while walking). Squared, it
-    charges a smooth reach (a few joints at ~0.02 rad/step) far less than that. Zero on an episode's first step.
+    action_rate term on the residual alone misses: an earlier policy's arms oscillated at about 3.2 Hz while reaching
+    (Isaac and the real robot), their targets moving 1.5-2.5 rad/s against 0.35 while walking. Squared, it charges a
+    smooth reach (a few joints at ~1 rad/s) far less than that. Zero on an episode's first step.
     """
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):

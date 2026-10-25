@@ -31,7 +31,7 @@ TARGETS = [
     ("turn_sign_agree", "Turn sense correct, commanded |wz| > 0.1 rad/s", 0.994, 0.99, "ge"),
     ("speed_ratio_median", "Linear speed achieved / commanded, median", 0.93, 0.90, "ge"),
     ("turn_ratio_median", "Turn rate achieved / commanded, median", 0.91, 0.90, "ge"),
-    ("cos_v_mean", "Direction cos(commanded, actual) xy velocity, mean", 0.96, 0.95, "ge"),
+    ("cos_v_mean", "Direction cos(commanded, actual) xy velocity, mean", "0.96 (creep removed; 0.65 raw)", 0.95, "ge"),
     ("ang_err_mean", "Angular velocity error, mean (rad/s)", 0.050, 0.05, "le"),
     ("lin_err_mean", "Linear velocity error, mean (m/s)", 0.147, 0.15, "le"),
 ]

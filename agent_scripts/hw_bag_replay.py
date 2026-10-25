@@ -13,8 +13,9 @@ is the node.
 
 Per policy and actor: the cell state c per unit and step, and the observation as the network normalizes it,
 z = (obs - mean) / std (clamped at +-5 inside the network). With --sim_seeds, the same is logged in MuJoCo
-(hw_stress_mujoco.StressMujoco, nominal plant) driven by the bag's own velocity commands as the reference range, and
-the report counts the real steps outside it.
+(hw_stress_mujoco.StressMujoco, nominal conditions on the training plant, at the policy's own rate) driven by the
+bag's own velocity commands as the reference range, and the report counts the real steps outside it. A policy at
+another rate than the node's ticks steps on its own clock, on the latest /lowstate.
 
     python agent_scripts/hw_bag_replay.py --bag <bag dir> --deployed mid360v2 \
         --policy mid360v2=<GOLEM>/core_ws/src/lmg_deploy/policies/mid360v2 [--policy name=<export dir> ...] \
@@ -48,7 +49,8 @@ parser.add_argument("--policy", action="append", required=True, help="name=dir: 
                     "export.yaml + legs.pt / arms.pt) or an export_marl.py output (the template is added)")
 parser.add_argument("--deployed", default=None, help="the --policy name the bag ran, for the target check")
 parser.add_argument("--golem", default=os.path.expanduser("~/GOLEM"))
-parser.add_argument("--urdf", default=str(REPO / "third_party/CL_Assets/ros_assets/h1_2_magpie.urdf"))
+parser.add_argument("--urdf", default=os.path.join(os.environ.get("CL_ASSETS_DIR", str(REPO / "third_party/CL_Assets")),
+                                                   "ros_assets", "h1_2_magpie.urdf"))
 parser.add_argument("--template", default=str(REPO / "agent_scripts/hw_deploy_template.yaml"))
 parser.add_argument("--imu", choices=("livox", "lowstate"), default="livox",
                     help="the deployed policy's IMU. lowstate: LowState.imu_state, as the node did up to GOLEM 8d1eddd "
@@ -83,7 +85,7 @@ from rosbags.typesys import Stores, get_types_from_msg, get_typestore  # noqa: E
 
 
 def load_cfg(folder: str) -> dict:
-    yamls = [p for p in glob.glob(os.path.join(folder, "*.yaml")) if not p.endswith("export.yaml")]
+    yamls = [p for p in glob.glob(os.path.join(folder, "*.yaml")) if os.path.basename(p) != "export.yaml"]
     cfg = yaml.safe_load(open(yamls[0] if yamls else args.template))
     cfg.update(yaml.safe_load(open(os.path.join(folder, "export.yaml"))) or {})
     cfg.setdefault("legs", {}).setdefault("policy", "legs.pt")

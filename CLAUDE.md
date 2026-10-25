@@ -39,13 +39,17 @@ An Isaac Lab external project (a DirectMARLEnv trained with skrl MAPPO) — sepa
 from `ALMI_RL`.
 
 - **Activate the env first:** `conda activate env_isaaclab`
-- **Tasks live in**
+- **The task lives in**
   `source/locomanipulation_game/locomanipulation_game/tasks/locomanip_marl/`
-  (`LocoManip-Marl-Direct-v0`, and the one-agent `LocoManip-WholeBody-Direct-v0`)
-- **Train:** `python scripts/skrl/train.py --headless [--task <TASK>]`; runs go to
-  `logs/skrl/locomanip_marl/`
-- **MuJoCo transfer** lives in `mujoco_evals/`; the reach evaluation in
-  `paper/reach/` (`make -C paper/reach all`) writes to `logs/reach/`.
+  (`LocoManip-Marl-Direct-v0`); its defaults are the sport-mode recipe (README).
+- **Train:** `python scripts/skrl/train.py --headless`; runs go to
+  `logs/skrl/locomanip_marl/`. The whole pipeline (train, scorecard, export,
+  checks): `scripts/train_candidate.sh`.
+- **Evaluate:** `scripts/skrl/eval_scorecard.py` (Isaac); the CPU checks of an
+  export, `agent_scripts/hw_stress_mujoco.py` and `hw_bag_replay.py`, run in a
+  separate python with mujoco (on `mujoco_evals/`).
+- Older recipes (the paper's reach evaluation, the whole-body baseline, the
+  learned pelvis estimator) are at the `pre-cleanup` tag.
 - When adding a new task name, keep `LocoManip-` in it: `scripts/list_envs.py:54`
   only lists ids containing that substring, so a task registered under a
   different name silently won't show up.

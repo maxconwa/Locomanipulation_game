@@ -1,13 +1,16 @@
-"""The hardware-perturbation stress test (hw_stress_test.py) in MuJoCo: an exported policy (GOLEM lmg_deploy's legs.pt /
-arms.pt, TorchScript, LSTM state carried) on CL_Assets' H1-2 MJCF, the model GOLEM's RoboCasa sim uses, at 500 Hz.
+"""The hardware-perturbation stress test in MuJoCo: an exported policy (GOLEM lmg_deploy's legs.pt / arms.pt,
+TorchScript, LSTM state carried) on CL_Assets' H1-2 MJCF, the model GOLEM's RoboCasa sim uses, at 500 Hz.
 
-Builds on mujoco_evals.mujoco_sim.MarlMujoco (the env's action bounds, PD, IK and observations) and adds what the
-Mid360 policies need and the perturbations:
-  IMU            the run's: the MID-360 chip (livox_imu_site) or the torso (imu), with its gyro low-pass
-  gait clock     each leg's phase sin (and cos) from the episode time, standing (phase 0) under a 0.1 command
+Builds on mujoco_evals.mujoco_sim.MarlMujoco (the env's action bounds, PD, IK, command filter, gait clock and
+observations, all from the export's settings) and adds the perturbations (CONDITIONS):
   plant          robocasa: the MJCF's joint dynamics (damping 10, frictionloss 0.2, armature 0.1, as RoboCasa);
                  isaac: the training plant's (none, armature 0.01)
-  strength, gain, dq_lag, gyro_k, delay_ms, torso_kg, enc   as in hw_stress_test.py (CONDITIONS there)
+  strength       the motors' torque x s (kp, kd and the effort limit together); gain: kp and kd x g
+  dq_lag         the observed hip pitch and knee velocity (LowState dq) this many ms late
+  gyro_k         the head's 20-21 Hz pitch resonance added to the gyro before its low-pass, at gyro_k x the measured
+                 amplitude
+  delay_ms       the joint targets this late; torso_kg: added to the torso; enc: encoder offsets on the legs (rad)
+  hang_s         held on the gantry (feet 8 cm up) this long, then lowered onto the feet over LOWER_S
 Per job (one condition, profile, plant and seed) one robot for --seconds; jobs run in parallel processes.
 
     python agent_scripts/hw_stress_mujoco.py --export <policies/name> --label <name> [--seeds 8] [--plants robocasa,isaac]
@@ -35,11 +38,10 @@ import yaml
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
-from mujoco_evals import common as C  # noqa: E402
 from mujoco_evals.mujoco_sim import (  # noqa: E402
-    ALL_NAMES, MarlMujoco, axis_angle, mjcf_path, qconj, qmul, qrot, qunique, xyzw)
+    ALL_NAMES, MarlMujoco, mjcf_path, qrot)
 
-# the same conditions as the Isaac stress test
+# the conditions; hw: the measured hardware effects together
 _HW = {"strength": 0.85, "dq_lag": 12.0, "gyro_k": 1.0, "delay_ms": 20.0, "enc": 0.02}
 CONDITIONS = {
     "nominal": {},
@@ -65,8 +67,8 @@ CONDITIONS = {
     # engaged hanging from the gantry (feet HANG_LIFT up) for hang_s, then lowered onto the feet over LOWER_S and let go
     "hang": {"hang_s": 4.0},
     "hang_hw": dict(_HW, hang_s=4.0),
-    # the actors' LSTM state zeroed every 10 s (both, the legs' only, the arms' only): does the policy go wrong
-    # past the training episode's 20 s because its state has run longer than any episode?
+    # the actors' LSTM state zeroed every 10 s (both, the legs' only, the arms' only): does the policy go wrong when
+    # its state has run long?
     "lstm_reset": {"lstm_reset_s": 10.0},
     "lstm_reset_legs": {"lstm_reset_s": 10.0, "lstm_reset_which": "legs"},
     "lstm_reset_arms": {"lstm_reset_s": 10.0, "lstm_reset_which": "arms"},
@@ -81,7 +83,6 @@ KNEE_IDX = [ALL_NAMES.index(n) for n in ("left_knee_joint", "right_knee_joint")]
 FALL_TILT, FALL_HEIGHT = 0.8, 0.55
 FLOOR_MARGIN, FLOOR_HOLD_S = 0.1, 0.5
 STAND_WINDOW = (2.0, 10.0)
-DT = C.POLICY_DT   # the template's 50 Hz; a run's own policy step is its sim's policy_dt (export.yaml control_dt)
 
 
 class Recurrent:
@@ -110,25 +111,17 @@ class Recurrent:
 
 
 class StressMujoco(MarlMujoco):
+    """MarlMujoco with the perturbations of one condition (CONDITIONS, f): the motors' strength and gain, the encoders'
+    offsets, LowState's joint-velocity lag, the joint targets' delay, the head's gyro resonance, a heavier torso, and
+    the gantry (held, then lowered onto the feet)."""
+
     def __init__(self, actors, f: dict, deploy: dict, physics: str, rng: np.random.Generator):
-        imu = deploy.get("imu", {})
-        self.head = imu.get("frame", "imu_link") != "imu_link"
-        self.gait_cos = bool(deploy.get("gait_phase_cos", False))
-        # the gait clock and the stand/walk gate as the run trained them (export.yaml over the template's 0.8 s, 0.1)
-        self.gait_period, self.zero_cmd_eps = float(deploy["gait_period"]), float(deploy["zero_cmd_eps"])
-        model =mujoco.MjModel.from_xml_path(str(mjcf_path()))
+        model = mujoco.MjModel.from_xml_path(str(mjcf_path()))
         torso = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
         model.body_mass[torso] += f["torso_kg"]
-        rest = np.array(deploy["rest_pose"], float)
-        limits = {k: tuple(v) for k, v in (deploy.get("target_limits") or {}).items()}
-        # the run's control rate, gains, default pose, action scales, IK step and command filter (MarlMujoco settings)
-        super().__init__(actors, None, physics=physics, rest_pose_b=rest, model=model, target_limits=limits,
-                         gyro_lowpass_hz=imu.get("gyro_lowpass_hz") or 0.0, settings=deploy)
+        super().__init__(actors, deploy, physics=physics, model=model)
         m = self.m
-        if self.head:
-            sens = lambda n: m.sensor_adr[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SENSOR, n)]  # noqa: E731
-            self.imu_site = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "livox_imu_site")
-            self.s_acc, self.s_gyro = sens("livox_imu_acc"), sens("livox_imu_gyro")
+        self.head = (deploy.get("imu") or {}).get("frame", "imu_link") != "imu_link"
         self.f = f
         self.enc = np.zeros(len(ALL_NAMES))
         self.enc[:12] = rng.uniform(-f["enc"], f["enc"], 12)
@@ -154,7 +147,6 @@ class StressMujoco(MarlMujoco):
         self.qd_hist = deque(maxlen=self.lag + 1)
         self.leg_rms = 0.0
         self.sub = 0
-        self.steps = 0
         super().reset(rng)
         self.hold_pose = self.d.qpos[0:7].copy()
         if self.f["hang_s"] > 0:
@@ -163,17 +155,19 @@ class StressMujoco(MarlMujoco):
         self.qd_hist.append(self.d.qvel[self.vadr].copy())
 
     # the motor: what it measures (q + encoder offset) and how strong it is
+    def measured_q(self) -> np.ndarray:
+        return self.d.qpos[self.qadr] + self.enc
+
+    def measured_dq(self) -> np.ndarray:
+        qd = self.d.qvel[self.vadr].copy()
+        qd[LAG_IDX] = self.qd_hist[0][LAG_IDX]  # lag substeps old once the deque is full
+        return qd
+
     def pd_torque(self, target):
-        q, qd = self.d.qpos[self.qadr] + self.enc, self.d.qvel[self.vadr]
+        q, qd = self.measured_q(), self.d.qvel[self.vadr]
         k = self.f["strength"] * self.f["gain"]
         return np.clip(k * self.kp * (target - q) - k * self.kd * qd, -self.f["strength"] * self.effort,
                        self.f["strength"] * self.effort)
-
-    def _torque_bounds(self, idx):
-        # the deploy's bound: nominal gains on the measured state
-        q, qd = (self.d.qpos[self.qadr] + self.enc)[idx], self.d.qvel[self.vadr][idx]
-        h = 0.85 * self.effort[idx]
-        return q + (self.kd[idx] * qd - h) / self.kp[idx], q + (self.kd[idx] * qd + h) / self.kp[idx]
 
     def physics_step(self):
         m, d = self.m, self.d
@@ -199,38 +193,6 @@ class StressMujoco(MarlMujoco):
                     u[1] += amp * math.sin(2 * math.pi * self.res_freq * self.sub * m.opt.timestep + self.res_phase)
                 self._gyro = self.gyro_lowpass(u, m.opt.timestep)
         self.last_tau = self.pd_torque(self.applied)
-
-    def gait(self):
-        if np.linalg.norm(self.observed_cmd()) < self.zero_cmd_eps:
-            phase = np.zeros(2)
-        else:
-            p = (self.steps * self.policy_dt % self.gait_period) / self.gait_period
-            phase = np.array([p, (p + 0.5) % 1.0])
-        return np.sin(2 * math.pi * phase), np.cos(2 * math.pi * phase)
-
-    def observations(self):
-        acc, gyro, grav = self.imu()
-        q = self.d.qpos[self.qadr] + self.enc
-        qd = self.d.qvel[self.vadr].copy()
-        qd[LAG_IDX] = self.qd_hist[0][LAG_IDX]  # lag substeps old once the deque is full
-        n, r = self.NOISE_POLICY, self.rng
-        u = lambda x, s: x + r.uniform(-s, s, np.shape(x))  # noqa: E731
-        believed = np.concatenate([xyzw(b) for b in self.believed])
-        sin, cos = self.gait()
-        common = [u(acc, n["lin_acc"]), u(gyro, n["ang_vel"]), u(grav, n["grav"]), self.observed_cmd(),
-                  np.array([1.0 if self.arm_mode else 0.0]), believed, u(q - self.default, n["jpos"]),
-                  u(qd, n["jvel"]), sin] + ([cos] if self.gait_cos else [])
-        legs_applied = (self.applied[self.leg_idx] - self.default[self.leg_idx]) / self.leg_scale
-        cur = self.wrist_poses_b()
-        wrist_pose = np.concatenate([xyzw(np.r_[c[:3], qunique(c[3:])]) for c in cur])
-        errs = np.concatenate([np.r_[b[:3] - c[:3], axis_angle(qmul(b[3:], qconj(c[3:])))]
-                               for b, c in zip(self.believed, cur)])
-        return {"legs": np.concatenate(common + [legs_applied]),
-                "arms": np.concatenate(common + [self.residual, u(wrist_pose, n["wrist"]), u(errs, n["wrist"])])}
-
-    def step(self, obs, **kw):
-        self.steps += 1
-        return super().step(obs, **kw)
 
     def torso_roll(self):
         w, x, y, z = self.d.xquat[self.torso_body]
@@ -346,7 +308,7 @@ def main():
     parser.add_argument("--workers", type=int, default=max(os.cpu_count() - 4, 1))
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
-    cfg_path = [p for p in glob.glob(os.path.join(args.export, "*.yaml")) if not p.endswith("export.yaml")][0]
+    cfg_path = [p for p in glob.glob(os.path.join(args.export, "*.yaml")) if os.path.basename(p) != "export.yaml"][0]
     deploy = yaml.safe_load(open(cfg_path))
     deploy.update(yaml.safe_load(open(os.path.join(args.export, "export.yaml"))) or {})
     head = deploy.get("imu", {}).get("frame", "imu_link") != "imu_link"

@@ -1,14 +1,10 @@
-# Deploy config for Mid360v2: LocoManip-Marl-Direct-v0 (Locomanipulation_game, branch marl-direct, commit f541d1c),
-# agent_196800 of a 200k-step run. As Mid360 on the measured MID-360 mount (CL_Assets ed592de): the IMU is the MID-360's
-# chip, imu.frame livox_imu_link (/livox/imu as it arrives; attitude from FAST-LIO, see marl_deploy_node "IMU"); its gyro
-# passes the 8 Hz GyroLowpass the run trained with (imu.gyro_lowpass_hz); the actors observe each leg's gait phase cos
-# after its sin (gait_phase_cos: legs 97, arms 125 inputs); the chip's mount (pitch +-1.5, roll and yaw +-0.75 deg) and
-# accelerometer bias (+-0.01 g) were randomized. Mid360v2 changed rewards and curricula only (cycle-mean linear tracking,
-# ramped arm goals, one-way reward share), so every value below is Mid360's (the Explicit500 setup: LSTM actors, explicit
-# PD at 500 Hz, 0-20 ms target delay, GOLEM e-stop target clip, 85% torque headroom, with its ankle-roll target clip);
-# the source is named on each block. Locomanipulation_game scripts/skrl/export_marl.py writes the networks and
-# export.yaml next to this file; export.yaml's keys (rest_pose, target_limits, gait_phase_cos, imu, source) override
-# the ones here.
+# The deploy template GOLEM's lmg_deploy reads for a LocoManip-Marl-Direct-v0 policy; scripts/skrl/export_marl.py
+# copies it next to the networks as <name>.yaml. The export's export.yaml overrides every key a run trains with:
+# control_dt, kp, kd, default_joint_pos, leg_action_scales and arm_residual_scales (over legs.action_scale and
+# arms.residual_scale), max_ik_step, gait_period, zero_cmd_eps, command_ranges, command_filter_tau, rest_pose,
+# target_limits, gait_phase_cos, imu. The values below are the fallbacks, from the Mid360v2 policy (50 Hz, the earlier
+# gains and stance), which runs on this file with its own export.yaml; the rest (joint names, limits, observation
+# sizes, the IK's damping, the SLAM frame) is the same for every run.
 
 control_dt: 0.02            # decimation 10 x sim dt 0.002 (env.sim.dt=0.002 env.decimation=10)
 

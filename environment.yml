@@ -60,13 +60,17 @@ dependencies:
 # skrl 2.1.0). `--install skrl` installs isaaclab_rl with skrl, whose wrapper
 # scripts/skrl/ uses, and pulls in the runtime deps this file omits on purpose
 # (gymnasium, prettytable, tensorboard, hydra-core) so their versions stay
-# Isaac Lab's to choose. mujoco_evals/eval_mujoco.py also needs `pip install
-# mujoco`; it runs in any python with mujoco, torch and pyyaml.
+# Isaac Lab's to choose.
+#
+# The CPU checks (agent_scripts/hw_stress_mujoco.py, hw_bag_replay.py) run in
+# another python >= 3.10 with mujoco, torch, numpy, pyyaml, pin (pinocchio) and
+# rosbags, and need GOLEM's lmg_deploy (--golem, default ~/GOLEM).
 #
 # Then, back in this repository:
 #
 #   pip install -e source/locomanipulation_game
-#   git submodule update --init --recursive     # third_party/CL_Assets
+#   git submodule update --init --recursive     # third_party/CL_Assets (SSH access to correlllab)
+#   git lfs pull                                # the arm-goal tables (*.pt)
 #
 # Verify:
 #

@@ -1,11 +1,12 @@
 """Score a checkpoint's velocity tracking against Unitree's sport mode, with the H1-2 Sport Mode Walking Report's
-metric code (scorecard_metrics.py).
+metric code (scorecard_metrics.py), and its wrist tracking on standing arm goals.
 
     python scripts/skrl/eval_scorecard.py --checkpoint <run>/checkpoints/agent_<N>.pt --headless [--num_envs 168]
         [env.<field>=... overrides]
 
 The run's own command-line overrides (<run>/params/hydra_overrides.txt, which train.py writes) are applied first, so
-the env is the one it trained in; overrides given here come after them.
+the env is the one it trained in (those whose key the current cfg no longer has are dropped, and listed); overrides
+given here come after them.
 
 Setup: arm goals off (navigation only, the wrists at their rest pose), no pushes, terrain row 0 (bumps of +-height_at_0,
 flat by default), the run's domain randomization, observation noise and action delay; deterministic actions.
@@ -20,6 +21,11 @@ Each segment type gets the same number of slots over all envs. The command goes 
 low-pass, if it trained with one), as a deploy would send it. Measured: the true pelvis velocity in the yaw frame and
 the world yaw rate, the knee angles, the torso's roll and pitch, falls and GOLEM e-stop trips. An env's data ends at
 its first fall. Everything is resampled to 100 Hz (commands held, the rest interpolated) for the metric code.
+
+Then the wrist phase: every env stands (zero velocity) and gets --wrist_goals arm goals in a row, WRIST_GOAL_S each,
+at depth level 0 (heights 1.0-1.7 m, which the standing arms reach), from the env's own goal tables. Per goal: reached
+(both wrists held within the env's reach tolerances, 5 cm and 0.35 rad, for 1 s), the closest approach and the final
+error (mean of both wrists); goals during which the env fell count apart.
 
 Scored (scorecard_metrics.score): per axis the fitted gain, delay and tau; on time spent stepping, the velocity
 averaged over one stride (the run's gait_period) against the lag-allowed command: turn sense, cos, speed and turn
@@ -44,19 +50,11 @@ parser.add_argument("--segments_per_env", type=int, default=6)
 parser.add_argument("--seed", type=int, default=7)
 parser.add_argument("--out", default=None, help="Directory for the scorecard files (default: beside the checkpoint).")
 parser.add_argument("--analysis_dir", default=None, help="The sport-mode bag analysis (scorecard_metrics).")
-parser.add_argument("--no_run_overrides", action="store_true", help="Ignore <run>/params/hydra_overrides.txt.")
+parser.add_argument("--wrist_goals", type=int, default=6, help="Arm goals per env in the wrist phase (0: none).")
 parser.add_argument("--save_raw", action="store_true", help="Also save the 100 Hz series (npz).")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 args_cli.headless = True
-
-checkpoint = os.path.abspath(args_cli.checkpoint)
-run_dir = os.path.dirname(os.path.dirname(checkpoint))
-overrides_file = os.path.join(run_dir, "params", "hydra_overrides.txt")
-run_overrides = []
-if os.path.isfile(overrides_file) and not args_cli.no_run_overrides:
-    run_overrides = [line.strip() for line in open(overrides_file) if line.strip()]
-sys.argv = [sys.argv[0]] + run_overrides + hydra_args
 simulation_app = AppLauncher(args_cli).app
 
 import json  # noqa: E402
@@ -72,12 +70,24 @@ from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 
 import locomanipulation_game.tasks  # noqa: E402, F401
 from locomanipulation_game.assets.h1_2 import LOWER_JOINT_NAMES, TORSO_LINK_NAME  # noqa: E402
-from locomanipulation_game.tasks.locomanip_marl.odometry import estimator_checkpoint_for  # noqa: E402
+from locomanipulation_game.tasks.locomanip_marl.run_files import (  # noqa: E402
+    known_overrides,
+    run_overrides,
+    state_checkpoint_for,
+)
+
+checkpoint = os.path.abspath(args_cli.checkpoint)
+run_dir = os.path.dirname(os.path.dirname(checkpoint))
+replayed, dropped = known_overrides(run_overrides(run_dir), args_cli.task)
+if dropped:
+    print(f"[INFO] run overrides the current cfg no longer has (their values are the defaults now): {dropped}")
+sys.argv = [sys.argv[0]] + replayed + hydra_args
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scorecard_metrics as sm  # noqa: E402
 
 SETTLE_S, HOLD_S, FLICK_S, GAP_S = 2.0, 4.0, 5.0, 2.0
+WRIST_GOAL_S = 4.0  # s per arm goal in the wrist phase, as in training
 PULSE_S, PULSE_EVERY = 0.15, (0.3, 0.5)
 BASE_FULL = (0.7, 0.3, 0.5)  # the baseline's range edges, which STEPS are written for
 KINDS = ("step", "flick", "small")
@@ -176,8 +186,45 @@ def markdown(res: dict) -> str:
         lines.append(f"| {kind} | {fmt(t.get('turn_sign_agree', np.nan))} | {fmt(t.get('speed_ratio_median', np.nan))} |"
                      f" {fmt(t.get('turn_ratio_median', np.nan))} | {fmt(t.get('cos_v_mean', np.nan))} |"
                      f" {fmt(t.get('ang_err_mean', np.nan))} | {fmt(t.get('lin_err_mean', np.nan))} |")
+    w = res.get("wrist")
+    if w:
+        lines += ["", f"Wrist tracking ({w['goals']} standing arm goals of {WRIST_GOAL_S:g} s at depth level 0, goals"
+                      f" during a fall left out: {w['fell']}): reached {100 * w['reached']:.1f}%, closest approach"
+                      f" {100 * w['best_error']:.1f} cm, final error {100 * w['final_error']:.1f} cm /"
+                      f" {w['final_rot_error']:.2f} rad"]
     lines += ["", f"Run overrides: `{' '.join(res['overrides']) or '(none)'}`", ""]
     return "\n".join(lines)
+
+
+def wrist_phase(base, runner, arm, obs, goals: int) -> dict:
+    """The wrist phase (module docstring): every env standing, `goals` arm goals in a row at depth level 0. Returns the
+    share of goals reached, the mean closest approach and final position error (m) and final rotation error (rad),
+    over the goals without a fall, and the number of goals with one."""
+    n, dt = base.num_envs, base.step_dt
+    ids = torch.arange(n, device=base.device)
+    arm.cfg.arm_goal_prob, arm.goals_enabled, arm.goals_enabled_at = 1.0, True, None
+    arm.level[:] = 0
+    steps = int(round(WRIST_GOAL_S / dt))
+    reached, best, final, final_rot, fell = (np.zeros((n, goals)) for _ in range(5))
+    states = base.state()
+    for g in range(goals):
+        arm._resample(ids)  # a fresh goal for every env (its timer stays out of reach: resampling_time_range)
+        for j in range(steps):
+            outputs = runner.agent.act(obs, {a: states for a in base.possible_agents}, timestep=0, timesteps=0)
+            actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in base.possible_agents}
+            obs, _, terminated, _, _ = base.step(actions)
+            states = base.state()
+            fell[:, g] = np.maximum(fell[:, g], terminated[base.possible_agents[0]].cpu().numpy())
+        pos_error, rot_error = arm.errors()
+        reached[:, g] = arm.goal_reached.cpu().numpy()
+        best[:, g] = arm.goal_best_error.cpu().numpy()
+        final[:, g], final_rot[:, g] = pos_error.mean(1).cpu().numpy(), rot_error.mean(1).cpu().numpy()
+        print(f"[INFO] wrist goal {g + 1}/{goals}: reached {reached[:, g].mean():.0%}, closest approach"
+              f" {best[:, g].mean():.3f} m")
+    ok = fell == 0
+    return {"goals": int(ok.sum()), "fell": int((~ok).sum()), "reached": float(reached[ok].mean()),
+            "best_error": float(best[ok].mean()), "final_error": float(final[ok].mean()),
+            "final_rot_error": float(final_rot[ok].mean())}
 
 
 @hydra_task_config(args_cli.task, "skrl_mappo_cfg_entry_point")
@@ -187,13 +234,13 @@ def main(env_cfg, agent_cfg: dict):
     env_cfg.sim.device = args_cli.device
     env_cfg.seed = args_cli.seed
     env_cfg.log_dir = run_dir
-    env_cfg.estimator.train = False
-    env_cfg.estimator.checkpoint_path = estimator_checkpoint_for(checkpoint)
+    env_cfg.training = False
+    env_cfg.state_checkpoint_path = state_checkpoint_for(checkpoint)
     env_cfg.episode_length_s = 1.0e4
     env_cfg.episode_length_mean_s = 0.0  # a run trained on drawn episode lengths: one long episode here
     env_cfg.events.push_robot = None
     arm_cfg, vel_cfg = env_cfg.commands.arm_targets, env_cfg.commands.base_velocity
-    arm_cfg.arm_goal_prob, arm_cfg.carry_prob = 0.0, 0.0
+    arm_cfg.arm_goal_prob = 0.0
     arm_cfg.resampling_time_range, arm_cfg.nav_time_range = (1.0e6, 1.0e6), (1.0e6, 1.0e6)
     arm_cfg.debug_vis = vel_cfg.debug_vis = False
     vel_cfg.resampling_time_range, vel_cfg.rel_standing_envs = (1.0e6, 1.0e6), 0.0
@@ -254,6 +301,7 @@ def main(env_cfg, agent_cfg: dict):
             rec["seen"][:, k] = vel.command.cpu().numpy()
             if k % 500 == 0:
                 print(f"[INFO] step {k}/{T}: {int((fell_at < T).sum())} fallen")
+        wrist = wrist_phase(base, runner, arm, obs, args_cli.wrist_goals) if args_cli.wrist_goals > 0 else None
 
     # -- 100 Hz series, each cut at its env's first fall
     rp = np.unwrap(rec["rp"].astype(float), axis=1)
@@ -281,7 +329,7 @@ def main(env_cfg, agent_cfg: dict):
     step = re.search(r"_(\d+)\.pt$", checkpoint)
     res.update(
         run=os.path.basename(run_dir), step=int(step.group(1)) if step else None, checkpoint=checkpoint,
-        overrides=run_overrides + hydra_args, num_envs=N, policy_dt=dt, full=list(full), gait_period=base.cfg.gait_period,
+        overrides=replayed + hydra_args, num_envs=N, policy_dt=dt, full=list(full), gait_period=base.cfg.gait_period,
         seconds_valid=seconds([np.ones(len(c), bool) for c in cmds100]), seconds_stepping=seconds(masks),
         seconds_commanded=seconds(commanded),
         commanded_not_stepping_share=seconds([c & ~m for c, m in zip(commanded, masks)]) / max(seconds(commanded), 1e-9),
@@ -294,6 +342,7 @@ def main(env_cfg, agent_cfg: dict):
         estop_share=float(np.mean([s["estop"].mean() for s in series])) if series else float("nan"),
         gait=sm.stride_stats([s["q"][:, [3, 9]] for s in series], masks),
         tilt=sm.tilt_stats([s["rp"] for s in series], masks),
+        wrist=wrist,
     )
     res["targets_met"] = sum(sm.verdict(res["tracking_vs_lagged"].get(k, np.nan), t, d) for k, _, _, t, d in sm.TARGETS)
     out_dir = args_cli.out or os.path.dirname(checkpoint)

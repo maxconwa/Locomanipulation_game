@@ -1,3 +1,3 @@
-"""MuJoCo transfer of the LocoManip-Marl-Direct-v0 policies: the env's policy loop ported to MuJoCo (mujoco_sim.py),
-the reach evaluation's MuJoCo trials (eval_mujoco.py), the Isaac-MuJoCo parity check (parity_check.py) and the Isaac
-side of GOLEM's MuJoCo walking test (eval_sim2sim_walk.py). Run the scripts from anywhere; import as mujoco_evals.*."""
+"""The LocoManip-Marl-Direct-v0 policy loop ported to MuJoCo for an exported policy (mujoco_sim.py), and the run
+settings the MuJoCo tools and the export share (common.py). The tools on top: agent_scripts/hw_stress_mujoco.py and
+agent_scripts/hw_bag_replay.py."""

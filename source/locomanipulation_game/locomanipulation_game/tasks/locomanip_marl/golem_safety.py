@@ -5,9 +5,11 @@ target into the URDF range shrunk by 0.001 rad, and e-stops the robot when the m
 polled at 500 Hz: a joint within its position offset of a URDF limit, |dq| above the URDF velocity limit times its
 ratio, or |tau_est| above the URDF torque limit times its ratio. The action terms clip every joint target into
 position_envelope, GOLEM's edges (its target clip, or its position e-stop where tighter) tightened by GolemEstopCfg's
-position margins, so a target never asks for a position GOLEM would clip or e-stop at. GolemEstopMonitor checks the measured state against GOLEM's own position
-thresholds and its velocity and torque thresholds times GolemEstopCfg's margins, for the golem_estop term (logged; it
-ends the episode only with cfg.golem_estop_ends_episode). Torque is the motor's PD demand at the current state. The table is copied from GOLEM (core/joint_limits.py and config/relax_safety_split.yaml at commit 462c479),
+position margins, so a target never asks for a position GOLEM would clip or e-stop at. GolemEstopMonitor checks the
+measured state against GOLEM's own position thresholds and its velocity and torque thresholds times GolemEstopCfg's
+margins, for the golem_estop term (trips are logged and charged, never end an episode). Torque is the motor's PD demand
+at the current state. The table is copied from GOLEM (core/joint_limits.py and config/relax_safety_split.yaml at
+commit 462c479),
 with the ankle pitches' torque e-stop since raised from 60 to 95 Nm (ratio 1.58334) in both: Unitree's sport
 mode peaks at 93 Nm on the right ankle pitch and would trip 60 Nm in every one of its walking bags.
 """
@@ -62,9 +64,8 @@ CAUSES = ("velocity", "position", "torque")
 
 @configclass
 class GolemEstopCfg:
-    """GOLEM's e-stops tightened for sim-to-real error (encoder noise, GOLEM's 500 Hz polling against the 200 Hz
-    physics, the torque estimate): the position margins place the target clip, the velocity and torque margins the
-    monitor's thresholds."""
+    """GOLEM's e-stops tightened for sim-to-real error (encoder noise, GOLEM's polling, the torque estimate): the
+    position margins place the target clip, the velocity and torque margins the monitor's thresholds."""
 
     velocity_margin: float = 0.9
     """Trip at this fraction of GOLEM's velocity e-stop."""
@@ -132,8 +133,7 @@ class GolemEstopMonitor:
             self.flags[cause] |= hit
 
     def _motor_torque(self) -> torch.Tensor:
-        """The motor's PD demand at the current state, with the motor's own damping (not the randomized passive part,
-        which the motor doesn't produce)."""
+        """The motor's PD demand at the current state, with the nominal gains (as GOLEM reads the motor's estimate)."""
         data, ids = self.robot.data, self.joint_ids
         error = data.joint_pos_target[:, ids] - data.joint_pos[:, ids]
         return data.default_joint_stiffness[:, ids] * error - data.default_joint_damping[:, ids] * data.joint_vel[:, ids]

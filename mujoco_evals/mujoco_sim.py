@@ -1,32 +1,23 @@
-"""The two-agent policy loop of LocoManip-Marl-Direct-v0 ported to MuJoCo, for sim-to-sim evaluation without ROS.
+"""The two-agent policy loop of LocoManip-Marl-Direct-v0 ported to MuJoCo, for sim-to-sim checks without ROS.
 
-Mirrors, step for step, what the Isaac env computes (locomanip_marl_env.py, mdp/actions.py, mdp/observations.py,
-odometry.py at marl-direct 72171c7):
+Mirrors, step for step, what the Isaac env computes (locomanip_marl_env.py, mdp/actions.py, the observation terms),
+for an exported policy and its deploy settings (`settings`: the export's <name>.yaml with export.yaml over it):
 
-    policy step (50 Hz)   actions -> joint targets; 10 MuJoCo steps of 2 ms with PD torques recomputed each step;
-                          then the odometry history and the learned pelvis estimator move the arm command (its
-                          vertical motion from the feet and its tilt from gravity, as estimator.vertical_from_feet
-                          and tilt_from_gravity do); then the
-                          actors' observations (with the training noise) for the next step
-    legs action           target = default + 0.25 a, inside [hard lower + 1 mm, hard upper - 1 mm] (and the run's
-                          target_limits, GOLEM's position e-stop range, where it has them) and then inside the
-                          targets whose PD torque at the measured state stays within 85% of the effort limit
-    arms action           one damped-least-squares IK step per arm toward the believed command (6-D pose error
-                          [p_t - p, axis-angle(q_t q^-1)] in the pelvis frame; the wrist Jacobian in the pelvis frame
-                          at the link's centre of mass, as PhysX computes it; lambda 0.05; capped at 0.1 rad),
-                          plus the residual low-passed at 3 Hz
-                          times 0.2, with the same two bounds
-    PD                    tau = kp (target - q) - kd qd, clipped to the effort limit: the Isaac actuator gains
-    observations          legs 95 / arms 123 values, term by term in the cfg's order (see LEGS_TERMS / ARMS_TERMS);
-                          with gyro_lowpass_hz the gyro through GyroLowpass, sampled at every MuJoCo step (the
-                          Isaac env's imu_filter.GyroLowpass at every physics substep, lmg_deploy's on /livox/imu)
-
-Those are the defaults. A run's deploy settings (settings=: its policy yaml with export.yaml over it, or
-common.read_deploy_settings) replace them where they name them: control_dt (the policy step; 0.01 for the sport-mode
-runs), kp and kd, default_joint_pos, leg_action_scales / arm_residual_scales (per joint) or legs.action_scale /
-arms.residual_scale, max_ik_step (or arms.max_ik_step), arms.residual_cutoff_hz, and command_filter_tau, a first-order
-low-pass on vel_cmd that the observations see (ModalVelocityCommand's), stepped once per policy step and zero during an
-arm goal.
+    policy step       control_dt; actions -> joint targets; MuJoCo steps of 2 ms with PD torques recomputed each
+                      step; then the actors' observations (with the training noise) for the next step
+    legs action       target = default_joint_pos + leg_action_scales a, inside [hard lower + 1 mm, hard upper - 1 mm]
+                      and the run's target_limits, then inside the targets whose PD torque at the measured state stays
+                      within 85% of the effort limit
+    arms action       one damped-least-squares IK step per arm toward the believed command (6-D pose error
+                      [p_t - p, axis-angle(q_t q^-1)] in the pelvis frame; the wrist Jacobian in the pelvis frame at the
+                      link's centre of mass, as PhysX computes it; lambda 0.05; capped at max_ik_step), plus the
+                      residual low-passed at arms.residual_cutoff_hz times arm_residual_scales, with the same bounds
+    PD                tau = kp (target - q) - kd qd, clipped to the effort limit (kp, kd from the export)
+    command           vel_cmd through the run's command_filter_tau low-pass (zero during an arm goal); the gait clock
+                      stands under zero_cmd_eps
+    observations      legs 97 / arms 125 values, term by term in the cfg's order: the run's IMU (the MID-360 chip or
+                      the torso) with its gyro low-pass sampled at every MuJoCo step, the gait phase's sin and cos
+    arm command       moved by the pelvis's true motion during an arm goal (FAST-LIO's on the robot)
 
 Joint limits for the target bounds are the URDF's (as Isaac imported them, and as GOLEM's safety layer clips); the
 MJCF's own ranges act as the physical stops.
@@ -50,30 +41,15 @@ LEG_NAMES = ["left_hip_yaw_joint", "left_hip_pitch_joint", "left_hip_roll_joint"
 ARM_NAMES = [f"{s}_{j}_joint" for s in ("left", "right") for j in
              ("shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow", "wrist_roll", "wrist_pitch", "wrist_yaw")]
 ALL_NAMES = LEG_NAMES + ["torso_joint"] + ARM_NAMES                    # the observations' joint order
-DEFAULT = {n: 0.0 for n in ALL_NAMES} | {f"{s}_hip_pitch_joint": -0.3 for s in ("left", "right")} | \
-    {f"{s}_knee_joint": 0.5 for s in ("left", "right")} | {f"{s}_ankle_pitch_joint": -0.2 for s in ("left", "right")}
+# effort limits (Nm), assets/h1_2.py's, by the joint name's part
+EFFORT = {"hip": 200.0, "knee": 300.0, "ankle_pitch": 60.0, "ankle_roll": 40.0, "torso": 200.0, "shoulder_pitch": 40.0,
+          "shoulder_roll": 40.0, "shoulder_yaw": 18.0, "elbow": 18.0, "wrist": 19.0}
 
 
-def _gains(name: str) -> tuple[float, float, float]:
-    """(kp, kd, effort limit) of the Isaac actuator for a joint (assets/h1_2.py _ACTUATORS)."""
-    if "_hip_" in name:
-        return 200.0, 2.5, 200.0
-    if "_knee_" in name:
-        return 300.0, 4.0, 300.0
-    if "ankle_pitch" in name:
-        return 40.0, 2.0, 60.0
-    if "ankle_roll" in name:
-        return 40.0, 2.0, 40.0
-    if name == "torso_joint":
-        return 300.0, 3.0, 200.0
-    if "shoulder_pitch" in name or "shoulder_roll" in name:
-        return 120.0, 2.0, 40.0
-    if "shoulder_yaw" in name:
-        return 120.0, 2.0, 18.0
-    if "elbow" in name:
-        return 80.0, 1.0, 18.0
-    if "wrist" in name:
-        return 40.0, 1.0, 19.0
+def _effort(name: str) -> float:
+    for key, value in EFFORT.items():
+        if f"_{key}_" in name or name.startswith(f"{key}_"):
+            return value
     raise KeyError(name)
 
 
@@ -121,21 +97,10 @@ def axis_angle(q):
     return q[1:] / s * angle
 
 
-def quat_from_rotvec(r):
-    a = np.linalg.norm(r)
-    if a < 1e-12:
-        return np.array([1.0, 0.5 * r[0], 0.5 * r[1], 0.5 * r[2]]) / np.linalg.norm([1.0, *(0.5 * r)])
-    return np.r_[math.cos(a / 2), math.sin(a / 2) * r / a]
-
-
 def relative(pos_a, quat_a, pose):
     """T_a^-1 o pose for pose (7,) = (x y z qw qx qy qz); qw >= 0."""
     qi = qconj(quat_a)
     return np.r_[qrot(qi, pose[:3] - pos_a), qunique(qmul(qi, pose[3:]))]
-
-
-def apply(pos_a, quat_a, pose):
-    return np.r_[qrot(quat_a, pose[:3]) + pos_a, qmul(quat_a, pose[3:])]
 
 
 def xyzw(pose):
@@ -145,8 +110,8 @@ def xyzw(pose):
 # ---------------------------------------------------------------- the sim
 
 class GyroLowpass:
-    """lmg_deploy.livox_imu.GyroLowpass (GOLEM 556a9e7): per axis, a 2nd-order Butterworth at cutoff_hz, exact ZOH
-    discretization over each sample's dt, started (and restarted by reset) at x = (u, 0)."""
+    """lmg_deploy.livox_imu.GyroLowpass: per axis, a 2nd-order Butterworth at cutoff_hz, exact ZOH discretization over
+    each sample's dt, started (and restarted by reset) at x = (u, 0)."""
 
     ZETA = 1.0 / math.sqrt(2.0)
 
@@ -174,51 +139,44 @@ class GyroLowpass:
 
 
 class MarlMujoco:
-    """One H1-2 in MuJoCo driven by a checkpoint's actors (legs and arms, or one whole-body actor) and its pelvis
-    estimator."""
+    """One H1-2 in MuJoCo driven by an export's actors (callables obs[None] -> action[None]) and its settings."""
 
-    POLICY_DT = C.POLICY_DT   # the default; each sim's own is policy_dt
-    NOISE_POLICY = {"lin_acc": 0.5, "ang_vel": 0.2, "grav": 0.05, "jpos": 0.01, "jvel": 1.5, "wrist": 0.005}
-    NOISE_ODOM = {"lin_acc": 0.05, "ang_vel": 0.02, "grav": 0.005, "jpos": 0.001, "jvel": 0.05, "tau": 2.0}
+    NOISE = {"lin_acc": 0.5, "ang_vel": 0.2, "grav": 0.05, "jpos": 0.01, "jvel": 1.5, "wrist": 0.005}
 
-    def __init__(self, actors: dict, estimator: torch.nn.Module | None, physics: str = "robocasa",
-                 assets: Path = C.DEFAULT_ASSETS, rest_pose_b: np.ndarray | None = None,
-                 model: mujoco.MjModel | None = None, target_limits: dict[str, tuple[float, float]] | None = None,
-                 vertical_from_feet: bool = True, tilt_from_gravity: bool = True, gyro_lowpass_hz: float = 0.0,
-                 settings: dict | None = None):
-        # model: the CL_Assets MJCF compiled with extra bodies that leave the robot untouched (human_control.py's
-        # target markers); default the MJCF as it is
+    def __init__(self, actors: dict, settings: dict, physics: str = "robocasa", assets: Path = C.DEFAULT_ASSETS,
+                 model: mujoco.MjModel | None = None):
+        # model: the CL_Assets MJCF compiled with changes that leave the robot's joints untouched; default as it is
         self.m = model if model is not None else mujoco.MjModel.from_xml_path(str(mjcf_path(assets)))
         self.d = mujoco.MjData(self.m)
         m = self.m
-        settings = settings or {}
-        legs, arms = settings.get("legs") or {}, settings.get("arms") or {}
-        self.policy_dt = float(settings.get("control_dt", C.POLICY_DT))
+        arms_cfg = settings["arms"]
+        self.policy_dt = float(settings["control_dt"])
         self.substeps = int(round(self.policy_dt / m.opt.timestep))
-        self.residual_alpha = 1.0 - math.exp(-2.0 * math.pi * float(arms.get("residual_cutoff_hz", 3.0)) * self.policy_dt)
-        self.leg_scale = np.asarray(settings.get("leg_action_scales", legs.get("action_scale", 0.25)), float) * np.ones(12)
-        self.arm_scale = np.asarray(settings.get("arm_residual_scales", arms.get("residual_scale", 0.2)), float) * np.ones(14)
-        self.max_ik_step = float(settings.get("max_ik_step", arms.get("max_ik_step", 0.1)))
+        self.residual_alpha = 1.0 - math.exp(-2.0 * math.pi * float(arms_cfg["residual_cutoff_hz"]) * self.policy_dt)
+        self.leg_scale = np.asarray(settings.get("leg_action_scales", settings["legs"]["action_scale"]), float) * np.ones(12)
+        self.arm_scale = np.asarray(settings.get("arm_residual_scales", arms_cfg["residual_scale"]), float) * np.ones(14)
+        self.max_ik_step = float(settings.get("max_ik_step", arms_cfg["max_ik_step"]))
         tau = float(settings.get("command_filter_tau") or 0.0)
         self.cmd_alpha = 1.0 - math.exp(-self.policy_dt / tau) if tau > 0 else None
+        self.gait_period, self.zero_cmd_eps = float(settings["gait_period"]), float(settings["zero_cmd_eps"])
+        self.gait_cos = bool(settings.get("gait_phase_cos", False))
         jid = {n: mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, n) for n in ALL_NAMES}
         self.qadr = np.array([m.jnt_qposadr[jid[n]] for n in ALL_NAMES])
         self.vadr = np.array([m.jnt_dofadr[jid[n]] for n in ALL_NAMES])
         self.leg_idx = np.arange(12)
         self.arm_idx = np.arange(13, 27)
-        self.default = np.array(settings.get("default_joint_pos", [DEFAULT[n] for n in ALL_NAMES]), float)
-        g = np.array([_gains(n) for n in ALL_NAMES])
-        self.kp, self.kd, self.effort = g[:, 0], g[:, 1], g[:, 2]
-        if "kp" in settings:
-            self.kp, self.kd = np.array(settings["kp"], float), np.array(settings["kd"], float)
+        self.default = np.array(settings["default_joint_pos"], float)
+        self.kp, self.kd = np.array(settings["kp"], float), np.array(settings["kd"], float)
+        self.effort = np.array([_effort(n) for n in ALL_NAMES])
         lim = urdf_limits(assets / "ros_assets" / "h1_2_magpie.urdf")
         self.lower = np.array([lim[n][0] for n in ALL_NAMES]) + 0.001
         self.upper = np.array([lim[n][1] for n in ALL_NAMES]) - 0.001
-        # target_limits: the run's own target clip, GOLEM's position e-stop range (common.read_target_limits)
+        # the run's own target clip, GOLEM's position e-stop range (export.yaml target_limits)
+        target_limits = settings.get("target_limits") or {}
         for i, n in enumerate(ALL_NAMES):
-            if target_limits and n in target_limits:
-                self.lower[i] = max(self.lower[i], target_limits[n][0])
-                self.upper[i] = min(self.upper[i], target_limits[n][1])
+            if n in target_limits:
+                low, high = target_limits[n]
+                self.lower[i], self.upper[i] = max(self.lower[i], low), min(self.upper[i], high)
         self.act_id = np.array([mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_ACTUATOR, n) for n in ALL_NAMES])
         if (self.act_id < 0).any():
             raise RuntimeError("MJCF lacks a motor for some joint")
@@ -232,33 +190,32 @@ class MarlMujoco:
         self.pelvis = body("pelvis")
         self.wrists = [body("left_wrist_yaw_link"), body("right_wrist_yaw_link")]
         self.feet = [body("left_ankle_roll_link"), body("right_ankle_roll_link")]
-        self.imu_site = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "imu")
+        # the run's IMU: the head's MID-360 chip, or the torso's
+        imu = settings.get("imu") or {}
+        head = imu.get("frame", "imu_link") != "imu_link"
         sens = lambda n: m.sensor_adr[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SENSOR, n)]  # noqa: E731
-        self.s_acc, self.s_gyro = sens("imu_acc"), sens("imu_gyro")
+        self.imu_site = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "livox_imu_site" if head else "imu")
+        self.s_acc, self.s_gyro = (sens("livox_imu_acc"), sens("livox_imu_gyro")) if head else (sens("imu_acc"), sens("imu_gyro"))
         self.foot_geoms = [set(np.nonzero(m.geom_bodyid == f)[0].tolist()) for f in self.feet]
         self.arm_cols = [self.vadr[13:20], self.vadr[20:27]]
-        self.actors, self.estimator = actors, estimator
-        # the estimator's input window, from its input size (Estimator.history_frames)
-        self.history_frames = estimator.history_frames if estimator is not None else 4
-        self.vertical_from_feet, self.tilt_from_gravity = vertical_from_feet, tilt_from_gravity
-        self.rest_b = np.asarray(rest_pose_b, float) if rest_pose_b is not None else None
+        self.actors = actors
+        self.rest_b = np.array(settings["rest_pose"], float)
         self.rng = np.random.default_rng(0)
-        self.total_mass = float(m.body_subtreemass[self.pelvis])
-        self.gyro_lowpass = GyroLowpass(gyro_lowpass_hz) if gyro_lowpass_hz else None
+        self.gyro_lowpass = GyroLowpass(imu["gyro_lowpass_hz"]) if imu.get("gyro_lowpass_hz") else None
         self._gyro = None
 
     # -- state
     def reset(self, rng: np.random.Generator):
+        """On the ground near the default pose, nearly still, from a fresh episode (gait clock, filters, residual)."""
         m, d = self.m, self.d
         self.rng = rng
         mujoco.mj_resetData(m, d)
-        q = self.default + rng.uniform(-0.05, 0.05, len(ALL_NAMES))
-        d.qpos[self.qadr] = q
+        d.qpos[self.qadr] = self.default + rng.uniform(-0.05, 0.05, len(ALL_NAMES))
         d.qvel[self.vadr] = rng.uniform(-0.1, 0.1, len(ALL_NAMES))
         roll, pitch = rng.uniform(-0.05, 0.05, 2)
         cr, sr, cp, sp = math.cos(roll / 2), math.sin(roll / 2), math.cos(pitch / 2), math.sin(pitch / 2)
         d.qpos[3:7] = qmul(np.array([cr, sr, 0, 0]), np.array([cp, 0, sp, 0]))
-        d.qpos[0:3] = (0.0, 0.0, C.STANDING_PELVIS_HEIGHT)
+        d.qpos[0:3] = (0.0, 0.0, 1.0)
         mujoco.mj_forward(m, d)
         sole = min(d.xpos[f][2] for f in self.feet) + C.SOLE_Z
         d.qpos[2] += -sole + rng.uniform(0.0, 0.02)
@@ -266,22 +223,17 @@ class MarlMujoco:
         mujoco.mj_forward(m, d)
         self.applied = d.qpos[self.qadr].copy()
         self.residual = np.zeros(14)
-        self.raw_actions = np.zeros(26)
         self.arm_mode = False
         self.believed = self.rest_b.copy()
-        self.anchor = None
-        self.use_estimate = True
         self.vel_cmd = np.zeros(3)
         self.cmd_filtered = np.zeros(3)
+        self.steps = 0
         self._prev_root = (d.qpos[0:3].copy(), d.qpos[3:7].copy())
-        self._prev_heights = self._feet_heights()
-        self._hist = None
         if self.gyro_lowpass is not None:
             self.gyro_lowpass.reset()
             self._gyro = self.gyro_lowpass(self._raw_gyro(), m.opt.timestep)
-        self._update_odometry(first=True)
 
-    # -- kinematics in the pelvis frame
+    # -- kinematics in the pelvis frame, sensors
     def root(self):
         return self.d.qpos[0:3].copy(), self.d.qpos[3:7].copy()
 
@@ -300,19 +252,27 @@ class MarlMujoco:
         grav = R.T @ np.array([0.0, 0.0, -1.0])
         return acc, gyro, grav
 
+    def measured_q(self) -> np.ndarray:
+        """The joint angles the policy and the torque bound see (a subclass adds encoder offsets)."""
+        return self.d.qpos[self.qadr].copy()
+
+    def measured_dq(self) -> np.ndarray:
+        """The joint velocities the policy sees (a subclass adds LowState's lag)."""
+        return self.d.qvel[self.vadr].copy()
+
     def pd_torque(self, target):
         q, qd = self.d.qpos[self.qadr], self.d.qvel[self.vadr]
         return np.clip(self.kp * (target - q) - self.kd * qd, -self.effort, self.effort)
 
     def _torque_bounds(self, idx):
-        q, qd = self.d.qpos[self.qadr][idx], self.d.qvel[self.vadr][idx]
+        """The deploy's bound: the nominal gains on the measured state."""
+        q, qd = self.measured_q()[idx], self.d.qvel[self.vadr][idx]
         h = 0.85 * self.effort[idx]
         return q + (self.kd[idx] * qd - h) / self.kp[idx], q + (self.kd[idx] * qd + h) / self.kp[idx]
 
     # -- actions
     def process_actions(self, a_legs: np.ndarray, a_arms: np.ndarray):
-        self.raw_actions = np.r_[np.clip(a_legs, -10, 10), np.clip(a_arms, -10, 10)]
-        a_legs, a_arms = self.raw_actions[:12], self.raw_actions[12:]
+        a_legs, a_arms = np.clip(a_legs, -10, 10), np.clip(a_arms, -10, 10)
         idx = self.leg_idx
         t = np.clip(self.default[idx] + self.leg_scale * a_legs, self.lower[idx], self.upper[idx])
         lo, hi = self._torque_bounds(idx)
@@ -324,13 +284,12 @@ class MarlMujoco:
         Rr = np.zeros(9)
         mujoco.mju_quat2Mat(Rr, qr)
         Rr = Rr.reshape(3, 3)
-        q_all = d.qpos[self.qadr]
-        ik = q_all[self.arm_idx].copy()
+        ik = d.qpos[self.qadr][self.arm_idx].copy()
         cur = self.wrist_poses_b()
         jacp, jacr = np.zeros((3, m.nv)), np.zeros((3, m.nv))
         for arm in range(2):
             # PhysX's articulation Jacobian is taken at the link's centre of mass (the task's pose error is at the
-            # link origin); mj_jacBodyCom reproduces Isaac's IK step to 2e-5 rad (parity_check.py)
+            # link origin); mj_jacBodyCom reproduces Isaac's IK step
             mujoco.mj_jacBodyCom(m, d, jacp, jacr, self.wrists[arm])
             J = np.vstack([Rr.T @ jacp[:, self.arm_cols[arm]], Rr.T @ jacr[:, self.arm_cols[arm]]])
             tgt = self.believed[arm]
@@ -346,70 +305,24 @@ class MarlMujoco:
 
     def physics_step(self):
         for _ in range(self.substeps):
-            tau = self.pd_torque(self.applied)
-            self.d.ctrl[self.act_id] = tau
+            self.d.ctrl[self.act_id] = self.pd_torque(self.applied)
             mujoco.mj_step(self.m, self.d)
             if self.gyro_lowpass is not None:
                 self._gyro = self.gyro_lowpass(self._raw_gyro(), self.m.opt.timestep)
         self.last_tau = self.pd_torque(self.applied)
 
-    # -- odometry: the learned pelvis estimator moves the believed command
-    def _odom_frame(self):
-        acc, gyro, grav = self.imu()
-        q, qd = self.d.qpos[self.qadr], self.d.qvel[self.vadr]
-        tau = self.pd_torque(self.applied)[self.leg_idx]
-        n, r = self.NOISE_ODOM, self.rng
-        u = lambda x, s: x + r.uniform(-s, s, np.shape(x))  # noqa: E731
-        return [u(acc, n["lin_acc"]), u(gyro, n["ang_vel"]), u(grav, n["grav"]), u(q - self.default, n["jpos"]),
-                u(qd, n["jvel"]), u(tau, n["tau"])]
-
-    def _feet_heights(self) -> np.ndarray:
-        """The pelvis's height above each ankle-roll origin along gravity, from the pelvis frame: -up . p (env
-        _from_feet_and_gravity)."""
-        # the pelvis's pose from the same forward kinematics as the feet (xpos lags qpos by one substep)
-        p, q = self.d.xpos[self.pelvis], self.d.xquat[self.pelvis]
-        up = qrot(qconj(q), np.array([0.0, 0.0, 1.0]))
-        return np.array([-(qrot(qconj(q), self.d.xpos[f] - p) @ up) for f in self.feet])
-
-    def _update_odometry(self, first=False):
-        frame = self._odom_frame()
-        heights = self._feet_heights()
-        if first or self._hist is None:
-            self._hist = [[f.copy() for _ in range(self.history_frames)] for f in frame]
-        else:
-            for h, f in zip(self._hist, frame):
-                h.pop(0)
-                h.append(f)
+    def _update_odometry(self):
+        """During an arm goal, move the believed command by the pelvis's true motion since the last step."""
         p, q = self.root()
-        if not first and self.arm_mode:
+        if self.arm_mode:
             pp, pq = self._prev_root
-            true_dp = qrot(qconj(pq), p - pp)
-            true_dq = qmul(qconj(pq), q)
-            if self.use_estimate and self.estimator is not None:
-                x = np.concatenate([np.concatenate(h) for h in self._hist] + [self.raw_actions])
-                with torch.no_grad():
-                    v = self.estimator(torch.as_tensor(x, dtype=torch.float32)[None])[0].numpy().astype(float)
-                dp, dq = v[:3] * self.policy_dt, quat_from_rotvec(v[3:] * self.policy_dt)
-                up_prev = qrot(qconj(pq), np.array([0.0, 0.0, 1.0]))
-                if self.tilt_from_gravity:
-                    # the smallest turn that carries the vertical in the new frame onto the previous one's
-                    # (odometry.align_tilt): roll and pitch from gravity, yaw from the estimate
-                    carried = qrot(dq, qrot(qconj(q), np.array([0.0, 0.0, 1.0])))
-                    axis = np.cross(carried, up_prev)
-                    dq = qmul(quat_from_rotvec(axis / max(np.linalg.norm(axis), 1e-9)
-                                               * math.atan2(np.linalg.norm(axis), carried @ up_prev)), dq)
-                if self.vertical_from_feet:
-                    # the lowest ankle is on the ground: the pelvis rose by the change in its height above it
-                    dp = dp + (heights.max() - self._prev_heights.max() - dp @ up_prev) * up_prev
-            else:
-                dp, dq = true_dp, true_dq
+            dp, dq = qrot(qconj(pq), p - pp), qmul(qconj(pq), q)
             self.believed = np.stack([relative(dp, dq, b) for b in self.believed])
         self._prev_root = (p, q)
-        self._prev_heights = heights
 
-    # -- the command the observations see
+    # -- the command and the gait clock
     def observed_cmd(self) -> np.ndarray:
-        return self.cmd_filtered.copy() if self.cmd_alpha is not None else self.vel_cmd
+        return self.cmd_filtered.copy() if self.cmd_alpha is not None else np.asarray(self.vel_cmd, float)
 
     def _filter_command(self):
         if self.cmd_alpha is None:
@@ -419,73 +332,44 @@ class MarlMujoco:
         else:
             self.cmd_filtered += self.cmd_alpha * (np.asarray(self.vel_cmd, float) - self.cmd_filtered)
 
+    def gait(self) -> list[np.ndarray]:
+        """Each leg's phase sin (and cos), both legs at phase 0 under a command below zero_cmd_eps."""
+        if np.linalg.norm(self.observed_cmd()) < self.zero_cmd_eps:
+            phase = np.zeros(2)
+        else:
+            p = (self.steps * self.policy_dt % self.gait_period) / self.gait_period
+            phase = np.array([p, (p + 0.5) % 1.0])
+        out = [np.sin(2 * math.pi * phase)]
+        return out + [np.cos(2 * math.pi * phase)] if self.gait_cos else out
+
     # -- observations
     def observations(self) -> dict[str, np.ndarray]:
         acc, gyro, grav = self.imu()
-        q, qd = self.d.qpos[self.qadr], self.d.qvel[self.vadr]
-        n, r = self.NOISE_POLICY, self.rng
+        n, r = self.NOISE, self.rng
         u = lambda x, s: x + r.uniform(-s, s, np.shape(x))  # noqa: E731
         believed = np.concatenate([xyzw(b) for b in self.believed])
         common = [u(acc, n["lin_acc"]), u(gyro, n["ang_vel"]), u(grav, n["grav"]), self.observed_cmd(),
-                  np.array([1.0 if self.arm_mode else 0.0]), believed, u(q - self.default, n["jpos"]),
-                  u(qd, n["jvel"]), np.zeros(2)]               # gait phase: sin(0) under a zero velocity command
+                  np.array([1.0 if self.arm_mode else 0.0]), believed, u(self.measured_q() - self.default, n["jpos"]),
+                  u(self.measured_dq(), n["jvel"])] + self.gait()
         legs_applied = (self.applied[self.leg_idx] - self.default[self.leg_idx]) / self.leg_scale
         cur = self.wrist_poses_b()
         wrist_pose = np.concatenate([xyzw(np.r_[c[:3], qunique(c[3:])]) for c in cur])
         errs = np.concatenate([np.r_[b[:3] - c[:3], axis_angle(qmul(b[3:], qconj(c[3:])))]
                                for b, c in zip(self.believed, cur)])
-        if "whole" in self.actors:
-            # LocoManip-WholeBody-Direct-v0: the shared terms once, the legs' and the arms' applied actions, then the
-            # arms' wrist terms (135)
-            return {"whole": np.concatenate(common + [legs_applied, self.residual, u(wrist_pose, n["wrist"]),
-                                                      u(errs, n["wrist"])])}
-        legs = np.concatenate(common + [legs_applied])
-        arms = np.concatenate(common + [self.residual, u(wrist_pose, n["wrist"]), u(errs, n["wrist"])])
-        return {"legs": legs, "arms": arms}
+        return {"legs": np.concatenate(common + [legs_applied]),
+                "arms": np.concatenate(common + [self.residual, u(wrist_pose, n["wrist"]), u(errs, n["wrist"])])}
 
-    def step(self, obs: dict, legs_blind: bool = False, arms_ik: bool = False):
-        if "whole" in obs:
-            if legs_blind:
-                raise ValueError("legs_blind needs separate leg and arm actors")
-            with torch.no_grad():
-                a = self.actors["whole"](torch.as_tensor(obs["whole"], dtype=torch.float32)[None])[0].numpy()
-            a_l, a_a = a[:12].astype(float), a[12:].astype(float)
-        else:
-            lo = obs["legs"].copy()
-            if legs_blind:
-                lo[12] = 0.0
-                lo[13:27] = np.concatenate([xyzw(b) for b in self.rest_b])
-            with torch.no_grad():
-                a_l = self.actors["legs"](torch.as_tensor(lo, dtype=torch.float32)[None])[0].numpy().astype(float)
-                a_a = self.actors["arms"](torch.as_tensor(obs["arms"], dtype=torch.float32)[None])[0].numpy().astype(float)
-        if arms_ik:
-            a_a[:] = 0.0
+    def step(self, obs: dict):
+        """One policy step from obs: act, simulate, then the next observations."""
+        with torch.no_grad():
+            a_l = self.actors["legs"](torch.as_tensor(obs["legs"], dtype=torch.float32)[None])[0].numpy().astype(float)
+            a_a = self.actors["arms"](torch.as_tensor(obs["arms"], dtype=torch.float32)[None])[0].numpy().astype(float)
         self.process_actions(a_l, a_a)
         self.physics_step()
+        self.steps += 1                    # the env's episode_length_buf counts the step before its observations
         self._update_odometry()
         self._filter_command()
         return self.observations()
-
-    # -- goals
-    def set_goal(self, poses_s: np.ndarray, use_estimate: bool = True):
-        """Arm goal from standing-frame poses (2, 7): placed at the pelvis's x, y, yaw and standing height now."""
-        p, q = self.root()
-        w, x, y, z = q
-        yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
-        q_yaw = np.array([math.cos(yaw / 2), 0, 0, math.sin(yaw / 2)])
-        origin = np.array([p[0], p[1], C.STANDING_PELVIS_HEIGHT])           # flat ground at z = 0
-        self.anchor = np.stack([apply(origin, q_yaw, ps) for ps in poses_s])
-        self.believed = np.stack([relative(p, q, a) for a in self.anchor])
-        self.arm_mode = True
-        self.use_estimate = use_estimate
-
-    def true_errors(self):
-        out_p, out_r = [], []
-        for arm, w in enumerate(self.wrists):
-            out_p.append(np.linalg.norm(self.d.xpos[w] - self.anchor[arm, :3]))
-            dq = qmul(self.anchor[arm, 3:], qconj(self.d.xquat[w]))
-            out_r.append(np.linalg.norm(axis_angle(dq)))
-        return np.array(out_p), np.array(out_r)
 
     def foot_forces(self) -> np.ndarray:
         m, d = self.m, self.d
@@ -499,57 +383,7 @@ class MarlMujoco:
                     f[k] += abs(c6[0])
         return f
 
-    def log_step(self) -> dict:
-        m, d = self.m, self.d
-        pe, re_ = self.true_errors()
-        p, q = self.root()
-        mujoco.mj_subtreeVel(m, d)
-        vel6 = np.zeros(6)
-        feet_vel = []
-        for f in self.feet:
-            mujoco.mj_objectVelocity(m, d, mujoco.mjtObj.mjOBJ_BODY, f, vel6, 0)
-            feet_vel.append(vel6[3:].copy())
-        ang_b = d.qvel[3:6].copy()                       # free joint angular velocity is in the body frame
-        tau = np.abs(self.pd_torque(self.applied)) / self.effort
-        groups = [np.r_[0:3, 6:9], np.r_[3, 9], np.r_[4:6, 10:12], self.arm_idx]
-        believed_w = np.stack([apply(p, q, b) for b in self.believed])
-        return {
-            "pos_err": pe, "rot_err": re_, "root_pos": p, "root_quat": q, "root_ang_vel_b": ang_b, "ground": 0.0,
-            "com": d.subtree_com[self.pelvis].copy(), "com_vel": d.subtree_linvel[self.pelvis].copy(),
-            "feet_pos": np.stack([d.xpos[f] for f in self.feet]), "feet_quat": np.stack([d.xquat[f] for f in self.feet]),
-            "feet_vel": np.stack(feet_vel), "feet_force": self.foot_forces(),
-            "wrist_pos": np.stack([d.xpos[w] for w in self.wrists]),
-            "torque_ratio": np.array([tau[g].max() for g in groups]),
-            "cmd_drift": float(np.mean(np.linalg.norm(believed_w[:, :3] - self.anchor[:, :3], axis=1))),
-        }
-
     def fell(self) -> bool:
         p, q = self.root()
         zb = qrot(q, np.array([0.0, 0.0, 1.0]))
         return math.acos(max(-1.0, min(1.0, zb[2]))) > 1.0
-
-
-def load_estimator(path: str | None) -> torch.nn.Module | None:
-    """The pelvis estimator saved beside a checkpoint: input norm + MLP (odometry.PelvisMotionEstimator)."""
-    if not path:
-        return None
-    state = torch.load(path, map_location="cpu", weights_only=False)["model"]
-    from .policy import _mlp
-
-    # inputs: history_frames odometry frames of 75 values (IMU 9, joints 27 + 27, leg torques 12), then 26 actions
-    frames, rest = divmod(state["norm.mean"].numel() - 26, 75)
-    if rest:
-        raise ValueError(f"{path}: {state['norm.mean'].numel()} estimator inputs is not 26 + 75 per frame")
-
-    class Estimator(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.register_buffer("mean", state["norm.mean"].float())
-            self.register_buffer("var", state["norm.var"].float())
-            self.net = _mlp(state, "net")
-            self.history_frames = frames
-
-        def forward(self, x):
-            return self.net((x - self.mean) / torch.sqrt(self.var + 1e-8))
-
-    return Estimator().eval()
