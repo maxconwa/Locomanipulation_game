@@ -11,8 +11,9 @@ Setup: arm goals off (navigation only, the wrists at their rest pose), no pushes
 flat by default), the run's domain randomization, observation noise and action delay; deterministic actions.
 Every env stands 2 s, then runs its own shuffled sequence of --segments_per_env scripted segments, each followed by 2 s of zero command:
   step   a command held 4 s: each axis alone (vx +-0.2/0.4/0.6, vy +-0.15/0.25, wz +-0.2/0.35/0.5) and 8 combinations,
-         all inside the baseline's ranges (vx +-0.7, vy +-0.3, wz +-0.5)
-  flick  the sport-mode operator's stick: 150 ms pulses at the axis's full value (0.7, 0.3, 0.5), one every
+         at the baseline's ranges (vx +-0.7, vy +-0.3, wz +-0.5), each axis scaled to the run's own (its command
+         term's ranges: a run trained on sport mode's 0.55 / 0.54 / 0.97 gets vx 0.16-0.47, vy 0.27-0.45, wz 0.39-0.97)
+  flick  the sport-mode operator's stick: 150 ms pulses at the axis's full value (the run's range edge), one every
          U(0.3, 0.5) s, for 5 s; per axis and sign
   small  a command of norm U(0.05, 0.15) over (vx, vy, wz) in a random direction, held 4 s
 Each segment type gets the same number of slots over all envs. The command goes through the run's command term (its
@@ -78,7 +79,7 @@ import scorecard_metrics as sm  # noqa: E402
 
 SETTLE_S, HOLD_S, FLICK_S, GAP_S = 2.0, 4.0, 5.0, 2.0
 PULSE_S, PULSE_EVERY = 0.15, (0.3, 0.5)
-FULL = (0.7, 0.3, 0.5)  # the baseline's range edges: a full stick
+BASE_FULL = (0.7, 0.3, 0.5)  # the baseline's range edges, which STEPS are written for
 KINDS = ("step", "flick", "small")
 STEPS = ([(s * v, 0.0, 0.0) for v in (0.2, 0.4, 0.6) for s in (1, -1)]
          + [(0.0, s * v, 0.0) for v in (0.15, 0.25) for s in (1, -1)]
@@ -89,9 +90,12 @@ FLICKS = [(axis, sign) for axis in range(3) for sign in (1.0, -1.0)]
 N_SMALL = 12
 
 
-def program(num_envs: int, per_env: int, dt: float, rng: np.random.Generator):
-    """(commands (N, T, 3), kind index (N, T): -1 settle/padding, else KINDS' index, the segment's gap included)."""
-    types = [("step", c) for c in STEPS] + [("flick", f) for f in FLICKS] + [("small", None)] * N_SMALL
+def program(num_envs: int, per_env: int, dt: float, rng: np.random.Generator, full: tuple[float, float, float]):
+    """(commands (N, T, 3), kind index (N, T): -1 settle/padding, else KINDS' index, the segment's gap included).
+    full: the run's range edge per axis (a full stick); the steps are scaled by full / BASE_FULL."""
+    scale = np.asarray(full) / np.asarray(BASE_FULL)
+    types = ([("step", tuple(np.asarray(c) * scale)) for c in STEPS] + [("flick", f) for f in FLICKS]
+             + [("small", None)] * N_SMALL)
     slots = [types[i % len(types)] for i in range(num_envs * per_env)]
     rng.shuffle(slots)
     seqs = []
@@ -110,7 +114,7 @@ def program(num_envs: int, per_env: int, dt: float, rng: np.random.Generator):
                 seg, t = np.zeros((n, 3)), 0.0
                 while t < FLICK_S:
                     a, b = int(round(t / dt)), int(round((t + PULSE_S) / dt))
-                    seg[a:min(b, n), axis] = sign * FULL[axis]
+                    seg[a:min(b, n), axis] = sign * full[axis]
                     t += rng.uniform(*PULSE_EVERY)
             gap = int(round(GAP_S / dt))
             cmd += [seg, np.zeros((gap, 3))]
@@ -145,7 +149,8 @@ def markdown(res: dict) -> str:
     lines = [f"# Sport-mode scorecard: {res['run']} @ {res['step']}", "",
              f"{res['num_envs']} envs, {res['seconds_valid']:.0f} s of valid data, {res['seconds_stepping']:.0f} s"
              f" stepping; policy {1 / res['policy_dt']:.0f} Hz, stride window {res['stride_samples'] * sm.DT:.2f} s."
-             f" Scored against the lag-allowed command (no creep correction).", "",
+             f" Scored against the lag-allowed command (no creep correction). Commands at the run's ranges: full"
+             f" stick vx {res['full'][0]:g}, vy {res['full'][1]:g}, wz {res['full'][2]:g}.", "",
              "| Metric | This checkpoint | Sport mode | Target | Met |", "| --- | --- | --- | --- | --- |"]
     for key, label, sport, target, sense in sm.TARGETS:
         v = lag.get(key, float("nan"))
@@ -212,7 +217,9 @@ def main(env_cfg, agent_cfg: dict):
     torso = robot.find_bodies(TORSO_LINK_NAME)[0][0]
     N, dt = base.num_envs, base.step_dt
     rng = np.random.default_rng(args_cli.seed)
-    cmds, kinds = program(N, args_cli.segments_per_env, dt, rng)
+    ranges = vel_cfg.ranges
+    full = tuple(float(max(abs(r[0]), abs(r[1]))) for r in (ranges.lin_vel_x, ranges.lin_vel_y, ranges.ang_vel_z))
+    cmds, kinds = program(N, args_cli.segments_per_env, dt, rng, full)
     T = cmds.shape[1]
     cmd_t = torch.tensor(cmds, dtype=torch.float, device=base.device)
     rec = {k: np.zeros((N, T) + s, np.float32) for k, s in
@@ -274,7 +281,7 @@ def main(env_cfg, agent_cfg: dict):
     step = re.search(r"_(\d+)\.pt$", checkpoint)
     res.update(
         run=os.path.basename(run_dir), step=int(step.group(1)) if step else None, checkpoint=checkpoint,
-        overrides=run_overrides + hydra_args, num_envs=N, policy_dt=dt, gait_period=base.cfg.gait_period,
+        overrides=run_overrides + hydra_args, num_envs=N, policy_dt=dt, full=list(full), gait_period=base.cfg.gait_period,
         seconds_valid=seconds([np.ones(len(c), bool) for c in cmds100]), seconds_stepping=seconds(masks),
         seconds_commanded=seconds(commanded),
         commanded_not_stepping_share=seconds([c & ~m for c, m in zip(commanded, masks)]) / max(seconds(commanded), 1e-9),
