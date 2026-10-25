@@ -293,10 +293,12 @@ class LegsRewardsCfg:
     track_ang_vel_z = RewTerm(func=mdp.track_velocity_cycle_exp, weight=1.5,
                               params={"command_name": "base_velocity", "component": "ang_z"})
     alive = RewTerm(func=mdp.is_alive, weight=0.15)
-    # --- posture: sport mode's torso is steady (roll/pitch sd 0.83/0.75 deg while stepping) and its stance tall
+    # --- posture: sport mode's torso is steady (roll/pitch sd 0.83/0.75 deg while stepping) and its stance tall.
+    # orientation -3 (ALMI-Open's -0.25 charged a 3.4 deg sway about 0.001 per second; at -10 the first sport-mode run
+    # fell in 40% of its episodes at 24k steps' worth of time, against 11% before)
     lin_vel_z = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
     ang_vel_xy = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.2)
-    orientation = RewTerm(func=mdp.flat_orientation_l2, weight=-10.0)
+    orientation = RewTerm(func=mdp.flat_orientation_l2, weight=-3.0)
     base_height = RewTerm(func=mdp.base_height_l2_navigation, weight=-10.0, params={
         "target_height": STANCE_PELVIS_HEIGHT, "sensor_cfg": SceneEntityCfg("height_scanner"),
         "arm_command_name": ARM_COMMAND})
@@ -395,8 +397,10 @@ class ArmsRewardsCfg:
     golem_torque = _golem(ARM_JOINT_NAMES, "torque", -10.0, GOLEM_RATE_MARGIN)
     dof_acc = _arm_joints(mdp.joint_acc_l2, -2.5e-7)
     # the residual's and the arm targets' rates, against reach jitter: -0.1 and -20 at 50 Hz halved the settled
-    # wrists' jitter; x4 at 100 Hz, and the residual's x2.2 for the matched scales
-    action_rate = RewTerm(func=mdp.action_term_rate_l2, weight=-0.89, params={"action_name": ARMS_ACTION})
+    # wrists' jitter. The residual's -0.2 at 100 Hz: noise (an untrained policy's actions) costs the same per step
+    # at any rate, a smooth motion 4x less per step; -0.89 (x4, x2.2 for the matched scales) charged the arms'
+    # exploration about 8 per second, their reward sat on its floor of 0, and they never learned to hold the rest pose
+    action_rate = RewTerm(func=mdp.action_term_rate_l2, weight=-0.2, params={"action_name": ARMS_ACTION})
     target_rate = RewTerm(func=mdp.arm_joint_target_rate_l2, weight=-80.0, params={
         "asset_cfg": SceneEntityCfg("robot", joint_names=ARM_JOINT_NAMES, preserve_order=True),
         "arm_command_name": ARM_COMMAND})
