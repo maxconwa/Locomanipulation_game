@@ -120,6 +120,28 @@ class RecurrentMAPPO(MAPPO):
                 raise ValueError(f"{uid}: sequence_length {self._sequence_length[uid]} must be the rollout length "
                                  f"{self.memories[uid].memory_size} (each env's rollout is one sequence)")
 
+    def load(self, path: str) -> None:
+        """skrl's load, except that an agent whose saved critic read another env state size (a checkpoint from before
+        the critics' state lost the actors' duplicate observations) keeps its fresh critic, state scaler and optimizer:
+        evaluation needs only the policies; a resumed run trains its critics anew."""
+        modules = torch.load(path, map_location=self.device, weights_only=False)
+        for uid in self.possible_agents:
+            if uid not in modules:
+                continue
+            saved = modules[uid].get("state_preprocessor") or {}
+            size = self.state_spaces[uid].shape[0]
+            if "running_mean" in saved and saved["running_mean"].shape[0] != size:
+                print(f"[WARN] {uid}: the checkpoint's critic reads a state of {saved['running_mean'].shape[0]}, the"
+                      f" env's is {size}; loading the policy only (fresh critic, state scaler and optimizer)")
+                for name in ("value", "state_preprocessor", "optimizer"):
+                    modules[uid].pop(name, None)
+            for name, data in modules[uid].items():
+                module = self.checkpoint_modules[uid].get(name)
+                if module is not None:
+                    module.load_state_dict(data)
+                    if hasattr(module, "eval"):
+                        module.eval()
+
     def reset_rnn(self, done: torch.Tensor) -> None:
         """Zero the LSTM state of the envs where done (bool, (num_envs,) or (num_envs, 1))."""
         ids = done.view(-1).nonzero(as_tuple=False)[:, 0]

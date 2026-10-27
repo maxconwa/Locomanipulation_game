@@ -8,8 +8,8 @@ The recipe copies sport mode, as measured in its bags (`docs/experiments/sportmo
 every joint (with action scales matched to them), its stance (knee 0.70 rad), its command ranges (vx 0.55, vy 0.54
 m/s, wz 0.97 rad/s), its 0.5 s command low-pass and 0.70 s stride, stepping on any command. The policy runs at
 100 Hz over 500 Hz physics with an explicit PD and 0-20 ms of action delay; the actors are LSTMs with a capped cell
-state; episodes have drawn lengths (mean 90 s); the arm goals start once training's own sport-mode tracking metrics
-pass. These are the defaults: `train.py` with no overrides trains the recipe.
+state; episodes have drawn lengths (uniform, 90-300 s); the arm goals start once training's own sport-mode tracking
+metrics pass. These are the defaults: `train.py` with no overrides trains the recipe.
 
 ## Layout
 
@@ -75,8 +75,9 @@ The evaluation scripts rebuild the env a run trained in from the current default
 (`<run>/params/hydra_overrides.txt`); an override whose key the current config no longer has is dropped (its value is
 now the default) and listed. Runs from before the 2026-10-25 cleanup on other recipes need the `pre-cleanup` tag.
 
-While training, `<run>/warm_start_gate.yaml` changes the arm goals' gate thresholds (any `warm_start_*` field) without a
-restart; TensorBoard shows training's sport-mode metrics under `Metrics/sport/`.
+While training, the robot walks unpushed on flat ground until the warm-start gate passes (falls per minute and the
+sport-mode metrics, `warm_start_*`); then the pushes, the terrain rows and the arm goals start. `<run>/warm_start_gate.yaml`
+changes its thresholds without a restart; TensorBoard shows training's sport-mode metrics under `Metrics/sport/`.
 
 ## Deploy
 

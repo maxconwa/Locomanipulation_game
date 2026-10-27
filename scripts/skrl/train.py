@@ -42,19 +42,25 @@ import locomanipulation_game.tasks  # noqa: E402, F401
 from locomanipulation_game.tasks.locomanip_marl.run_files import state_checkpoint_for  # noqa: E402
 
 
-def bound_log_std(agent, policy_cfg: dict, per_agent: dict):
+def bound_log_std(agent, policy_cfg: dict, per_agent: dict, anneal: dict | None = None):
     """Clamp each agent's log_std parameter into [min_log_std, max_log_std], narrowed per agent to per_agent[uid]
     ([low, high]), now and after every update. skrl clamps log_std only in the forward pass; a parameter pushed past
-    the bound then gets no gradient and the std stays pinned."""
+    the bound then gets no gradient and the std stays pinned. anneal[uid] ([high_end, end_timestep]) lowers that
+    agent's upper bound linearly from high to high_end by end_timestep."""
     floor, ceiling = policy_cfg["min_log_std"], policy_cfg["max_log_std"]
     bounds = {uid: (floor, ceiling) for uid in agent.policies}
     for uid, (low, high) in per_agent.items():
         bounds[uid] = (max(low, floor), min(high, ceiling))
-    print(f"[INFO] log_std bounds per agent: {bounds}")
+    anneal = {uid: tuple(v) for uid, v in (anneal or {}).items() if v}
+    print(f"[INFO] log_std bounds per agent: {bounds}; upper bound annealed: {anneal}")
 
-    def project(uid):
+    def project(uid, timestep=0):
+        low, high = bounds[uid]
+        if uid in anneal:
+            high_end, end = anneal[uid]
+            high += (high_end - high) * min(timestep / end, 1.0)
         with torch.no_grad():
-            agent.policies[uid].log_std_parameter.clamp_(*bounds[uid])
+            agent.policies[uid].log_std_parameter.clamp_(low, high)
 
     for uid in agent.policies:
         project(uid)
@@ -62,7 +68,7 @@ def bound_log_std(agent, policy_cfg: dict, per_agent: dict):
 
     def update_and_project(*, timestep, timesteps, uid):
         update(timestep=timestep, timesteps=timesteps, uid=uid)
-        project(uid)
+        project(uid, timestep)
 
     agent.update = update_and_project
 
@@ -109,7 +115,8 @@ def main(env_cfg, agent_cfg: dict):
     if args_cli.checkpoint:
         print(f"[INFO] Loading model checkpoint from: {args_cli.checkpoint}")
         runner.agent.load(os.path.abspath(args_cli.checkpoint))
-    bound_log_std(runner.agent, agent_cfg["models"]["policy"], agent_cfg["log_std_bounds"])
+    bound_log_std(runner.agent, agent_cfg["models"]["policy"], agent_cfg["log_std_bounds"],
+                  agent_cfg.get("log_std_anneal"))
 
     start_time = time.time()
     runner.run()

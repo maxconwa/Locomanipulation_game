@@ -59,7 +59,7 @@ def gated_terrain_levels(env: ManagerBasedRLEnv, env_ids: Sequence[int], command
                          arm_command_name: str, max_fall_share: float = 0.02, min_tracked_share: float = 0.7,
                          min_depth_level: float = 4.0, min_crouch_ratio: float = 0.75, steps_per_row: int = 16000,
                          episode_decay: float = 0.999, fall_term: str = "fell",
-                         time_out_term: str = "time_out") -> dict[str, torch.Tensor]:
+                         time_out_term: str = "time_out", after_warm_start: bool = False) -> dict[str, torch.Tensor]:
     """At episode end an env moves down a terrain row after a fall and up one after a time-out that tracked its
     velocity commands (mean navigation error under max_error, m/s), under a ceiling that starts at row 0 (flat, where
     every robot starts: max_init_terrain_level 0) and rises slowly once navigation is robust and the crouch has
@@ -72,7 +72,8 @@ def gated_terrain_levels(env: ManagerBasedRLEnv, env_ids: Sequence[int], command
     over min_tracked_share, the arm depth level's mean at least min_depth_level and the pelvis dropping at least
     min_crouch_ratio x as far as the targets during arm goals (the legs helping the arms). It opens once, raising the
     ceiling to row 1, then one row more every steps_per_row policy steps while the gate's conditions still hold; a
-    row up is never forced, each env still has to earn it. Logs the ceiling and the gate's inputs."""
+    row up is never forced, each env still has to earn it. after_warm_start: the gate is instead the env's warm start
+    having ended (arm_command_name's goals_enabled), for walking alone. Logs the ceiling and the gate's inputs."""
     terrain = env.scene.terrain
     if not hasattr(env, "terrain_gate"):
         zero = lambda: torch.zeros((), device=env.device)  # noqa: E731
@@ -94,8 +95,11 @@ def gated_terrain_levels(env: ManagerBasedRLEnv, env_ids: Sequence[int], command
         gate["target"] = keep * gate["target"] + (1.0 - keep) * arm._crouch_t[env_ids].sum() / steps.sum()
     ratio = gate["pelvis"] / gate["target"].clamp(min=1e-3)
     depth = arm.level.float().mean()
-    ready = bool((gate["fell"] <= max_fall_share) & (gate["tracked"] >= min_tracked_share)
-                 & (depth >= min_depth_level) & (ratio >= min_crouch_ratio))
+    if after_warm_start:
+        ready = bool(arm.goals_enabled)
+    else:
+        ready = bool((gate["fell"] <= max_fall_share) & (gate["tracked"] >= min_tracked_share)
+                     & (depth >= min_depth_level) & (ratio >= min_crouch_ratio))
     last_row = terrain.max_terrain_level - 1
     step = env.common_step_counter
     if ready and gate["ceiling"] < last_row and (gate["ceiling"] == 0 or step - gate["raised_at"] >= steps_per_row):
@@ -117,16 +121,21 @@ def _push_levels(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 def push_levels(env: ManagerBasedRLEnv, env_ids: Sequence[int], num_levels: int, max_speed: float,
                 command_name: str, max_error: float, fall_term: str = "fell",
-                time_out_term: str = "time_out", seconds_per_level: float = 20.0) -> dict[str, torch.Tensor]:
+                time_out_term: str = "time_out", seconds_per_level: float = 20.0,
+                warm_start_command: str | None = None) -> dict[str, torch.Tensor]:
     """At episode end, as the terrain rows: an env's push level goes down one after an episode that ended in
     fall_term, and up one per seconds_per_level of its length (at least one) after a time-out that tracked its
     velocity commands (mean navigation error under max_error, m/s), within [0, num_levels]; otherwise it stays.
     push_by_level pushes it at up to level / num_levels x max_speed. Counting seconds keeps the pace in sim time
     whatever the episode lengths (one level per episode climbed 4.5 times slower on 90 s episodes than on 20 s ones);
-    tracking, not survival alone (robots once climbed to 0.86 m/s pushes standing still). Logs the mean level, push
-    and the shares promoted and demoted."""
+    tracking, not survival alone (robots once climbed to 0.86 m/s pushes standing still). With warm_start_command
+    (the arm command), every level stays 0 until the env's warm start ends (that term's goals_enabled: the sport-mode
+    gate, or its deadline): the robot learns to walk unpushed. Logs the mean level, push and the shares promoted and
+    demoted."""
     level = _push_levels(env)
     move_up, fell = _tracked_episode(env, env_ids, command_name, max_error, fall_term, time_out_term)
+    if warm_start_command is not None and not env.command_manager.get_term(warm_start_command).goals_enabled:
+        move_up = torch.zeros_like(move_up)
     seconds = env.episode_length_buf[env_ids].float() * env.step_dt  # read before the reset clears it
     up = move_up.long() * torch.floor(seconds / seconds_per_level).long().clamp(min=1)
     level[env_ids] = (level[env_ids] + up - fell.long()).clamp(0, num_levels)

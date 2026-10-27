@@ -911,13 +911,15 @@ class ArmTargetsCommand(CommandTerm):
 
     @property
     def arm_goal_prob(self) -> float:
-        """The share of tasks that are arm goals: cfg.arm_goal_prob, ramped linearly from cfg.arm_goal_ramp_start over
-        cfg.arm_goal_ramp_steps env steps after the warm start ends (outside training, or resumed: no ramp)."""
+        """The share of tasks that are arm goals: cfg.arm_goal_prob, ramped linearly from cfg.arm_goal_ramp_start (or
+        arm_goal_prob, if lower) over cfg.arm_goal_ramp_steps env steps after the warm start ends (outside training, or
+        resumed: no ramp)."""
         cfg = self.cfg
         if self.goals_enabled_at is None or cfg.arm_goal_ramp_steps <= 0:
             return cfg.arm_goal_prob
+        start = min(cfg.arm_goal_ramp_start, cfg.arm_goal_prob)
         frac = min(1.0, (self._env.common_step_counter - self.goals_enabled_at) / cfg.arm_goal_ramp_steps)
-        return cfg.arm_goal_ramp_start + frac * (cfg.arm_goal_prob - cfg.arm_goal_ramp_start)
+        return start + frac * (cfg.arm_goal_prob - start)
 
     def _update_command(self):
         pass

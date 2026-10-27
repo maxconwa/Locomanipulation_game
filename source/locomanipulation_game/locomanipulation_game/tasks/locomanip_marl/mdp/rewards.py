@@ -6,6 +6,7 @@ terms here are restricted to one agent.
 
 from __future__ import annotations
 
+import numpy as np
 import re
 import torch
 from typing import TYPE_CHECKING
@@ -17,7 +18,7 @@ from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 
 from ..golem_safety import GOLEM_LIMITS
 from .commands import ground_height
-from .legs_rewards import STANCE_THRESHOLD, joint_deviation_l2, leg_phase
+from .legs_rewards import STANCE_THRESHOLD, joint_deviation_l2, leg_phase, standing_command
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -143,21 +144,22 @@ class yaw_twist_l2(_CycleMean):
 
 class joint_mean_deviation_l2(_CycleMean):
     """Squared gap between asset_cfg's joint angles' gait-cycle mean and their defaults, summed over the joints,
-    outside arm goals (rad^2). Standing it holds the default pose (sport mode's stance); walking, the cycle mean, so
-    the swing itself is free: sport mode's cycle mean while walking sits within 0.04 rad of its stance. Without it the
-    stance sank from a 0.9 to a 1.2 rad knee once arm goals started, base_height on in navigation notwithstanding:
-    the pelvis height alone let the crouch through on bent ankles."""
+    outside arm goals (rad^2; during them times arm_goal_scale, 0 by default). Standing it holds the default pose
+    (sport mode's stance); walking, the cycle mean, so the swing itself is free: sport mode's cycle mean while walking
+    sits within 0.04 rad of its stance. Without it the stance sank from a 0.9 to a 1.2 rad knee once arm goals started,
+    base_height on in navigation notwithstanding: the pelvis height alone let the crouch through on bent ankles."""
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
         asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
         self._ids = env.scene[asset_cfg.name].find_joints(asset_cfg.joint_names, preserve_order=True)[0]
         super().__init__(cfg, env, len(self._ids))
 
-    def __call__(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, arm_command_name: str) -> torch.Tensor:
+    def __call__(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, arm_command_name: str,
+                 arm_goal_scale: float = 0.0) -> torch.Tensor:
         data = env.scene[asset_cfg.name].data
         mean = self._push(data.joint_pos[:, self._ids] - data.default_joint_pos[:, self._ids])
         arm = env.command_manager.get_term(arm_command_name).arm_mode
-        return torch.sum(torch.square(mean), dim=1) * (~arm).float()
+        return torch.sum(torch.square(mean), dim=1) * torch.where(arm, arm_goal_scale, 1.0)
 
 
 def arm_target_pos_exp(env: ManagerBasedRLEnv, command_name: str, arm: int, std: float) -> torch.Tensor:
@@ -199,12 +201,70 @@ def yaw_rate_l2_during_arm_goal(env: ManagerBasedRLEnv, arm_command_name: str) -
     return torch.square(yaw_rate) * env.command_manager.get_term(arm_command_name).arm_mode
 
 
+class sport_gait_exp(_CycleMean):
+    """exp(-|s - s_ref|^2 / std^2) over asset_cfg's joints (the legs, in LOWER_JOINT_NAMES's order), outside arm goals:
+    sport mode's swing. s is each joint's angle less its gait-cycle mean; s_ref is sport mode's at this gait phase
+    (leg_phase's left leg) and velocity command (clamped to the bags' range), as scripts/fit_sport_gait.py fitted it to
+    the sport-mode bags (reference_file) less its cycle mean, and zero while standing is commanded. The velocity
+    rewards alone left the turn to the action noise: the policy held both hip yaws 0.3 rad into the turn where sport
+    mode swings them +-0.1 rad about zero with each step, and its knees swung a quarter of sport mode's. The swing
+    alone, not the pose: on the whole pose (std 0.3) standing still in the stance earned 64% of the term, and a policy
+    stood through 66% of its commands. The stance is posture's, hip_yaw_mean's and hip_roll_pos's. std narrows linearly
+    to std_end by std_steps env steps (std_end None: fixed): at a fixed 0.1 a policy swinging a quarter of sport mode's
+    amplitude earned almost nothing more than standing, and its swing never grew."""
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        self._ids = env.scene[asset_cfg.name].find_joints(asset_cfg.joint_names, preserve_order=True)[0]
+        super().__init__(cfg, env, len(self._ids))
+        ref = np.load(cfg.params["reference_file"])
+        self._harmonics = int(ref["harmonics"])
+        # (features, basis, joints) without the constant basis function: the fit's cycle mean dropped
+        coef = torch.tensor(ref["coef"], device=env.device).view(-1, 1 + 2 * self._harmonics, len(self._ids))
+        self._coef = coef[:, 1:].flatten(0, 1)
+        self._low = torch.tensor(ref["v_low"], device=env.device)
+        self._high = torch.tensor(ref["v_high"], device=env.device)
+
+    def swing(self, env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+        """Sport mode's joint angles less their cycle mean, for each env's phase and command, (num_envs, joints)."""
+        cmd = env.command_manager.get_term(command_name).command[:, :3]
+        v = torch.maximum(torch.minimum(cmd, self._high), self._low)
+        features = torch.cat([torch.ones_like(v[:, :1]), v, v.abs()], dim=1)
+        angle = 2.0 * torch.pi * leg_phase(env, command_name)[:, :1]
+        basis = torch.cat([f(h * angle) for h in range(1, self._harmonics + 1) for f in (torch.cos, torch.sin)], dim=1)
+        x = (features.unsqueeze(2) * basis.unsqueeze(1)).flatten(1)
+        return torch.where(standing_command(env, cmd).unsqueeze(1), 0.0, x @ self._coef)
+
+    def __call__(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, command_name: str, arm_command_name: str,
+                 std: float, reference_file: str, std_end: float | None = None, std_steps: int = 0) -> torch.Tensor:
+        q = env.scene[asset_cfg.name].data.joint_pos[:, self._ids]
+        swing = q - self._push(q)
+        error = torch.sum(torch.square(swing - self.swing(env, command_name)), dim=1)
+        if std_end is not None:
+            std += (std_end - std) * min(env.common_step_counter / max(std_steps, 1), 1.0)
+        arm = env.command_manager.get_term(arm_command_name).arm_mode
+        return torch.exp(-error / std**2) * (~arm).float()
+
+
 def joint_deviation_l2_modal(
-    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, arm_command_name: str, arm_goal_scale: float
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, arm_command_name: str, arm_goal_scale: float,
+    command_name: str = "base_velocity", turn_free_joint_names: list[str] | None = None
 ) -> torch.Tensor:
-    """joint_deviation_l2, times arm_goal_scale during arm goals."""
+    """joint_deviation_l2, times arm_goal_scale during arm goals. Of asset_cfg's joints, turn_free_joint_names
+    (regexes) cost nothing while command_name commands a turn (|w_z| at least its min_cos_speed)."""
     arm_mode = env.command_manager.get_term(arm_command_name).arm_mode
-    return joint_deviation_l2(env, asset_cfg) * torch.where(arm_mode, arm_goal_scale, 1.0)
+    scale = torch.where(arm_mode, arm_goal_scale, 1.0)
+    if not turn_free_joint_names:
+        return joint_deviation_l2(env, asset_cfg) * scale
+    asset = env.scene[asset_cfg.name]
+    ids = asset_cfg.joint_ids if isinstance(asset_cfg.joint_ids, list) else list(range(asset.num_joints))
+    free_ids = set(asset.find_joints(turn_free_joint_names)[0])
+    free = torch.tensor([j in free_ids for j in ids], device=env.device)
+    term = env.command_manager.get_term(command_name)
+    turning = torch.abs(term.command[:, 2]) >= term.cfg.min_cos_speed
+    dev = torch.square(asset.data.joint_pos[:, ids] - asset.data.default_joint_pos[:, ids])
+    dev = torch.where(turning.unsqueeze(1) & free, 0.0, dev)
+    return torch.sum(dev, dim=1) * scale
 
 
 def knee_valgus(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, margin: float = 0.0) -> torch.Tensor:
@@ -253,6 +313,64 @@ def feet_swing_clearance(
     progress = ((phase - STANCE_THRESHOLD) / (1.0 - STANCE_THRESHOLD)).clamp(0.0, 1.0)
     reference = rest_height + lift_height * torch.sin(torch.pi * progress)
     return torch.sum((reference - foot_z).clamp(min=0.0) * swing, dim=1)
+
+
+def feet_swing_height_exp(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    rest_height: float,
+    lift_height: float,
+    command_name: str = "base_velocity",
+    terrain_sensor_cfg: SceneEntityCfg | None = None,
+    std: float = 0.03,
+) -> torch.Tensor:
+    """exp(-shortfall^2 / std^2) per foot in its swing phase, summed over the feet; stance feet give 0.
+
+    The positive counterpart of feet_swing_clearance, on its gait clock, reference and terrain correction: shortfall is
+    how far the foot is below the swing reference (m), overshoot free. The legs reward is floored at 0 per step, and on
+    the steps under the floor (half of a shuffling policy's walking steps) the clearance penalty gives no gradient; a
+    positive term lifts those steps' total and pays for a lift exactly there.
+    """
+    asset = env.scene[asset_cfg.name]
+    foot_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+    if terrain_sensor_cfg is not None:
+        foot_z = foot_z - ground_height(env.scene.sensors[terrain_sensor_cfg.name]).unsqueeze(1)
+    phase = leg_phase(env, command_name)
+    swing = phase >= STANCE_THRESHOLD
+    progress = ((phase - STANCE_THRESHOLD) / (1.0 - STANCE_THRESHOLD)).clamp(0.0, 1.0)
+    reference = rest_height + lift_height * torch.sin(torch.pi * progress)
+    shortfall = (reference - foot_z).clamp(min=0.0)
+    return torch.sum(torch.exp(-torch.square(shortfall) / std**2) * swing, dim=1)
+
+
+def feet_swing_height_tracking_exp(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    rest_height: float,
+    lift_height: float,
+    command_name: str = "base_velocity",
+    terrain_sensor_cfg: SceneEntityCfg | None = None,
+    std: float = 0.03,
+) -> torch.Tensor:
+    """sin(pi * s) * exp(-(foot_z - reference)^2 / std^2) per foot in its swing phase, summed over the feet; stance
+    feet give 0.
+
+    feet_swing_clearance's gait clock, reference and terrain correction, the error two-sided (the foot goes to the
+    reference's height, not past it) and weighted by the reference's own lift share sin(pi * s): at the swing's ends
+    the reference sits at rest_height, where a dragged foot matches it and feet_swing_height_exp paid it 0.31 of a
+    full lift. Weighted, a dragged foot earns 0.15 of a full lift at std 0.03 (half the lift height: 0.54).
+    """
+    asset = env.scene[asset_cfg.name]
+    foot_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+    if terrain_sensor_cfg is not None:
+        foot_z = foot_z - ground_height(env.scene.sensors[terrain_sensor_cfg.name]).unsqueeze(1)
+    phase = leg_phase(env, command_name)
+    swing = phase >= STANCE_THRESHOLD
+    progress = ((phase - STANCE_THRESHOLD) / (1.0 - STANCE_THRESHOLD)).clamp(0.0, 1.0)
+    lift_share = torch.sin(torch.pi * progress)
+    reference = rest_height + lift_height * lift_share
+    kernel = torch.exp(-torch.square(foot_z - reference) / std**2)
+    return torch.sum(lift_share * kernel * swing, dim=1)
 
 
 class golem_limits(ManagerTermBase):

@@ -72,6 +72,8 @@ GRIPPER_JOINTS = ["[lr]g_.*_hinge_.*"]
 # is close: knee 0.74, hip pitch -0.39. The pelvis then stands STANCE_PELVIS_HEIGHT above the ground (forward
 # kinematics on CL_Assets' h1_2 MJCF).
 STANCE_PELVIS_HEIGHT = 0.9798
+# The knee links' horizontal distance in the stance (the same forward kinematics); the feet are as far apart.
+STANCE_KNEE_DISTANCE = 0.326
 # The pelvis height of the stance the arm-goal tables were built at (knee 0.5 rad): the arm goals are placed in a
 # standing frame this high (mdp.ArmTargetsCommand), 2.3 cm above the sport stance's pelvis.
 TABLE_PELVIS_HEIGHT = 1.0024

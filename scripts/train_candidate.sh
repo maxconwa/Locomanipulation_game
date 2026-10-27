@@ -7,6 +7,7 @@
 #
 #   bash scripts/train_candidate.sh [name] [seed ...]           (default: Candidate, seeds 42 43; e.g. in tmux)
 #   SMOKE=<updates> bash scripts/train_candidate.sh              (one seed, into logs/skrl/smoke, no checks)
+#   ITERATIONS=<updates> MID=<step> OVERRIDES="<hydra args>" ...  (a shorter run, its scorecard step, its overrides)
 #
 # Status lines in logs/candidates/status.txt; per run: logs/candidates/<name>_s<seed>/ (logs, the export in a folder
 # of the same name, parity, replays);
@@ -28,16 +29,16 @@ mkdir -p "$OUT"
 NAME=${1:-Candidate}
 shift || true
 if [ $# -gt 0 ]; then SEEDS=("$@"); else SEEDS=(42 43); fi
-ITERATIONS=12500   # x 48 = 600,000 policy steps (6000 s per env at 100 Hz)
-FINAL=600000
-MID=393600         # a checkpoint (every 9600) near two thirds
-EXTRA=()
+ITERATIONS=${ITERATIONS:-12500}   # x 48 = 600,000 policy steps (6000 s per env at 100 Hz)
+MID=${MID:-393600}                 # a checkpoint (every 9600) near two thirds
+read -r -a EXTRA <<< "${OVERRIDES:-}"
 if [ -n "${SMOKE:-}" ]; then
   ITERATIONS=$SMOKE
   SEEDS=(${SEEDS[0]})
   # the arm goals start at 600 steps whatever the gate says, so the switch-on path runs too
-  EXTRA=(agent.agent.experiment.directory=smoke env.warm_start_deadline_steps=600 env.state_save_every=480)
+  EXTRA+=(agent.agent.experiment.directory=smoke env.warm_start_deadline_steps=600 env.state_save_every=480)
 fi
+FINAL=$((ITERATIONS * 48))
 
 note() { [ -z "${SMOKE:-}" ] && echo "$(date '+%F %T') $*" >> "$STATUS"; echo "$(date '+%F %T') $*"; }
 
@@ -71,8 +72,7 @@ for seed in "${SEEDS[@]}"; do
   code=$?
   run=$(grep -ao "Logging to /[^ ]*_$name" "$dir/train.log" | head -1 | sed 's/^Logging to //')
   kernels=$(grep -ac "fail to launch kernel" "$dir/train.log")
-  final=$((ITERATIONS * 48))
-  if [ $code -ne 0 ] || [ ! -f "$run/checkpoints/agent_$final.pt" ]; then
+  if [ $code -ne 0 ] || [ ! -f "$run/checkpoints/agent_$FINAL.pt" ]; then
     note "$name: training FAILED (exit $code, kernel failures $kernels, run ${run:-?}); see $dir/train.log"
     continue
   fi

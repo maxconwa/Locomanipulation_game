@@ -16,7 +16,7 @@ __all__ = ["episode_limit_reached", "golem_estop", "pelvis_contact_or_tilt"]
 
 
 def episode_limit_reached(env: LocoManipMarlEnv) -> torch.Tensor:
-    """The time-out with a length drawn per episode (cfg.episode_length_mean_s; LocoManipMarlEnv.episode_limit, in
+    """The time-out with a length drawn per episode (cfg.episode_length_range_s; LocoManipMarlEnv.episode_limit, in
     policy steps), never past max_episode_length (episode_length_s); Isaac Lab's time_out without a draw."""
     limit = getattr(env, "episode_limit", None)
     if limit is None:

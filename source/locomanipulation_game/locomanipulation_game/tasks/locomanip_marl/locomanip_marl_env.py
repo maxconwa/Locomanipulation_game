@@ -5,14 +5,15 @@ them onto the per-agent dicts:
 
     actions:      one ActionManager, the agents' terms concatenated in possible_agents order (cfg.agent_action_terms);
                   with cfg.action_delay_range each env's joint targets reach the robot that many physics substeps late
-    observations: agent -> its observation group; the env state is both agents' groups plus `critic`
+    observations: agent -> its observation group; the env state is the `critic` group
     rewards:      agent -> its own RewardManager, floored at 0, plus termination_penalty on terminating steps and
                   golem_estop_penalty on the step a GOLEM e-stop trip starts
     dones:        one TerminationManager, shared (one body, one episode)
 
 After every step it moves the arm command by the pelvis's motion (on the robot, FAST-LIO's odometry does). Each
-episode's length is drawn at its reset (cfg.episode_length_mean_s). While training, episodes are navigation only until
-the robot walks like sport mode (cfg.warm_start_*, _update_warm_start); then the arm goals start. GolemEstopMonitor
+episode's length is drawn at its reset (cfg.episode_length_range_s). While training, episodes are unpushed navigation on flat ground
+until the robot walks like sport mode (cfg.warm_start_*, _update_warm_start); then the pushes, the terrain rows and the
+arm goals start. GolemEstopMonitor
 (golem_safety.py) checks GOLEM's e-stops at every physics substep; trips are logged and charged, never end an episode.
 """
 
@@ -46,10 +47,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
         cfg.sync_derived()
         super().__init__(cfg, render_mode, **kwargs)
         self._set_soft_joint_limits()
-        # each episode's own length in policy steps (cfg.episode_length_mean_s; mdp.episode_limit_reached), drawn at
-        # its reset; None: every episode max_episode_length (episode_length_mean_s 0)
+        # each episode's own length in policy steps (cfg.episode_length_range_s; mdp.episode_limit_reached), drawn at
+        # its reset; None: every episode max_episode_length (episode_length_range_s None)
         self.episode_limit = (torch.full((self.num_envs,), self.max_episode_length, device=self.device)
-                              if cfg.episode_length_mean_s > 0 else None)
+                              if cfg.episode_length_range_s is not None else None)
 
         # After super() has started the sim, in ManagerBasedRLEnv.load_managers' order: observations read commands
         # and actions, rewards read terminations.
@@ -69,9 +70,11 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self.curriculum_manager = CurriculumManager(self.cfg.curriculum, self)
         print("[INFO] Curriculum Manager: ", self.curriculum_manager)
         self._robot = self.scene["robot"]
-        # the warm start: the exponential mean of the share of ending episodes that fell, the sport-mode gate's
-        # consecutive passing checks and the last check's metrics
-        self._walk_fell = torch.tensor(1.0, device=self.device)
+        # the warm start: exponential means over the ending episodes of their falls and their minutes (falls per
+        # minute is their ratio, from 1: a start far above any threshold that the means forget within ~10k episodes),
+        # the sport-mode gate's consecutive passing checks and the last check's metrics
+        self._walk_falls = torch.tensor(1.0, device=self.device)
+        self._walk_minutes = torch.tensor(1.0, device=self.device)
         self._sport_streak = 0
         self._sport_metrics: dict[str, float] = {}
         self._warm_start_log: dict[str, torch.Tensor] = {}
@@ -83,7 +86,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
 
         group_dims = self.observation_manager.group_obs_dim
         self.cfg.observation_spaces = {agent: group_dims[agent][0] for agent in self.cfg.possible_agents}
-        self.cfg.state_space = group_dims["critic"][0] + sum(group_dims[agent][0] for agent in self.cfg.possible_agents)
+        self.cfg.state_space = group_dims["critic"][0]
         terms = [term for agent in self.cfg.possible_agents for term in self.cfg.agent_action_terms[agent]]
         if terms != list(self.action_manager.active_terms):
             raise ValueError(f"Agents' action terms {terms} are not the ActionManager's {self.action_manager.active_terms}")
@@ -175,10 +178,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
     def _get_rewards(self) -> dict[str, torch.Tensor]:
         terminated = self.termination_manager.terminated.float()
         # a GOLEM e-stop trip costs golem_estop_penalty once, on its first step, after the floor as a fall's penalty does
-        # (from the end of the warm start, as the arm goals start, so the stepping it learns first isn't buried)
+        # (from the start: held back to the end of the warm start, a policy tripped on 11% of its steps)
         new_trip = self.golem_tripped & ~self._golem_tripped_prev
         self._golem_tripped_prev = self.golem_tripped.clone()
-        trip_cost = self.cfg.golem_estop_penalty * new_trip.float() * float(self._arm_command.goals_enabled)
+        trip_cost = self.cfg.golem_estop_penalty * new_trip.float()
         self.golem_log["Safety/trip_starts"] = new_trip.float().mean()
         rewards = {}
         for agent, manager in self.reward_managers.items():
@@ -202,7 +205,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
 
     def _get_states(self) -> torch.Tensor:
         # computed in _get_observations, which step() and reset() call before state()
-        return torch.cat([self._obs_buf[agent] for agent in self.cfg.possible_agents] + [self._obs_buf["critic"]], dim=1)
+        return self._obs_buf["critic"]
 
     def _reset_idx(self, env_ids: Sequence[int]):
         # ManagerBasedRLEnv._reset_idx's order: curriculum before the scene reset, managers after
@@ -210,8 +213,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
         super()._reset_idx(env_ids)  # scene, reset events, episode_length_buf
         if self.episode_limit is not None:
             ids = torch.as_tensor(env_ids, device=self.device)
-            seconds = torch.empty(len(ids), device=self.device).exponential_(1.0 / self.cfg.episode_length_mean_s)
-            steps = torch.ceil(seconds.clamp(min=self.cfg.episode_length_min_s) / self.step_dt)
+            seconds = torch.empty(len(ids), device=self.device).uniform_(*self.cfg.episode_length_range_s)
+            steps = torch.ceil(seconds / self.step_dt)
             self.episode_limit[ids] = steps.clamp(max=self.max_episode_length).long()
         self._refresh_sensors_after_reset(env_ids)
         self._fresh[env_ids] = True
@@ -259,18 +262,23 @@ class LocoManipMarlEnv(DirectMARLEnv):
             self.save_state()
 
     def _update_warm_start(self, ending: torch.Tensor):
-        """Start the arm goals once the robot walks like sport mode: over the ending episodes (an exponential mean,
-        decay cfg.warm_start_episode_decay per episode) the share that fell is at most cfg.warm_start_max_fall_share,
-        and the sport-mode gate passes (_sport_gate); or at cfg.warm_start_deadline_steps. Runs before the resets,
-        while the velocity command still holds the ending episodes' sums."""
+        """End the warm start (goals_enabled: the pushes, the terrain rows and the arm goals start) once the robot
+        walks like sport mode: over the ending episodes (exponential means, decay cfg.warm_start_episode_decay per
+        episode) at most cfg.warm_start_max_falls_per_min falls per minute, and the sport-mode gate passes
+        (_sport_gate); or at cfg.warm_start_deadline_steps. Per minute, not per episode: the share of episodes that
+        fall grows with their length. Runs before the resets, while the velocity command still holds the ending
+        episodes' sums and episode_length_buf their lengths."""
         cfg = self.cfg
         ids = ending.nonzero(as_tuple=False).flatten()
         if len(ids):
             _, fell = _tracked_episode(self, ids, "base_velocity", TERRAIN_MAX_TRACKING_ERROR, "fell", "time_out")
+            minutes = self.episode_length_buf[ids].float() * self.step_dt / 60.0
             keep = cfg.warm_start_episode_decay ** len(ids)
-            self._walk_fell = keep * self._walk_fell + (1.0 - keep) * fell.float().mean()
+            self._walk_falls = keep * self._walk_falls + (1.0 - keep) * fell.float().mean()
+            self._walk_minutes = keep * self._walk_minutes + (1.0 - keep) * minutes.mean()
+        falls_per_min = self._walk_falls / self._walk_minutes
         sport = self._sport_gate()  # every check, so the metrics are logged before and after the goals start
-        walks = bool(self._walk_fell <= cfg.warm_start_max_fall_share) and sport
+        walks = bool(falls_per_min <= cfg.warm_start_max_falls_per_min) and sport
         deadline = 0 < cfg.warm_start_deadline_steps <= self.common_step_counter
         arm = self._arm_command
         if not arm.goals_enabled and (walks or deadline):
@@ -278,9 +286,9 @@ class LocoManipMarlEnv(DirectMARLEnv):
             arm.goals_enabled_at = self.common_step_counter  # the arm-goal share ramps up from here
             metrics = ", ".join(f"{k} {v:.3f}" for k, v in self._sport_metrics.items() if not k.startswith("n_"))
             print(f"[INFO] Warm start over at step {self.common_step_counter}{' (deadline)' if not walks else ''}:"
-                  f" {self._walk_fell.item():.1%} of episodes fall; sport metrics {metrics or 'none yet'};"
-                  " arm goals start")
-        self._warm_start_log["Curriculum/warm_start_fell_share"] = self._walk_fell
+                  f" {falls_per_min.item():.3f} falls per minute; sport metrics {metrics or 'none yet'};"
+                  " pushes, terrain rows and arm goals start")
+        self._warm_start_log["Curriculum/warm_start_falls_per_min"] = falls_per_min
         self._warm_start_log["Curriculum/arm_goals_enabled"] = torch.tensor(float(arm.goals_enabled), device=self.device)
 
     def _sport_gate(self) -> bool:

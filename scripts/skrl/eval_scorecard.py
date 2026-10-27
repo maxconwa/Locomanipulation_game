@@ -52,6 +52,8 @@ parser.add_argument("--out", default=None, help="Directory for the scorecard fil
 parser.add_argument("--analysis_dir", default=None, help="The sport-mode bag analysis (scorecard_metrics).")
 parser.add_argument("--wrist_goals", type=int, default=6, help="Arm goals per env in the wrist phase (0: none).")
 parser.add_argument("--save_raw", action="store_true", help="Also save the 100 Hz series (npz).")
+parser.add_argument("--stochastic", action="store_true",
+                    help="Sample the actions, as in training (default: the mean action, as deployed).")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 args_cli.headless = True
@@ -150,6 +152,11 @@ def to_100hz(x: np.ndarray, dt: float, hold: bool, n: int, offset: float) -> np.
     return out.reshape((n,) + x.shape[1:])
 
 
+def pick(outputs, agent: str) -> torch.Tensor:
+    """The agent's action: sampled with --stochastic, else the mean."""
+    return outputs[0][agent] if args_cli.stochastic else outputs[-1][agent].get("mean_actions", outputs[0][agent])
+
+
 def fmt(v, digits=3):
     return "—" if v is None or not np.isfinite(v) else f"{v:.{digits}f}"
 
@@ -158,7 +165,7 @@ def markdown(res: dict) -> str:
     lag = res["tracking_vs_lagged"]
     lines = [f"# Sport-mode scorecard: {res['run']} @ {res['step']}", "",
              f"{res['num_envs']} envs, {res['seconds_valid']:.0f} s of valid data, {res['seconds_stepping']:.0f} s"
-             f" stepping; policy {1 / res['policy_dt']:.0f} Hz, stride window {res['stride_samples'] * sm.DT:.2f} s."
+             f" stepping; policy {1 / res['policy_dt']:.0f} Hz, {'sampled' if res.get('stochastic') else 'mean'} actions, stride window {res['stride_samples'] * sm.DT:.2f} s."
              f" Scored against the lag-allowed command (no creep correction). Commands at the run's ranges: full"
              f" stick vx {res['full'][0]:g}, vy {res['full'][1]:g}, wz {res['full'][2]:g}.", "",
              "| Metric | This checkpoint | Sport mode | Target | Met |", "| --- | --- | --- | --- | --- |"]
@@ -211,7 +218,7 @@ def wrist_phase(base, runner, arm, obs, goals: int) -> dict:
         arm._resample(ids)  # a fresh goal for every env (its timer stays out of reach: resampling_time_range)
         for j in range(steps):
             outputs = runner.agent.act(obs, {a: states for a in base.possible_agents}, timestep=0, timesteps=0)
-            actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in base.possible_agents}
+            actions = {a: pick(outputs, a) for a in base.possible_agents}
             obs, _, terminated, _, _ = base.step(actions)
             states = base.state()
             fell[:, g] = np.maximum(fell[:, g], terminated[base.possible_agents[0]].cpu().numpy())
@@ -237,7 +244,7 @@ def main(env_cfg, agent_cfg: dict):
     env_cfg.training = False
     env_cfg.state_checkpoint_path = state_checkpoint_for(checkpoint)
     env_cfg.episode_length_s = 1.0e4
-    env_cfg.episode_length_mean_s = 0.0  # a run trained on drawn episode lengths: one long episode here
+    env_cfg.episode_length_range_s = None  # a run trained on drawn episode lengths: one long episode here
     env_cfg.events.push_robot = None
     arm_cfg, vel_cfg = env_cfg.commands.arm_targets, env_cfg.commands.base_velocity
     arm_cfg.arm_goal_prob = 0.0
@@ -282,7 +289,7 @@ def main(env_cfg, agent_cfg: dict):
             vel.time_left[:] = 1.0e6
             vel.is_standing_env[:] = False
             outputs = runner.agent.act(obs, {a: states for a in base.possible_agents}, timestep=0, timesteps=0)
-            actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in base.possible_agents}
+            actions = {a: pick(outputs, a) for a in base.possible_agents}
             obs, _, terminated, _, _ = base.step(actions)
             states = base.state()
             done = terminated[base.possible_agents[0]].cpu().numpy()
@@ -329,7 +336,7 @@ def main(env_cfg, agent_cfg: dict):
     step = re.search(r"_(\d+)\.pt$", checkpoint)
     res.update(
         run=os.path.basename(run_dir), step=int(step.group(1)) if step else None, checkpoint=checkpoint,
-        overrides=replayed + hydra_args, num_envs=N, policy_dt=dt, full=list(full), gait_period=base.cfg.gait_period,
+        overrides=replayed + hydra_args, stochastic=args_cli.stochastic, num_envs=N, policy_dt=dt, full=list(full), gait_period=base.cfg.gait_period,
         seconds_valid=seconds([np.ones(len(c), bool) for c in cmds100]), seconds_stepping=seconds(masks),
         seconds_commanded=seconds(commanded),
         commanded_not_stepping_share=seconds([c & ~m for c, m in zip(commanded, masks)]) / max(seconds(commanded), 1e-9),
@@ -348,6 +355,7 @@ def main(env_cfg, agent_cfg: dict):
     out_dir = args_cli.out or os.path.dirname(checkpoint)
     os.makedirs(out_dir, exist_ok=True)
     tag = f"scorecard_{res['step']}" if res["step"] is not None else "scorecard"
+    tag += "_sampled" if args_cli.stochastic else ""
     with open(os.path.join(out_dir, f"{tag}.json"), "w") as f:
         json.dump(res, f, indent=1, default=float)
     with open(os.path.join(out_dir, f"{tag}.md"), "w") as f:

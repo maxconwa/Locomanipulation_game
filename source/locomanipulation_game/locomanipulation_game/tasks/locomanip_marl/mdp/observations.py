@@ -71,13 +71,23 @@ def applied_action(env: ManagerBasedRLEnv, action_name: str) -> torch.Tensor:
 def arm_target_error_in_root(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     """Per arm, the wrist's error to the believed target: (dx, dy, dz, axis-angle rx, ry, rz). Shape (num_envs, 6 * arms)."""
     term: ArmTargetsCommand = env.command_manager.get_term(command_name)
+    return _target_errors(term, term.believed_b)
+
+
+def true_arm_target_error_in_root(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """arm_target_error_in_root against the true targets. Privileged: for the critic."""
+    term: ArmTargetsCommand = env.command_manager.get_term(command_name)
+    return _target_errors(term, term.true_targets_in_root())
+
+
+def _target_errors(term: ArmTargetsCommand, targets_b: torch.Tensor) -> torch.Tensor:
     robot = term.robot
     errors = []
     for arm, body_id in enumerate(term.body_ids):
         pos_b, quat_b = subtract_frame_transforms(
             robot.data.root_pos_w, robot.data.root_quat_w, robot.data.body_pos_w[:, body_id], robot.data.body_quat_w[:, body_id]
         )
-        target = term.believed_b[:, arm]
+        target = targets_b[:, arm]
         pos_err, rot_err = compute_pose_error(pos_b, quat_b, target[:, :3], target[:, 3:], rot_error_type="axis_angle")
         errors.append(torch.cat([pos_err, rot_err], dim=-1))
     return torch.cat(errors, dim=-1)

@@ -100,6 +100,22 @@ def body_pair_distance(
     return (torch.exp(-torch.abs(d_min) * 100.0) + torch.exp(-torch.abs(d_max) * 100.0)) / 2.0
 
 
+def body_pair_distance_band(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    min_dist: float = 0.3,
+    max_dist: float = 0.6,
+) -> torch.Tensor:
+    """In [0, 1]: 1 while the two bodies' horizontal distance is within [min_dist, max_dist], exp(-100 x) at x m
+    outside (0.37 at 1 cm, 0.05 at 3 cm). A reward for staying in the band only: body_pair_distance still pays half
+    of it however far outside."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    pos = asset.data.body_pos_w[:, asset_cfg.body_ids, :2]
+    dist = torch.norm(pos[:, 0, :] - pos[:, 1, :], dim=1)
+    outside = torch.clamp(min_dist - dist, min=0.0) + torch.clamp(dist - max_dist, min=0.0)
+    return torch.exp(-outside * 100.0)
+
+
 def stance_base_vel(env: ManagerBasedRLEnv, command_name: str = "base_velocity") -> torch.Tensor:
     """Squared pelvis xy velocity while standing is commanded."""
     asset: Articulation = env.scene["robot"]

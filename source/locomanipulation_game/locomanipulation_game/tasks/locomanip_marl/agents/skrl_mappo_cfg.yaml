@@ -1,5 +1,5 @@
-# MAPPO (skrl 2.1): one PPO learner per agent, each with its own reward; both critics see the env state (both
-# actors' observations plus privileged information).
+# MAPPO (skrl 2.1): one PPO learner per agent, each with its own reward; both critics see the env state (the
+# actors' observations once each as true, noise-free quantities, plus privileged information).
 # https://skrl.readthedocs.io/en/latest/api/multi_agents/mappo.html
 
 seed: 42
@@ -44,6 +44,10 @@ models:
 log_std_bounds:
   legs: [-3.0, -0.51]   # std 0.05 .. 0.6
   arms: [-3.0, 0.0]     # std 0.05 .. 1.0
+# Per agent, [log_std_end, timestep]: the upper bound falls linearly to log_std_end by timestep (null: fixed).
+log_std_anneal:
+  legs: null
+  arms: null
 # Critics trained on raw returns: skrl fits the value scaler to the critic's own predictions too, and it ran away
 # (the arms' in runs A-B, the legs' in fresh runs to a mean of 1e5-1e14).
 no_value_preprocessor: [arms, legs]
