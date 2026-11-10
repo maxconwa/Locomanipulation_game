@@ -1,19 +1,23 @@
 """Two agents, one H1-2: the legs walk on a velocity command as Unitree's sport mode does, the arms track a wrist pose
 each. MAPPO via skrl.
 
-At every command event an env gets navigation (a velocity command, each wrist holding its rest pose) or an arm goal
-(zero velocity, a wrist pose per arm fixed in the world; mdp.ArmTargetsCommand). Arm goals start once the robot walks
-like sport mode (LocoManipMarlEnv._sport_gate). The policies see the arm command in the pelvis frame, moved by the
-pelvis's motion as the robot's FAST-LIO odometry moves it; rewards score the world target, with kernels that narrow
-as the errors fall.
+At every command event an env gets navigation (a velocity command, a quarter of them zero, each wrist holding its rest
+pose) or an arm goal (zero velocity, a wrist pose per arm fixed in the world at a standing height;
+mdp.ArmTargetsCommand). The arm goals, and the arms' residual on their IK, ramp in once the robot walks like sport mode
+(LocoManipMarlEnv._sport_gate); until then the IK alone holds the arms at rest. The policies see the arm command in the
+pelvis frame, moved by the pelvis's motion as the robot's FAST-LIO odometry moves it; rewards score the world target,
+with kernels that narrow as the errors fall.
 
+The legs are paid for following the velocity command and the gait clock (each swing foot at sport mode's 6 cm lift,
+the stance foot down, the leg joints' swing sport mode's), less the safety and smoothness costs, plus a small reward
+for the feet, the knees and the pelvis height inside their bands (nothing outside): no alive, posture or hip terms.
 Sport mode (assets/h1_2.py, docs/experiments/sportmode_ablations.md): its PD gains on every joint with action scales
-matched to them, its stance (knee 0.70 rad) held by a posture term, its command ranges (vx 0.55, vy 0.54 m/s, wz 0.97
-rad/s), its 0.5 s command low-pass and 0.70 s stride, stepping on any command over 0.03. The policy runs at 100 Hz
+matched to them, its command ranges (vx 0.55, vy 0.54 m/s, wz 0.97 rad/s), its 0.5 s command low-pass and 0.70 s
+stride, stepping on any command over 0.03. The policy runs at 100 Hz
 over 500 Hz physics with an explicit PD (the torque computed every physics step and clipped at the effort limit) and
 0-20 ms of action delay. Joint targets are clipped inside GOLEM's position e-stop range and bounded by PD torque;
 GOLEM's e-stops are checked and charged (golem_safety.py). Domain randomization: motor gains and strength, friction and
-torso mass (all drawn at each reset), the IMU's mount and bias, observation noise and pushes on a curriculum. Episodes
+torso mass (all drawn at each reset), the IMU's mount and bias, observation noise. Flat ground, no pushes. Episodes
 have drawn lengths (uniform, 90-300 s).
 """
 
@@ -41,7 +45,6 @@ from locomanipulation_game.assets.h1_2 import (
     COLLISION_LINK_NAMES,
     FINGER_LINK_NAMES,
     FOOT_LINK_NAMES,
-    HIP_YAW_ROLL_JOINT_NAMES,
     KNEE_LINK_NAMES,
     LEGS_ACTION_SCALE,
     LOWER_JOINT_NAMES,
@@ -61,9 +64,7 @@ RIGHT_ARM_JOINT_NAMES = ARM_JOINT_NAMES[7:]
 LEFT_EE_BODY = "left_wrist_yaw_link"
 RIGHT_EE_BODY = "right_wrist_yaw_link"
 ARM_COMMAND = "arm_targets"
-TERRAIN_MAX_TRACKING_ERROR = 0.4  # m/s, an episode's mean navigation velocity error for a terrain row or push level up
-PUSH_LEVELS = 10  # the push curriculum's levels: level L pushes at up to L / PUSH_LEVELS x MAX_PUSH_SPEED
-MAX_PUSH_SPEED = 1.0  # m/s, ALMI-Open's fixed push
+TERRAIN_MAX_TRACKING_ERROR = 0.4  # m/s, the navigation velocity error under which an ending episode counts as tracked
 
 # Each agent is charged for the self-contact pairs that include one of its links.
 LEGS_OWN_LINKS = [PELVIS_LINK_NAME] + LOWER_LINK_NAMES
@@ -89,7 +90,6 @@ SPORT_GAIT_REFERENCE = os.path.normpath(os.path.join(os.path.dirname(os.path.abs
 # lambda: the legs' reward includes this share of the arms' command-following terms (the arms take none of the
 # legs': their cycle-mean yaw term diluted the arms' own). 0: the legs' arms_* terms have weight 0 and drop out.
 REWARD_SHARE_TO_LEGS = 0.0
-ARM_GOAL_HIP_POS_SCALE = 0.2  # the legs' hip yaw/roll deviation term during arm goals, as a share of its weight
 CLIP_ACTIONS = 10.0       # the env clamps every raw policy action to +-this
 TORQUE_HEADROOM = 0.85    # targets ask for at most this share of a joint's effort limit (the e-stop trips at 0.9)
 KNEE_VALGUS_MARGIN = 0.02  # m: each knee may sit this far inside its hip-ankle line before knee_valgus charges
@@ -98,6 +98,11 @@ KNEE_VALGUS_MARGIN = 0.02  # m: each knee may sit this far inside its hip-ankle 
 # knees 0.281-0.376 m apart (p1-p99) and score 0.99 in it; the earlier band, exactly 0.3, scored them 0.60 and the
 # stance 0.54, paying the knees to come together.
 KNEE_DISTANCE_RANGE = (STANCE_KNEE_DISTANCE - 2.0 * KNEE_VALGUS_MARGIN, STANCE_KNEE_DISTANCE + 0.05)
+# feet_distance's band (m): from sport mode's narrowest turns in place (0.285; the stance is 0.326) to its p95 at speed
+FEET_DISTANCE_RANGE = (0.28, 0.45)
+# base_height's band (m): the sport stance's pelvis height, 4 cm lower to 2 cm higher. Without it the legs crouched,
+# the pelvis at 0.77 m and the knees at 1.86 rad by 200k steps (AlwaysStepBand_s42)
+BASE_HEIGHT_RANGE = (STANCE_PELVIS_HEIGHT - 0.04, STANCE_PELVIS_HEIGHT + 0.02)
 # mdp.golem_limits: the measured joints are charged within GOLEM_POSITION_MARGIN (rad) of GOLEM's position e-stops,
 # and for |dq| or the motor torque beyond GOLEM_RATE_MARGIN of its velocity or torque e-stop
 GOLEM_POSITION_MARGIN = 0.03
@@ -126,10 +131,6 @@ LIN_VEL_STDS = (0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1)  # m/s
 ANG_VEL_STDS = (1.5, 1.0, 0.7, 0.5, 0.4, 0.3, 0.2)  # rad/s
 # knee_valgus's bodies: hip, knee, ankle per leg, left then right
 VALGUS_LINK_NAMES = [f"{side}_{link}_link" for side in ("left", "right") for link in ("hip_roll", "knee", "ankle_pitch")]
-# posture's joints: the sagittal ones, which set the stance height (hip yaw and roll have hip_yaw_mean, hip_roll_pos)
-HIP_YAW_JOINT_NAMES = [n for n in HIP_YAW_ROLL_JOINT_NAMES if "yaw" in n]
-HIP_ROLL_JOINT_NAMES = [n for n in HIP_YAW_ROLL_JOINT_NAMES if "roll" in n]
-POSTURE_JOINT_NAMES = [f"{side}_{joint}_joint" for side in ("left", "right") for joint in ("hip_pitch", "knee", "ankle_pitch")]
 # the motors' gain and strength draws (mdp.randomize_actuator_scales)
 ACTUATOR_SCALES = {"gain_range": (0.8, 1.2), "strength_range": (0.85, 1.15)}
 
@@ -140,17 +141,18 @@ class MarlCommandsCfg:
     base_velocity = mdp.ModalVelocityCommandCfg(
         asset_name="robot",
         resampling_time_range=(10.0, 10.0),  # in training the navigation events resample it (nav_time_range)
-        rel_standing_envs=0.05,
+        rel_standing_envs=0.25,  # so standing still under the stand/walk gate is learned as well as stepping
         heading_command=False,  # a yaw rate, like a joystick
         debug_vis=True,
         # sport mode's full stick
         ranges=mdp.ModalVelocityCommandCfg.Ranges(lin_vel_x=(-0.55, 0.55), lin_vel_y=(-0.54, 0.54),
                                                   ang_vel_z=(-0.97, 0.97)),
         arm_command_name=ARM_COMMAND,
-        # uniform sampling almost never draws a turn in place, a pure sideways walk or a command near the gate
+        # uniform sampling almost never draws a turn in place or a pure sideways walk (of the moving commands, 20% turn
+        # in place, 20% walk sideways, 60% uniform over the full ranges)
         pure_turn_prob=0.2,
         pure_lateral_prob=0.2,
-        small_command_prob=0.2,
+        small_command_prob=0.0,
         lin_vel_stds=LIN_VEL_STDS,
         ang_vel_stds=ANG_VEL_STDS,
     )
@@ -165,8 +167,8 @@ class MarlCommandsCfg:
         ],
         standing_height=TABLE_PELVIS_HEIGHT,
         resampling_time_range=(4.0, 4.0),
-        # legs only for now (sport-mode command following): every task is navigation, the arms hold their rest pose
-        arm_goal_prob=0.0,
+        # standing goals only: the depth curriculum stays at level 0 (no crouch goals), so the pelvis-height band holds
+        levels=0,
         fine_pos_stds=FINE_POS_STDS,
         rot_stds=ROT_STDS,
         table_file=ARM_TARGET_TABLE,
@@ -197,6 +199,7 @@ class MarlActionsCfg:
         arm_joint_names=[LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES],
         command_name=ARM_COMMAND,
         residual_cutoff_hz=3.0,
+        residual_ramp=True,  # the IK alone until the warm start ends, then the residual ramps in with the arm goals
         target_margin=-GOLEM_TARGET_CLIP,
         torque_headroom=TORQUE_HEADROOM,
     )
@@ -304,49 +307,67 @@ def _golem(joint_names: list[str], quantity: str, weight: float, margin: float =
 
 @configclass
 class LegsRewardsCfg:
-    """The legs' reward: ALMI-Open's h1_2_lower terms (gait clock, feet, effort and smoothness), unitree_rl_gym's
-    H1-2 tracking (per step, on the gait-cycle mean velocity, kernels narrowed by the command's curriculum, at twice
-    its weights) and alive term, and the task's own: sport mode's stance (base_height and posture outside arm goals,
-    whose crouch is free), a steady torso, the swing clearance, the knees and hips, GOLEM's limits, and the yaw rate
-    and hip deviation during arm goals. Weights are per second (the manager multiplies by dt)."""
+    """The legs' reward: unitree_rl_gym's H1-2 tracking (per step, on the gait-cycle mean velocity, kernels narrowed by
+    the command's curriculum, at twice its weights) and the gait: ALMI-Open's gait clock, each swing foot lifted to
+    sport mode's 6 cm sine reference over its 0.70 s stride and the leg joints' swing sport mode's (sport_gait; on
+    foot height alone the policy reached 6 cm with the thigh vertical, the shin folded back and the toes down). A small
+    reward for the feet, the knees and the pelvis height inside their bands, nothing outside. Then the costs: a steady
+    torso, effort and smoothness, GOLEM's limits, joint limits, contact forces, self-contact, knee valgus and the yaw
+    rate during arm goals. No alive, posture, hip or drift terms. Weights are per second (the manager multiplies by
+    dt)."""
 
     # --- task
     track_lin_vel_xy = RewTerm(func=mdp.track_velocity_cycle_exp, weight=2.0,
                                params={"command_name": "base_velocity", "component": "lin_xy"})
     track_ang_vel_z = RewTerm(func=mdp.track_velocity_cycle_exp, weight=1.5,
                               params={"command_name": "base_velocity", "component": "ang_z"})
-    alive = RewTerm(func=mdp.is_alive, weight=0.15)
-    # --- posture: sport mode's torso is steady (roll/pitch sd 0.83/0.75 deg while stepping) and its stance tall.
-    # orientation -3 (ALMI-Open's -0.25 charged a 3.4 deg sway about 0.001 per second; at -10 the first sport-mode run
-    # fell in 40% of its episodes at 24k steps' worth of time, against 11% before)
+    # --- torso: sport mode's is steady (roll/pitch sd 0.83/0.75 deg while stepping). orientation -3 (ALMI-Open's
+    # -0.25 charged a 3.4 deg sway about 0.001 per second; at -10 the first sport-mode run fell in 40% of its episodes
+    # at 24k steps' worth of time, against 11% before)
     lin_vel_z = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
     ang_vel_xy = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.2)
     orientation = RewTerm(func=mdp.flat_orientation_l2, weight=-3.0)
-    base_height = RewTerm(func=mdp.base_height_l2_navigation, weight=-10.0, params={
-        "target_height": STANCE_PELVIS_HEIGHT, "sensor_cfg": SceneEntityCfg("height_scanner"),
-        "arm_command_name": ARM_COMMAND})
-    # --- gait (ALMI-Open)
-    contact = RewTerm(func=mdp.contact_matches_phase, weight=0.18,
+    # --- gait
+    # each swing foot at the 6 cm sine reference: at most 0.57 per second at weight 1 (two feet, 45% of the stride
+    # each, the lift-share weighting's mean 0.64), 0.15 of that for dragged feet. At 4.0 (2.3/s) the tracking's 2.1/s
+    # for shuffling won and the feet stayed down (StepWalk_s42); at 12.0 (a full lift 6.9/s, twice the tracking's
+    # maximum) the rear foot lifted in place and the stance staggered (LegsOnly_s42); at 8.0 a full lift pays 4.6/s
+    feet_swing_height_tracking = RewTerm(func=mdp.feet_swing_height_tracking_exp, weight=8.0, params={
+        "asset_cfg": SceneEntityCfg("robot", body_names=FOOT_LINK_NAMES, preserve_order=True),
+        "rest_height": 0.045,  # the ankle's standing height
+        "lift_height": 0.06,
+        "command_name": "base_velocity",
+        "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
+        "std": 0.03,
+    })
+    # each foot's contact at the clock's stance or swing: at most 2 per second at weight 1, 1.1 with both feet down
+    contact = RewTerm(func=mdp.contact_matches_phase, weight=0.5,
                       params={"sensor_cfg": _FEET_CONTACT, "command_name": "base_velocity"})
-    contact_no_vel = RewTerm(func=mdp.contact_no_vel, weight=-0.2, params={"sensor_cfg": _FEET_CONTACT, "asset_cfg": _FEET})
-    # the feet from 0.28 m apart: sport mode's turns in place go down to 0.285 (the stance is 0.326)
-    feet_distance = RewTerm(func=mdp.body_pair_distance, weight=1.0,
-                            params={"asset_cfg": _FEET, "min_dist": 0.28, "max_dist": 0.6})
-    knee_distance = RewTerm(func=mdp.body_pair_distance, weight=0.2, params={
+    # sport mode's swing (the bags' fit, less its cycle mean) at the gait phase and command, outside arm goals; its std
+    # narrows 0.3 -> 0.17 rad over the first 96k steps. Without it no policy turned on its mean action (turn ratio
+    # -0.03 at 20k steps; 0.23 with it); narrowed to 0.1 its pay fell to a third and the stride stopped stepping
+    # through (LegsOnly_s42)
+    sport_gait = RewTerm(func=mdp.sport_gait_exp, weight=1.5, params={
+        "asset_cfg": SceneEntityCfg("robot", joint_names=LOWER_JOINT_NAMES, preserve_order=True),
+        "command_name": "base_velocity", "arm_command_name": ARM_COMMAND, "std": 0.3, "std_end": 0.17,
+        "std_steps": 96000, "reference_file": SPORT_GAIT_REFERENCE})
+    # walking forward or backward, each foot ahead of the other by 5 cm once a cycle (step-through, not step-to): at
+    # most 1 per second. sport_gait's swing left the feet's fore-aft centre free, and LegsSport_s42 walked with the
+    # left foot always ahead
+    feet_pass = RewTerm(func=mdp.feet_pass_cycle, weight=1.0, params={
+        "asset_cfg": SceneEntityCfg("robot", body_names=FOOT_LINK_NAMES, preserve_order=True),
+        "command_name": "base_velocity", "target": 0.05, "min_speed": 0.15})
+    # --- the stance: 1 inside each band, 0.37 at 1 cm out, 0.05 at 3 cm (the distances horizontal, stride included).
+    # Without the feet and knee bands the stance widened unchecked, the feet 1.31 m apart standing by 200k steps
+    # (AlwaysStep200k_s42); sport mode's bags score 0.96-0.99 in them
+    feet_distance = RewTerm(func=mdp.body_pair_distance_band, weight=0.5, params={
+        "asset_cfg": _FEET, "min_dist": FEET_DISTANCE_RANGE[0], "max_dist": FEET_DISTANCE_RANGE[1]})
+    knee_distance = RewTerm(func=mdp.body_pair_distance_band, weight=0.5, params={
         "asset_cfg": SceneEntityCfg("robot", body_names=KNEE_LINK_NAMES), "min_dist": KNEE_DISTANCE_RANGE[0],
         "max_dist": KNEE_DISTANCE_RANGE[1]})
-    # hip yaw and roll at their defaults, scaled down during arm goals: they hold the pelvis's yaw against twisting.
-    # The yaw's gait-cycle mean only: a turn swings the hip yaws +-0.15-0.23 rad about zero with each step in sport mode
-    # (its turns in place, 0.0148 rad^2 of instantaneous deviation against 0.0004 for the cycle mean), and the
-    # instantaneous deviation charged that swing; holding the hips 0.3 rad into the turn costs as much as before. The
-    # roll's instantaneous angle: sport mode's barely moves while turning.
-    hip_yaw_mean = RewTerm(func=mdp.joint_mean_deviation_l2, weight=-1.0, params={
-        "asset_cfg": SceneEntityCfg("robot", joint_names=HIP_YAW_JOINT_NAMES, preserve_order=True),
-        "arm_command_name": ARM_COMMAND, "arm_goal_scale": ARM_GOAL_HIP_POS_SCALE})
-    hip_roll_pos = RewTerm(func=mdp.joint_deviation_l2_modal, weight=-1.0, params={
-        "asset_cfg": SceneEntityCfg("robot", joint_names=HIP_ROLL_JOINT_NAMES), "arm_command_name": ARM_COMMAND,
-        "arm_goal_scale": ARM_GOAL_HIP_POS_SCALE, "command_name": "base_velocity", "turn_free_joint_names": None})
-    stance_base_vel = RewTerm(func=mdp.stance_base_vel, weight=-1.0, params={"command_name": "base_velocity"})
+    base_height = RewTerm(func=mdp.base_height_band, weight=0.5, params={
+        "sensor_cfg": SceneEntityCfg("height_scanner"), "min_height": BASE_HEIGHT_RANGE[0],
+        "max_height": BASE_HEIGHT_RANGE[1]})
     # --- effort and smoothness. The rate terms are on raw actions: x4 for 100 Hz (a smooth trajectory's per-step
     # change halves) and x the mean squared ratio of the matched scales to the earlier ones (0.62), so a joint-target
     # change costs what it did
@@ -364,28 +385,8 @@ class LegsRewardsCfg:
                                   params={"sensor_cfg": _FEET_CONTACT, "max_force": 1400.0, "window": 3})
     self_collision = RewTerm(func=mdp.self_contacts_involving, weight=-1.0,
                              params={**_SELF_CONTACT_PARAMS, "own_links": LEGS_OWN_LINKS})
-    # --- the task's own
-    arm_goal_yaw_rate = RewTerm(func=mdp.yaw_rate_l2_during_arm_goal, weight=-1.0,
-                                params={"arm_command_name": ARM_COMMAND})
     action_beyond_clip = RewTerm(func=mdp.action_beyond_clip, weight=-0.02,
                                  params={"agent": "legs", "action_name": LEGS_ACTION, "clip": CLIP_ACTIONS})
-    # a dragging foot pays; sport mode lifts its feet 6 cm
-    feet_swing_clearance = RewTerm(func=mdp.feet_swing_clearance, weight=-25.0, params={
-        "asset_cfg": SceneEntityCfg("robot", body_names=FOOT_LINK_NAMES, preserve_order=True),
-        "rest_height": 0.045,  # the ankle's standing height
-        "lift_height": 0.06,
-        "command_name": "base_velocity",
-        "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
-    })
-    # the positive counterpart of feet_swing_clearance (a lift signal on steps the floor zeroes); off by default
-    feet_swing_height = RewTerm(func=mdp.feet_swing_height_exp, weight=0.0, params={
-        "asset_cfg": SceneEntityCfg("robot", body_names=FOOT_LINK_NAMES, preserve_order=True),
-        "rest_height": 0.045,
-        "lift_height": 0.06,
-        "command_name": "base_velocity",
-        "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
-        "std": 0.03,
-    })
     knee_valgus = RewTerm(func=mdp.knee_valgus, weight=-10.0, params={
         "asset_cfg": SceneEntityCfg("robot", body_names=VALGUS_LINK_NAMES, preserve_order=True),
         "margin": KNEE_VALGUS_MARGIN})
@@ -394,18 +395,9 @@ class LegsRewardsCfg:
                              ".*_ankle_roll_joint": GOLEM_ANKLE_ROLL_POSITION_MARGIN})
     golem_velocity = _golem(LOWER_JOINT_NAMES, "velocity", -10.0, GOLEM_RATE_MARGIN)
     golem_torque = _golem(LOWER_JOINT_NAMES, "torque", -10.0, GOLEM_RATE_MARGIN)
-    yaw_twist = RewTerm(func=mdp.yaw_twist_l2, weight=-1.0)
-    # sport mode's swing (the bags' fit, less its cycle mean) at the gait phase and command, outside arm goals; its std
-    # narrows 0.3 -> 0.1 rad over the first 96k steps. Without it no policy turned on its mean action (turn ratio
-    # -0.03 at 20k steps; 0.23 with it)
-    sport_gait = RewTerm(func=mdp.sport_gait_exp, weight=1.5, params={
-        "asset_cfg": SceneEntityCfg("robot", joint_names=LOWER_JOINT_NAMES, preserve_order=True),
-        "command_name": "base_velocity", "arm_command_name": ARM_COMMAND, "std": 0.3, "std_end": 0.1,
-        "std_steps": 96000, "reference_file": SPORT_GAIT_REFERENCE})
-    # sport mode's stance: the sagittal joints' gait-cycle mean at the default pose, outside arm goals
-    posture = RewTerm(func=mdp.joint_mean_deviation_l2, weight=-2.0, params={
-        "asset_cfg": SceneEntityCfg("robot", joint_names=POSTURE_JOINT_NAMES, preserve_order=True),
-        "arm_command_name": ARM_COMMAND})
+    # --- arm goals: turning moves the world-fixed targets in the pelvis frame
+    arm_goal_yaw_rate = RewTerm(func=mdp.yaw_rate_l2_during_arm_goal, weight=-1.0,
+                                params={"arm_command_name": ARM_COMMAND})
 
 
 def _arm_tracking_annealed(arm: int, func) -> RewTerm:
@@ -500,9 +492,6 @@ class MarlEventCfg:
     reset_joints = EventTerm(func=mdp.reset_joints_by_offset, mode="reset", params={
         "asset_cfg": SceneEntityCfg("robot", joint_names=LOWER_JOINT_NAMES + ARM_JOINT_NAMES, preserve_order=True),
         "position_range": (-0.05, 0.05), "velocity_range": (-0.1, 0.1)})
-    # ALMI-Open's pushes, scaled per env by the push curriculum
-    push_robot = EventTerm(func=mdp.push_by_level, mode="interval", interval_range_s=(10.0, 10.0),
-                           params={"num_levels": PUSH_LEVELS, "max_speed": MAX_PUSH_SPEED})
     # the MID-360 chip's mount, beyond what CL_Assets measured, and its accelerometer's horizontal bias
     imu_mount = EventTerm(func=mdp.randomize_imu_mount, mode="reset", params={
         "roll_deg": IMU_MOUNT_ROLL_DEG, "pitch_deg": IMU_MOUNT_PITCH_DEG, "yaw_deg": IMU_MOUNT_YAW_DEG,
@@ -531,19 +520,7 @@ class MarlTerminationsCfg:
 
 @configclass
 class MarlCurriculumCfg:
-    # down a row after a fall, up one after a time-out that tracked the velocity commands, rows above 0 only once
-    # the warm start has ended (the robot walks), one more row of ceiling per steps_per_row
-    terrain_levels = CurrTerm(func=mdp.gated_terrain_levels, params={
-        "command_name": "base_velocity", "max_error": TERRAIN_MAX_TRACKING_ERROR, "arm_command_name": ARM_COMMAND,
-        "max_fall_share": 0.02, "min_tracked_share": 0.7, "min_depth_level": 4.0, "min_crouch_ratio": 0.75,
-        "steps_per_row": 16000, "after_warm_start": True,
-    })
-    # down after a fall, up per 20 s of a time-out that tracked the velocity commands; no pushes until the warm start
-    # ends
-    push_levels = CurrTerm(func=mdp.push_levels, params={
-        "num_levels": PUSH_LEVELS, "max_speed": MAX_PUSH_SPEED, "command_name": "base_velocity",
-        "max_error": TERRAIN_MAX_TRACKING_ERROR, "seconds_per_level": 20.0, "warm_start_command": ARM_COMMAND,
-    })
+    # flat ground (every env on the terrain's row 0) and no pushes: no terrain or push curriculum
     arm_target_levels = CurrTerm(func=mdp.arm_target_levels, params={"command_name": ARM_COMMAND})
     velocity_kernels = CurrTerm(func=mdp.velocity_kernels, params={"command_name": "base_velocity"})
 
@@ -584,27 +561,27 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
 
     # -- training
     training: bool = True
-    """Training: the warm start holds the arm goals back until the robot walks, and the curriculum state is saved
-    under <log_dir>/curriculum. False (evaluation): arm goals from the start."""
+    """Training: the warm start holds the arm goals and the arms' residual back until the robot walks, and the
+    curriculum state is saved under <log_dir>/curriculum. False (evaluation): both from the start."""
     state_checkpoint_path: str | None = None
     """A saved curriculum state to start from (the scripts fill it in from an skrl checkpoint)."""
     state_save_every: int = 9600
     """Policy steps between curriculum-state saves: the skrl checkpoint interval."""
-    # While training, episodes are unpushed navigation on flat ground until the robot walks well enough to harden:
-    # over the ending episodes (exponential means, warm_start_episode_decay per episode) at most
-    # warm_start_max_falls_per_min falls per minute, and the sport-mode metrics on training's own navigation
-    # (ModalVelocityCommand.sport_metrics, sampled actions) within these thresholds, warm_start_sport_checks checks in
-    # a row warm_start_sport_every steps apart; or at warm_start_deadline_steps (0: none). Then the pushes, the
-    # terrain rows and the arm goals start. <log_dir>/warm_start_gate.yaml overrides any warm_start_* field while
-    # training (LocoManipMarlEnv._read_gate_overrides).
-    warm_start_max_falls_per_min: float = 0.02
+    # While training, every task is navigation and the arms' residual is off until the robot walks well enough: the
+    # sport-mode metrics on training's own navigation (ModalVelocityCommand.sport_metrics, sampled actions) within
+    # these thresholds, warm_start_sport_checks checks in a row warm_start_sport_every steps apart; or at
+    # warm_start_deadline_steps (0: none). The falls per minute over the ending episodes (exponential means,
+    # warm_start_episode_decay per episode) and the speed and turn ratios are checked only when set. Then the arm goals
+    # and the arms' residual ramp in. <log_dir>/warm_start_gate.yaml overrides any warm_start_* field while training
+    # (LocoManipMarlEnv._read_gate_overrides).
+    warm_start_max_falls_per_min: float | None = None
     warm_start_episode_decay: float = 0.999
     warm_start_min_turn_sense: float = 0.9
-    warm_start_speed_ratio_range: tuple[float, float] = (0.7, 1.3)
-    warm_start_turn_ratio_range: tuple[float, float] = (0.7, 1.3)
+    warm_start_speed_ratio_range: tuple[float, float] | None = None
+    warm_start_turn_ratio_range: tuple[float, float] | None = None
     warm_start_min_sport_cos: float = 0.8
-    warm_start_max_ang_err: float = 0.1
-    warm_start_max_lin_err: float = 0.12
+    warm_start_max_ang_err: float = 0.15
+    warm_start_max_lin_err: float = 0.2
     warm_start_sport_every: int = 100
     warm_start_sport_checks: int = 3
     warm_start_deadline_steps: int = 0
@@ -621,10 +598,10 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     """Physics substeps each env's joint targets reach the robot late, drawn at each reset; None: on time."""
     gait_period: float = 0.7
     """s per full stride of the gait clock (mdp.leg_phase), sport mode's at every speed; the gait-cycle means of the
-    tracking terms, the posture term and the velocity command's metrics span one."""
+    tracking terms, sport_gait and the velocity command's metrics span one."""
     zero_cmd_eps: float = 0.03
     """The stand/walk gate: a command whose norm over (vx, vy, wz) is under this counts as standing (gait phase 0,
-    stance_base_vel); sport mode steps on any input."""
+    both feet down); sport mode steps on any input."""
 
     @property
     def policy_dt(self) -> float:

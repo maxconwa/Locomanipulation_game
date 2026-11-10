@@ -55,7 +55,7 @@ cpu_checks() {  # $1 run name, $2 export dir, $3 out dir
     > "$dir/stress_small60.log" 2>&1
   for bag in mid360v2_deploy mid360v2_deploy_2; do
     PYTHONPATH=$ROSBAGS_PATH python agent_scripts/hw_bag_replay.py --bag "$BAGS/$bag" --deployed mid360v2 \
-      --golem "$GOLEM" --policy "mid360v2=$GOLEM/core_ws/src/lmg_deploy/policies/mid360v2" --policy "$name=$export" \
+      --golem "$GOLEM" --policy "mid360v2=logs/deploy_baselines/mid360v2" --policy "$name=$export" \
       --sim_seeds 4 --out "$dir/replay_$bag" > "$dir/replay_$bag.log" 2>&1
   done
   note "$name: CPU checks done (stress: logs/hw_stress_mujoco/$name*, replays: $dir/replay_*)"
@@ -85,7 +85,7 @@ for seed in "${SEEDS[@]}"; do
       > "$dir/scorecard_$step.log" 2>&1
     note "$name: scorecard agent_$step exit $? (kernel failures $(grep -ac 'fail to launch kernel' "$dir/scorecard_$step.log"))"
   done
-  export=$dir/$name   # a policies/<name> folder for lmg_deploy
+  export=$dir/$name   # a candidate export; lmg_deploy's policies/h12 takes one only when chosen
   if python scripts/skrl/export_marl.py --checkpoint "$run/checkpoints/agent_$FINAL.pt" --out "$export" \
       > "$dir/export.log" 2>&1; then
     python scripts/skrl/deploy_parity.py --checkpoint "$run/checkpoints/agent_$FINAL.pt" --export "$export" \

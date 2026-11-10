@@ -147,7 +147,7 @@ def main(env_cfg, agent_cfg: dict):
         d = robot.data
         gyro = deploy_gyro.value if deploy_gyro.value is not None else imu.data.ang_vel_b[i].double().cpu().numpy()
         return RobotState(q=d.joint_pos[i, ids].double().cpu().numpy(), dq=d.joint_vel[i, ids].double().cpu().numpy(),
-                          tau=d.applied_torque[i, ids].double().cpu().numpy(), quat=imu.data.quat_w[i].double().cpu().numpy(),
+                          quat=imu.data.quat_w[i].double().cpu().numpy(),
                           gyro=gyro, acc=imu.data.lin_acc_b[i].double().cpu().numpy())
 
     def sync(i: int = 0):

@@ -189,6 +189,16 @@ def base_height_l2_navigation(
     return base_height_l2(env, target_height, sensor_cfg=sensor_cfg) * (~arm).float()
 
 
+def base_height_band(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, min_height: float,
+                     max_height: float) -> torch.Tensor:
+    """In [0, 1]: 1 while the pelvis's height above the scanned ground is within [min_height, max_height], exp(-100 x)
+    at x m outside (0.37 at 1 cm, 0.05 at 3 cm), 0 where every ray missed. A reward for staying in the band only, as
+    body_pair_distance_band."""
+    height = env.scene["robot"].data.root_pos_w[:, 2] - ground_height(env.scene.sensors[sensor_cfg.name])
+    outside = torch.clamp(min_height - height, min=0.0) + torch.clamp(height - max_height, min=0.0)
+    return torch.nan_to_num(torch.exp(-outside * 100.0), nan=0.0)
+
+
 def arm_goal_reached(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     """1 on the step after both wrists were first held on the goal: a one-off bonus, so finishing pays more than
     hovering just outside the tolerance."""
@@ -244,6 +254,41 @@ class sport_gait_exp(_CycleMean):
             std += (std_end - std) * min(env.common_step_counter / max(std_steps, 1), 1.0)
         arm = env.command_manager.get_term(arm_command_name).arm_mode
         return torch.exp(-error / std**2) * (~arm).float()
+
+
+class feet_pass_cycle(_CycleMean):
+    """In [0, 1] while walking forward or backward (|v_x command| at least min_speed; 0 otherwise): how far each foot
+    got ahead of the other over the last gait cycle, the lesser of the two, over target. The feet's fore-aft offset
+    dx (left less right, forward in the pelvis heading frame) swings to both sides of 0 in a step-through gait and
+    stays on one side in a step-to gait. sport_gait's swing is less its cycle mean, so it left the offset's centre
+    free: LegsSport_s42 swung dx 30 cm at sport mode's period but about +21 cm, the right foot never ahead (both feet
+    passed in 0-4% of its cycles; sport mode's bags 100%, the lesser foot 7.5 cm ahead). The unfilled slots after a
+    reset read 0, which pays nothing."""
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env, 1)
+
+    def __call__(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, command_name: str, target: float = 0.05,
+                 min_speed: float = 0.15) -> torch.Tensor:
+        data = env.scene[asset_cfg.name].data
+        offset = data.body_pos_w[:, asset_cfg.body_ids[0]] - data.body_pos_w[:, asset_cfg.body_ids[1]]
+        self._push(quat_apply_inverse(yaw_quat(data.root_quat_w), offset)[:, 0:1])
+        dx = self._samples[:, :, 0]
+        lead = torch.minimum(dx.max(dim=1).values, (-dx).max(dim=1).values)
+        walking = env.command_manager.get_command(command_name)[:, 0].abs() >= min_speed
+        return torch.clamp(lead / target, 0.0, 1.0) * walking.float()
+
+
+def electrical_power_exp(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, heat_at_limit: float,
+                         power_scale: float) -> torch.Tensor:
+    """In (0, 1]: exp(-P / power_scale) of asset_cfg's joints' electrical power P (W): the mechanical sum |tau qd| and
+    the windings' copper loss, heat_at_limit (W) per joint at its effort limit and quadratic in the torque, so holding
+    a pose costs its torque (mechanical power alone is zero for any pose held still)."""
+    data = env.scene[asset_cfg.name].data
+    tau = data.applied_torque[:, asset_cfg.joint_ids]
+    mechanical = torch.sum(torch.abs(tau * data.joint_vel[:, asset_cfg.joint_ids]), dim=1)
+    heat = heat_at_limit * torch.sum(torch.square(tau / data.joint_effort_limits[:, asset_cfg.joint_ids]), dim=1)
+    return torch.exp(-(mechanical + heat) / power_scale)
 
 
 def joint_deviation_l2_modal(

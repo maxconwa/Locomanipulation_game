@@ -67,7 +67,8 @@ def read_deploy_settings(run_dir: Path) -> dict:
     (config/policy_template.yaml; marl_deploy_node.py lets export.yaml override them), from params/env.yaml:
     control_dt (decimation x sim dt), kp and kd per joint in the policies' joint order (the actuators' stiffness and
     damping), gait_period, zero_cmd_eps, command_ranges and command_filter_tau (the first-order low-pass on the
-    velocity command, s; 0: none), and the default pose and each action term's scale per joint."""
+    velocity command, s; 0: none), the default pose and each action term's scale per joint, and arm_goals (whether the
+    run trained arm goals at all, arm_goal_prob > 0)."""
     import re
 
     env = _yaml_load_any((Path(run_dir) / "params" / "env.yaml").read_text())
@@ -94,14 +95,21 @@ def read_deploy_settings(run_dir: Path) -> dict:
             raise ValueError(f"{joint}: {len(hits)} entries in {list(table)}")
         return float(hits[0])
 
-    # the default pose (the legs' action offset) and each action term's scale per joint, when it is a dict (lmg_deploy
-    # reads them over the template's legs.action_scale and arms.residual_scale)
+    # the default pose (the legs' action offset) and each action term's scale per joint (lmg_deploy reads them over the
+    # template's legs.action_scale and arms.residual_scale). A single number too: dropped, the template's would apply
+    # (an arms residual trained at scale 0 would deploy at the template's 0.2)
     pose = {"default_joint_pos": [matching(env["scene"]["robot"]["init_state"]["joint_pos"], j) for j in names]}
     actions = env.get("actions", {})
     for term, key in (("joint_pos", "leg_action_scales"), ("arm_pos", "arm_residual_scales")):
         scale = (actions.get(term) or {}).get("scale")
         if isinstance(scale, dict):
             pose[key] = [matching(scale, j) for j in actions[term]["joint_names"]]
+        elif isinstance(scale, (int, float)):
+            pose[key] = [float(scale)] * len(actions[term]["joint_names"])
+    # the arms' residual gain (IKResidualArmActionCfg.residual_gain) folded into their scales
+    gain = (actions.get("arm_pos") or {}).get("residual_gain")
+    if gain is not None and "arm_residual_scales" in pose:
+        pose["arm_residual_scales"] = [float(gain) * s for s in pose["arm_residual_scales"]]
     if (actions.get("arm_pos") or {}).get("max_ik_step") is not None:
         pose["max_ik_step"] = float(actions["arm_pos"]["max_ik_step"])
     return {
@@ -113,4 +121,8 @@ def read_deploy_settings(run_dir: Path) -> dict:
         "command_ranges": {axis: [float(v) for v in velocity["ranges"][axis]]
                            for axis in ("lin_vel_x", "lin_vel_y", "ang_vel_z")},
         "command_filter_tau": float(velocity.get("command_filter_tau", 0.0)),
+        "arm_goals": float(env["commands"]["arm_targets"]["arm_goal_prob"]) > 0.0,
+        # each actor's observation terms in order (MarlMujoco builds the vectors from them)
+        **{f"{agent}_obs_terms": [name for name, term in env["observations"][agent].items()
+                                  if isinstance(term, dict) and "func" in term] for agent in ("legs", "arms")},
     }

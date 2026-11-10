@@ -51,6 +51,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
         # its reset; None: every episode max_episode_length (episode_length_range_s None)
         self.episode_limit = (torch.full((self.num_envs,), self.max_episode_length, device=self.device)
                               if cfg.episode_length_range_s is not None else None)
+        # metrics the mdp terms log each step (mdp.amp_style's discriminator)
+        self.term_log: dict[str, torch.Tensor] = {}
 
         # After super() has started the sim, in ManagerBasedRLEnv.load_managers' order: observations read commands
         # and actions, rewards read terminations.
@@ -201,6 +203,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._obs_buf = {g: self.observation_manager.compute_group(g) for g in groups}
         self.extras.setdefault("log", {}).update(self._warm_start_log)
         self.extras["log"].update(self.golem_log)
+        self.extras["log"].update(self.term_log)
         return {agent: self._obs_buf[agent] for agent in self.cfg.possible_agents}
 
     def _get_states(self) -> torch.Tensor:
@@ -262,10 +265,11 @@ class LocoManipMarlEnv(DirectMARLEnv):
             self.save_state()
 
     def _update_warm_start(self, ending: torch.Tensor):
-        """End the warm start (goals_enabled: the pushes, the terrain rows and the arm goals start) once the robot
-        walks like sport mode: over the ending episodes (exponential means, decay cfg.warm_start_episode_decay per
-        episode) at most cfg.warm_start_max_falls_per_min falls per minute, and the sport-mode gate passes
-        (_sport_gate); or at cfg.warm_start_deadline_steps. Per minute, not per episode: the share of episodes that
+        """End the warm start (goals_enabled: the arm goals and the arms' residual ramp in, and the pushes and terrain
+        rows start where configured) once the robot walks like sport mode: the sport-mode gate passes (_sport_gate)
+        and, if cfg.warm_start_max_falls_per_min is set, over the ending episodes (exponential means, decay
+        cfg.warm_start_episode_decay per episode) at most that many falls per minute; or at
+        cfg.warm_start_deadline_steps. Per minute, not per episode: the share of episodes that
         fall grows with their length. Runs before the resets, while the velocity command still holds the ending
         episodes' sums and episode_length_buf their lengths."""
         cfg = self.cfg
@@ -278,7 +282,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
             self._walk_minutes = keep * self._walk_minutes + (1.0 - keep) * minutes.mean()
         falls_per_min = self._walk_falls / self._walk_minutes
         sport = self._sport_gate()  # every check, so the metrics are logged before and after the goals start
-        walks = bool(falls_per_min <= cfg.warm_start_max_falls_per_min) and sport
+        max_falls = cfg.warm_start_max_falls_per_min
+        walks = (max_falls is None or bool(falls_per_min <= max_falls)) and sport
         deadline = 0 < cfg.warm_start_deadline_steps <= self.common_step_counter
         arm = self._arm_command
         if not arm.goals_enabled and (walks or deadline):
@@ -287,7 +292,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
             metrics = ", ".join(f"{k} {v:.3f}" for k, v in self._sport_metrics.items() if not k.startswith("n_"))
             print(f"[INFO] Warm start over at step {self.common_step_counter}{' (deadline)' if not walks else ''}:"
                   f" {falls_per_min.item():.3f} falls per minute; sport metrics {metrics or 'none yet'};"
-                  " pushes, terrain rows and arm goals start")
+                  " the arm goals start")
         self._warm_start_log["Curriculum/warm_start_falls_per_min"] = falls_per_min
         self._warm_start_log["Curriculum/arm_goals_enabled"] = torch.tensor(float(arm.goals_enabled), device=self.device)
 
@@ -305,9 +310,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._sport_metrics = m
         for key, value in m.items():
             self._warm_start_log[f"Metrics/sport/{key}"] = torch.tensor(value, device=self.device)
+        speed, turn = cfg.warm_start_speed_ratio_range, cfg.warm_start_turn_ratio_range
         passes = (m["turn_sense"] >= cfg.warm_start_min_turn_sense
-                  and cfg.warm_start_speed_ratio_range[0] <= m["speed_ratio"] <= cfg.warm_start_speed_ratio_range[1]
-                  and cfg.warm_start_turn_ratio_range[0] <= m["turn_ratio"] <= cfg.warm_start_turn_ratio_range[1]
+                  and (speed is None or speed[0] <= m["speed_ratio"] <= speed[1])
+                  and (turn is None or turn[0] <= m["turn_ratio"] <= turn[1])
                   and m["cos"] >= cfg.warm_start_min_sport_cos
                   and m["ang_err"] <= cfg.warm_start_max_ang_err
                   and m["lin_err"] <= cfg.warm_start_max_lin_err)  # nan compares False
@@ -352,6 +358,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
             "terrain_levels": terrain.terrain_levels.clone(),
             "terrain_types": terrain.terrain_types.clone(),
             "arm_goals_enabled": self._arm_command.goals_enabled,
+            "reward_terms": {key: term.checkpoint_state() for key, term in self._stateful_reward_terms().items()},
         }
         directory = os.path.join(self.cfg.log_dir, "curriculum")
         os.makedirs(directory, exist_ok=True)
@@ -371,6 +378,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
             terrain.terrain_levels[:] = levels[torch.randint(0, len(levels), (self.num_envs,), device=self.device)]
         terrain.env_origins[:] = terrain.terrain_origins[terrain.terrain_levels, terrain.terrain_types]
         self._arm_command.goals_enabled |= state["arm_goals_enabled"]
+        for key, term in self._stateful_reward_terms().items():
+            if key in state.get("reward_terms", {}):
+                term.load_checkpoint_state(state["reward_terms"][key])
+                print(f"[INFO] Restored reward term state: {key}")
         print(
             f"[INFO] Restored curriculum: depth level mean {self._arm_command.level.float().mean().item():.2f},"
             f" arm goals {self._arm_command.goals_enabled}, velocity kernel stages lin"
@@ -380,6 +391,13 @@ class LocoManipMarlEnv(DirectMARLEnv):
     """
     Helpers.
     """
+
+    def _stateful_reward_terms(self) -> dict:
+        """agent/term -> the class reward terms that carry learned state (checkpoint_state; mdp.amp_style)."""
+        return {f"{agent}/{name}": cfg.func
+                for agent, manager in self.reward_managers.items()
+                for name, cfg in zip(manager._term_names, manager._term_cfgs)
+                if hasattr(cfg.func, "checkpoint_state")}
 
     def _refresh_sensors_after_reset(self, env_ids: Sequence[int]):
         """Make the IMU read the reset state, not the robot's last pose before the reset.

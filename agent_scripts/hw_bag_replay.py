@@ -18,7 +18,7 @@ bag's own velocity commands as the reference range, and the report counts the re
 another rate than the node's ticks steps on its own clock, on the latest /lowstate.
 
     python agent_scripts/hw_bag_replay.py --bag <bag dir> --deployed mid360v2 \
-        --policy mid360v2=<GOLEM>/core_ws/src/lmg_deploy/policies/mid360v2 [--policy name=<export dir> ...] \
+        --policy mid360v2=logs/deploy_baselines/mid360v2 [--policy name=<export dir> ...] \
         [--sim_seeds 4] [--out logs/hw_bag_replay/<bag>]
 
 Any python with numpy, torch, pinocchio, pyyaml, mujoco (for --sim_seeds) and rosbags. Run from the repo root.
@@ -180,7 +180,6 @@ class Replayer:
         self.attitude_source.append(source)
         return RobotState(q=np.array([motors[i].q for i in range(NUM_JOINTS)], dtype=np.float64),
                           dq=np.array([motors[i].dq for i in range(NUM_JOINTS)], dtype=np.float64),
-                          tau=np.array([motors[i].tau_est for i in range(NUM_JOINTS)], dtype=np.float64),
                           quat=quat, gyro=gyro, acc=acc)
 
     def engage(self, msg, now):

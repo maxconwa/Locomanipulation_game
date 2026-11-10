@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
+from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -114,6 +115,40 @@ def body_pair_distance_band(
     dist = torch.norm(pos[:, 0, :] - pos[:, 1, :], dim=1)
     outside = torch.clamp(min_dist - dist, min=0.0) + torch.clamp(dist - max_dist, min=0.0)
     return torch.exp(-outside * 100.0)
+
+
+def body_pair_offset_band(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    axis: int,
+    min_dist: float = 0.0,
+    max_dist: float = 0.05,
+    command_name: str | None = None,
+) -> torch.Tensor:
+    """In [0, 1]: body_pair_distance_band on one component of the two bodies' offset in the pelvis heading frame,
+    |offset[axis]| (0 fore-aft, 1 lateral), so the stance's width and stagger are scored apart. With command_name,
+    paid only while standing is commanded (0 otherwise)."""
+    data = env.scene[asset_cfg.name].data
+    offset = data.body_pos_w[:, asset_cfg.body_ids[0]] - data.body_pos_w[:, asset_cfg.body_ids[1]]
+    dist = quat_apply_inverse(yaw_quat(data.root_quat_w), offset)[:, axis].abs()
+    outside = torch.clamp(min_dist - dist, min=0.0) + torch.clamp(dist - max_dist, min=0.0)
+    score = torch.exp(-outside * 100.0)
+    if command_name is not None:
+        score = score * standing_command(env, env.command_manager.get_command(command_name)).float()
+    return score
+
+
+def feet_load_balance_band(
+    env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, max_imbalance: float = 0.1, command_name: str = "base_velocity"
+) -> torch.Tensor:
+    """In [0, 1] while standing is commanded (0 otherwise): each foot's share of the two feet's vertical contact force
+    (mean over the policy step's physics substeps), exp(-20 * the excess of |share - 0.5| over max_imbalance), so 1
+    up to 60/40 at 0.1, 0.37 at 65/35, 0.14 at 70/30. Both feet unloaded scores as all on one."""
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    fz = sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, 2].clamp(min=0.0).mean(dim=1)
+    share = fz[:, 0] / fz.sum(dim=1).clamp(min=1.0)
+    score = torch.exp(-torch.clamp((share - 0.5).abs() - max_imbalance, min=0.0) * 20.0)
+    return score * standing_command(env, env.command_manager.get_command(command_name)).float()
 
 
 def stance_base_vel(env: ManagerBasedRLEnv, command_name: str = "base_velocity") -> torch.Tensor:

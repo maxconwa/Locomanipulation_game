@@ -1,21 +1,23 @@
 """Export a checkpoint of the two-agent task for GOLEM's lmg_deploy package.
 
-Writes into --out (a policies/<name> directory of the deploy package):
+Writes into --out (the deploy package's policies/<robot> directory, which holds one policy: empty it first; or a
+candidate folder under logs/):
   legs.pt, arms.pt   TorchScript actors: skrl's observation scaler (RunningStandardScaler, eps 1e-8, clip +-5), the
                      LSTM (its cell state capped as in training, c <- s tanh(c / s)) and the MLP's mean, and the env's
                      +-clip_actions clamp, as forward(obs, h, c) -> (action, h, c) with hidden_size and num_layers
                      attributes; the deploy node carries h, c and zeroes them at engage.
-  <name>.yaml        the deploy template (agent_scripts/hw_deploy_template.yaml): what no run changes.
+  <name>.yaml        (<name> = the folder's name: h12.yaml in policies/h12) the deploy template (agent_scripts/hw_deploy_template.yaml): what no run changes.
   export.yaml        what the run trained with, which the node loads over the template: the navigation rest pose
                      (the arm target tables' default_poses), target_limits (joint -> [low, high], the run's clip of
                      every joint target into GOLEM's position e-stop range), gait_phase_cos, imu (the body its IMU
                      sat on and the gyro low-pass), and (mujoco_evals.common.read_deploy_settings) control_dt, kp, kd,
                      default_joint_pos, the per-joint action scales, max_ik_step, gait_period, zero_cmd_eps,
-                     command_ranges and command_filter_tau; and the source files.
+                     command_ranges, command_filter_tau and arm_goals (false: the run never trained an arm goal,
+                     and the deploy refuses one); and the source files.
 Needs only torch and pyyaml; no simulator.
 
     python scripts/skrl/export_marl.py --checkpoint logs/skrl/locomanip_marl/<run>/checkpoints/agent_<step>.pt \
-        --out ~/GOLEM/core_ws/src/lmg_deploy/policies/<name>
+        --out ~/GOLEM/core_ws/src/lmg_deploy/policies/h12
 """
 
 import argparse
@@ -93,7 +95,8 @@ def mlp(state: dict, prefix: str) -> nn.Sequential:
 
 
 if os.path.basename(os.path.normpath(args.out)) == "export":
-    raise SystemExit("--out: name the folder after the policy (policies/<name>), not 'export': <name>.yaml is the deploy yaml")
+    raise SystemExit("--out: policies/<robot> or a folder named after the policy, not 'export': <name>.yaml is the deploy "
+                     "yaml")
 ckpt_path = os.path.abspath(args.checkpoint)
 run_dir = os.path.dirname(os.path.dirname(ckpt_path))
 ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)

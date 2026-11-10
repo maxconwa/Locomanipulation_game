@@ -6,7 +6,9 @@ to the real robot through GOLEM's `lmg_deploy` package.
 
 The recipe copies sport mode, as measured in its bags (`docs/experiments/sportmode_ablations.md`): its PD gains on
 every joint (with action scales matched to them), its stance (knee 0.70 rad), its command ranges (vx 0.55, vy 0.54
-m/s, wz 0.97 rad/s), its 0.5 s command low-pass and 0.70 s stride, stepping on any command. The policy runs at
+m/s, wz 0.97 rad/s), its 0.5 s command low-pass and 0.70 s stride, stepping on any command. The legs are paid for
+following the command, sport mode's 6 cm foot lift and joint swing, and small rewards for the feet, knees and pelvis
+height inside their bands (no posture or alive terms); a quarter of the commands are zero. The policy runs at
 100 Hz over 500 Hz physics with an explicit PD and 0-20 ms of action delay; the actors are LSTMs with a capped cell
 state; episodes have drawn lengths (uniform, 90-300 s); the arm goals start once training's own sport-mode tracking
 metrics pass. These are the defaults: `train.py` with no overrides trains the recipe.
@@ -57,14 +59,15 @@ bash scripts/train_candidate.sh <name> 42 43        # SMOKE=30 for a 30-update s
 # the sport-mode scorecard and the wrist phase (motors nominal) -> <run>/checkpoints/scorecard_<N>.{json,md}
 python scripts/skrl/eval_scorecard.py --checkpoint <run>/checkpoints/agent_<N>.pt --headless \
     'env.events.actuator_scales.params.gain_range=[1.0,1.0]' 'env.events.actuator_scales.params.strength_range=[1.0,1.0]'
-# export for lmg_deploy: legs.pt, arms.pt, <name>.yaml (the template), export.yaml (what the run trained with)
-python scripts/skrl/export_marl.py --checkpoint <run>/checkpoints/agent_<N>.pt --out ~/GOLEM/core_ws/src/lmg_deploy/policies/<name>
+# export for lmg_deploy: legs.pt, arms.pt, h12.yaml (the template), export.yaml (what the run trained with); empty
+# policies/h12 first: it holds one policy
+python scripts/skrl/export_marl.py --checkpoint <run>/checkpoints/agent_<N>.pt --out ~/GOLEM/core_ws/src/lmg_deploy/policies/h12
 # the deploy controller against the env, step by step
 python scripts/skrl/deploy_parity.py --checkpoint <run>/checkpoints/agent_<N>.pt --export <export dir> --headless
 # CPU: MuJoCo stress tests and the replay of a robot bag
 python agent_scripts/hw_stress_mujoco.py --export <export dir> --label <name>
 python agent_scripts/hw_bag_replay.py --bag <bag> --deployed mid360v2 \
-    --policy mid360v2=~/GOLEM/core_ws/src/lmg_deploy/policies/mid360v2 --policy <name>=<export dir> --sim_seeds 4
+    --policy mid360v2=logs/deploy_baselines/mid360v2 --policy <name>=<export dir> --sim_seeds 4
 python scripts/skrl/play.py --checkpoint <run>/checkpoints/agent_<N>.pt
 ```
 
@@ -75,14 +78,18 @@ The evaluation scripts rebuild the env a run trained in from the current default
 (`<run>/params/hydra_overrides.txt`); an override whose key the current config no longer has is dropped (its value is
 now the default) and listed. Runs from before the 2026-10-25 cleanup on other recipes need the `pre-cleanup` tag.
 
-While training, the robot walks unpushed on flat ground until the warm-start gate passes (falls per minute and the
-sport-mode metrics, `warm_start_*`); then the pushes, the terrain rows and the arm goals start. `<run>/warm_start_gate.yaml`
-changes its thresholds without a restart; TensorBoard shows training's sport-mode metrics under `Metrics/sport/`.
+While training, the robot walks on flat ground, unpushed, with the arms held at rest by their IK alone, until the
+warm-start gate passes (training's sport-mode metrics: cos >= 0.8, turn sense >= 0.9, linear error <= 0.2 m/s, angular
+error <= 0.15 rad/s; `warm_start_*`); then standing-height arm goals and the arms' residual ramp in over 20k steps.
+`<run>/warm_start_gate.yaml` changes its thresholds without a restart; TensorBoard shows training's sport-mode metrics
+under `Metrics/sport/`.
 
 ## Deploy
 
-Copy or export into `~/GOLEM/core_ws/src/lmg_deploy/policies/<name>/`, build, and launch with `policy:=<name>` (GOLEM's
-`lmg_deploy` README). The node runs at the policy's `control_dt` and reads the gains, stance, action scales, command
+Export into `~/GOLEM/core_ws/src/lmg_deploy/policies/h12/`, replacing what is there, build, and launch `lmg_sim` or
+`lmg_real` (GOLEM's `lmg_deploy` README). The deploy package keeps one policy per robot, one iteration at a time: old
+ones are deleted, not kept beside it. `logs/deploy_baselines/mid360v2` keeps the export the robot bags were recorded
+with, for the bag replays. The node runs at the policy's `control_dt` and reads the gains, stance, action scales, command
 filter and ranges from `export.yaml`.
 
 ## Gotchas

@@ -160,6 +160,8 @@ class MarlMujoco:
         self.cmd_alpha = 1.0 - math.exp(-self.policy_dt / tau) if tau > 0 else None
         self.gait_period, self.zero_cmd_eps = float(settings["gait_period"]), float(settings["zero_cmd_eps"])
         self.gait_cos = bool(settings.get("gait_phase_cos", False))
+        # each actor's observation terms by name (read_deploy_settings); None: the walking task's layout
+        self.legs_terms, self.arms_terms = settings.get("legs_obs_terms"), settings.get("arms_obs_terms")
         jid = {n: mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, n) for n in ALL_NAMES}
         self.qadr = np.array([m.jnt_qposadr[jid[n]] for n in ALL_NAMES])
         self.vadr = np.array([m.jnt_dofadr[jid[n]] for n in ALL_NAMES])
@@ -348,16 +350,28 @@ class MarlMujoco:
         n, r = self.NOISE, self.rng
         u = lambda x, s: x + r.uniform(-s, s, np.shape(x))  # noqa: E731
         believed = np.concatenate([xyzw(b) for b in self.believed])
-        common = [u(acc, n["lin_acc"]), u(gyro, n["ang_vel"]), u(grav, n["grav"]), self.observed_cmd(),
-                  np.array([1.0 if self.arm_mode else 0.0]), believed, u(self.measured_q() - self.default, n["jpos"]),
-                  u(self.measured_dq(), n["jvel"])] + self.gait()
-        legs_applied = (self.applied[self.leg_idx] - self.default[self.leg_idx]) / self.leg_scale
+        gait = self.gait()
         cur = self.wrist_poses_b()
         wrist_pose = np.concatenate([xyzw(np.r_[c[:3], qunique(c[3:])]) for c in cur])
         errs = np.concatenate([np.r_[b[:3] - c[:3], axis_angle(qmul(b[3:], qconj(c[3:])))]
                                for b, c in zip(self.believed, cur)])
-        return {"legs": np.concatenate(common + [legs_applied]),
-                "arms": np.concatenate(common + [self.residual, u(wrist_pose, n["wrist"]), u(errs, n["wrist"])])}
+        # each observation term by its env cfg name
+        terms = {"base_lin_acc": u(acc, n["lin_acc"]), "base_ang_vel": u(gyro, n["ang_vel"]),
+                 "projected_gravity": u(grav, n["grav"]), "velocity_commands": self.observed_cmd(),
+                 "arm_goal": np.array([1.0 if self.arm_mode else 0.0]), "ee_targets": believed,
+                 "joint_pos": u(self.measured_q() - self.default, n["jpos"]), "joint_vel": u(self.measured_dq(), n["jvel"]),
+                 "gait_phase": gait[0]}
+        if len(gait) > 1:
+            terms["gait_phase_cos"] = gait[1]
+        legs = {**terms, "actions": (self.applied[self.leg_idx] - self.default[self.leg_idx]) / self.leg_scale}
+        arms = {**terms, "actions": self.residual, "wrist_poses": u(wrist_pose, n["wrist"]),
+                "wrist_errors": u(errs, n["wrist"])}
+        # the walking task's layout: the shared terms, then each agent's own
+        default = list(terms)
+        legs_terms = self.legs_terms or default + ["actions"]
+        arms_terms = self.arms_terms or default + ["actions", "wrist_poses", "wrist_errors"]
+        return {"legs": np.concatenate([legs[k] for k in legs_terms]),
+                "arms": np.concatenate([arms[k] for k in arms_terms])}
 
     def step(self, obs: dict):
         """One policy step from obs: act, simulate, then the next observations."""

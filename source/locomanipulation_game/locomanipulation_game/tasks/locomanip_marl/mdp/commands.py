@@ -915,11 +915,18 @@ class ArmTargetsCommand(CommandTerm):
         arm_goal_prob, if lower) over cfg.arm_goal_ramp_steps env steps after the warm start ends (outside training, or
         resumed: no ramp)."""
         cfg = self.cfg
-        if self.goals_enabled_at is None or cfg.arm_goal_ramp_steps <= 0:
-            return cfg.arm_goal_prob
         start = min(cfg.arm_goal_ramp_start, cfg.arm_goal_prob)
-        frac = min(1.0, (self._env.common_step_counter - self.goals_enabled_at) / cfg.arm_goal_ramp_steps)
-        return start + frac * (cfg.arm_goal_prob - start)
+        return start + self.goal_ramp * (cfg.arm_goal_prob - start)
+
+    @property
+    def goal_ramp(self) -> float:
+        """0 before the goals are enabled, then 0 -> 1 linearly over cfg.arm_goal_ramp_steps env steps (1 at once
+        outside training, resumed, or with no ramp): the arm-goal share's and the arms' residual's ramp."""
+        if not self.goals_enabled:
+            return 0.0
+        if self.goals_enabled_at is None or self.cfg.arm_goal_ramp_steps <= 0:
+            return 1.0
+        return min(1.0, (self._env.common_step_counter - self.goals_enabled_at) / self.cfg.arm_goal_ramp_steps)
 
     def _update_command(self):
         pass

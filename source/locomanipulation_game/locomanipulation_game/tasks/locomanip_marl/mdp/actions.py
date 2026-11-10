@@ -130,7 +130,8 @@ class IKResidualArmAction(_BoundedTargets):
     Each policy step and arm, Isaac Lab's DifferentialIKController steps the arm from its measured joint angles
     toward the command the policies see (ArmTargetsCommand.believed_b, pelvis frame), capped at max_ik_step rad per
     joint. The policy's action, low-passed at residual_cutoff_hz (one pole, per policy step) and times scale, is added
-    in joint space. The policy observes the filtered residual.
+    in joint space, times cfg.residual_gain; with cfg.residual_ramp, also times the arm command's goal_ramp (0 until the warm start ends, then
+    up to 1 with the arm-goal share). The policy observes the filtered residual.
     """
 
     cfg: IKResidualArmActionCfg
@@ -166,7 +167,8 @@ class IKResidualArmAction(_BoundedTargets):
         # detached: outside skrl's no_grad the recursion would chain the policy's graph across steps
         self._residual = self._residual + self._filter_alpha * (actions.detach() - self._residual)
         robot = self._asset
-        command = self._env.command_manager.get_term(self.cfg.command_name).believed_b  # (N, arms, 7), wxyz
+        term = self._env.command_manager.get_term(self.cfg.command_name)
+        command = term.believed_b  # (N, arms, 7), wxyz
         root_pos, root_quat = robot.data.root_pos_w, robot.data.root_quat_w
         to_root = matrix_from_quat(quat_inv(root_quat))
         jacobians = robot.root_physx_view.get_jacobians()
@@ -182,7 +184,8 @@ class IKResidualArmAction(_BoundedTargets):
             q_arm = q[:, cols]
             step = self._ik[arm].compute(ee_pos, ee_quat, jac, q_arm) - q_arm
             ik[:, cols] = ik[:, cols] + step.clamp(-self.cfg.max_ik_step, self.cfg.max_ik_step)
-        self._apply_bounds(ik + self._residual * self._scale)
+        gain = (term.goal_ramp if self.cfg.residual_ramp else 1.0) * self.cfg.residual_gain
+        self._apply_bounds(ik + self._residual * (self._scale * gain))
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         super().reset(env_ids)
@@ -205,6 +208,10 @@ class IKResidualArmActionCfg(JointPositionActionCfg):
     max_ik_step: float = 0.05
     """rad per joint per policy step (5 rad/s at 100 Hz)."""
     residual_cutoff_hz: float = MISSING
+    residual_ramp: bool = False
+    """Scale the residual by the arm command's goal_ramp: the IK alone holds the arms until the warm start ends."""
+    residual_gain: float = 1.0
+    """Times scale (one number, so a run can override it; scale is per joint): 0 holds the arms by the IK alone."""
     target_margin: float = MISSING
     joint_limits: dict[str, tuple[float, float]] | None = None
     """joint name -> (low, high) the target must also stay inside (golem_safety.position_envelope)."""
