@@ -279,18 +279,6 @@ class feet_pass_cycle(_CycleMean):
         return torch.clamp(lead / target, 0.0, 1.0) * walking.float()
 
 
-def electrical_power_exp(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, heat_at_limit: float,
-                         power_scale: float) -> torch.Tensor:
-    """In (0, 1]: exp(-P / power_scale) of asset_cfg's joints' electrical power P (W): the mechanical sum |tau qd| and
-    the windings' copper loss, heat_at_limit (W) per joint at its effort limit and quadratic in the torque, so holding
-    a pose costs its torque (mechanical power alone is zero for any pose held still)."""
-    data = env.scene[asset_cfg.name].data
-    tau = data.applied_torque[:, asset_cfg.joint_ids]
-    mechanical = torch.sum(torch.abs(tau * data.joint_vel[:, asset_cfg.joint_ids]), dim=1)
-    heat = heat_at_limit * torch.sum(torch.square(tau / data.joint_effort_limits[:, asset_cfg.joint_ids]), dim=1)
-    return torch.exp(-(mechanical + heat) / power_scale)
-
-
 def joint_deviation_l2_modal(
     env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, arm_command_name: str, arm_goal_scale: float,
     command_name: str = "base_velocity", turn_free_joint_names: list[str] | None = None

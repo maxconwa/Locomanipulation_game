@@ -15,9 +15,6 @@ The state (scripts/build_amp_reference.STATE_NAMES builds the reference's): the 
 gravity in the pelvis frame, the pelvis's linear and angular velocity in its own frame, and both feet (the ankle-roll
 links) relative to the pelvis in its heading frame, their heights above the ground (the height scanner's) and their
 velocities in the heading frame: a skating stance foot moves over the ground, a planted one doesn't.
-
-reset_from_reference is AMP's reference state initialisation: a share of the resets start from a reference frame
-(mid-stride), so the policy starts in the reference's states instead of having to find them from standing.
 """
 
 from __future__ import annotations
@@ -27,10 +24,9 @@ import torch
 import torch.nn as nn
 from typing import TYPE_CHECKING
 
-from isaaclab.managers import EventTermCfg, ManagerTermBase, RewardTermCfg, SceneEntityCfg
-from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_mul, yaw_quat
+from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
+from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 
-from ..golem_safety import position_envelope
 from .commands import ground_height
 
 if TYPE_CHECKING:
@@ -194,58 +190,3 @@ class amp_style(ManagerTermBase):
         self.disc.load_state_dict(state["disc"])
         self.optimizer.load_state_dict(state["optimizer"])
 
-
-class reset_from_reference(ManagerTermBase):
-    """Reference state initialisation: each reset env, with the given probability, starts from a random reference
-    frame no faster than max_speed (m/s, horizontal): the leg joints and their velocities (inside GOLEM's position
-    envelope and the soft limits), the pelvis's tilt, height above the env origin's ground and its linear and angular
-    velocity. The heading and the x, y are the earlier reset events' (reset_base); the torso and arms keep theirs
-    (reset_joints). Frames whose lower ankle-roll link sits under its standing height (a stance foot rolling on its
-    heel or toe) are raised until it is clearance above it, so no frame starts in the ground. params: reference
-    (build_amp_reference's npz, with root_height and root_quat), probability, max_speed, clearance (m), joint_cfg
-    (the 12 leg joints in the reference's order). Runs after reset_base and reset_joints (a later field)."""
-
-    def __init__(self, cfg: EventTermCfg, env: ManagerBasedRLEnv):
-        super().__init__(cfg, env)
-        p = cfg.params
-        ref = np.load(p["reference"])
-        if "root_height" not in ref:
-            raise ValueError(f"{p['reference']}: no root_height/root_quat; rebuild it with build_amp_reference.py")
-        states = ref["states"]
-        keep = np.linalg.norm(states[:, 27:29], axis=1) <= p["max_speed"]
-        lift = np.maximum(SOLE + p["clearance"] - states[:, 39:41].min(axis=1), 0.0)
-        to = lambda a: torch.as_tensor(a[keep], dtype=torch.float32, device=self.device)  # noqa: E731
-        self._q, self._qd = to(states[:, 0:12]), to(states[:, 12:24])
-        self._v_b, self._w_b = to(states[:, 27:30]), to(states[:, 30:33])
-        self._height, self._quat = to(ref["root_height"] + lift), to(ref["root_quat"])
-        self._limits = None
-        print(f"[INFO] Reference state initialisation: {int(keep.sum())} frames no faster than {p['max_speed']} m/s,"
-              f" p {p['probability']}")
-
-    def __call__(self, env: ManagerBasedRLEnv, env_ids: torch.Tensor | None, reference: str, probability: float,
-                 max_speed: float, clearance: float, joint_cfg: SceneEntityCfg):
-        asset = env.scene[joint_cfg.name]
-        if env_ids is None:
-            env_ids = torch.arange(env.num_envs, device=self.device)
-        ids = env_ids[torch.rand(len(env_ids), device=self.device) < probability]
-        if len(ids) == 0:
-            return
-        if self._limits is None:
-            envelope = position_envelope(env.cfg.golem_estop)
-            soft = asset.data.soft_joint_pos_limits[0, joint_cfg.joint_ids]
-            names = [asset.joint_names[j] for j in joint_cfg.joint_ids]
-            low = torch.tensor([envelope.get(n, (-np.inf, np.inf))[0] for n in names], device=self.device)
-            high = torch.tensor([envelope.get(n, (-np.inf, np.inf))[1] for n in names], device=self.device)
-            self._limits = torch.maximum(low, soft[:, 0]), torch.minimum(high, soft[:, 1])
-        k = torch.randint(0, len(self._q), (len(ids),), device=self.device)
-        data = asset.data
-        quat = quat_mul(yaw_quat(data.root_link_quat_w[ids]), self._quat[k])
-        pos = data.root_link_pos_w[ids].clone()
-        pos[:, 2] = env.scene.env_origins[ids, 2] + self._height[k]
-        asset.write_root_link_pose_to_sim(torch.cat([pos, quat], dim=1), env_ids=ids)
-        vel = torch.cat([quat_apply(quat, self._v_b[k]), quat_apply(quat, self._w_b[k])], dim=1)
-        asset.write_root_link_velocity_to_sim(vel, env_ids=ids)
-        q = torch.clamp(self._q[k], *self._limits)
-        vmax = data.soft_joint_vel_limits[ids][:, joint_cfg.joint_ids]
-        qd = torch.clamp(self._qd[k], -vmax, vmax)
-        asset.write_joint_state_to_sim(q, qd, joint_ids=joint_cfg.joint_ids, env_ids=ids)

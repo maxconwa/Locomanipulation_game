@@ -14,9 +14,9 @@ degrees) and turning no faster than the command's 0.97 rad/s (the yaw rate's mea
 
     python scripts/build_amp_reference.py <h1_2 csv dir> [--out <npz>]
 
-Writes states (N, 47) and next_valid (N,): frame i and i + 1 are consecutive kept frames of one clip; and for
-reference state initialisation (mdp.reset_from_reference) each frame's pelvis height above the clip's ground
-(root_height) and its orientation with the heading removed (root_quat, w x y z). LAFAN1 is
+Writes states (N, 47) and next_valid (N,): frame i and i + 1 are consecutive kept frames of one clip; and each
+frame's pelvis height above the clip's ground (root_height) and its orientation with the heading removed (root_quat,
+w x y z), for a reference state initialisation (no task uses one). LAFAN1 is
 CC BY-NC-ND 4.0: the file is for research use and is not redistributed.
 """
 
