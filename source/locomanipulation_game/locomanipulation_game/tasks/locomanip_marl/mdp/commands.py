@@ -25,13 +25,18 @@ from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.sensors import ContactSensor, RayCaster
 from isaaclab.utils import configclass
 from isaaclab.utils.math import (
+    axis_angle_from_quat,
     combine_frame_transforms,
     quat_error_magnitude,
+    quat_from_angle_axis,
+    quat_inv,
+    quat_mul,
     quat_unique,
     subtract_frame_transforms,
     yaw_quat,
 )
 
+from .arm_kinematics import ArmKinematics
 from .legs_rewards import standing_command
 
 if TYPE_CHECKING:
@@ -446,6 +451,23 @@ class ArmTargetsCommand(CommandTerm):
     cfg.rot_stds for all envs. After every kernel_window_goals ended arm goals the stage narrows when enough of them
     came within its kernels, and widens when too few did (_judge_kernels), so the kernels follow the error down.
 
+    **Goal distance.** With goal_scales, an arm goal's poses are moved from each wrist's rest pose goal_scale of the
+    way to the drawn ones (position linearly, orientation along the shortest rotation), one stage of goal_scales for
+    all envs, nearest first: after every goal_window_goals ended arm goals the stage widens when at least
+    goal_promote_share of them were reached and narrows when fewer than goal_demote_share were (_judge_goal_scale).
+    The default, (1.0,), keeps the drawn poses. With offtable_prob, each arm goal is instead moved a random
+    U[offtable_scale_range] of the way with that probability (and kept as drawn otherwise): poses off the table rows,
+    whose joint seeds (below) are only the nearest rows'.
+
+    **Joint seeds.** With table_joints, the tables keep each row's arm joint angles, and seed_q holds, per env and arm,
+    the joint angles of the table row nearest the command (position, and rotation at seed_rot_weight m per rad; the
+    default angles while navigating): a solution on the right branch for an IK to aim its posture at
+    (mdp.IKPostureArmAction with posture_from_command). On the robot the same lookup runs on the commanded pose. With
+    seed_solve, the nearest row's angles start a damped-least-squares solve for the commanded pose itself (an off-table
+    goal's own solution). With collision_check, an arm goal whose seed, or the straight joint-space path to it from the
+    arms' measured angles, overlaps cuRobo's self-collision spheres is drawn again. With rest_goal_prob, that share of
+    arm goals is the rest pose, fixed in the world, its seed the default angles.
+
     **Reach.** A goal lasts its timer. It is reached once, when both wrists are first held inside the tolerances
     for reach_hold_s (the bonus is paid then); the tracking terms keep paying for staying on target.
 
@@ -499,6 +521,11 @@ class ArmTargetsCommand(CommandTerm):
         self._kernel_hits = torch.zeros((), device=self.device)
         self._kernel_goals = torch.zeros((), device=self.device)
         self.kernel_window_share = torch.tensor(float("nan"), device=self.device)  # the last judged window's
+        # -- goal-distance curriculum: likewise, judged on the reached share
+        self.goal_stage = 0
+        self._goal_hits = torch.zeros((), device=self.device)
+        self._goal_ended = torch.zeros((), device=self.device)
+        self.goal_window_share = torch.tensor(float("nan"), device=self.device)
 
         # -- metrics. CommandTerm.reset logs their mean over the reset envs, then zeroes them.
         for name in ("command_drift", "goals_reached", "goals_missed", "crouch_goals_reached", "crouch_goals_missed"):
@@ -530,6 +557,30 @@ class ArmTargetsCommand(CommandTerm):
             raise ValueError("z_min must stay below z_max at every depth level")
         # (num_arms, 7): the wrist poses at the default joint angles, the navigation rest pose
         self.rest_pose_b = torch.stack(data["default_poses"])
+        # joint seeds: each table row's arm joint angles, and per env and arm the nearest row's to the command
+        self._arm_joint_ids = [self.robot.find_joints(names, preserve_order=True)[0] for names in cfg.joint_names]
+        self._default_arm_q = torch.stack([self.robot.data.default_joint_pos[0, ids] for ids in self._arm_joint_ids])
+        self._table_joints = None
+        if cfg.table_joints:
+            if "joints" not in data:
+                raise ValueError("table_joints: the tables were built without their joint angles")
+            self._table_joints = data["joints"]
+        self.seed_q = self._default_arm_q.unsqueeze(0).repeat(self.num_envs, 1, 1)
+        # the seeds' solve and the goals' collision check: the URDF's arms from the pelvis, the torso at its default
+        self._kin = None
+        if (cfg.seed_solve or cfg.collision_check) and not cfg.table_joints:
+            raise ValueError("seed_solve and collision_check work on the seeds: they need table_joints")
+        if cfg.seed_solve or cfg.collision_check:
+            for arm, names in zip(ArmKinematics.ARMS, cfg.joint_names):
+                if list(names) != [f"{arm}_{j}_joint" for j in ArmKinematics.JOINTS]:
+                    raise ValueError(f"seed_solve / collision_check: joint_names {names} are not ArmKinematics' order")
+            torso = self.robot.data.default_joint_pos[0, self.robot.find_joints("torso_joint")[0][0]].item()
+            self._kin = ArmKinematics(cfg.kinematics_urdf, cfg.kinematics_spheres, device=self.device, torso_q=torso)
+            limits = torch.stack([self.robot.data.soft_joint_pos_limits[0, ids] for ids in self._arm_joint_ids])
+            self._solve_low = limits[..., 0] + cfg.joint_range_margin
+            self._solve_high = limits[..., 1] - cfg.joint_range_margin
+        self.goals_redrawn = 0  # arm goals drawn again for a collision, since the start
+        self.goals_unscreened = 0  # arm goals kept colliding after collision_retries
 
     def __str__(self) -> str:
         cfg = self.cfg
@@ -641,6 +692,7 @@ class ArmTargetsCommand(CommandTerm):
         goals; move the level on a full window, and restart the window when it moves."""
         cfg, window = self.cfg, self.cfg.level_window
         self._judge_kernels(ended)
+        self._judge_goal_scale(ended)
         ended = ended & (self.goal_height <= self.z_min(self.level) + cfg.judge_band)
         slot = (self.outcome_count % window).unsqueeze(1)
         value = torch.where(ended, self.goal_best_error.clamp(max=10.0), self.error_outcomes.gather(1, slot).squeeze(1))
@@ -683,15 +735,41 @@ class ArmTargetsCommand(CommandTerm):
         self._kernel_hits.zero_()
         self._kernel_goals.zero_()
 
+    @property
+    def goal_scale(self) -> float:
+        """How far an arm goal's poses are moved from the rest pose toward the drawn ones, at the current stage."""
+        return self.cfg.goal_scales[self.goal_stage]
+
+    def _judge_goal_scale(self, ended: torch.Tensor):
+        """Count the ended arm goals and those reached. After every goal_window_goals of them: widen the goals a stage
+        if at least goal_promote_share were reached, narrow them a stage if fewer than goal_demote_share were."""
+        cfg = self.cfg
+        if len(cfg.goal_scales) < 2:
+            return
+        self._goal_hits += (ended & self.goal_reached).sum()
+        self._goal_ended += ended.sum()
+        if self._goal_ended.item() < cfg.goal_window_goals:
+            return
+        share = self._goal_hits / self._goal_ended
+        self.goal_window_share = share
+        if share.item() >= cfg.goal_promote_share and self.goal_stage < len(cfg.goal_scales) - 1:
+            self.goal_stage += 1
+        elif share.item() < cfg.goal_demote_share and self.goal_stage > 0:
+            self.goal_stage -= 1
+        self._goal_hits.zero_()
+        self._goal_ended.zero_()
+
     def state_dict(self) -> dict[str, torch.Tensor]:
         """Curriculum state, saved with the env's state so a resumed or evaluated run keeps its levels."""
-        return {"level": self.level.clone(), "kernel_stage": torch.tensor(self.kernel_stage)}
+        return {"level": self.level.clone(), "kernel_stage": torch.tensor(self.kernel_stage),
+                "goal_stage": torch.tensor(self.goal_stage)}
 
     def load_state_dict(self, state: dict[str, torch.Tensor]):
         saved = state["level"].to(self.device)
         pick = slice(None) if len(saved) == self.num_envs else torch.randint(0, len(saved), (self.num_envs,), device=self.device)
         self.level[:] = saved[pick].clamp(0, self.cfg.levels)
         self.kernel_stage = min(max(int(state["kernel_stage"]), 0), len(self.cfg.fine_pos_stds) - 1)
+        self.goal_stage = min(max(int(state.get("goal_stage", 0)), 0), len(self.cfg.goal_scales) - 1)
 
     """
     Table construction.
@@ -703,6 +781,9 @@ class ArmTargetsCommand(CommandTerm):
         return {
             "body_names": list(cfg.body_names), "min_target_x": cfg.min_target_x, "balance_cell": cfg.balance_cell,
             "balance_min_rows": cfg.balance_min_rows, "table_size": cfg.table_size, "build_size": cfg.build_size,
+            # only when set: the tables built before they existed keep loading
+            **({"joint_range_margin": cfg.joint_range_margin} if cfg.joint_range_margin else {}),
+            **({"table_joints": True} if cfg.table_joints else {}),
         }
 
     def _load_or_build_tables(self, env: ManagerBasedEnv) -> dict:
@@ -720,11 +801,15 @@ class ArmTargetsCommand(CommandTerm):
         root_state = self.robot.data.default_root_state.clone()
         root_state[:, :3] += env.scene.env_origins
         default_q = self.robot.data.default_joint_pos.clone()
-        tables, default_poses = [], []
+        tables, default_poses, joints = [], [], []
         for arm in range(self.num_arms):
-            table, default_pose = self._build_table(env, arm, default_q, root_state, self.cfg.build_size)
-            table = table[table[:, 0] >= self.cfg.min_target_x]
-            table = _balance_cells(table, self.cfg.balance_cell, self.cfg.table_size, self.cfg.balance_min_rows, generator)
+            table, default_pose, q = self._build_table(env, arm, default_q, root_state, self.cfg.build_size)
+            keep = table[:, 0] >= self.cfg.min_target_x
+            # the rows balanced with their joint angles beside them
+            wide = _balance_cells(torch.cat([table[keep], q[keep]], dim=1), self.cfg.balance_cell, self.cfg.table_size,
+                                  self.cfg.balance_min_rows, generator)
+            table = wide[:, :7]
+            joints.append(wide[:, 7:])
             print(
                 f"[INFO] ArmTargetsCommand({self.cfg.body_names[arm]}): {len(table)} targets after filtering and"
                 f" balancing. Default pose (pelvis frame): {[round(v, 3) for v in default_pose.tolist()]}"
@@ -733,6 +818,8 @@ class ArmTargetsCommand(CommandTerm):
             default_poses.append(default_pose)
         data = {"settings": settings, "body_names": list(self.cfg.body_names), "tables": tables,
                 "default_poses": default_poses}
+        if self.cfg.table_joints:
+            data["joints"] = joints
         # leave the robot where the env's reset expects it
         self._step_state(env, default_q, root_state)
         if path:
@@ -742,17 +829,18 @@ class ArmTargetsCommand(CommandTerm):
 
     def _build_table(
         self, env: ManagerBasedEnv, arm: int, base_q: torch.Tensor, root_state: torch.Tensor, size: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """size collision-free wrist poses of one arm at random joint angles within its soft limits, the rest of the
-        robot at base_q, in the pelvis frame. Returns (table, the pose at the arm's default angles), which must read
-        collision-free: the check that the contact test works."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """size collision-free wrist poses of one arm at random joint angles within its soft limits (narrowed by
+        joint_range_margin at each end), the rest of the robot at base_q, in the pelvis frame. Returns (table, the
+        pose at the arm's default angles, which must read collision-free: the check that the contact test works, and
+        each row's arm joint angles)."""
         robot = self.robot
         body_idx = self.body_ids[arm]
         joint_ids, _ = robot.find_joints(self.cfg.joint_names[arm], preserve_order=True)
         sensor: ContactSensor = env.scene.sensors[self.cfg.contact_sensor_name]
         check_ids, _ = sensor.find_bodies(self.cfg.collision_body_names[arm], preserve_order=True)
         limits = robot.data.soft_joint_pos_limits[0, joint_ids]
-        low, high = limits[:, 0], limits[:, 1]
+        low, high = limits[:, 0] + self.cfg.joint_range_margin, limits[:, 1] - self.cfg.joint_range_margin
 
         default_pose, default_ok = self._reach(env, body_idx, base_q, root_state, sensor, check_ids)
         if not default_ok.all():
@@ -761,22 +849,23 @@ class ArmTargetsCommand(CommandTerm):
                 f"{int((~default_ok).sum())} envs; the contact test is broken."
             )
 
-        poses, total, tried = [], 0, 0
+        poses, angles, total, tried = [], [], 0, 0
         for _ in range(self.cfg.max_build_batches):
             q = base_q.clone()
             q[:, joint_ids] = low + (high - low) * torch.rand(self.num_envs, len(joint_ids), device=self.device)
             pose, ok = self._reach(env, body_idx, q, root_state, sensor, check_ids)
             poses.append(pose[ok])
+            angles.append(q[ok][:, joint_ids])
             total += int(ok.sum())
             tried += self.num_envs
             if total >= size:
                 break
-        table = torch.cat(poses)[:size]
+        table, joints = torch.cat(poses)[:size], torch.cat(angles)[:size]
         print(
             f"[INFO] ArmTargetsCommand({self.cfg.body_names[arm]}): {len(table)} targets kept,"
             f" {100.0 * total / tried:.1f}% of {tried} random arm poses collision-free."
         )
-        return table, default_pose[0].clone()
+        return table, default_pose[0].clone(), joints
 
     def _step_state(self, env: ManagerBasedEnv, q: torch.Tensor, root_state: torch.Tensor):
         """Every env at rest in joint state q with its root at root_state, then one physics step."""
@@ -868,14 +957,40 @@ class ArmTargetsCommand(CommandTerm):
         nav_ids = env_ids[~arm_goal]
         if len(nav_ids) > 0:
             self.believed_b[nav_ids] = self.rest_pose_b
+            self.seed_q[nav_ids] = self._default_arm_q
             self.time_left[nav_ids] = torch.empty(len(nav_ids), device=self.device).uniform_(*self.cfg.nav_time_range)
             velocity._resample(nav_ids)
 
-        # -- arm goal: a height in [z_min, z_max], table poses near it (lowered below the table), anchored in the world
+        # -- arm goal: _draw_arm_goals's; with collision_check, collision_retries more candidates per env, the first
+        # whose seed, and the straight joint-space path to it from the arms' measured angles, are clear of collisions
         arm_ids = env_ids[arm_goal]
         m = len(arm_ids)
         if m == 0:
             return
+        velocity.vel_command_b[arm_ids] = 0.0
+        velocity.vel_command_filtered[arm_ids] = 0.0
+        cfg = self.cfg
+        if not cfg.collision_check:
+            goal = self._draw_arm_goals(arm_ids)
+        else:
+            k = cfg.collision_retries + 1
+            goal = self._draw_arm_goals(arm_ids.repeat(k))  # candidate-major: (k * m)
+            start_q = torch.stack([self.robot.data.joint_pos[arm_ids][:, ids] for ids in self._arm_joint_ids], dim=1)
+            bad = self._kin.path_collides(start_q.repeat(k, 1, 1), goal["seed_q"]).view(k, m)
+            # the first clear candidate, or the last
+            pick = torch.where(bad.all(dim=0), k - 1, (~bad).float().argmax(dim=0))
+            self.goals_redrawn += int(pick.sum())
+            self.goals_unscreened += int(bad.all(dim=0).sum())
+            sel = pick * m + torch.arange(m, device=self.device)
+            goal = {key: value[sel] for key, value in goal.items()}
+        for key, value in goal.items():
+            getattr(self, key)[arm_ids] = value
+
+    def _draw_arm_goals(self, arm_ids: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Arm goals for arm_ids (repeats allowed), not yet set: a height in [z_min, z_max], table poses near it
+        (lowered below the table), anchored in the world, moved toward the rest pose (goal_scale, offtable_prob) or
+        the rest pose itself (rest_goal_prob), and their seeds. {attribute: its values for arm_ids}."""
+        m = len(arm_ids)
         cfg = self.cfg
         z_min = self.z_min(self.level[arm_ids])
         height = z_min + torch.rand(m, device=self.device) * (cfg.z_max - z_min)
@@ -884,20 +999,68 @@ class ArmTargetsCommand(CommandTerm):
         targets_s = self._draw_rows(source)
         drop = source - height_s
         targets_s[..., 2] -= drop.unsqueeze(1)
-        self.target_drop[arm_ids] = drop
-        self.goal_height[arm_ids] = height
-        self.needs_crouch[arm_ids] = (targets_s[..., 2] < self._standing_min_z).any(dim=1)
+        needs_crouch = (targets_s[..., 2] < self._standing_min_z).any(dim=1)
 
         origin, quat = self.standing_frame_w()
         if self._at_reset:
             # the height scan still shows where the robot was before the reset teleported it
             origin[arm_ids, 2] = self._env.scene.env_origins[arm_ids, 2] + self.cfg.standing_height
-        self.anchor_w[arm_ids] = _apply(origin[arm_ids], quat[arm_ids], targets_s)
-        self.believed_b[arm_ids] = _relative(
-            self.robot.data.root_pos_w[arm_ids], self.robot.data.root_quat_w[arm_ids], self.anchor_w[arm_ids]
-        )
-        velocity.vel_command_b[arm_ids] = 0.0
-        velocity.vel_command_filtered[arm_ids] = 0.0
+        anchor = _apply(origin[arm_ids], quat[arm_ids], targets_s)
+        if self.goal_scale < 1.0:
+            anchor = self._toward_rest(arm_ids, anchor, self.goal_scale)
+        if cfg.offtable_prob > 0.0:
+            low, high = cfg.offtable_scale_range
+            scale = low + (high - low) * torch.rand(m, 1, 1, device=self.device)
+            off = torch.rand(m, device=self.device) < cfg.offtable_prob
+            anchor = torch.where(off.view(-1, 1, 1), self._toward_rest(arm_ids, anchor, scale), anchor)
+        root_pos, root_quat = self.robot.data.root_pos_w[arm_ids], self.robot.data.root_quat_w[arm_ids]
+        rest = torch.rand(m, device=self.device) < cfg.rest_goal_prob
+        if rest.any():
+            anchor[rest] = _apply(root_pos[rest], root_quat[rest], self.rest_pose_b.expand(int(rest.sum()), -1, -1))
+            drop = torch.where(rest, 0.0, drop)
+            needs_crouch = needs_crouch & ~rest
+        goal = {"target_drop": drop, "goal_height": height, "needs_crouch": needs_crouch, "anchor_w": anchor,
+                "believed_b": _relative(root_pos, root_quat, anchor)}
+        if self._table_joints is not None:
+            seed = self.nearest_joints(goal["believed_b"])
+            if cfg.seed_solve:
+                seed = self._kin.solve(goal["believed_b"], seed, self._solve_low, self._solve_high,
+                                       iters=cfg.seed_solve_iters, damping=cfg.seed_solve_damping,
+                                       rot_weight=cfg.seed_solve_rot_weight)
+            seed[rest] = self._default_arm_q
+            goal["seed_q"] = seed
+        return goal
+
+    def _toward_rest(self, env_ids: torch.Tensor, goal_w: torch.Tensor, scale: float | torch.Tensor) -> torch.Tensor:
+        """(len(env_ids), num_arms, 7): goal_w moved from each wrist's rest pose (on the pelvis now) scale (a number, or
+        (len(env_ids), 1, 1)) of the way: position linearly, orientation along the shortest rotation."""
+        rest = self.rest_pose_b.unsqueeze(0).expand(len(env_ids), -1, -1)
+        rest_w = _apply(self.robot.data.root_pos_w[env_ids], self.robot.data.root_quat_w[env_ids], rest)
+        pos = rest_w[..., :3] + scale * (goal_w[..., :3] - rest_w[..., :3])
+        q_rest, q_goal = rest_w[..., 3:].reshape(-1, 4), goal_w[..., 3:].reshape(-1, 4)
+        rotvec = axis_angle_from_quat(quat_mul(quat_inv(q_rest), q_goal))
+        rotvec = rotvec * (scale.expand(-1, pos.shape[1], 1).reshape(-1, 1) if torch.is_tensor(scale) else scale)
+        angle = rotvec.norm(dim=-1)
+        axis = torch.where(angle.unsqueeze(-1) > 1e-9, rotvec / angle.clamp(min=1e-9).unsqueeze(-1),
+                           torch.tensor([1.0, 0.0, 0.0], device=self.device))
+        quat = quat_unique(quat_mul(q_rest, quat_from_angle_axis(angle, axis)))
+        return torch.cat([pos, quat.view(pos.shape[0], pos.shape[1], 4)], dim=-1)
+
+    def nearest_joints(self, poses_b: torch.Tensor, chunk: int = 256) -> torch.Tensor:
+        """(n, num_arms, joints): per arm, the joint angles of the table row nearest each pose of poses_b (n, num_arms,
+        7, pelvis frame): squared position distance plus (seed_rot_weight x rotation angle)^2, the angle from
+        8 (1 - |q . q_row|)."""
+        out = []
+        w2 = self.cfg.seed_rot_weight ** 2
+        for arm, (table, joints) in enumerate(zip(self._tables, self._table_joints)):
+            picks = []
+            for start in range(0, len(poses_b), chunk):
+                pose = poses_b[start:start + chunk, arm]
+                d = torch.cdist(pose[:, :3], table[:, :3]).square()
+                d = d + w2 * 8.0 * (1.0 - (pose[:, 3:] @ table[:, 3:].T).abs())
+                picks.append(d.argmin(dim=1))
+            out.append(joints[torch.cat(picks)])
+        return torch.stack(out, dim=1)
 
     def _draw_rows(self, source: torch.Tensor) -> torch.Tensor:
         """(len(source), num_arms, 7): per arm a table row within arm_height_spread of source (pelvis-frame height)."""
@@ -1026,6 +1189,18 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     kernel_promote_share: float = 0.5
     kernel_demote_share: float = 0.25
 
+    # -- goal-distance curriculum (ArmTargetsCommand._judge_goal_scale): how far each stage's arm goals sit from the
+    # rest pose toward the drawn poses, nearest first; (1.0,): the drawn poses, no curriculum
+    goal_scales: tuple[float, ...] = (1.0,)
+    goal_window_goals: int = 20000
+    """Ended arm goals (all envs) per judged window."""
+    goal_promote_share: float = 0.5
+    """Reached share of a window that widens the goals a stage."""
+    goal_demote_share: float = 0.2
+    offtable_prob: float = 0.0
+    """Share of arm goals moved toward the rest pose by a random U[offtable_scale_range] (the class doc)."""
+    offtable_scale_range: tuple[float, float] = (0.25, 1.0)
+
     # -- tables
     table_file: str = "arm_target_tables_v3.pt"
     """Loaded when present and built with the same settings (a relative path: under the env's log_dir); otherwise
@@ -1034,6 +1209,32 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     build_size: int = 300_000
     """Collision-free targets collected per arm before filtering and balancing."""
     max_build_batches: int = 4000
+    joint_range_margin: float = 0.0
+    """rad: the tables' random joint angles stay this far inside each soft joint limit."""
+    table_joints: bool = False
+    """Keep each table row's arm joint angles and look up seed_q (the class doc's joint seeds)."""
+    seed_rot_weight: float = 0.3
+    """m per rad of rotation in the seed lookup's distance."""
+    seed_solve: bool = False
+    """Solve each arm goal's seed_q from the nearest row's angles (table_joints) for the commanded pose itself: damped
+    least squares on the URDF's kinematics (mdp.arm_kinematics), inside the tables' joint ranges."""
+    seed_solve_iters: int = 20
+    """Each about 0.6 ms on the GPU whatever the batch (kernel launches). Off-table goals within 5 cm / 0.35 rad: 93.8%
+    at 20, 94.1% at 60."""
+    seed_solve_damping: float = 0.05
+    seed_solve_rot_weight: float = 0.5
+    """m per rad of rotation in the solve's pose error."""
+    collision_check: bool = False
+    """Draw an arm goal again when its seed_q, or the straight joint-space path to it from the arms' measured angles,
+    overlaps the cuRobo spheres of kinematics_spheres (table_joints)."""
+    collision_retries: int = 8
+    """Draws after the first; a goal still colliding after them is kept (goals_unscreened counts them)."""
+    rest_goal_prob: float = 0.0
+    """Share of arm goals that are each wrist's rest pose (the default joint angles), fixed in the world."""
+    kinematics_urdf: str = ""
+    """The robot's URDF, for seed_solve and collision_check."""
+    kinematics_spheres: str = ""
+    """cuRobo's robot yml with the collision spheres, for collision_check (and seed_solve: the class loads both)."""
     min_target_x: float = 0.1
     """m: targets less than this far forward of the pelvis are dropped."""
     balance_cell: float = 0.1

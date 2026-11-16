@@ -13,7 +13,10 @@ candidate folder under logs/):
                      sat on and the gyro low-pass), and (mujoco_evals.common.read_deploy_settings) control_dt, kp, kd,
                      default_joint_pos, the per-joint action scales, max_ik_step, gait_period, zero_cmd_eps,
                      command_ranges, command_filter_tau and arm_goals (false: the run never trained an arm goal,
-                     and the deploy refuses one); and the source files.
+                     and the deploy refuses one), arm_ik (mdp.IKPostureArmAction's IK, when the run used it); and the
+                     source files.
+  arm_seed_table.npz with arm_ik.posture_from_command: per arm the run's goal-table poses (poses_<arm>, pelvis frame,
+                     x y z qw qx qy qz) and their joint angles (joints_<arm>), for the IK's posture lookup.
 Needs only torch and pyyaml; no simulator.
 
     python scripts/skrl/export_marl.py --checkpoint logs/skrl/locomanip_marl/<run>/checkpoints/agent_<step>.pt \
@@ -140,6 +143,15 @@ export = {
     "source": {"checkpoint": ckpt_path, "target_tables": tables[-1] if tables else None, "task": args.task,
                "exported": datetime.now().isoformat(timespec="seconds")},
 }
+# mdp.IKPostureArmAction's posture from the table row nearest the command: the run's tables and their joint angles
+if (export.get("arm_ik") or {}).get("posture_from_command"):
+    if not tables or "joints" not in data:
+        raise SystemExit("arm_ik.posture_from_command: the run's target tables lack their joint angles")
+    import numpy as np
+    np.savez_compressed(os.path.join(args.out, "arm_seed_table.npz"),
+                        **{f"poses_{i}": t.numpy() for i, t in enumerate(data["tables"])},
+                        **{f"joints_{i}": j.numpy() for i, j in enumerate(data["joints"])})
+    export["arm_seed_table"] = "arm_seed_table.npz"
 with open(os.path.join(args.out, "export.yaml"), "w") as f:
     yaml.safe_dump(export, f, sort_keys=False)
 name = os.path.basename(os.path.normpath(args.out))

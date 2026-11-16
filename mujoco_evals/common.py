@@ -68,7 +68,7 @@ def read_deploy_settings(run_dir: Path) -> dict:
     control_dt (decimation x sim dt), kp and kd per joint in the policies' joint order (the actuators' stiffness and
     damping), gait_period, zero_cmd_eps, command_ranges and command_filter_tau (the first-order low-pass on the
     velocity command, s; 0: none), the default pose and each action term's scale per joint, and arm_goals (whether the
-    run trained arm goals at all, arm_goal_prob > 0)."""
+    run trained arm goals at all, arm_goal_prob > 0), and arm_ik (mdp.IKPostureArmAction's settings, when the run used it)."""
     import re
 
     env = _yaml_load_any((Path(run_dir) / "params" / "env.yaml").read_text())
@@ -112,6 +112,30 @@ def read_deploy_settings(run_dir: Path) -> dict:
         pose["arm_residual_scales"] = [float(gain) * s for s in pose["arm_residual_scales"]]
     if (actions.get("arm_pos") or {}).get("max_ik_step") is not None:
         pose["max_ik_step"] = float(actions["arm_pos"]["max_ik_step"])
+    # mdp.IKPostureArmAction's IK (LocoManip-ArmsOnly-v0): its settings, and its action twice as wide
+    arm_pos = actions.get("arm_pos") or {}
+    if "rot_weight" in arm_pos:
+        pose["arm_ik"] = {key: float(arm_pos[key]) for key in ("rot_weight", "null_gain", "posture_scale",
+                                                              "posture_gain", "limit_margin", "ik_damping")}
+        pose["arm_ik"]["ik_passes"] = int(arm_pos["ik_passes"])
+        pose["arm_ik"]["posture_from_command"] = bool(arm_pos.get("posture_from_command", False))
+        pose["arm_ik"]["trajectory"] = bool(arm_pos.get("trajectory", False))
+        pose["arm_ik"]["seed_rot_weight"] = float(env["commands"]["arm_targets"].get("seed_rot_weight", 0.3))
+        pose["arm_ik"]["posture_actions"] = bool(arm_pos.get("posture_actions", True))
+        for key in ("trajectory_max_vel", "trajectory_max_acc"):
+            pose["arm_ik"][key] = None if arm_pos.get(key) is None else float(arm_pos[key])
+        # IKPostureArmActionCfg.gravity_offset: the arm joints' gravity torque at the target over kp, on the target
+        pose["arm_ik"]["gravity_offset"] = bool(arm_pos.get("gravity_offset", False))
+        # IKPostureArmActionCfg.freeze_residual_on_goal: the residual latched on the goal
+        if arm_pos.get("freeze_residual_on_goal"):
+            pose["arm_ik"]["freeze"] = {key: float(arm_pos[f"freeze_{key}"]) for key in ("pos_tol", "rot_tol", "settle_s")}
+        # ArmTargetsCommandCfg.seed_solve: the seed solved for the command from the nearest row (mdp.arm_kinematics)
+        arm_cmd = env["commands"]["arm_targets"]
+        if arm_cmd.get("seed_solve"):
+            pose["arm_ik"]["seed_solve"] = {"iters": int(arm_cmd["seed_solve_iters"]),
+                                            "damping": float(arm_cmd["seed_solve_damping"]),
+                                            "rot_weight": float(arm_cmd["seed_solve_rot_weight"]),
+                                            "joint_range_margin": float(arm_cmd.get("joint_range_margin") or 0.0)}
     return {
         "control_dt": round(float(env["decimation"]) * float(env["sim"]["dt"]), 6),
         **gains,

@@ -15,7 +15,8 @@ if TYPE_CHECKING:
 def arm_target_levels(env: ManagerBasedRLEnv, env_ids: Sequence[int], command_name: str) -> dict[str, torch.Tensor]:
     """At episode end, a fall during an arm goal drops the depth level (ArmTargetsCommand.update_levels; the rest of
     the depth curriculum moves at goal events). Logs the mean depth level and z_min, and the tracking-kernel stage,
-    its stds and the share of the last judged window that came within them."""
+    its stds and the share of the last judged window that came within them, and the goal-distance stage's scale and the
+    reached share of its last judged window."""
     term = env.command_manager.get_term(command_name)
     term.update_levels(env_ids, fell=env.termination_manager.terminated[env_ids])
     return {
@@ -25,6 +26,8 @@ def arm_target_levels(env: ManagerBasedRLEnv, env_ids: Sequence[int], command_na
         "fine_pos_std": torch.tensor(term.fine_pos_std, device=env.device),
         "rot_std": torch.tensor(term.rot_std, device=env.device),
         "kernel_window_share": term.kernel_window_share,
+        "goal_scale": torch.tensor(term.goal_scale, device=env.device),
+        "goal_window_share": term.goal_window_share,
         "arm_goal_prob": torch.tensor(term.arm_goal_prob if term.goals_enabled else 0.0, device=env.device),
     }
 

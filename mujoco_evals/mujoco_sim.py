@@ -11,7 +11,10 @@ for an exported policy and its deploy settings (`settings`: the export's <name>.
     arms action       one damped-least-squares IK step per arm toward the believed command (6-D pose error
                       [p_t - p, axis-angle(q_t q^-1)] in the pelvis frame; the wrist Jacobian in the pelvis frame at the
                       link's centre of mass, as PhysX computes it; lambda 0.05; capped at max_ik_step), plus the
-                      residual low-passed at arms.residual_cutoff_hz times arm_residual_scales, with the same bounds
+                      residual low-passed at arms.residual_cutoff_hz times arm_residual_scales, with the same bounds;
+                      with arm_ik (mdp.IKPostureArmAction, LocoManip-ArmsOnly-v0) the step is that term's instead:
+                      position weighted over rotation, joints locked short of their bounds, the null-space pull toward
+                      the default angles plus the action's second half (the posture offset), see _posture_step
     PD                tau = kp (target - q) - kd qd, clipped to the effort limit (kp, kd from the export)
     command           vel_cmd through the run's command_filter_tau low-pass (zero during an arm goal); the gait clock
                       stands under zero_cmd_eps
@@ -53,8 +56,37 @@ def _effort(name: str) -> float:
     raise KeyError(name)
 
 
+def _arm_kinematics():
+    """The task's mdp/arm_kinematics.py (plain torch), loaded by path: the task package's __init__ needs Isaac Lab."""
+    import importlib.util
+    path = (C.REPO / "source" / "locomanipulation_game" / "locomanipulation_game" / "tasks" / "locomanip_marl" / "mdp"
+            / "arm_kinematics.py")
+    spec = importlib.util.spec_from_file_location("arm_kinematics", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def mjcf_path(assets: Path = C.DEFAULT_ASSETS) -> Path:
     return assets / "mujoco_assets" / "h1_2_magpie.xml"
+
+
+PIN_WELD = "pelvis_pin"
+
+
+def with_pelvis_weld(spec: mujoco.MjSpec) -> mujoco.MjSpec:
+    """spec with the pelvis welded to the world (PIN_WELD), which MarlMujoco(pinned=True) places at each reset. Setting
+    the pelvis's qpos back after each step alone leaves the robot falling freely within the step: the arms near
+    weightless (shoulder pitch held by 0.9 of its 8 Nm of gravity)."""
+    eq = spec.add_equality()
+    eq.name, eq.type, eq.objtype, eq.name1 = PIN_WELD, mujoco.mjtEq.mjEQ_WELD, mujoco.mjtObj.mjOBJ_BODY, "pelvis"
+    eq.solref, eq.solimp = [0.004, 1.0], [0.99, 0.999, 0.001, 0.5, 2.0]
+    return spec
+
+
+def pinned_model(assets: Path = C.DEFAULT_ASSETS) -> mujoco.MjModel:
+    """The CL_Assets MJCF compiled with the pelvis weld, for MarlMujoco(pinned=True)."""
+    return with_pelvis_weld(mujoco.MjSpec.from_file(str(mjcf_path(assets)))).compile()
 
 
 def urdf_limits(urdf: Path) -> dict[str, tuple[float, float]]:
@@ -144,9 +176,21 @@ class MarlMujoco:
     NOISE = {"lin_acc": 0.5, "ang_vel": 0.2, "grav": 0.05, "jpos": 0.01, "jvel": 1.5, "wrist": 0.005}
 
     def __init__(self, actors: dict, settings: dict, physics: str = "robocasa", assets: Path = C.DEFAULT_ASSETS,
-                 model: mujoco.MjModel | None = None):
-        # model: the CL_Assets MJCF compiled with changes that leave the robot's joints untouched; default as it is
-        self.m = model if model is not None else mujoco.MjModel.from_xml_path(str(mjcf_path(assets)))
+                 model: mujoco.MjModel | None = None, pinned: bool = False):
+        # model: the CL_Assets MJCF compiled with changes that leave the robot's joints untouched; default as it is.
+        # pinned: the pelvis held still where each reset leaves it, upright (LocoManip-ArmsOnly-v0's fix_root_link), by
+        # a weld (with_pelvis_weld; a model passed in needs it, pinned_model).
+        # actors without "legs": no legs policy, the legs held at their default pose; without "arms": the arms' residual
+        # 0, the IK alone
+        self.pinned, self._pin = pinned, None
+        if model is None:
+            model = pinned_model(assets) if pinned else mujoco.MjModel.from_xml_path(str(mjcf_path(assets)))
+        self.m = model
+        self._pin_eq = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_EQUALITY, PIN_WELD)
+        if pinned and self._pin_eq < 0:
+            raise ValueError("pinned needs the pelvis weld: build the model with pinned_model() or with_pelvis_weld()")
+        if self._pin_eq >= 0:
+            model.eq_active0[self._pin_eq] = pinned
         self.d = mujoco.MjData(self.m)
         m = self.m
         arms_cfg = settings["arms"]
@@ -154,8 +198,30 @@ class MarlMujoco:
         self.substeps = int(round(self.policy_dt / m.opt.timestep))
         self.residual_alpha = 1.0 - math.exp(-2.0 * math.pi * float(arms_cfg["residual_cutoff_hz"]) * self.policy_dt)
         self.leg_scale = np.asarray(settings.get("leg_action_scales", settings["legs"]["action_scale"]), float) * np.ones(12)
+        if "legs" not in actors:
+            self.leg_scale = np.zeros(12)
         self.arm_scale = np.asarray(settings.get("arm_residual_scales", arms_cfg["residual_scale"]), float) * np.ones(14)
         self.max_ik_step = float(settings.get("max_ik_step", arms_cfg["max_ik_step"]))
+        # mdp.IKPostureArmAction's IK (export.yaml arm_ik), its action twice as wide: the residual, then the posture
+        # (posture_actions False: the residual alone)
+        self.arm_ik = settings.get("arm_ik")
+        self.n_arm_actions = 28 if self.arm_ik and self.arm_ik.get("posture_actions", True) else 14
+        # IKPostureArmAction's freeze_residual_on_goal: the residual latched once the wrists settle on the command
+        self.freeze = (self.arm_ik or {}).get("freeze")
+        # its posture from the goal table's row nearest the command (export's arm_seed_table, an absolute path here)
+        self.seed_table = None
+        if self.arm_ik and self.arm_ik.get("posture_from_command"):
+            table = np.load(settings["arm_seed_table"])
+            self.seed_table = [(table[f"poses_{i}"].astype(float), table[f"joints_{i}"].astype(float)) for i in range(2)]
+        # ArmTargetsCommandCfg.seed_solve: the nearest row's angles solved for the command itself (mdp.arm_kinematics)
+        self.seed_solve, self._kin, self._seeds_for = (self.arm_ik or {}).get("seed_solve"), None, None
+        # IKPostureArmActionCfg.gravity_offset: the arm joints' gravity torque at the target over kp (the same kinematics)
+        self.gravity_offset = bool((self.arm_ik or {}).get("gravity_offset"))
+        if self.seed_solve or self.gravity_offset:
+            self._urdf = assets / "ros_assets" / "h1_2_magpie.urdf"
+            self._kin = _arm_kinematics().ArmKinematics(self._urdf,
+                                                        assets / "curobo_assets" / "h1_2_magpie_curobo.yml",
+                                                        dtype=torch.float64)
         tau = float(settings.get("command_filter_tau") or 0.0)
         self.cmd_alpha = 1.0 - math.exp(-self.policy_dt / tau) if tau > 0 else None
         self.gait_period, self.zero_cmd_eps = float(settings["gait_period"]), float(settings["zero_cmd_eps"])
@@ -187,6 +253,8 @@ class MarlMujoco:
             for n in ALL_NAMES:
                 a = m.jnt_dofadr[jid[n]]
                 m.dof_damping[a], m.dof_armature[a], m.dof_frictionloss[a] = 0.0, 0.01, 0.0
+            # and the grippers' weight: the MJCF gives them gravcomp 1, Isaac's USD 9 x 0.05 kg per gripper
+            m.body_gravcomp[:] = 0.0
         self.physics = physics
         body = lambda n: mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, n)  # noqa: E731
         self.pelvis = body("pelvis")
@@ -214,7 +282,7 @@ class MarlMujoco:
         mujoco.mj_resetData(m, d)
         d.qpos[self.qadr] = self.default + rng.uniform(-0.05, 0.05, len(ALL_NAMES))
         d.qvel[self.vadr] = rng.uniform(-0.1, 0.1, len(ALL_NAMES))
-        roll, pitch = rng.uniform(-0.05, 0.05, 2)
+        roll, pitch = (0.0, 0.0) if self.pinned else rng.uniform(-0.05, 0.05, 2)
         cr, sr, cp, sp = math.cos(roll / 2), math.sin(roll / 2), math.cos(pitch / 2), math.sin(pitch / 2)
         d.qpos[3:7] = qmul(np.array([cr, sr, 0, 0]), np.array([cp, 0, sp, 0]))
         d.qpos[0:3] = (0.0, 0.0, 1.0)
@@ -222,9 +290,20 @@ class MarlMujoco:
         sole = min(d.xpos[f][2] for f in self.feet) + C.SOLE_Z
         d.qpos[2] += -sole + rng.uniform(0.0, 0.02)
         d.qvel[0:6] = np.r_[rng.uniform(-0.1, 0.1, 2), rng.uniform(-0.05, 0.05), rng.uniform(-0.1, 0.1, 3)]
+        if self.pinned:
+            d.qvel[0:6] = 0.0
+            self._pin = d.qpos[0:7].copy()
+            # the weld at the pin: its anchor (a world point) in the pelvis frame, and the world's rotation in it
+            anchor = m.eq_data[self._pin_eq, 0:3]
+            m.eq_data[self._pin_eq, 3:6] = qrot(qconj(self._pin[3:7]), anchor - self._pin[0:3])
+            m.eq_data[self._pin_eq, 6:10] = qconj(self._pin[3:7])
         mujoco.mj_forward(m, d)
         self.applied = d.qpos[self.qadr].copy()
-        self.residual = np.zeros(14)
+        self.residual = np.zeros(self.n_arm_actions)
+        self.ik_q = d.qpos[self.qadr][self.arm_idx].copy()  # arm_ik.trajectory: the target's own last value
+        self.traj_v = np.zeros(14)  # arm_ik.trajectory_max_vel: the target's velocity (rad/s)
+        self.frozen, self.settled_steps = False, 0  # arm_ik.freeze
+        self._seeds_for = None
         self.arm_mode = False
         self.believed = self.rest_b.copy()
         self.vel_cmd = np.zeros(3)
@@ -280,13 +359,34 @@ class MarlMujoco:
         lo, hi = self._torque_bounds(idx)
         self.applied[idx] = np.clip(t, lo, hi)
         # arms
-        self.residual = self.residual + self.residual_alpha * (a_arms - self.residual)
+        if not self.frozen:
+            self.residual = self.residual + self.residual_alpha * (a_arms - self.residual)
         m, d = self.m, self.d
         p, qr = self.root()
         Rr = np.zeros(9)
         mujoco.mju_quat2Mat(Rr, qr)
         Rr = Rr.reshape(3, 3)
         ik = d.qpos[self.qadr][self.arm_idx].copy()
+        if self.arm_ik and self.arm_ik.get("trajectory"):
+            # IKPostureArmAction's trajectory: the target from its own last value straight to the posture, no IK
+            c, idx = self.arm_ik, self.arm_idx
+            low, high = self.lower[idx] + c["limit_margin"], self.upper[idx] - c["limit_margin"]
+            base = np.concatenate([self.seed_q(0), self.seed_q(1)]) if self.seed_table is not None else self.default[idx]
+            offset = self.residual[14:] if self.n_arm_actions == 28 else 0.0
+            posture = np.clip(base + c["posture_scale"] * c["posture_gain"] * offset, low, high)
+            if c.get("trajectory_max_vel") is None:
+                ik = self.ik_q + np.clip(posture - self.ik_q, -self.max_ik_step, self.max_ik_step)
+            else:
+                ik = self._synchronized_step(posture)
+            self.ik_q = np.clip(ik, self.lower[idx], self.upper[idx])
+            t = np.clip(self.ik_q + self.gravity_target_offset(Rr) + self.arm_scale * self.residual[:14],
+                        self.lower[idx], self.upper[idx])
+            lo, hi = self._torque_bounds(idx)
+            self.applied[idx] = np.clip(t, lo, hi)
+            self.applied[12] = 0.0
+            if self.freeze:
+                self._update_freeze(posture)
+            return
         cur = self.wrist_poses_b()
         jacp, jacr = np.zeros((3, m.nv)), np.zeros((3, m.nv))
         for arm in range(2):
@@ -296,19 +396,128 @@ class MarlMujoco:
             J = np.vstack([Rr.T @ jacp[:, self.arm_cols[arm]], Rr.T @ jacr[:, self.arm_cols[arm]]])
             tgt = self.believed[arm]
             err = np.r_[tgt[:3] - cur[arm, :3], axis_angle(qmul(tgt[3:], qconj(cur[arm, 3:])))]
-            step = J.T @ np.linalg.solve(J @ J.T + 0.05 ** 2 * np.eye(6), err)
             sl = slice(7 * arm, 7 * arm + 7)
+            if self.arm_ik:
+                ik[sl] = ik[sl] + self._posture_step(J, err, ik[sl], self.residual[14:][sl], self.arm_idx[sl])
+                continue
+            step = J.T @ np.linalg.solve(J @ J.T + 0.05 ** 2 * np.eye(6), err)
             ik[sl] = ik[sl] + np.clip(step, -self.max_ik_step, self.max_ik_step)
         idx = self.arm_idx
-        t = np.clip(ik + self.arm_scale * self.residual, self.lower[idx], self.upper[idx])
+        self.ik_q = np.clip(ik, self.lower[idx], self.upper[idx])  # where trajectory would start from
+        t = np.clip(ik + self.arm_scale * self.residual[:14], self.lower[idx], self.upper[idx])
         lo, hi = self._torque_bounds(idx)
         self.applied[idx] = np.clip(t, lo, hi)
         self.applied[12] = 0.0                                    # torso held at default by its own actuator
 
+    def _update_freeze(self, posture: np.ndarray):
+        """mdp.IKPostureArmAction._update_freeze: latch the residual once the target has stopped at the posture and both
+        wrists have been inside the tolerances of the believed command for settle_s; release when the posture moves."""
+        f = self.freeze
+        arrived = np.abs(self.ik_q - posture).max() < 1e-4 and np.abs(self.traj_v).max() < 1e-3
+        self.frozen = self.frozen and arrived and self.arm_mode
+        cur = self.wrist_poses_b()
+        on_goal = self.arm_mode and all(
+            np.linalg.norm(cur[a, :3] - self.believed[a, :3]) < f["pos_tol"]
+            and np.linalg.norm(axis_angle(qmul(self.believed[a, 3:], qconj(cur[a, 3:])))) < f["rot_tol"]
+            for a in range(2))
+        self.settled_steps = self.settled_steps + 1 if (arrived and on_goal and not self.frozen) else 0
+        self.frozen = self.frozen or self.settled_steps >= max(1, int(round(f["settle_s"] / self.policy_dt)))
+
+    def _synchronized_step(self, posture: np.ndarray) -> np.ndarray:
+        """mdp.IKPostureArmAction._synchronized_step: per arm, all joints along the straight line to the posture, the
+        fastest at trajectory_max_vel, slowed to stop there, the velocity changed by at most trajectory_max_acc."""
+        c, dt = self.arm_ik, self.policy_dt
+        vmax, amax = c["trajectory_max_vel"], c.get("trajectory_max_acc")
+        ik = self.ik_q.copy()
+        for arm in range(2):
+            sl = slice(7 * arm, 7 * arm + 7)
+            delta = posture[sl] - self.ik_q[sl]
+            dist = max(np.abs(delta).max(), 1e-9)
+            cap = min(vmax, math.sqrt(2.0 * amax * dist)) if amax is not None else vmax
+            v_want = delta / dt * min(1.0, cap * dt / dist)
+            if amax is not None:
+                dv = v_want - self.traj_v[sl]
+                v = self.traj_v[sl] + dv * min(1.0, amax * dt / max(np.abs(dv).max(), 1e-12))
+            else:
+                v = v_want
+            self.traj_v[sl] = v
+            ik[sl] = self.ik_q[sl] + v * dt
+        return ik
+
+    def gravity_target_offset(self, R_pelvis: np.ndarray) -> np.ndarray | float:
+        """mdp.IKPostureArmAction's gravity_offset: (14,) minus each arm joint's gravity torque at the target ik_q
+        (ArmKinematics.gravity_torques, gravity in the pelvis frame) over its kp; 0 without it."""
+        if not self.gravity_offset:
+            return 0.0
+        gravity_b = torch.tensor(R_pelvis.T @ self.m.opt.gravity, dtype=torch.float64)[None]
+        tau = self._kin.gravity_torques(torch.tensor(self.ik_q, dtype=torch.float64).view(1, 2, 7), gravity_b)
+        return -tau.numpy().reshape(14) / self.kp[self.arm_idx]
+
+    def seed_q(self, arm: int) -> np.ndarray:
+        """mdp.ArmTargetsCommand.seed_q for one arm: during an arm goal the joint angles of the seed table's row
+        nearest the believed command (position, rotation at seed_rot_weight m per rad), with seed_solve solved from
+        there for the command itself (once per command; the rest pose's seed the default angles), else the default
+        angles."""
+        idx = self.arm_idx[7 * arm:7 * arm + 7]
+        if self.seed_table is None or not self.arm_mode:
+            return self.default[idx]
+        if self.seed_solve:
+            if self._seeds_for is None or not np.array_equal(self._seeds_for[0], self.believed):
+                self._seeds_for = (self.believed.copy(), self._solved_seeds())
+            return self._seeds_for[1][arm]
+        return self._nearest_row(arm)
+
+    def _nearest_row(self, arm: int) -> np.ndarray:
+        poses, joints = self.seed_table[arm]
+        b = self.believed[arm]
+        d = ((poses[:, :3] - b[:3]) ** 2).sum(1) + self.arm_ik["seed_rot_weight"] ** 2 * 8.0 * (1.0 - np.abs(poses[:, 3:] @ b[3:]))
+        return joints[int(np.argmin(d))]
+
+    def _solved_seeds(self) -> np.ndarray:
+        """(2, 7): ArmTargetsCommand's seed solve for the believed command, inside the URDF limits narrowed by the
+        tables' joint_range_margin."""
+        if np.allclose(self.believed, self.rest_b, atol=1e-9):
+            return self.default[self.arm_idx].reshape(2, 7)
+        c = self.seed_solve
+        lim = urdf_limits(self._urdf)
+        names = ALL_NAMES[13:27]
+        low = torch.tensor([lim[n][0] for n in names], dtype=torch.float64).view(2, 7) + c["joint_range_margin"]
+        high = torch.tensor([lim[n][1] for n in names], dtype=torch.float64).view(2, 7) - c["joint_range_margin"]
+        q0 = torch.tensor(np.stack([self._nearest_row(0), self._nearest_row(1)]), dtype=torch.float64)[None]
+        goal = torch.tensor(self.believed, dtype=torch.float64)[None]
+        q = self._kin.solve(goal, q0, low, high, iters=c["iters"], damping=c["damping"], rot_weight=c["rot_weight"])
+        return q[0].numpy()
+
+    def _posture_step(self, J, err, q, offset, idx) -> np.ndarray:
+        """mdp.IKPostureArmAction._step for one arm: the weighted DLS task step and the null-space pull toward the
+        posture (the default angles, or with posture_from_command seed_q, plus posture_scale x posture_gain x offset,
+        inside the IK's bounds), joints that would pass limit_margin short of their bounds locked and solved out,
+        ik_passes times; capped at max_ik_step."""
+        c = self.arm_ik
+        low, high = self.lower[idx] + c["limit_margin"], self.upper[idx] - c["limit_margin"]
+        base = self.seed_q(0 if idx[0] == self.arm_idx[0] else 1) if self.seed_table is not None else self.default[idx]
+        posture = np.clip(base + c["posture_scale"] * c["posture_gain"] * offset, low, high)
+        w = np.r_[1.0, 1.0, 1.0, c["rot_weight"], c["rot_weight"], c["rot_weight"]]
+        jac_w, err_w = J * w[:, None], err * w
+        pull = c["null_gain"] * (posture - q)
+        free = np.ones(len(q), bool)
+        for _ in range(int(c["ik_passes"])):
+            f = free.astype(float)
+            jf = jac_w * f[None, :]
+            pinv = jf.T @ np.linalg.inv(jf @ jf.T + c["ik_damping"] ** 2 * np.eye(6))
+            step = (pinv @ err_w + (np.eye(len(q)) - pinv @ jf) @ (pull * f)) * f
+            step = np.clip(step, -self.max_ik_step, self.max_ik_step)
+            new = q + step
+            hit = ((new < low) & (step < 0)) | ((new > high) & (step > 0))
+            if not (hit & free).any():
+                break
+            free &= ~hit
+        return step
+
     def physics_step(self):
         for _ in range(self.substeps):
             self.d.ctrl[self.act_id] = self.pd_torque(self.applied)
-            mujoco.mj_step(self.m, self.d)
+            mujoco.mj_step(self.m, self.d)  # pinned: the weld holds the pelvis (setting its qpos back too twisted the torso)
             if self.gyro_lowpass is not None:
                 self._gyro = self.gyro_lowpass(self._raw_gyro(), self.m.opt.timestep)
         self.last_tau = self.pd_torque(self.applied)
@@ -363,7 +572,10 @@ class MarlMujoco:
                  "gait_phase": gait[0]}
         if len(gait) > 1:
             terms["gait_phase_cos"] = gait[1]
-        legs = {**terms, "actions": (self.applied[self.leg_idx] - self.default[self.leg_idx]) / self.leg_scale}
+        # a leg scale of 0 holds the default pose (LocoManip-ArmsOnly-v0's legs): its action reads 0, as in the env
+        held = self.leg_scale == 0.0
+        legs_action = (self.applied[self.leg_idx] - self.default[self.leg_idx]) / np.where(held, 1.0, self.leg_scale)
+        legs = {**terms, "actions": np.where(held, 0.0, legs_action)}
         arms = {**terms, "actions": self.residual, "wrist_poses": u(wrist_pose, n["wrist"]),
                 "wrist_errors": u(errs, n["wrist"])}
         # the walking task's layout: the shared terms, then each agent's own
@@ -376,8 +588,10 @@ class MarlMujoco:
     def step(self, obs: dict):
         """One policy step from obs: act, simulate, then the next observations."""
         with torch.no_grad():
-            a_l = self.actors["legs"](torch.as_tensor(obs["legs"], dtype=torch.float32)[None])[0].numpy().astype(float)
-            a_a = self.actors["arms"](torch.as_tensor(obs["arms"], dtype=torch.float32)[None])[0].numpy().astype(float)
+            a_l = (self.actors["legs"](torch.as_tensor(obs["legs"], dtype=torch.float32)[None])[0].numpy().astype(float)
+                   if "legs" in self.actors else np.zeros(12))
+            a_a = (self.actors["arms"](torch.as_tensor(obs["arms"], dtype=torch.float32)[None])[0].numpy().astype(float)
+                   if "arms" in self.actors else np.zeros(self.n_arm_actions))
         self.process_actions(a_l, a_a)
         self.physics_step()
         self.steps += 1                    # the env's episode_length_buf counts the step before its observations

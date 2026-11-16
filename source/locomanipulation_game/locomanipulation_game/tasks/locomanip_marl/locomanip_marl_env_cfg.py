@@ -585,6 +585,15 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     warm_start_sport_every: int = 100
     warm_start_sport_checks: int = 3
     warm_start_deadline_steps: int = 0
+    policy_output_init_scale: dict[str, float] = {}
+    """Per agent, its fresh actor's last layer at initialisation: the weights times this and the bias zeroed, so the
+    actions start near 0 (scripts/skrl/train.py, before any checkpoint loads over them). Agents not listed keep skrl's
+    initialisation."""
+    policy_initial_std: dict[str, float] = {}
+    """Per agent, its fresh actor's action std at initialisation (scripts/skrl/train.py, before any checkpoint loads
+    over it). Agents not listed start at the agent yaml's initial_log_std."""
+    policy_log_std_bounds: dict[str, tuple[float, float]] = {}
+    """Per agent, its log_std's [low, high] over the agent yaml's log_std_bounds (scripts/skrl/train.py)."""
 
     agent_action_terms: dict[str, list[str]] = AGENT_ACTION_TERMS
     clip_actions: float = CLIP_ACTIONS

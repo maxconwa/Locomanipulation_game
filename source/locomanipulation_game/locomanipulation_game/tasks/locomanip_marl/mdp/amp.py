@@ -15,6 +15,9 @@ The state (scripts/build_amp_reference.STATE_NAMES builds the reference's): the 
 gravity in the pelvis frame, the pelvis's linear and angular velocity in its own frame, and both feet (the ankle-roll
 links) relative to the pelvis in its heading frame, their heights above the ground (the height scanner's) and their
 velocities in the heading frame: a skating stance foot moves over the ground, a planted one doesn't.
+
+amp_arm_style is the same prior on the arms (LocoManip-ArmsOnly-v0): its state is the 14 arm joints and their
+velocities (build_amp_reference.py --arms), its own discriminator, logged under AMP_arms/.
 """
 
 from __future__ import annotations
@@ -33,7 +36,15 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 AMP_STATE_DIM = 47
+ARM_AMP_STATE_DIM = 28
 SOLE = 0.045  # m, the ankle-roll link above the ground standing (build_amp_reference.SOLE)
+
+
+def arm_amp_state(env: ManagerBasedRLEnv, joint_cfg: SceneEntityCfg) -> torch.Tensor:
+    """(num_envs, 28): the arms' reference state from the sim (build_amp_reference.ARM_STATE_NAMES): the 14 arm joints
+    in the reference's order and their velocities."""
+    data = env.scene[joint_cfg.name].data
+    return torch.cat([data.joint_pos[:, joint_cfg.joint_ids], data.joint_vel[:, joint_cfg.joint_ids]], dim=1)
 
 
 def amp_state(env: ManagerBasedRLEnv, joint_cfg: SceneEntityCfg, feet_cfg: SceneEntityCfg,
@@ -59,13 +70,16 @@ class amp_style(ManagerTermBase):
     in the reference's order), feet_cfg (the ankle-roll links, left first), sensor_cfg (the height scanner),
     reference (build_amp_reference's npz), and the discriminator's settings."""
 
+    STATE_DIM = AMP_STATE_DIM
+    LOG = "AMP"
+
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
         p = cfg.params
         ref = np.load(p["reference"])
         states = torch.as_tensor(ref["states"], dtype=torch.float32, device=self.device)
-        if states.shape[1] != AMP_STATE_DIM:
-            raise ValueError(f"{p['reference']}: states of {states.shape[1]}, the env's are {AMP_STATE_DIM}")
+        if states.shape[1] != self.STATE_DIM:
+            raise ValueError(f"{p['reference']}: states of {states.shape[1]}, the env's are {self.STATE_DIM}")
         self._ref_states = states
         self._stride = p.get("frame_stride", 1)
         # pairs (i, i + stride): the frames between are consecutive frames of one clip
@@ -78,7 +92,7 @@ class amp_style(ManagerTermBase):
         self._mean = states.mean(dim=0)
         self._std = states.std(dim=0).clamp(min=1e-2)
         hidden = p.get("hidden", (1024, 512))
-        layers, width = [], 2 * AMP_STATE_DIM
+        layers, width = [], 2 * self.STATE_DIM
         for h in hidden:
             layers += [nn.Linear(width, h), nn.ReLU()]
             width = h
@@ -91,15 +105,15 @@ class amp_style(ManagerTermBase):
         self._gp = p.get("grad_penalty", 5.0)
         self._logit_reg = p.get("logit_reg", 0.05)
         capacity = p.get("buffer_size", 400_000)
-        self._buffer = torch.zeros(capacity, 2 * AMP_STATE_DIM, device=self.device)
+        self._buffer = torch.zeros(capacity, 2 * self.STATE_DIM, device=self.device)
         self._buffer_next = 0
         self._buffer_full = False
         # each env's last frame_stride states (a ring, slot _slot the oldest) and its steps since the reset
-        self._history = torch.zeros(env.num_envs, self._stride, AMP_STATE_DIM, device=self.device)
+        self._history = torch.zeros(env.num_envs, self._stride, self.STATE_DIM, device=self.device)
         self._slot = 0
         self._age = torch.zeros(env.num_envs, dtype=torch.long, device=self.device)
         self._calls = 0
-        print(f"[INFO] AMP: {len(states)} reference states, {len(self._ref_pairs)} pairs {self._stride} frames apart"
+        print(f"[INFO] {self.LOG}: {len(states)} reference states, {len(self._ref_pairs)} pairs {self._stride} frames apart"
               f" ({p['reference']}); discriminator {list(hidden)}, {self._num_updates} updates of {self._batch} every"
               f" {self._update_every} steps")
 
@@ -108,7 +122,7 @@ class amp_style(ManagerTermBase):
         self._age[slice(None) if env_ids is None else env_ids] = 0
 
     def _scores(self, pairs: torch.Tensor) -> torch.Tensor:
-        a, b = pairs[:, :AMP_STATE_DIM], pairs[:, AMP_STATE_DIM:]
+        a, b = pairs[:, :self.STATE_DIM], pairs[:, self.STATE_DIM:]
         x = torch.cat([(a - self._mean) / self._std, (b - self._mean) / self._std], dim=1)
         return self.disc(x).squeeze(1)
 
@@ -117,7 +131,10 @@ class amp_style(ManagerTermBase):
                  grad_penalty=5.0, logit_reg=0.05, update_every=48, num_updates=16, batch_size=8192,
                  buffer_size=400_000, frame_stride=1, style_ramp=None) -> torch.Tensor:
         # the settings are read once, in __init__
-        state = amp_state(env, joint_cfg, feet_cfg, sensor_cfg).clone()
+        return self._style(env, amp_state(env, joint_cfg, feet_cfg, sensor_cfg).clone(), style_ramp)
+
+    def _style(self, env: ManagerBasedRLEnv, state: torch.Tensor, style_ramp) -> torch.Tensor:
+        """Score each env's transition into state, store it, train the discriminator on schedule; the reward."""
         pairs = torch.cat([self._history[:, self._slot], state], dim=1)
         valid = self._age >= self._stride
         with torch.no_grad():
@@ -134,9 +151,9 @@ class amp_style(ManagerTermBase):
         self._calls += 1
         log = getattr(env, "term_log", None)
         if log is not None and valid.any():
-            log["AMP/policy_score"] = score[valid].mean()
-            log["AMP/style_reward"] = reward[valid].mean()
-            log["AMP/style_share"] = torch.tensor(share, device=self.device)
+            log[f"{self.LOG}/policy_score"] = score[valid].mean()
+            log[f"{self.LOG}/style_reward"] = reward[valid].mean()
+            log[f"{self.LOG}/style_share"] = torch.tensor(share, device=self.device)
         # evaluation (cfg.training False) scores with the checkpoint's discriminator and leaves it as it is
         if self._calls % self._update_every == 0 and getattr(env.cfg, "training", True):
             self._train(log)
@@ -181,7 +198,7 @@ class amp_style(ManagerTermBase):
         if log is not None:
             stats /= self._num_updates
             for key, value in zip(("loss", "grad_penalty", "expert_score", "policy_score_train"), stats):
-                log[f"AMP/{key}"] = value
+                log[f"{self.LOG}/{key}"] = value
 
     def checkpoint_state(self) -> dict:
         return {"disc": self.disc.state_dict(), "optimizer": self.optimizer.state_dict()}
@@ -190,3 +207,15 @@ class amp_style(ManagerTermBase):
         self.disc.load_state_dict(state["disc"])
         self.optimizer.load_state_dict(state["optimizer"])
 
+
+class amp_arm_style(amp_style):
+    """amp_style on the arms (module doc). params: joint_cfg (the 14 arm joints in the reference's order, left arm
+    first), reference (build_amp_reference.py --arms's npz), and the discriminator's settings."""
+
+    STATE_DIM = ARM_AMP_STATE_DIM
+    LOG = "AMP_arms"
+
+    def __call__(self, env: ManagerBasedRLEnv, joint_cfg: SceneEntityCfg, reference: str, hidden=(1024, 512), lr=5e-5,
+                 weight_decay=1e-4, grad_penalty=5.0, logit_reg=0.05, update_every=48, num_updates=16,
+                 batch_size=8192, buffer_size=400_000, frame_stride=1, style_ramp=None) -> torch.Tensor:
+        return self._style(env, arm_amp_state(env, joint_cfg).clone(), style_ramp)

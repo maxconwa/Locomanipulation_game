@@ -26,6 +26,7 @@ args_cli, hydra_args = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + hydra_args
 simulation_app = AppLauncher(args_cli).app
 
+import math  # noqa: E402
 import os  # noqa: E402
 import time  # noqa: E402
 from datetime import datetime  # noqa: E402
@@ -82,6 +83,26 @@ def drop_value_preprocessors(agent, uids):
         print(f"[INFO] {uid}: no value preprocessor, the critic learns raw returns")
 
 
+def scale_policy_outputs(agent, scales: dict):
+    """Scale each listed agent's fresh actor's last layer (env_cfg.policy_output_init_scale): weights times the scale,
+    bias zeroed. Before loading a checkpoint, which replaces them."""
+    for uid, scale in scales.items():
+        last = agent.policies[uid].net[-1]
+        with torch.no_grad():
+            last.weight.mul_(scale)
+            last.bias.zero_()
+        print(f"[INFO] {uid}: actor's last layer scaled by {scale} at initialisation, its bias zeroed")
+
+
+def set_initial_std(agent, stds: dict):
+    """Start each listed agent's fresh actor's action std at stds[uid] (env_cfg.policy_initial_std) instead of the
+    yaml's initial_log_std. Before loading a checkpoint, which replaces it."""
+    for uid, std in stds.items():
+        with torch.no_grad():
+            agent.policies[uid].log_std_parameter.fill_(math.log(std))
+        print(f"[INFO] {uid}: action std {std} at initialisation")
+
+
 @hydra_task_config(args_cli.task, "skrl_mappo_cfg_entry_point")
 def main(env_cfg, agent_cfg: dict):
     if args_cli.num_envs is not None:
@@ -112,11 +133,14 @@ def main(env_cfg, agent_cfg: dict):
     env = SkrlVecEnvWrapper(gym.make(args_cli.task, cfg=env_cfg))
     runner = MarlRunner(env, agent_cfg)
     drop_value_preprocessors(runner.agent, agent_cfg["no_value_preprocessor"])
+    runner.agent.lipschitz_penalty = {uid: w for uid, w in (agent_cfg.get("lipschitz_penalty") or {}).items() if w}
+    scale_policy_outputs(runner.agent, env_cfg.policy_output_init_scale)
+    set_initial_std(runner.agent, env_cfg.policy_initial_std)
     if args_cli.checkpoint:
         print(f"[INFO] Loading model checkpoint from: {args_cli.checkpoint}")
         runner.agent.load(os.path.abspath(args_cli.checkpoint))
-    bound_log_std(runner.agent, agent_cfg["models"]["policy"], agent_cfg["log_std_bounds"],
-                  agent_cfg.get("log_std_anneal"))
+    bound_log_std(runner.agent, agent_cfg["models"]["policy"],
+                  {**agent_cfg["log_std_bounds"], **env_cfg.policy_log_std_bounds}, agent_cfg.get("log_std_anneal"))
 
     start_time = time.time()
     runner.run()

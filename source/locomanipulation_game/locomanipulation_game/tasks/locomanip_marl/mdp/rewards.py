@@ -181,6 +181,19 @@ def arm_target_quat_exp_annealed(env: ManagerBasedRLEnv, command_name: str, arm:
     return torch.exp(-rot_error[:, arm].square() / term.rot_std**2)
 
 
+def arm_target_quat_exp(env: ManagerBasedRLEnv, command_name: str, arm: int, std: float) -> torch.Tensor:
+    """exp(-theta^2 / std^2) on one arm's wrist rotation error (rad)."""
+    _, rot_error = env.command_manager.get_term(command_name).errors()
+    return torch.exp(-rot_error[:, arm].square() / std**2)
+
+
+def arm_target_pos_capped(env: ManagerBasedRLEnv, command_name: str, arm: int, cap: float) -> torch.Tensor:
+    """One arm's wrist position error (m), capped at cap: with a negative weight, a constant slope inside cap that a
+    far wrist doesn't pay more of (the per-step total is floored at 0)."""
+    pos_error, _ = env.command_manager.get_term(command_name).errors()
+    return pos_error[:, arm].clamp(max=cap)
+
+
 def base_height_l2_navigation(
     env: ManagerBasedRLEnv, target_height: float, arm_command_name: str, sensor_cfg: SceneEntityCfg | None = None
 ) -> torch.Tensor:
@@ -203,6 +216,21 @@ def arm_goal_reached(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     """1 on the step after both wrists were first held on the goal: a one-off bonus, so finishing pays more than
     hovering just outside the tolerance."""
     return env.command_manager.get_term(command_name).just_reached.float()
+
+
+def arm_hold_still(env: ManagerBasedRLEnv, command_name: str, tolerance: float, scale: float,
+                   pos_tol: float | None = None, rot_tol: float | None = None) -> torch.Tensor:
+    """While both wrists are on the goal (inside pos_tol m / rot_tol rad, by default the arm command's reach
+    tolerances), exp(-excess / scale), the excess the faster wrist's travel this policy step (its world speed x step_dt,
+    m) beyond tolerance: 1 at or under it; 0 off the goal."""
+    term = env.command_manager.get_term(command_name)
+    pos_error, rot_error = term.errors()
+    pos_tol = term.cfg.reach_pos_tol if pos_tol is None else pos_tol
+    rot_tol = term.cfg.reach_rot_tol if rot_tol is None else rot_tol
+    on_goal = (pos_error < pos_tol).all(dim=1) & (rot_error < rot_tol).all(dim=1)
+    speed = env.scene[term.cfg.asset_name].data.body_lin_vel_w[:, term.body_ids].norm(dim=-1).amax(dim=1)
+    excess = (speed * env.step_dt - tolerance).clamp(min=0.0)
+    return torch.exp(-excess / scale) * (on_goal & term.arm_mode)
 
 
 def yaw_rate_l2_during_arm_goal(env: ManagerBasedRLEnv, arm_command_name: str) -> torch.Tensor:

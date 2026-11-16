@@ -13,6 +13,11 @@ foot's sole. Kept frames: upright (the pelvis at least 0.80 m above the lower fo
 degrees) and turning no faster than the command's 0.97 rad/s (the yaw rate's mean over a 0.70 s gait cycle).
 
     python scripts/build_amp_reference.py <h1_2 csv dir> [--out <npz>]
+    python scripts/build_amp_reference.py <h1_2 csv dir> --arms [--out <npz>]
+
+--arms builds mdp.amp_arm_style's reference instead (data/amp_lafan1_h1_2_arms.npz): the 14 arm joints and their
+velocities (ARM_STATE_NAMES) of the walk, dance, fight and fightAndSports clips and their mirrors, upright frames only
+(no turn-rate limit: the arms' prior is on the arms alone), the same 100 Hz resampling.
 
 Writes states (N, 47) and next_valid (N,): frame i and i + 1 are consecutive kept frames of one clip; and each
 frame's pelvis height above the clip's ground (root_height) and its orientation with the heading removed (root_quat,
@@ -33,8 +38,10 @@ from scipy.spatial.transform import Rotation, RotationSpline
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MJCF = os.path.join(REPO, "third_party", "CL_Assets", "mujoco_assets", "h1_2_magpie.xml")
 OUT = os.path.join(REPO, "source", "locomanipulation_game", "locomanipulation_game", "data", "amp_lafan1_h1_2.npz")
+ARMS_OUT = OUT.replace(".npz", "_arms.npz")
 SRC_FPS, FPS = 30.0, 100.0
 KINDS = ("walk", "run", "sprint")
+ARM_KINDS = ("walk", "dance", "fight", "fightAndSports")
 JOINTS = ["left_hip_yaw", "left_hip_pitch", "left_hip_roll", "left_knee", "left_ankle_pitch", "left_ankle_roll",
           "right_hip_yaw", "right_hip_pitch", "right_hip_roll", "right_knee", "right_ankle_pitch", "right_ankle_roll"]
 FEET = ["left_ankle_roll_link", "right_ankle_roll_link"]
@@ -56,6 +63,10 @@ STATE_NAMES = ([f"q_{j}" for j in JOINTS] + [f"qd_{j}" for j in JOINTS] + ["grav
                + [f"{s}_foot_{a}" for s in ("left", "right") for a in "xyz"]
                + ["left_foot_height", "right_foot_height"]
                + [f"{s}_foot_v{a}" for s in ("left", "right") for a in "xyz"])
+# mdp.amp.arm_amp_state: the arm block of the rows (ARM_JOINT_NAMES' order, left arm first), then its velocities
+_ARM_COLS = [_ORDER.index(f"{s}_{j}") for s in ("left", "right") for j in _ARM]
+ARM_STATE_NAMES = ([f"q_{s}_{j}" for s in ("left", "right") for j in _ARM]
+                   + [f"qd_{s}_{j}" for s in ("left", "right") for j in _ARM])
 
 
 def mirror(raw: np.ndarray) -> np.ndarray:
@@ -69,7 +80,7 @@ def mirror(raw: np.ndarray) -> np.ndarray:
 
 
 def clip_states(raw: np.ndarray, m: mujoco.MjModel, d: mujoco.MjData) -> tuple[np.ndarray, np.ndarray, np.ndarray,
-                                                                                np.ndarray]:
+                                                                                np.ndarray, np.ndarray]:
     t_src = np.arange(len(raw)) / SRC_FPS
     t = np.arange(0.0, t_src[-1], 1.0 / FPS)
     pos_s, q_s = CubicSpline(t_src, raw[:, :3]), CubicSpline(t_src, raw[:, 7:19])
@@ -107,28 +118,46 @@ def clip_states(raw: np.ndarray, m: mujoco.MjModel, d: mujoco.MjData) -> tuple[n
     keep = upright & (np.abs(yaw_rate) <= MAX_YAW_RATE)
     # the pelvis's height above the ground and its tilt (the orientation with the heading taken out), w x y z
     root = np.concatenate([(pos[:, 2] - ground)[:, None], (heading_inv * rot).as_quat()[:, [3, 0, 1, 2]]], axis=1)
-    return states, keep, feet_w, root
+    return states, keep, feet_w, root, upright
+
+
+def arm_clip_states(raw: np.ndarray, upright: np.ndarray) -> np.ndarray:
+    """(T, 28) at 100 Hz: the arm joints (cubic spline, clip_states' times) and their velocities; upright is
+    clip_states' mask, for the frame count."""
+    t_src = np.arange(len(raw)) / SRC_FPS
+    t = np.arange(0.0, t_src[-1], 1.0 / FPS)
+    arm_s = CubicSpline(t_src, raw[:, 7:][:, _ARM_COLS])
+    states = np.concatenate([arm_s(t), arm_s(t, 1)], axis=1)
+    if len(states) != len(upright):
+        raise RuntimeError(f"{len(states)} arm frames against {len(upright)}")
+    return states
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("csv_dir")
-    parser.add_argument("--out", default=OUT)
+    parser.add_argument("--out", default=None)
+    parser.add_argument("--arms", action="store_true", help="The arms' reference (mdp.amp_arm_style).")
     args = parser.parse_args()
+    kinds = ARM_KINDS if args.arms else KINDS
+    out = args.out or (ARMS_OUT if args.arms else OUT)
     m = mujoco.MjModel.from_xml_path(MJCF)
     d = mujoco.MjData(m)
     paths = sorted(p for p in glob.glob(os.path.join(args.csv_dir, "*.csv"))
-                   if os.path.basename(p).split("_")[0].rstrip("0123456789") in KINDS)
+                   if os.path.basename(p).split("_")[0].rstrip("0123456789") in kinds)
     if not paths:
-        raise SystemExit(f"no {'/'.join(KINDS)} clips in {args.csv_dir}")
+        raise SystemExit(f"no {'/'.join(kinds)} clips in {args.csv_dir}")
     states, next_valid, roots, names = [], [], [], []
     for path in paths:
         raw = np.loadtxt(path, delimiter=",", dtype=np.float64)
         if raw.ndim != 2 or raw.shape[1] != 34:
             raise ValueError(f"{path}: expected 34 columns, got {raw.shape}")
         name = os.path.basename(path)[:-4]
-        s, keep, feet_w, root = clip_states(raw, m, d)
-        s_m, keep_m, feet_m, root_m = clip_states(mirror(raw), m, d)
+        s, keep, feet_w, root, upright = clip_states(raw, m, d)
+        s_m, keep_m, feet_m, root_m, upright_m = clip_states(mirror(raw), m, d)
+        if args.arms:
+            s, keep = arm_clip_states(raw, upright), upright
+            s_m, keep_m = arm_clip_states(mirror(raw), upright_m), upright_m
         # the mirror's left foot is the original's right foot reflected
         err = np.abs(feet_m[:, 0] - feet_w[:, 1] * [1.0, -1.0, 1.0]).max()
         if err > 1e-6:
@@ -146,10 +175,11 @@ def main():
     states = np.concatenate(states).astype(np.float32)
     next_valid = np.concatenate(next_valid)
     roots = np.concatenate(roots).astype(np.float32)
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    np.savez_compressed(args.out, states=states, next_valid=next_valid, state_names=np.array(STATE_NAMES),
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    np.savez_compressed(out, states=states, next_valid=next_valid,
+                        state_names=np.array(ARM_STATE_NAMES if args.arms else STATE_NAMES),
                         root_height=roots[:, 0], root_quat=roots[:, 1:], clips=np.array(names), fps=FPS)
-    print(f"wrote {args.out}: {len(states)} states ({len(states) / FPS / 60:.1f} min), {next_valid.sum()} pairs")
+    print(f"wrote {out}: {len(states)} states ({len(states) / FPS / 60:.1f} min), {next_valid.sum()} pairs")
 
 
 if __name__ == "__main__":
