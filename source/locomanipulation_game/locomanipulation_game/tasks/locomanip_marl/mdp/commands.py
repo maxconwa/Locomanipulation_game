@@ -120,9 +120,8 @@ class ModalVelocityCommand(UniformVelocityCommand):
     """UniformVelocityCommand that is zero during arm goals.
 
     A resampled moving command is replaced, with probability pure_turn_prob, by a turn in place (|yaw rate| in
-    pure_turn_speed, either sign), with probability pure_lateral_prob by a sideways walk (|vy| in pure_lateral_speed)
-    and with probability small_command_prob by a small command (norm over (vx, vy, wz) in small_command_norm, a random
-    direction, near the stand/walk gate): uniform sampling almost never draws any of them. In training the command
+    pure_turn_speed, either sign) and with probability pure_lateral_prob by a sideways walk (|vy| in
+    pure_lateral_speed): uniform sampling almost never draws either. In training the command
     changes at every navigation event (ArmTargetsCommand's nav_time_range); its own resampling_time_range only runs out
     inside arm goals, where it is zero anyway.
 
@@ -144,7 +143,7 @@ class ModalVelocityCommand(UniformVelocityCommand):
 
     **Sport-mode metrics.** The sport-mode scorecard's tracking numbers (scripts/skrl/scorecard_metrics.py), measured
     on training's own navigation from the cycle means: a sample every sport_metric_stride steps per env once the
-    window is full, sport_settle_s after a resample or reset and the window plus sport_settle_s after a push, while a
+    window is full, sport_settle_s after a resample or reset, while a
     command is given (|vx| or |vy| or |wz| over 0.05). The last sport_metric_samples samples of each kind are kept
     (sport_metrics): linear and angular error over all of them; cos and the speed ratio (median) where
     |v_cmd| >= 0.1; turn sense and the turn ratio (median) where |w_cmd| >= 0.1. The scorecard fits each controller's
@@ -253,7 +252,7 @@ class ModalVelocityCommand(UniformVelocityCommand):
         ids = torch.as_tensor(env_ids, device=self.device)
         ids = ids[~self.is_standing_env[ids]]
         u = torch.rand(len(ids), device=self.device)
-        p_turn, p_lateral, p_small = self.cfg.pure_turn_prob, self.cfg.pure_lateral_prob, self.cfg.small_command_prob
+        p_turn, p_lateral = self.cfg.pure_turn_prob, self.cfg.pure_lateral_prob
         turn = ids[u < p_turn]
         lateral = ids[(u >= p_turn) & (u < p_turn + p_lateral)]
         for sub, axis, speed in ((turn, 2, self.cfg.pure_turn_speed), (lateral, 1, self.cfg.pure_lateral_speed)):
@@ -262,11 +261,6 @@ class ModalVelocityCommand(UniformVelocityCommand):
             sign = torch.where(torch.rand(len(sub), device=self.device) < 0.5, -1.0, 1.0)
             self.vel_command_b[sub] = 0.0
             self.vel_command_b[sub, axis] = sign * torch.empty(len(sub), device=self.device).uniform_(*speed)
-        small = ids[(u >= p_turn + p_lateral) & (u < p_turn + p_lateral + p_small)]
-        if len(small) > 0:
-            direction = torch.nn.functional.normalize(torch.randn(len(small), 3, device=self.device), dim=-1)
-            norm = torch.empty(len(small), 1, device=self.device).uniform_(*self.cfg.small_command_norm)
-            self.vel_command_b[small] = direction * norm
 
     def _update_command(self):
         super()._update_command()
@@ -319,9 +313,6 @@ class ModalVelocityCommand(UniformVelocityCommand):
         cmd = self._cmd_samples.sum(dim=1) / self._count.clamp(min=1.0).unsqueeze(-1)
         valid = nav & (self._count >= self._window) & (self._since_cmd >= self._settle_steps)
         valid &= (self._env_ids + step) % cfg.sport_metric_stride == 0
-        last_push = getattr(env, "last_push_step", None)  # no pushes (the scorecard): none to leave out
-        if last_push is not None:
-            valid &= (step - last_push) >= self._window + self._settle_steps
         valid &= (cmd[:, :2].abs().max(dim=1).values > 0.05) | (cmd[:, 2].abs() > 0.05)
         if not valid.any():
             return
@@ -394,9 +385,6 @@ class ModalVelocityCommandCfg(UniformVelocityCommandCfg):
     pure_turn_speed: tuple[float, float] = (0.2, 0.97)       # rad/s
     pure_lateral_prob: float = 0.0
     pure_lateral_speed: tuple[float, float] = (0.15, 0.54)   # m/s
-    small_command_prob: float = 0.0
-    """Share of moving commands drawn small: norm over (vx, vy, wz) in small_command_norm, a random direction."""
-    small_command_norm: tuple[float, float] = (0.05, 0.15)
     min_cos_speed: float = 0.1
     """The commanded |v_xy| (m/s) from which a step counts for nav_cos_vel_xy and a segment is judged for the linear
     kernel, and the commanded |w_z| (rad/s) from which a segment is judged for the yaw kernel."""
@@ -418,7 +406,7 @@ class ModalVelocityCommandCfg(UniformVelocityCommandCfg):
     sport_metric_stride: int = 8
     """A sample from each env every this many steps (staggered over the envs)."""
     sport_settle_s: float = 1.0
-    """s: left out after a resample or reset, and (plus the window) after a push."""
+    """s: left out after a resample or reset."""
 
 
 class ArmTargetsCommand(CommandTerm):
@@ -440,24 +428,14 @@ class ArmTargetsCommand(CommandTerm):
     standing_height above the scanned ground: the stance the tables were built at, assets.h1_2.TABLE_PELVIS_HEIGHT)
     and kept fixed in the world for the goal.
 
-    **Curriculum.** z_max stays put, a height the standing arms reach; z_min falls with a depth level k_d per env,
-    0..levels: z_min = z_min_start - depth_per_level * k_d. Goals keep coming from the whole range, high and low.
-    Only the low goals (height within judge_band of z_min) are judged: once the env's last level_window of them have
-    ended, k_d rises when their mean closest approach (per goal, the least mean of both wrists' position errors) is
-    within promote_error and falls when it is beyond demote_error; each move restarts the window. A fall during any
-    arm goal drops k_d by one and restarts the window.
-
     **Kernels.** The annealed tracking rewards read fine_pos_std and rot_std, one stage of cfg.fine_pos_stds /
     cfg.rot_stds for all envs. After every kernel_window_goals ended arm goals the stage narrows when enough of them
     came within its kernels, and widens when too few did (_judge_kernels), so the kernels follow the error down.
 
-    **Goal distance.** With goal_scales, an arm goal's poses are moved from each wrist's rest pose goal_scale of the
-    way to the drawn ones (position linearly, orientation along the shortest rotation), one stage of goal_scales for
-    all envs, nearest first: after every goal_window_goals ended arm goals the stage widens when at least
-    goal_promote_share of them were reached and narrows when fewer than goal_demote_share were (_judge_goal_scale).
-    The default, (1.0,), keeps the drawn poses. With offtable_prob, each arm goal is instead moved a random
-    U[offtable_scale_range] of the way with that probability (and kept as drawn otherwise): poses off the table rows,
-    whose joint seeds (below) are only the nearest rows'.
+    **Off-table goals.** With offtable_prob, an arm goal's poses are moved from each wrist's rest pose a random
+    U[offtable_scale_range] of the way to the drawn ones (position linearly, orientation along the shortest rotation)
+    with that probability, and kept as drawn otherwise: poses off the table rows, whose joint seeds (below) are only
+    the nearest rows'.
 
     **Joint seeds.** With table_joints, the tables keep each row's arm joint angles, and seed_q holds, per env and arm,
     the joint angles of the table row nearest the command (position, and rotation at seed_rot_weight m per rad; the
@@ -506,10 +484,6 @@ class ArmTargetsCommand(CommandTerm):
         self._errors_cache: tuple[torch.Tensor, torch.Tensor] | None = None
         self._errors_step = -1
 
-        # -- curriculum: the closest approach of each env's last level_window arm goals
-        self.level = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        self.error_outcomes = torch.zeros(self.num_envs, cfg.level_window, device=self.device)
-        self.outcome_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         # each arm goal's closest approach (mean of both wrists' position error, m) and least rotation error (rad)
         self.goal_best_error = torch.full((self.num_envs,), float("inf"), device=self.device)
         self.goal_best_rot_error = torch.full((self.num_envs,), float("inf"), device=self.device)
@@ -521,11 +495,6 @@ class ArmTargetsCommand(CommandTerm):
         self._kernel_hits = torch.zeros((), device=self.device)
         self._kernel_goals = torch.zeros((), device=self.device)
         self.kernel_window_share = torch.tensor(float("nan"), device=self.device)  # the last judged window's
-        # -- goal-distance curriculum: likewise, judged on the reached share
-        self.goal_stage = 0
-        self._goal_hits = torch.zeros((), device=self.device)
-        self._goal_ended = torch.zeros((), device=self.device)
-        self.goal_window_share = torch.tensor(float("nan"), device=self.device)
 
         # -- metrics. CommandTerm.reset logs their mean over the reset envs, then zeroes them.
         for name in ("command_drift", "goals_reached", "goals_missed", "crouch_goals_reached", "crouch_goals_missed"):
@@ -553,8 +522,8 @@ class ArmTargetsCommand(CommandTerm):
         if cfg.z_max - cfg.standing_height + spread > top:
             raise ValueError(f"z_max {cfg.z_max} m: the standing tables reach {top + cfg.standing_height:.2f} m;"
                              f" z_max + arm_height_spread must stay below it")
-        if self.z_min(torch.tensor(cfg.levels)).item() >= cfg.z_max or cfg.z_min_start >= cfg.z_max:
-            raise ValueError("z_min must stay below z_max at every depth level")
+        if cfg.z_min >= cfg.z_max:
+            raise ValueError("z_min must stay below z_max")
         # (num_arms, 7): the wrist poses at the default joint angles, the navigation rest pose
         self.rest_pose_b = torch.stack(data["default_poses"])
         # joint seeds: each table row's arm joint angles, and per env and arm the nearest row's to the command
@@ -587,8 +556,7 @@ class ArmTargetsCommand(CommandTerm):
         msg = "ArmTargetsCommand:\n"
         msg += f"\tBodies: {cfg.body_names}\n"
         msg += f"\tArm goal probability once enabled: {cfg.arm_goal_prob}, navigation {cfg.nav_time_range} s\n"
-        msg += (f"\tGoal heights: U[z_min, {cfg.z_max}] m, z_min = {cfg.z_min_start} - {cfg.depth_per_level} k_d m,"
-                f" k_d 0..{cfg.levels}\n")
+        msg += f"\tGoal heights: U[{cfg.z_min}, {cfg.z_max}] m\n"
         for arm, table in enumerate(self._tables):
             msg += f"\tTargets ({cfg.body_names[arm]}): {len(table)}\n"
         return msg
@@ -675,36 +643,6 @@ class ArmTargetsCommand(CommandTerm):
     Curriculum.
     """
 
-    def z_min(self, level: torch.Tensor) -> torch.Tensor:
-        """The lowest goal height above the ground at each depth level (m)."""
-        return self.cfg.z_min_start - self.cfg.depth_per_level * level.float()
-
-    def update_levels(self, env_ids: Sequence[int], fell: torch.Tensor):
-        """At episode end: a fall during an arm goal drops the depth level by one and restarts the env's window."""
-        env_ids = torch.as_tensor(env_ids, device=self.device)
-        down = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        down[env_ids] = fell & self.arm_mode[env_ids]
-        self.level -= (down & (self.level > 0)).long()
-        self.outcome_count = torch.where(down, 0, self.outcome_count)
-
-    def _record_outcomes(self, ended: torch.Tensor):
-        """Push this step's ended low arm goals' closest approach into each env's window of its last level_window low
-        goals; move the level on a full window, and restart the window when it moves."""
-        cfg, window = self.cfg, self.cfg.level_window
-        self._judge_kernels(ended)
-        self._judge_goal_scale(ended)
-        ended = ended & (self.goal_height <= self.z_min(self.level) + cfg.judge_band)
-        slot = (self.outcome_count % window).unsqueeze(1)
-        value = torch.where(ended, self.goal_best_error.clamp(max=10.0), self.error_outcomes.gather(1, slot).squeeze(1))
-        self.error_outcomes.scatter_(1, slot, value.unsqueeze(1))
-        self.outcome_count += ended.long()
-        judged = ended & (self.outcome_count >= window)
-        error = self.error_outcomes.mean(dim=1)
-        up = judged & (error <= cfg.promote_error) & (self.level < cfg.levels)
-        down = judged & (error > cfg.demote_error) & (self.level > 0)
-        self.level += up.long() - down.long()
-        self.outcome_count = torch.where(up | down, 0, self.outcome_count)
-
     @property
     def fine_pos_std(self) -> float:
         """The fine wrist-position kernel's std at the current kernel stage (m)."""
@@ -735,41 +673,12 @@ class ArmTargetsCommand(CommandTerm):
         self._kernel_hits.zero_()
         self._kernel_goals.zero_()
 
-    @property
-    def goal_scale(self) -> float:
-        """How far an arm goal's poses are moved from the rest pose toward the drawn ones, at the current stage."""
-        return self.cfg.goal_scales[self.goal_stage]
-
-    def _judge_goal_scale(self, ended: torch.Tensor):
-        """Count the ended arm goals and those reached. After every goal_window_goals of them: widen the goals a stage
-        if at least goal_promote_share were reached, narrow them a stage if fewer than goal_demote_share were."""
-        cfg = self.cfg
-        if len(cfg.goal_scales) < 2:
-            return
-        self._goal_hits += (ended & self.goal_reached).sum()
-        self._goal_ended += ended.sum()
-        if self._goal_ended.item() < cfg.goal_window_goals:
-            return
-        share = self._goal_hits / self._goal_ended
-        self.goal_window_share = share
-        if share.item() >= cfg.goal_promote_share and self.goal_stage < len(cfg.goal_scales) - 1:
-            self.goal_stage += 1
-        elif share.item() < cfg.goal_demote_share and self.goal_stage > 0:
-            self.goal_stage -= 1
-        self._goal_hits.zero_()
-        self._goal_ended.zero_()
-
     def state_dict(self) -> dict[str, torch.Tensor]:
-        """Curriculum state, saved with the env's state so a resumed or evaluated run keeps its levels."""
-        return {"level": self.level.clone(), "kernel_stage": torch.tensor(self.kernel_stage),
-                "goal_stage": torch.tensor(self.goal_stage)}
+        """Curriculum state, saved with the env's state so a resumed or evaluated run keeps its kernel stage."""
+        return {"kernel_stage": torch.tensor(self.kernel_stage)}
 
     def load_state_dict(self, state: dict[str, torch.Tensor]):
-        saved = state["level"].to(self.device)
-        pick = slice(None) if len(saved) == self.num_envs else torch.randint(0, len(saved), (self.num_envs,), device=self.device)
-        self.level[:] = saved[pick].clamp(0, self.cfg.levels)
         self.kernel_stage = min(max(int(state["kernel_stage"]), 0), len(self.cfg.fine_pos_stds) - 1)
-        self.goal_stage = min(max(int(state.get("goal_stage", 0)), 0), len(self.cfg.goal_scales) - 1)
 
     """
     Table construction.
@@ -935,8 +844,7 @@ class ArmTargetsCommand(CommandTerm):
         self.goal_best_rot_error = torch.where(self.arm_mode, best_rot, self.goal_best_rot_error)
         self._best_err_sum += torch.where(ended, self.goal_best_error.clamp(max=10.0), 0.0)
         self._best_err_n += ended.float()
-        # before CommandTerm.compute resamples the ended goals, so the next goal is drawn at the new level
-        self._record_outcomes(ended)
+        self._judge_kernels(ended)
 
     def _resample_command(self, env_ids: Sequence[int]):
         self.invalidate_errors()
@@ -988,12 +896,11 @@ class ArmTargetsCommand(CommandTerm):
 
     def _draw_arm_goals(self, arm_ids: torch.Tensor) -> dict[str, torch.Tensor]:
         """Arm goals for arm_ids (repeats allowed), not yet set: a height in [z_min, z_max], table poses near it
-        (lowered below the table), anchored in the world, moved toward the rest pose (goal_scale, offtable_prob) or
+        (lowered below the table), anchored in the world, moved toward the rest pose (offtable_prob) or
         the rest pose itself (rest_goal_prob), and their seeds. {attribute: its values for arm_ids}."""
         m = len(arm_ids)
         cfg = self.cfg
-        z_min = self.z_min(self.level[arm_ids])
-        height = z_min + torch.rand(m, device=self.device) * (cfg.z_max - z_min)
+        height = cfg.z_min + torch.rand(m, device=self.device) * (cfg.z_max - cfg.z_min)
         height_s = height - cfg.standing_height  # in the standing frame
         source = height_s.clamp(min=self._lowest_source)
         targets_s = self._draw_rows(source)
@@ -1006,8 +913,6 @@ class ArmTargetsCommand(CommandTerm):
             # the height scan still shows where the robot was before the reset teleported it
             origin[arm_ids, 2] = self._env.scene.env_origins[arm_ids, 2] + self.cfg.standing_height
         anchor = _apply(origin[arm_ids], quat[arm_ids], targets_s)
-        if self.goal_scale < 1.0:
-            anchor = self._toward_rest(arm_ids, anchor, self.goal_scale)
         if cfg.offtable_prob > 0.0:
             low, high = cfg.offtable_scale_range
             scale = low + (high - low) * torch.rand(m, 1, 1, device=self.device)
@@ -1162,21 +1067,13 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     reach_rot_tol: float = 0.35
     reach_hold_s: float = 1.0
 
-    # -- height curriculum: goal heights above the ground ~ U[z_min, z_max]
+    # -- goal heights above the ground ~ U[z_min, z_max]
     z_max: float = 1.7
-    """m: the highest goal height, fixed; the standing tables still reach it with arm_height_spread to spare."""
-    z_min_start: float = 1.0
-    """m: the lowest goal height at depth level 0 (about the lowest the standing arms reach)."""
-    levels: int = 8
-    depth_per_level: float = 0.1
-    """m: z_min = z_min_start - depth_per_level * k_d."""
+    """m: the highest goal height; the standing tables still reach it with arm_height_spread to spare."""
+    z_min: float = 1.0
+    """m: the lowest goal height (about the lowest the standing arms reach)."""
     arm_height_spread: float = 0.15
     """m: each wrist sits within this of the goal height."""
-    judge_band: float = 0.3
-    """m: goals no higher than z_min + this are the low goals the depth level is judged on."""
-    level_window: int = 5
-    promote_error: float = 0.12
-    demote_error: float = 0.18
 
     # -- tracking-kernel curriculum (ArmTargetsCommand._judge_kernels): the annealed reward terms' stds per stage,
     # narrowest last
@@ -1189,14 +1086,6 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     kernel_promote_share: float = 0.5
     kernel_demote_share: float = 0.25
 
-    # -- goal-distance curriculum (ArmTargetsCommand._judge_goal_scale): how far each stage's arm goals sit from the
-    # rest pose toward the drawn poses, nearest first; (1.0,): the drawn poses, no curriculum
-    goal_scales: tuple[float, ...] = (1.0,)
-    goal_window_goals: int = 20000
-    """Ended arm goals (all envs) per judged window."""
-    goal_promote_share: float = 0.5
-    """Reached share of a window that widens the goals a stage."""
-    goal_demote_share: float = 0.2
     offtable_prob: float = 0.0
     """Share of arm goals moved toward the rest pose by a random U[offtable_scale_range] (the class doc)."""
     offtable_scale_range: tuple[float, float] = (0.25, 1.0)

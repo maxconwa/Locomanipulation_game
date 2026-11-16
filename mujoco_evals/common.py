@@ -112,6 +112,12 @@ def read_deploy_settings(run_dir: Path) -> dict:
         pose["arm_residual_scales"] = [float(gain) * s for s in pose["arm_residual_scales"]]
     if (actions.get("arm_pos") or {}).get("max_ik_step") is not None:
         pose["max_ik_step"] = float(actions["arm_pos"]["max_ik_step"])
+    # the run's own, where the deploy template has one value for every run
+    for key in ("residual_cutoff_hz", "ik_damping"):
+        if (actions.get("arm_pos") or {}).get(key) is not None:
+            pose[key] = float(actions["arm_pos"][key])
+    if env.get("clip_actions") is not None:
+        pose["clip_actions"] = float(env["clip_actions"])
     # mdp.IKPostureArmAction's IK (LocoManip-ArmsOnly-v0): its settings, and its action twice as wide
     arm_pos = actions.get("arm_pos") or {}
     if "rot_weight" in arm_pos:
@@ -126,6 +132,16 @@ def read_deploy_settings(run_dir: Path) -> dict:
             pose["arm_ik"][key] = None if arm_pos.get(key) is None else float(arm_pos[key])
         # IKPostureArmActionCfg.gravity_offset: the arm joints' gravity torque at the target over kp, on the target
         pose["arm_ik"]["gravity_offset"] = bool(arm_pos.get("gravity_offset", False))
+        # residual_integrate: the residual integrated (leak, gain, clamp), not low-passed
+        if arm_pos.get("residual_integrate"):
+            pose["arm_ik"]["residual_integrate"] = {"gain": float(arm_pos["residual_integrate_gain"]),
+                                                    "leak_s": float(arm_pos["residual_leak_s"]),
+                                                    "clamp": float(arm_pos["residual_clamp"])}
+        # integral_gain: the measured wrists' pose error integrated onto the target once it has stopped
+        if float(arm_pos.get("integral_gain") or 0.0) > 0.0:
+            pose["arm_ik"]["integral"] = {"gain": float(arm_pos["integral_gain"]),
+                                          "leak_s": float(arm_pos["integral_leak_s"]),
+                                          "clamp": float(arm_pos["integral_clamp"])}
         # IKPostureArmActionCfg.freeze_residual_on_goal: the residual latched on the goal
         if arm_pos.get("freeze_residual_on_goal"):
             pose["arm_ik"]["freeze"] = {key: float(arm_pos[f"freeze_{key}"]) for key in ("pos_tol", "rot_tol", "settle_s")}
@@ -150,3 +166,22 @@ def read_deploy_settings(run_dir: Path) -> dict:
         **{f"{agent}_obs_terms": [name for name, term in env["observations"][agent].items()
                                   if isinstance(term, dict) and "func" in term] for agent in ("legs", "arms")},
     }
+
+
+def load_deploy_cfg(export_dir: str, config: str | None = None, template: str | None = None) -> dict:
+    """An export folder's deploy cfg, as lmg_deploy reads it: `config`, else the folder's yaml that isn't export.yaml
+    (the copy of the policy template that export_marl.py leaves there), else `template`; with export.yaml's keys over
+    it and the policies' file names filled in."""
+    import glob
+
+    import yaml
+
+    yamls = sorted(p for p in glob.glob(os.path.join(export_dir, "*.yaml")) if os.path.basename(p) != "export.yaml")
+    path = config or (yamls[0] if yamls else template)
+    if path is None:
+        raise FileNotFoundError(f"{export_dir}: no deploy yaml beside export.yaml")
+    cfg = yaml.safe_load(open(path))
+    cfg.update(yaml.safe_load(open(os.path.join(export_dir, "export.yaml"))) or {})
+    cfg.setdefault("legs", {}).setdefault("policy", "legs.pt")
+    cfg.setdefault("arms", {}).setdefault("policy", "arms.pt")
+    return cfg

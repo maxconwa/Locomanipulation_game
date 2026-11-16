@@ -170,12 +170,6 @@ class ArmKinematics:
             ps.append(p); Rs.append(R)
         return torch.stack(ps, dim=2), torch.stack(Rs, dim=2)
 
-    def wrists(self, q: torch.Tensor) -> torch.Tensor:
-        """(N, 2, 7) wrist_yaw_link poses: position, quaternion."""
-        p, R = self.links(q)
-        idx = [8, 15]
-        return torch.cat([p[:, idx], quat_from_matrix(R[:, idx])], dim=-1)
-
     def gravity_torques(self, q: torch.Tensor, gravity_b: torch.Tensor) -> torch.Tensor:
         """(N, 2, 7): the torque gravity puts on each arm joint at q (N, 2, 7), from the URDF's masses (the gripper
         lumped into the wrist), gravity_b (N, 3) the gravity vector (m/s^2) in the pelvis frame. A PD holds q against

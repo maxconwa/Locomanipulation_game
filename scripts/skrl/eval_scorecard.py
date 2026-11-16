@@ -23,7 +23,7 @@ the world yaw rate, the knee angles, the torso's roll and pitch, falls and GOLEM
 its first fall. Everything is resampled to 100 Hz (commands held, the rest interpolated) for the metric code.
 
 Then the wrist phase: every env stands (zero velocity) and gets --wrist_goals arm goals in a row, WRIST_GOAL_S each,
-at depth level 0 (heights 1.0-1.7 m, which the standing arms reach), from the env's own goal tables. Per goal: reached
+(heights 1.0-1.7 m, which the standing arms reach), from the env's own goal tables. Per goal: reached
 (both wrists held within the env's reach tolerances, 5 cm and 0.35 rad, for 1 s), the closest approach and the final
 error (mean of both wrists); goals during which the env fell count apart.
 
@@ -44,7 +44,7 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("--checkpoint", required=True)
-parser.add_argument("--task", default="LocoManip-Marl-Direct-v0")
+parser.add_argument("--task", default=None, help="Default: the task the run was trained on (<run>/params/task.txt).")
 parser.add_argument("--num_envs", type=int, default=168)
 parser.add_argument("--segments_per_env", type=int, default=6)
 parser.add_argument("--seed", type=int, default=7)
@@ -72,18 +72,9 @@ from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 
 import locomanipulation_game.tasks  # noqa: E402, F401
 from locomanipulation_game.assets.h1_2 import LOWER_JOINT_NAMES, TORSO_LINK_NAME  # noqa: E402
-from locomanipulation_game.tasks.locomanip_marl.run_files import (  # noqa: E402
-    known_overrides,
-    run_overrides,
-    state_checkpoint_for,
-)
+from locomanipulation_game.tasks.locomanip_marl.run_files import evaluation_cfgs, replay_run  # noqa: E402
 
-checkpoint = os.path.abspath(args_cli.checkpoint)
-run_dir = os.path.dirname(os.path.dirname(checkpoint))
-replayed, dropped = known_overrides(run_overrides(run_dir), args_cli.task)
-if dropped:
-    print(f"[INFO] run overrides the current cfg no longer has (their values are the defaults now): {dropped}")
-sys.argv = [sys.argv[0]] + replayed + hydra_args
+checkpoint, run_dir, args_cli.task, replayed = replay_run(args_cli.checkpoint, args_cli.task, hydra_args)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scorecard_metrics as sm  # noqa: E402
@@ -134,7 +125,7 @@ def program(num_envs: int, per_env: int, dt: float, rng: np.random.Generator, fu
         seqs.append((np.concatenate(cmd), np.concatenate(kind)))
     T = max(len(c) for c, _ in seqs)
     cmds = np.zeros((num_envs, T, 3))
-    kinds = np.full((num_envs, T), -1)
+    kinds = np.full((num_envs, T), -2)  # after an env's own program (they differ in length): standing, kind -2
     for e, (c, k) in enumerate(seqs):
         cmds[e, :len(c)], kinds[e, :len(k)] = c, k
     return cmds, kinds
@@ -195,7 +186,7 @@ def markdown(res: dict) -> str:
                      f" {fmt(t.get('ang_err_mean', np.nan))} | {fmt(t.get('lin_err_mean', np.nan))} |")
     w = res.get("wrist")
     if w:
-        lines += ["", f"Wrist tracking ({w['goals']} standing arm goals of {WRIST_GOAL_S:g} s at depth level 0, goals"
+        lines += ["", f"Wrist tracking ({w['goals']} standing arm goals of {WRIST_GOAL_S:g} s, goals"
                       f" during a fall left out: {w['fell']}): reached {100 * w['reached']:.1f}%, closest approach"
                       f" {100 * w['best_error']:.1f} cm, final error {100 * w['final_error']:.1f} cm /"
                       f" {w['final_rot_error']:.2f} rad"]
@@ -204,13 +195,12 @@ def markdown(res: dict) -> str:
 
 
 def wrist_phase(base, runner, arm, obs, goals: int) -> dict:
-    """The wrist phase (module docstring): every env standing, `goals` arm goals in a row at depth level 0. Returns the
+    """The wrist phase (module docstring): every env standing, `goals` arm goals in a row. Returns the
     share of goals reached, the mean closest approach and final position error (m) and final rotation error (rad),
     over the goals without a fall, and the number of goals with one."""
     n, dt = base.num_envs, base.step_dt
     ids = torch.arange(n, device=base.device)
     arm.cfg.arm_goal_prob, arm.goals_enabled, arm.goals_enabled_at = 1.0, True, None
-    arm.level[:] = 0
     steps = int(round(WRIST_GOAL_S / dt))
     reached, best, final, final_rot, fell = (np.zeros((n, goals)) for _ in range(5))
     states = base.state()
@@ -219,9 +209,11 @@ def wrist_phase(base, runner, arm, obs, goals: int) -> dict:
         for j in range(steps):
             outputs = runner.agent.act(obs, {a: states for a in base.possible_agents}, timestep=0, timesteps=0)
             actions = {a: pick(outputs, a) for a in base.possible_agents}
-            obs, _, terminated, _, _ = base.step(actions)
+            obs, _, terminated, truncated, _ = base.step(actions)
             states = base.state()
-            fell[:, g] = np.maximum(fell[:, g], terminated[base.possible_agents[0]].cpu().numpy())
+            agent = base.possible_agents[0]
+            runner.agent.reset_rnn(terminated[agent] | truncated[agent])  # a reset env starts from a zero state
+            fell[:, g] = np.maximum(fell[:, g], terminated[agent].cpu().numpy())
         pos_error, rot_error = arm.errors()
         reached[:, g] = arm.goal_reached.cpu().numpy()
         best[:, g] = arm.goal_best_error.cpu().numpy()
@@ -240,20 +232,14 @@ def main(env_cfg, agent_cfg: dict):
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = args_cli.device
     env_cfg.seed = args_cli.seed
-    env_cfg.log_dir = run_dir
-    env_cfg.training = False
-    env_cfg.state_checkpoint_path = state_checkpoint_for(checkpoint)
+    evaluation_cfgs(env_cfg, agent_cfg, checkpoint, run_dir)
     env_cfg.episode_length_s = 1.0e4
     env_cfg.episode_length_range_s = None  # a run trained on drawn episode lengths: one long episode here
-    env_cfg.events.push_robot = None
     arm_cfg, vel_cfg = env_cfg.commands.arm_targets, env_cfg.commands.base_velocity
     arm_cfg.arm_goal_prob = 0.0
     arm_cfg.resampling_time_range, arm_cfg.nav_time_range = (1.0e6, 1.0e6), (1.0e6, 1.0e6)
     arm_cfg.debug_vis = vel_cfg.debug_vis = False
     vel_cfg.resampling_time_range, vel_cfg.rel_standing_envs = (1.0e6, 1.0e6), 0.0
-    agent_cfg["trainer"]["close_environment_at_exit"] = False
-    agent_cfg["agent"]["experiment"]["write_interval"] = 0
-    agent_cfg["agent"]["experiment"]["checkpoint_interval"] = 0
 
     env = SkrlVecEnvWrapper(gym.make(args_cli.task, cfg=env_cfg))
     base = env.unwrapped
@@ -262,11 +248,7 @@ def main(env_cfg, agent_cfg: dict):
     runner.agent.enable_training_mode(False, apply_to_models=True)
     robot, vel = base.scene["robot"], base.command_manager.get_term("base_velocity")
     arm = base.command_manager.get_term("arm_targets")
-    arm._record_outcomes = lambda ended: None
-    arm.update_levels = lambda env_ids, fell: None
-    terrain = base.scene.terrain
-    terrain.terrain_levels[:] = 0
-    terrain.env_origins[:] = terrain.terrain_origins[terrain.terrain_levels, terrain.terrain_types]
+    arm._judge_kernels = lambda ended: None  # the kernel stage the run reached, not moved by this evaluation
     knees = robot.find_joints(LOWER_JOINT_NAMES, preserve_order=True)[0]
     torso = robot.find_bodies(TORSO_LINK_NAME)[0][0]
     N, dt = base.num_envs, base.step_dt
@@ -290,9 +272,11 @@ def main(env_cfg, agent_cfg: dict):
             vel.is_standing_env[:] = False
             outputs = runner.agent.act(obs, {a: states for a in base.possible_agents}, timestep=0, timesteps=0)
             actions = {a: pick(outputs, a) for a in base.possible_agents}
-            obs, _, terminated, _, _ = base.step(actions)
+            obs, _, terminated, truncated, _ = base.step(actions)
             states = base.state()
-            done = terminated[base.possible_agents[0]].cpu().numpy()
+            agent = base.possible_agents[0]
+            runner.agent.reset_rnn(terminated[agent] | truncated[agent])  # a reset env starts from a zero state
+            done = terminated[agent].cpu().numpy()
             fell_at = np.where(done & (fell_at == T), k, fell_at)
             estop[:, k] = base.golem_tripped.cpu().numpy()
             yaw = torch.atan2(2 * (robot.data.root_quat_w[:, 0] * robot.data.root_quat_w[:, 3]
@@ -344,7 +328,7 @@ def main(env_cfg, agent_cfg: dict):
         / max(seconds([c & s for c, s in zip(commanded, small)]), 1e-9),
         falls=int((fell_at < T).sum()),
         falls_by_kind={name: int(sum(1 for e in range(N) if fell_at[e] < T and kinds[e, fell_at[e]] == i))
-                       for i, name in enumerate(("settle",) + KINDS, start=-1)},
+                       for i, name in enumerate(("after_program", "settle") + KINDS, start=-2)},
         falls_per_min=float((fell_at < T).sum() / (np.minimum(fell_at, T).sum() * dt / 60)),
         estop_share=float(np.mean([s["estop"].mean() for s in series])) if series else float("nan"),
         gait=sm.stride_stats([s["q"][:, [3, 9]] for s in series], masks),

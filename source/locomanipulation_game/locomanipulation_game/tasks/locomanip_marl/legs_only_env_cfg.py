@@ -84,12 +84,6 @@ class LegsOnlyRewardsCfg(MarlRewardsCfg):
 class LegsOnlyEnvCfg(LocoManipMarlEnvCfg):
     rewards: LegsOnlyRewardsCfg = LegsOnlyRewardsCfg()
 
-    # configclass's post-init deep-copies every member that isn't a property of the instance's own class (its
-    # __dict__), and would try to set the inherited one
-    @property
-    def policy_dt(self) -> float:
-        return self.decimation * self.sim.dt
-
     def __post_init__(self):
         super().__post_init__()
         # no arm goals; the arms at their rest pose by IK alone

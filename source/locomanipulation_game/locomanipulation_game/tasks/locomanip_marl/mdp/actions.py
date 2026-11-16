@@ -174,6 +174,16 @@ class IKResidualArmAction(_BoundedTargets):
     def applied_actions(self) -> torch.Tensor:
         return self._residual
 
+    def _wrist_and_jacobian(self, arm: int, jacobians: torch.Tensor, to_root: torch.Tensor, root_pos: torch.Tensor,
+                            root_quat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One arm's wrist position (N, 3) and quaternion (N, 4) in the root frame, and its Jacobian (N, 6, arm
+        joints) rotated into that frame."""
+        robot, body = self._asset, self._body_ids[arm]
+        ee_pos, ee_quat = subtract_frame_transforms(
+            root_pos, root_quat, robot.data.body_pos_w[:, body], robot.data.body_quat_w[:, body])
+        jac = jacobians[:, self._jac_body_ids[arm]][:, :, self._jac_cols[arm]]  # world frame
+        return ee_pos, ee_quat, torch.cat([torch.bmm(to_root, jac[:, :3]), torch.bmm(to_root, jac[:, 3:])], dim=1)
+
     def process_actions(self, actions: torch.Tensor):
         self._raw_actions[:] = actions
         # detached: outside skrl's no_grad the recursion would chain the policy's graph across steps
@@ -186,13 +196,8 @@ class IKResidualArmAction(_BoundedTargets):
         jacobians = robot.root_physx_view.get_jacobians()
         q = robot.data.joint_pos[:, self._joint_ids]
         ik = q.clone()
-        for arm, (cols, jac_cols, body, jac_body) in enumerate(
-                zip(self._arm_cols, self._jac_cols, self._body_ids, self._jac_body_ids)):
-            ee_pos, ee_quat = subtract_frame_transforms(
-                root_pos, root_quat, robot.data.body_pos_w[:, body], robot.data.body_quat_w[:, body]
-            )
-            jac = jacobians[:, jac_body][:, :, jac_cols]  # (N, 6, arm joints), world frame
-            jac = torch.cat([torch.bmm(to_root, jac[:, :3]), torch.bmm(to_root, jac[:, 3:])], dim=1)
+        for arm, cols in enumerate(self._arm_cols):
+            ee_pos, ee_quat, jac = self._wrist_and_jacobian(arm, jacobians, to_root, root_pos, root_quat)
             self._ik[arm].set_command(command[:, arm])
             q_arm = q[:, cols]
             step = self._ik[arm].compute(ee_pos, ee_quat, jac, q_arm) - q_arm
@@ -274,7 +279,6 @@ class IKPostureArmAction(IKResidualArmAction):
 
     def __init__(self, cfg: IKPostureArmActionCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
-        n = self._num_joints
         robot = self._asset
         self._rest = robot.data.default_joint_pos[:, self._joint_ids].clone()
         self._ik_lower = self._lower + cfg.limit_margin
@@ -283,7 +287,6 @@ class IKPostureArmAction(IKResidualArmAction):
                                         device=self.device)
         self._eye6 = torch.eye(6, device=self.device) * cfg.ik_damping ** 2
         self._posture = self._rest.clone()  # the posture each step's null-space pull aims for
-        self._locked = torch.zeros(self.num_envs, n, dtype=torch.bool, device=self.device)  # last step's, for logging
         self._ik_q = robot.data.joint_pos[:, self._joint_ids].clone()  # trajectory: the target's own last value
         self._traj_v = torch.zeros_like(self._ik_q)  # trajectory_max_vel: the target's velocity (rad/s)
         if cfg.freeze_residual_on_goal and not cfg.trajectory:
@@ -313,24 +316,9 @@ class IKPostureArmAction(IKResidualArmAction):
         return (2 if self.cfg.posture_actions else 1) * self._num_joints
 
     @property
-    def posture(self) -> torch.Tensor:
-        """(N, joints): the posture the last step aimed for."""
-        return self._posture
-
-    @property
-    def locked(self) -> torch.Tensor:
-        """(N, joints): the joints the last step locked at their bounds."""
-        return self._locked
-
-    @property
     def frozen(self) -> torch.Tensor:
         """(N,): the envs whose residual is latched (freeze_residual_on_goal)."""
         return self._frozen
-
-    @property
-    def gravity(self) -> torch.Tensor:
-        """(N, joints): the gravity offset the last step added to the target (rad; 0 without gravity_offset)."""
-        return self._gravity
 
     def _gravity_offset(self, term, q: torch.Tensor) -> torch.Tensor:
         """(N, joints): minus each arm joint's gravity torque at q over its nominal kp (gravity_offset), else 0."""
@@ -388,13 +376,8 @@ class IKPostureArmAction(IKResidualArmAction):
                 self._update_freeze(term, root_pos, root_quat)
             return
         ik = q.clone()
-        for arm, (cols, jac_cols, body, jac_body) in enumerate(
-                zip(self._arm_cols, self._jac_cols, self._body_ids, self._jac_body_ids)):
-            ee_pos, ee_quat = subtract_frame_transforms(
-                root_pos, root_quat, robot.data.body_pos_w[:, body], robot.data.body_quat_w[:, body]
-            )
-            jac = jacobians[:, jac_body][:, :, jac_cols]  # (N, 6, arm joints), world frame
-            jac = torch.cat([torch.bmm(to_root, jac[:, :3]), torch.bmm(to_root, jac[:, 3:])], dim=1)
+        for arm, cols in enumerate(self._arm_cols):
+            ee_pos, ee_quat, jac = self._wrist_and_jacobian(arm, jacobians, to_root, root_pos, root_quat)
             pos_err, rot_err = compute_pose_error(ee_pos, ee_quat, command[:, arm, :3], command[:, arm, 3:],
                                                   rot_error_type="axis_angle")
             step = self._step(q[:, cols], jac, torch.cat([pos_err, rot_err], dim=1), cols)
@@ -425,16 +408,12 @@ class IKPostureArmAction(IKResidualArmAction):
     def _update_integral(self, command, jacobians, to_root, root_pos, root_quat):
         """Leak the pose-error integral, add integral_gain x each arm's weighted DLS step on its measured wrist's error
         where the target has stopped at the posture, clamp (class doc)."""
-        cfg, robot = self.cfg, self._asset
+        cfg = self.cfg
         arrived = self._arrived().float().unsqueeze(1)
         self._integral *= self._integral_leak
-        for arm, (cols, jac_cols, body, jac_body) in enumerate(
-                zip(self._arm_cols, self._jac_cols, self._body_ids, self._jac_body_ids)):
-            ee_pos, ee_quat = subtract_frame_transforms(
-                root_pos, root_quat, robot.data.body_pos_w[:, body], robot.data.body_quat_w[:, body])
-            jac = jacobians[:, jac_body][:, :, jac_cols]  # (N, 6, arm joints), world frame
-            jac_w = torch.cat([torch.bmm(to_root, jac[:, :3]), torch.bmm(to_root, jac[:, 3:])], dim=1) \
-                * self._row_weight.view(1, 6, 1)
+        for arm, cols in enumerate(self._arm_cols):
+            ee_pos, ee_quat, jac = self._wrist_and_jacobian(arm, jacobians, to_root, root_pos, root_quat)
+            jac_w = jac * self._row_weight.view(1, 6, 1)
             pos_err, rot_err = compute_pose_error(ee_pos, ee_quat, command[:, arm, :3], command[:, arm, 3:],
                                                   rot_error_type="axis_angle")
             err_w = (torch.cat([pos_err, rot_err], dim=1) * self._row_weight).unsqueeze(2)
@@ -487,14 +466,12 @@ class IKPostureArmAction(IKResidualArmAction):
             if not (hit & free).any():
                 break
             free = free & ~hit
-        self._locked[:, cols] = ~free
         return step
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         super().reset(env_ids)
         ids = slice(None) if env_ids is None else env_ids
         self._posture[ids] = self._rest[ids]
-        self._locked[ids] = False
         self._ik_q[ids] = self._asset.data.joint_pos[ids][:, self._joint_ids]
         self._traj_v[ids] = 0.0
         self._frozen[ids] = False

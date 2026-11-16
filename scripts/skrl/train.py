@@ -4,8 +4,9 @@
         [--checkpoint <run>/checkpoints/agent_<N>.pt] [env.<field>=... agent.<field>=...]
 
 --checkpoint resumes the agents and the env's curriculum state saved beside them. Arguments after these are Hydra
-overrides of the env and agent configs; they are saved to <run>/params/hydra_overrides.txt, one per line, for the
-evaluation scripts. When the run's last step is not a checkpoint step, a last checkpoint (and curriculum state) is
+overrides of the env and agent configs; they are saved to <run>/params/hydra_overrides.txt, one per line, and the
+task's id to <run>/params/task.txt, for the evaluation and export scripts. An override of a field that the env cfg's
+sync_derived writes would be lost without a word: the run is refused. When the run's last step is not a checkpoint step, a last checkpoint (and curriculum state) is
 saved at the end.
 """
 
@@ -40,18 +41,18 @@ from isaaclab_rl.skrl import SkrlVecEnvWrapper  # noqa: E402
 from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 
 import locomanipulation_game.tasks  # noqa: E402, F401
-from locomanipulation_game.tasks.locomanip_marl.run_files import state_checkpoint_for  # noqa: E402
+from locomanipulation_game.tasks.locomanip_marl.run_files import (  # noqa: E402
+    cfg_value,
+    env_override_keys,
+    state_checkpoint_for,
+)
 
 
-def bound_log_std(agent, policy_cfg: dict, per_agent: dict, anneal: dict | None = None):
-    """Clamp each agent's log_std parameter into [min_log_std, max_log_std], narrowed per agent to per_agent[uid]
-    ([low, high]), now and after every update. skrl clamps log_std only in the forward pass; a parameter pushed past
-    the bound then gets no gradient and the std stays pinned. anneal[uid] ([high_end, end_timestep]) lowers that
-    agent's upper bound linearly from high to high_end by end_timestep."""
-    floor, ceiling = policy_cfg["min_log_std"], policy_cfg["max_log_std"]
-    bounds = {uid: (floor, ceiling) for uid in agent.policies}
-    for uid, (low, high) in per_agent.items():
-        bounds[uid] = (max(low, floor), min(high, ceiling))
+def bound_log_std(agent, bounds: dict, anneal: dict | None = None):
+    """Clamp each agent's log_std parameter into bounds[uid] ((low, high): MarlRunner.log_std_bounds), now and after
+    every update. skrl clamps log_std only in the forward pass; a parameter pushed past the bound then gets no
+    gradient and the std stays pinned. anneal[uid] ([high_end, end_timestep]) lowers that agent's upper bound
+    linearly from high to high_end by end_timestep."""
     anneal = {uid: tuple(v) for uid, v in (anneal or {}).items() if v}
     print(f"[INFO] log_std bounds per agent: {bounds}; upper bound annealed: {anneal}")
 
@@ -121,11 +122,22 @@ def main(env_cfg, agent_cfg: dict):
     agent_cfg["agent"]["experiment"]["experiment_name"] = run_name
     log_dir = os.path.join(log_root, run_name)
     print(f"[INFO] Logging to {log_dir}")
+    overridden = {key: cfg_value(env_cfg, key) for key in env_override_keys(hydra_args)}
+    # the curriculum state saved at the checkpoints' steps: an evaluated checkpoint starts from its own step's
+    env_cfg.state_save_every = agent_cfg["agent"]["experiment"]["checkpoint_interval"] or env_cfg.state_save_every
     env_cfg.sync_derived()  # after the overrides, so env.yaml records what the run uses
+    lost = [key for key, value in overridden.items() if cfg_value(env_cfg, key) != value]
+    if lost:
+        print(f"[ERROR] These overrides are of fields that follow from others (the env cfg's sync_derived;"
+              f" state_save_every from the agent's checkpoint_interval), which would replace them: {lost}."
+              f" Set the fields they follow from instead.", flush=True)
+        os._exit(2)  # (a SystemExit here left the process's exit code at 0: the app's shutdown)
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
     with open(os.path.join(log_dir, "params", "hydra_overrides.txt"), "w") as f:
         f.writelines(f"{arg}\n" for arg in hydra_args)
+    with open(os.path.join(log_dir, "params", "task.txt"), "w") as f:
+        f.write(args_cli.task + "\n")
     env_cfg.log_dir = log_dir
     if args_cli.checkpoint:
         env_cfg.state_checkpoint_path = state_checkpoint_for(args_cli.checkpoint)
@@ -139,8 +151,7 @@ def main(env_cfg, agent_cfg: dict):
     if args_cli.checkpoint:
         print(f"[INFO] Loading model checkpoint from: {args_cli.checkpoint}")
         runner.agent.load(os.path.abspath(args_cli.checkpoint))
-    bound_log_std(runner.agent, agent_cfg["models"]["policy"],
-                  {**agent_cfg["log_std_bounds"], **env_cfg.policy_log_std_bounds}, agent_cfg.get("log_std_anneal"))
+    bound_log_std(runner.agent, runner.log_std_bounds, agent_cfg.get("log_std_anneal"))
 
     start_time = time.time()
     runner.run()

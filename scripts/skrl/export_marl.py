@@ -50,8 +50,8 @@ TEMPLATE = REPO / "agent_scripts" / "hw_deploy_template.yaml"
 parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", required=True)
 parser.add_argument("--out", required=True)
-parser.add_argument("--task", default="LocoManip-Marl-Direct-v0", help="Recorded in export.yaml.")
-parser.add_argument("--clip_actions", type=float, default=10.0, help="The env's cfg.clip_actions.")
+parser.add_argument("--task", default=None, help="Recorded in export.yaml; default: the run's params/task.txt.")
+parser.add_argument("--clip_actions", type=float, default=None, help="Default: the run's env.yaml clip_actions.")
 args = parser.parse_args()
 
 
@@ -104,6 +104,14 @@ ckpt_path = os.path.abspath(args.checkpoint)
 run_dir = os.path.dirname(os.path.dirname(ckpt_path))
 ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 os.makedirs(args.out, exist_ok=True)
+env_yaml = Path(run_dir, "params", "env.yaml").read_text()
+env_cfg = _yaml_load_any(env_yaml)
+clip_actions = args.clip_actions if args.clip_actions is not None else float(env_cfg.get("clip_actions", 10.0))
+task_file = Path(run_dir, "params", "task.txt")
+task = args.task or (task_file.read_text().strip() if task_file.is_file() else None)
+if task is None:
+    print("[WARNING] the run does not record its task (trained before 2026-11-16) and --task is not given:"
+          " export.yaml's source.task is left empty")
 for agent in ("legs", "arms"):
     pre, policy = ckpt[agent]["observation_preprocessor"], ckpt[agent]["policy"]
     if "lstm.weight_ih_l0" not in policy:
@@ -115,14 +123,13 @@ for agent in ("legs", "arms"):
     lstm.load_state_dict({k[len("lstm."):]: v for k, v in policy.items() if k.startswith("lstm.")})
     net = mlp(policy, "net")
     actor = RecurrentActor(pre["running_mean"], pre["running_variance"], lstm, net, net[0].in_features == hidden + n,
-                           1e-8, 5.0, args.clip_actions,
+                           1e-8, 5.0, clip_actions,
                            cell_cap=float(policy["cell_cap_value"][0]) if "cell_cap_value" in policy else 0.0).eval()
     torch.jit.script(actor).save(os.path.join(args.out, f"{agent}.pt"))
     print(f"{agent}: {n} obs -> LSTM {layers}x{hidden}{' + skip' if actor.skip_observations else ''}"
           f"{f' (c capped at {actor.cell_cap:g})' if actor.cell_cap > 0 else ''} -> {net[-1].out_features} actions")
 
-env_yaml = Path(run_dir, "params", "env.yaml").read_text()
-legs_terms = (_yaml_load_any(env_yaml).get("observations") or {}).get("legs") or {}
+legs_terms = (env_cfg.get("observations") or {}).get("legs") or {}
 # the tables the run trained with: its env.yaml table_file (absolute, or in the run dir), else the newest in the run dir
 m = re.search(r"^\s*table_file: (\S+)$", env_yaml, re.M)
 named = os.path.join(run_dir, m.group(1)) if m else None
@@ -137,10 +144,11 @@ export = {
     "rest_pose": rest,
     "target_limits": {name: [round(low, 6), round(high, 6)] for name, (low, high) in limits.items()} if limits else None,
     # the actors observe each leg's gait phase cos after its sin (lmg_deploy controller: legs 97, arms 125)
-    "gait_phase_cos": "gait_phase_cos" in legs_terms,
+    # (a term the run removed is in env.yaml too, as null)
+    "gait_phase_cos": isinstance(legs_terms.get("gait_phase_cos"), dict),
     "imu": read_imu(Path(run_dir)),
     **read_deploy_settings(Path(run_dir)),
-    "source": {"checkpoint": ckpt_path, "target_tables": tables[-1] if tables else None, "task": args.task,
+    "source": {"checkpoint": ckpt_path, "target_tables": tables[-1] if tables else None, "task": task,
                "exported": datetime.now().isoformat(timespec="seconds")},
 }
 # mdp.IKPostureArmAction's posture from the table row nearest the command: the run's tables and their joint angles

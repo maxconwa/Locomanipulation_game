@@ -3,8 +3,8 @@
 The two-agent task (locomanip_marl_env_cfg.py) with only the arms acting and learning anything:
 - the pelvis is pinned in the world at the stance height (fix_root_link), so nothing has to balance; the reset still
   places it (x, y, yaw drawn as the walking task's) but upright and at the stance height;
-- the legs hold their default pose: their action scale is 0 and they are paid nothing (their own terms off; the
-  arms' terms they share in are at the walking task's share, 0), so the legs agent's actions do nothing;
+- the legs hold their default pose: their action scale is 0 and their reward terms are off, so the legs agent's
+  actions do nothing (it is still trained, on the fall and GOLEM-trip penalties alone);
 - every task is a standing arm goal (arm_goal_prob 1, the velocity command zero), from the first step: the walking
   task's warm-start gate needs walking, which a pinned robot never does, so its deadline opens it at step 1 with no
   ramp, and the arms' residual is at full gain from then on;
@@ -99,7 +99,6 @@ from isaaclab.utils import configclass
 from locomanipulation_game.assets.h1_2 import ARM_JOINT_NAMES, CL_ASSETS_DIR
 
 from . import mdp
-from .golem_safety import position_envelope
 from .locomanip_marl_env_cfg import FINE_POS_STDS, ROT_STDS, ArmsRewardsCfg, LocoManipMarlEnvCfg, MarlRewardsCfg
 
 ARMS_OUTPUT_INIT_SCALE = 0.01
@@ -196,10 +195,9 @@ class ArmsOnlyRewardsCfg(MarlRewardsCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        # the legs are paid nothing: their own terms off; the arms' terms shared with them (arms_*) stay, at the
-        # walking task's share, REWARD_SHARE_TO_LEGS (0), which sync_derived sets
+        # the legs' reward terms off (the env still charges them a fall and a GOLEM trip, which cannot move them here)
         for name, term in list(vars(self.legs).items()):
-            if isinstance(term, RewTerm) and not name.startswith("arms_"):
+            if isinstance(term, RewTerm):
                 setattr(self.legs, name, None)
 
 
@@ -218,12 +216,6 @@ class ArmsOnlyEnvCfg(LocoManipMarlEnvCfg):
     position and rotation kernels, hold_still gated at ARMS_PRECISION_HOLD_TOLS, action_rate at
     ARMS_PRECISION_ACTION_RATE."""
 
-    # configclass's post-init deep-copies every member that isn't a property of the instance's own class (its
-    # __dict__), and would try to set the inherited one
-    @property
-    def policy_dt(self) -> float:
-        return self.decimation * self.sim.dt
-
     def __post_init__(self):
         super().__post_init__()
         # the pelvis pinned, upright at the stance height
@@ -237,17 +229,12 @@ class ArmsOnlyEnvCfg(LocoManipMarlEnvCfg):
         self.commands.arm_targets.arm_goal_ramp_steps = 0
         self.warm_start_deadline_steps = 1
         self.policy_output_init_scale = {"arms": ARMS_OUTPUT_INIT_SCALE}
-        self.policy_initial_std = {"arms": ARMS_INITIAL_STD}
         # the arm joints' targets ARMS_TARGET_MARGIN inside GOLEM's edges, not 0.02 rad
         self.golem_estop.joint_position_margins[ARM_JOINTS] = (ARMS_TARGET_MARGIN, ARMS_TARGET_MARGIN)
-        envelope = {name: list(bounds) for name, bounds in position_envelope(self.golem_estop).items()}
-        self.actions.joint_pos.joint_limits = envelope
-        self.actions.arm_pos.joint_limits = envelope
         # the limit-aware, posture-seeking IK, the policy setting the posture too
         fields = {k: v for k, v in vars(self.actions.arm_pos).items() if k != "class_type"}
         self.actions.arm_pos = mdp.IKPostureArmActionCfg(**{**fields, **ARMS_IK})
         self.actions.arm_pos.scale = {k: v * ARMS_RESIDUAL_SCALE_FACTOR for k, v in self.actions.arm_pos.scale.items()}
-        self.policy_log_std_bounds = {"arms": (math.log(ARMS_MIN_STD), 0.0)}
         # goals from joint angles off the limits, nearest the rest pose first
         arm = self.commands.arm_targets
         arm.joint_range_margin = ARMS_JOINT_RANGE_MARGIN

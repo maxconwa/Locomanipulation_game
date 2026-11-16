@@ -61,18 +61,6 @@ def contact_matches_phase(
     return res
 
 
-def contact_no_vel(
-    env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg
-) -> torch.Tensor:
-    """Squared velocity of the feet in contact: a planted foot should not slide."""
-    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    asset: Articulation = env.scene[asset_cfg.name]
-    forces = sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
-    in_contact = forces.norm(dim=-1).max(dim=1)[0] > 1.0
-    foot_vel = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :]
-    return torch.sum(torch.square(foot_vel * in_contact.unsqueeze(-1)), dim=(1, 2))
-
-
 def feet_contact_forces(
     env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, max_force: float = 700.0, window: int = 3
 ) -> torch.Tensor:
@@ -86,21 +74,6 @@ def feet_contact_forces(
     return torch.sum((force.max(dim=1)[0] - max_force).clip(min=0.0), dim=1)
 
 
-def body_pair_distance(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg,
-    min_dist: float = 0.3,
-    max_dist: float = 0.6,
-) -> torch.Tensor:
-    """In [0, 1]: the two bodies' horizontal distance within [min_dist, max_dist] scores 1, falling off outside."""
-    asset: Articulation = env.scene[asset_cfg.name]
-    pos = asset.data.body_pos_w[:, asset_cfg.body_ids, :2]
-    dist = torch.norm(pos[:, 0, :] - pos[:, 1, :], dim=1)
-    d_min = torch.clamp(dist - min_dist, -0.5, 0.0)
-    d_max = torch.clamp(dist - max_dist, 0.0, 0.5)
-    return (torch.exp(-torch.abs(d_min) * 100.0) + torch.exp(-torch.abs(d_max) * 100.0)) / 2.0
-
-
 def body_pair_distance_band(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
@@ -108,8 +81,7 @@ def body_pair_distance_band(
     max_dist: float = 0.6,
 ) -> torch.Tensor:
     """In [0, 1]: 1 while the two bodies' horizontal distance is within [min_dist, max_dist], exp(-100 x) at x m
-    outside (0.37 at 1 cm, 0.05 at 3 cm). A reward for staying in the band only: body_pair_distance still pays half
-    of it however far outside."""
+    outside (0.37 at 1 cm, 0.05 at 3 cm). A reward for staying in the band only."""
     asset: Articulation = env.scene[asset_cfg.name]
     pos = asset.data.body_pos_w[:, asset_cfg.body_ids, :2]
     dist = torch.norm(pos[:, 0, :] - pos[:, 1, :], dim=1)
@@ -149,13 +121,6 @@ def feet_load_balance_band(
     share = fz[:, 0] / fz.sum(dim=1).clamp(min=1.0)
     score = torch.exp(-torch.clamp((share - 0.5).abs() - max_imbalance, min=0.0) * 20.0)
     return score * standing_command(env, env.command_manager.get_command(command_name)).float()
-
-
-def stance_base_vel(env: ManagerBasedRLEnv, command_name: str = "base_velocity") -> torch.Tensor:
-    """Squared pelvis xy velocity while standing is commanded."""
-    asset: Articulation = env.scene["robot"]
-    standing = standing_command(env, env.command_manager.get_command(command_name))
-    return torch.sum(torch.square(asset.data.root_lin_vel_b[:, :2]), dim=1) * standing
 
 
 def joint_deviation_l2(

@@ -33,13 +33,13 @@ arms_eval[_offtable]_ik_only.*, no step) beside the checkpoint (or --out <dir>).
 import argparse
 import os
 import re
-import sys
 
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("--checkpoint", required=True)
-parser.add_argument("--task", default="LocoManip-ArmsOnly-v0")
+parser.add_argument("--task", default=None, help="Default: the task the run was trained on (<run>/params/task.txt;"
+                                                 " LocoManip-ArmsOnly-v0 for a run that did not record it).")
 parser.add_argument("--num_envs", type=int, default=64)
 parser.add_argument("--goals", type=int, default=8, help="Arm goals per env.")
 parser.add_argument("--seed", type=int, default=7)
@@ -70,18 +70,10 @@ from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 
 import locomanipulation_game.tasks  # noqa: E402, F401
 from locomanipulation_game.assets.h1_2 import ARM_JOINT_NAMES  # noqa: E402
-from locomanipulation_game.tasks.locomanip_marl.run_files import (  # noqa: E402
-    known_overrides,
-    run_overrides,
-    state_checkpoint_for,
-)
+from locomanipulation_game.tasks.locomanip_marl.run_files import evaluation_cfgs, replay_run  # noqa: E402
 
-checkpoint = os.path.abspath(args_cli.checkpoint)
-run_dir = os.path.dirname(os.path.dirname(checkpoint))
-replayed, dropped = known_overrides(run_overrides(run_dir), args_cli.task)
-if dropped:
-    print(f"[INFO] run overrides the current cfg no longer has (their values are the defaults now): {dropped}")
-sys.argv = [sys.argv[0]] + replayed + hydra_args
+checkpoint, run_dir, args_cli.task, replayed = replay_run(args_cli.checkpoint, args_cli.task, hydra_args,
+                                                          fallback="LocoManip-ArmsOnly-v0")
 
 GOAL_S = 4.0     # s per arm goal, training's
 HOLD_S = 2.0     # s: the goal's last part, scored as the hold
@@ -159,20 +151,14 @@ def main(env_cfg, agent_cfg: dict):
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = args_cli.device
     env_cfg.seed = args_cli.seed
-    env_cfg.log_dir = run_dir
-    env_cfg.training = False
-    env_cfg.state_checkpoint_path = state_checkpoint_for(checkpoint)
+    evaluation_cfgs(env_cfg, agent_cfg, checkpoint, run_dir)
     env_cfg.episode_length_s = 1.0e4
     env_cfg.episode_length_range_s = None
-    env_cfg.events.push_robot = None
     arm_cfg, vel_cfg = env_cfg.commands.arm_targets, env_cfg.commands.base_velocity
     arm_cfg.arm_goal_prob = 1.0
     arm_cfg.resampling_time_range, arm_cfg.nav_time_range = (1.0e6, 1.0e6), (1.0e6, 1.0e6)
     arm_cfg.debug_vis = vel_cfg.debug_vis = False
     vel_cfg.resampling_time_range, vel_cfg.rel_standing_envs = (1.0e6, 1.0e6), 1.0
-    agent_cfg["trainer"]["close_environment_at_exit"] = False
-    agent_cfg["agent"]["experiment"]["write_interval"] = 0
-    agent_cfg["agent"]["experiment"]["checkpoint_interval"] = 0
 
     env = SkrlVecEnvWrapper(gym.make(args_cli.task, cfg=env_cfg))
     base = env.unwrapped
@@ -181,14 +167,9 @@ def main(env_cfg, agent_cfg: dict):
     runner.agent.enable_training_mode(False, apply_to_models=True)
     robot = base.scene["robot"]
     arm = base.command_manager.get_term("arm_targets")
-    arm._record_outcomes = lambda ended: None
-    arm.update_levels = lambda env_ids, fell: None
+    arm._judge_kernels = lambda ended: None  # the kernel stage the run reached, not moved by this evaluation
     arm.goals_enabled, arm.goals_enabled_at = True, None
-    arm.level[:] = 0
-    # full-distance goals whatever goal-distance stage the run reached (ArmTargetsCommandCfg.goal_scales); the table's
-    # rows as drawn, or with --offtable every goal off them
-    trained_stage = arm.goal_stage
-    arm.goal_stage = len(arm.cfg.goal_scales) - 1
+    # the table's rows as drawn, or with --offtable every goal off them
     arm.cfg.offtable_prob = 1.0 if args_cli.offtable else 0.0
     arm.cfg.rest_goal_prob = 0.0  # no rest-pose goals (ArmTargetsCommandCfg.rest_goal_prob): reaching only
     arm_joints = robot.find_joints(ARM_JOINT_NAMES, preserve_order=True)[0]
@@ -215,6 +196,7 @@ def main(env_cfg, agent_cfg: dict):
                 if args_cli.ik_only:
                     actions["arms"] = torch.zeros_like(actions["arms"])
                 obs, _, terminated, truncated, _ = base.step(actions)
+                runner.agent.reset_rnn(terminated["arms"] | truncated["arms"])  # a reset env starts from a zero state
                 fell[:, g] |= (terminated["arms"] | truncated["arms"]).cpu().numpy()
                 states = base.state()
                 pos_error, rot_error = arm.errors()
@@ -259,7 +241,6 @@ def main(env_cfg, agent_cfg: dict):
            "ik_only": args_cli.ik_only,
            "num_envs": N, "goals": args_cli.goals, "holds": int(keep.sum() * 2), "goals_with_reset": int(fell.sum()),
            "policy_dt": dt,
-           "trained_goal_scale": float(arm.cfg.goal_scales[trained_stage]),
            "offtable": args_cli.offtable,
            "reached": float(reached.mean()),
            "reach_tol": [float(arm.cfg.reach_pos_tol), float(arm.cfg.reach_rot_tol)],

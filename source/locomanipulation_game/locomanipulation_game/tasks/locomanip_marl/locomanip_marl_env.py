@@ -11,10 +11,10 @@ them onto the per-agent dicts:
     dones:        one TerminationManager, shared (one body, one episode)
 
 After every step it moves the arm command by the pelvis's motion (on the robot, FAST-LIO's odometry does). Each
-episode's length is drawn at its reset (cfg.episode_length_range_s). While training, episodes are unpushed navigation on flat ground
-until the robot walks like sport mode (cfg.warm_start_*, _update_warm_start); then the pushes, the terrain rows and the
-arm goals start. GolemEstopMonitor
-(golem_safety.py) checks GOLEM's e-stops at every physics substep; trips are logged and charged, never end an episode.
+episode's length is drawn at its reset (cfg.episode_length_range_s). While training, every task is navigation until
+the robot walks like sport mode (cfg.warm_start_*, _update_warm_start); then the arm goals start. GolemEstopMonitor
+(golem_safety.py) checks GOLEM's e-stops after every physics substep; trips are logged and charged, never end an
+episode.
 """
 
 from __future__ import annotations
@@ -36,8 +36,7 @@ from isaaclab.utils.math import quat_apply_inverse, subtract_frame_transforms
 
 from .golem_safety import GolemEstopMonitor
 from .imu_filter import GyroLowpass
-from .locomanip_marl_env_cfg import ARM_COMMAND, TERRAIN_MAX_TRACKING_ERROR, LocoManipMarlEnvCfg
-from .mdp.curriculums import _tracked_episode
+from .locomanip_marl_env_cfg import ARM_COMMAND, LocoManipMarlEnvCfg
 
 
 class LocoManipMarlEnv(DirectMARLEnv):
@@ -155,8 +154,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
         if self._substep > 0:
             # the IMU sample the previous substep left; the step's last one is taken in _get_observations
             self.gyro_lowpass(self.scene["imu"].data.ang_vel_b)
-        # once per physics substep: the state the previous substep left (mdp.golem_estop checks the last)
-        self.golem_monitor.update()
+            # the state the previous substep left (mdp.golem_estop checks the last one's; at substep 0 that is the
+            # state it has already checked: a second look counted its trip on this step too, and the stale flag then
+            # hid the next real trip's start from the penalty)
+            self.golem_monitor.update()
         if self._target_history:
             # substep k of this policy step applies the targets of ceil((d - k) / decimation) policy steps ago
             back = (self._delay_steps - self._substep).clamp(min=0)
@@ -265,8 +266,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
             self.save_state()
 
     def _update_warm_start(self, ending: torch.Tensor):
-        """End the warm start (goals_enabled: the arm goals and the arms' residual ramp in, and the pushes and terrain
-        rows start where configured) once the robot walks like sport mode: the sport-mode gate passes (_sport_gate)
+        """End the warm start (goals_enabled: the arm goals and the arms' residual ramp in) once the robot walks like
+        sport mode: the sport-mode gate passes (_sport_gate)
         and, if cfg.warm_start_max_falls_per_min is set, over the ending episodes (exponential means, decay
         cfg.warm_start_episode_decay per episode) at most that many falls per minute; or at
         cfg.warm_start_deadline_steps. Per minute, not per episode: the share of episodes that
@@ -275,7 +276,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
         cfg = self.cfg
         ids = ending.nonzero(as_tuple=False).flatten()
         if len(ids):
-            _, fell = _tracked_episode(self, ids, "base_velocity", TERRAIN_MAX_TRACKING_ERROR, "fell", "time_out")
+            fell = self.termination_manager.get_term("fell")[ids]
             minutes = self.episode_length_buf[ids].float() * self.step_dt / 60.0
             keep = cfg.warm_start_episode_decay ** len(ids)
             self._walk_falls = keep * self._walk_falls + (1.0 - keep) * fell.float().mean()
@@ -348,15 +349,12 @@ class LocoManipMarlEnv(DirectMARLEnv):
     """
 
     def save_state(self):
-        """Save the curriculum state (the arm and velocity commands' curricula, the terrain tiles, whether the arm
-        goals have started) to <log_dir>/curriculum/state_<step>.pt and state_latest.pt: a resumed or evaluated run
+        """Save the curriculum state (the arm and velocity commands' kernel stages, whether the arm goals have
+        started, the reward terms' learned state) to <log_dir>/curriculum/state_<step>.pt and state_latest.pt: a resumed or evaluated run
         starts from it (cfg.state_checkpoint_path)."""
-        terrain = self.scene.terrain
         env_state = {
             "arm_targets": self._arm_command.state_dict(),
             "base_velocity": self.command_manager.get_term("base_velocity").state_dict(),
-            "terrain_levels": terrain.terrain_levels.clone(),
-            "terrain_types": terrain.terrain_types.clone(),
             "arm_goals_enabled": self._arm_command.goals_enabled,
             "reward_terms": {key: term.checkpoint_state() for key, term in self._stateful_reward_terms().items()},
         }
@@ -366,25 +364,17 @@ class LocoManipMarlEnv(DirectMARLEnv):
             torch.save({"env_state": env_state}, os.path.join(directory, name))
 
     def _load_state(self, state: dict):
-        """Curriculum levels, terrain tiles and the end of the warm start saved by save_state."""
+        """The kernel stages, the end of the warm start and the reward terms' state saved by save_state."""
         self._arm_command.load_state_dict(state["arm_targets"])
         self.command_manager.get_term("base_velocity").load_state_dict(state["base_velocity"])
-        terrain = self.scene.terrain
-        levels = state["terrain_levels"].to(self.device)
-        if len(levels) == self.num_envs:
-            terrain.terrain_levels[:] = levels
-            terrain.terrain_types[:] = state["terrain_types"].to(self.device)
-        else:
-            terrain.terrain_levels[:] = levels[torch.randint(0, len(levels), (self.num_envs,), device=self.device)]
-        terrain.env_origins[:] = terrain.terrain_origins[terrain.terrain_levels, terrain.terrain_types]
         self._arm_command.goals_enabled |= state["arm_goals_enabled"]
         for key, term in self._stateful_reward_terms().items():
             if key in state.get("reward_terms", {}):
                 term.load_checkpoint_state(state["reward_terms"][key])
                 print(f"[INFO] Restored reward term state: {key}")
         print(
-            f"[INFO] Restored curriculum: depth level mean {self._arm_command.level.float().mean().item():.2f},"
-            f" arm goals {self._arm_command.goals_enabled}, velocity kernel stages lin"
+            f"[INFO] Restored curriculum: arm kernel stage {self._arm_command.kernel_stage}, arm goals"
+            f" {self._arm_command.goals_enabled}, velocity kernel stages lin"
             f" {state['base_velocity']['lin_kernel_stage']} ang {state['base_velocity']['ang_kernel_stage']}"
         )
 

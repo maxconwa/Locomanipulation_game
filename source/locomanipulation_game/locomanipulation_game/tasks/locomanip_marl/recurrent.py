@@ -100,7 +100,8 @@ class RecurrentMAPPO(MAPPO):
 
     While training, record_transition stores each step's input LSTM state and then moves on to the state the act
     produced, zeroed for envs whose episode ended. Outside training (evaluation scripts, which call act only) act
-    moves on itself; reset_rnn(done) zeroes the envs that were reset.
+    moves on itself, and the script has to call reset_rnn(done) after every env step: an env that was reset would
+    otherwise go on with its last episode's state, which no training episode started from.
 
     lipschitz_penalty[uid] > 0 adds a smoothness term to that agent's loss, after LCP (Chen et al. 2024, "Learning
     Smooth Humanoid Locomotion through Lipschitz-Constrained Policies"): the penalty times the squared gradient of the
@@ -349,10 +350,23 @@ class RecurrentMAPPO(MAPPO):
 
 class MarlRunner(Runner):
     """skrl's Runner; with models.policy.rnn ({hidden_size, num_layers, skip_observations}) in the cfg, the policies are
-    LSTMGaussianPolicy (the MLP after the LSTM from models.policy.network[0]) and the agent RecurrentMAPPO."""
+    LSTMGaussianPolicy (the MLP after the LSTM from models.policy.network[0]) and the agent RecurrentMAPPO.
+
+    log_std_bounds: per agent, its log std's (low, high): the cfg's log_std_bounds, then the env cfg's
+    policy_log_std_bounds over them (agents in neither: models.policy's). The models clamp their log std in the
+    forward pass at models.policy's bounds, one pair for all agents, so those are widened here to hold every agent's:
+    with them left at the yaml's -3.0, an agent given a lower floor never got below it. scripts/skrl/train.py keeps
+    each agent's parameter inside its own pair."""
 
     def __init__(self, env, cfg: dict, **kwargs):
-        self._rnn_cfg = cfg["models"]["policy"].get("rnn")
+        policy = cfg["models"]["policy"]
+        self._rnn_cfg = policy.get("rnn")
+        bounds = {uid: (policy["min_log_std"], policy["max_log_std"]) for uid in env.possible_agents}
+        per_agent = {**(cfg.get("log_std_bounds") or {}), **getattr(env.unwrapped.cfg, "policy_log_std_bounds", {})}
+        bounds.update({uid: (float(low), float(high)) for uid, (low, high) in per_agent.items()})
+        self.log_std_bounds = bounds
+        policy["min_log_std"] = min(low for low, _ in bounds.values())
+        policy["max_log_std"] = max(high for _, high in bounds.values())
         super().__init__(env, cfg, **kwargs)
 
     def _generate_models(self, env, cfg: dict):

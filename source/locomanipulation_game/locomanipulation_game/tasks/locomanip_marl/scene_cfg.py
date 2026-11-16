@@ -66,7 +66,7 @@ class TerrainSceneCfg(InteractiveSceneCfg):
         prim_path="/World/ground",
         terrain_type="generator",
         terrain_generator=TERRAINS_ROUGH_CFG,
-        # every env starts on row 0; the terrain_levels curriculum moves envs up and down
+        # every env starts and stays on row 0, the flat one (nothing moves them: no terrain curriculum)
         max_init_terrain_level=0,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(

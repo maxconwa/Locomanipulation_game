@@ -22,7 +22,6 @@ Writes logs/hw_stress_mujoco/<label>/summary.json and summary.md. Any python wit
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import math
 import os
@@ -34,10 +33,10 @@ from pathlib import Path
 import mujoco
 import numpy as np
 import torch
-import yaml
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
+from mujoco_evals.common import load_deploy_cfg  # noqa: E402
 from mujoco_evals.mujoco_sim import (  # noqa: E402
     ALL_NAMES, MarlMujoco, mjcf_path, qrot)
 
@@ -308,9 +307,7 @@ def main():
     parser.add_argument("--workers", type=int, default=max(os.cpu_count() - 4, 1))
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
-    cfg_path = [p for p in glob.glob(os.path.join(args.export, "*.yaml")) if os.path.basename(p) != "export.yaml"][0]
-    deploy = yaml.safe_load(open(cfg_path))
-    deploy.update(yaml.safe_load(open(os.path.join(args.export, "export.yaml"))) or {})
+    deploy = load_deploy_cfg(args.export)
     head = deploy.get("imu", {}).get("frame", "imu_link") != "imu_link"
     names = args.conditions.split(",") if args.conditions else list(CONDITIONS)
     if not head:

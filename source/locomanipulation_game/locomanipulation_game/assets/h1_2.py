@@ -20,7 +20,6 @@ H1_2_MAGPIE_USD = CL_ASSETS_DIR / "isaac_assets/robots/h1_2_magpie/h1_2_magpie.u
 FOOT_LINK_NAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
 ANKLE_JOINT_NAMES = ["left_ankle_pitch_joint", "right_ankle_pitch_joint", "left_ankle_roll_joint", "right_ankle_roll_joint"]
 KNEE_LINK_NAMES = ["left_knee_link", "right_knee_link"]
-HIP_YAW_ROLL_JOINT_NAMES = ["left_hip_yaw_joint", "right_hip_yaw_joint", "left_hip_roll_joint", "right_hip_roll_joint"]
 
 # Unitree LowCmd motor order (H1_2_JointIndex in unitree_sdk2_python's h1_2 example).
 # Actions and observations use preserve_order=True on these lists: do not reorder.

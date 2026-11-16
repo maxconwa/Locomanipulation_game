@@ -8,7 +8,7 @@ actions, residual filter), and compares:
   networks       the exported legs.pt / arms.pt on the env's observation vs skrl's mean action (clamped)
   targets        the deploy joint targets for the env's action vs the targets the env applied
   gyro_lowpass   lmg_deploy's gyro low-pass on env 0's IMU samples vs the env's
-and writes the worst differences per term to <out>/parity.json. The arm goals' odometry is FAST-LIO's on the robot and
+and writes the worst differences per term to <out>/parity.json. Exits 1 when any is over --tolerance. The arm goals' odometry is FAST-LIO's on the robot and
 the true motion here: not compared.
 
     python scripts/skrl/deploy_parity.py --checkpoint <run>/checkpoints/agent_<N>.pt --export <export dir> \
@@ -16,7 +16,6 @@ the true motion here: not compared.
 """
 
 import argparse
-import glob
 import json
 import os
 import sys
@@ -29,7 +28,9 @@ parser.add_argument("--export", required=True, help="Folder with legs.pt, arms.p
 parser.add_argument("--config", default=None, help="Deploy yaml; default: the export folder's only *.yaml besides export.yaml.")
 parser.add_argument("--deploy_pkg", default=os.path.expanduser("~/GOLEM/core_ws/src/lmg_deploy"))
 parser.add_argument("--urdf", default=None, help="Default: the CL_Assets submodule's ros_assets/h1_2_magpie.urdf.")
-parser.add_argument("--task", default="LocoManip-Marl-Direct-v0")
+parser.add_argument("--task", default=None, help="Default: the task the run was trained on (<run>/params/task.txt).")
+parser.add_argument("--tolerance", type=float, default=2.0e-3,
+                    help="The largest difference that passes (past exports' worst: 4e-4, the arms' targets).")
 parser.add_argument("--num_envs", type=int, default=4)
 parser.add_argument("--steps", type=int, default=600)
 parser.add_argument("--arm_goal_prob", type=float, default=None, help="Share of events that are arm goals; default: the task's.")
@@ -42,7 +43,6 @@ app = AppLauncher(args).app
 import gymnasium as gym  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
-import yaml  # noqa: E402
 from locomanipulation_game.tasks.locomanip_marl.recurrent import MarlRunner  # noqa: E402
 
 from isaaclab_rl.skrl import SkrlVecEnvWrapper  # noqa: E402
@@ -50,11 +50,10 @@ from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 
 import locomanipulation_game.tasks  # noqa: E402, F401
 from locomanipulation_game.assets.h1_2 import CL_ASSETS_DIR  # noqa: E402
-from locomanipulation_game.tasks.locomanip_marl.run_files import (  # noqa: E402
-    known_overrides,
-    run_overrides,
-    state_checkpoint_for,
-)
+from locomanipulation_game.tasks.locomanip_marl.run_files import evaluation_cfgs, replay_run  # noqa: E402
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+from mujoco_evals.common import load_deploy_cfg  # noqa: E402
 
 sys.path.insert(0, args.deploy_pkg)
 from lmg_deploy.controller import ARM_START, NUM_LEGS, MarlController, Mode, RobotState  # noqa: E402
@@ -62,19 +61,13 @@ from lmg_deploy.kinematics import ArmKinematics  # noqa: E402
 from lmg_deploy.livox_imu import GyroLowpass as DeployGyroLowpass  # noqa: E402
 from lmg_deploy.networks import load_network  # noqa: E402
 
-RUN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(args.checkpoint)))
-replayed, dropped = known_overrides(run_overrides(RUN_DIR), args.task)
-if dropped:
-    print(f"[INFO] run overrides the current cfg no longer has (their values are the defaults now): {dropped}")
-sys.argv = [sys.argv[0]] + replayed + hydra_args
+args.checkpoint, RUN_DIR, args.task, _ = replay_run(args.checkpoint, args.task, hydra_args)
 torch.set_grad_enabled(False)
 
 
 @hydra_task_config(args.task, "skrl_mappo_cfg_entry_point")
 def main(env_cfg, agent_cfg: dict):
-    cfg_path = args.config or [p for p in glob.glob(os.path.join(args.export, "*.yaml")) if os.path.basename(p) != "export.yaml"][0]
-    cfg = yaml.safe_load(open(cfg_path))
-    cfg.update(yaml.safe_load(open(os.path.join(args.export, "export.yaml"))) or {})
+    cfg = load_deploy_cfg(args.export, args.config)
     names = cfg["joint_names"]
     urdf = args.urdf or str(CL_ASSETS_DIR / "ros_assets" / "h1_2_magpie.urdf")
     kin = ArmKinematics(urdf, names, cfg["arms"]["ee_frames"], [names[ARM_START:ARM_START + 7], names[ARM_START + 7:]],
@@ -87,19 +80,13 @@ def main(env_cfg, agent_cfg: dict):
 
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.sim.device = args.device
-    env_cfg.log_dir = RUN_DIR
-    env_cfg.training = False
-    env_cfg.state_checkpoint_path = state_checkpoint_for(args.checkpoint)
-    env_cfg.events.push_robot = None
+    evaluation_cfgs(env_cfg, agent_cfg, args.checkpoint, RUN_DIR)
     env_cfg.events.imu_mount = None  # the deploy reads the same, unperturbed sensor
     if args.arm_goal_prob is not None:
         env_cfg.commands.arm_targets.arm_goal_prob = args.arm_goal_prob
     for group in ("legs", "arms"):
         getattr(env_cfg.observations, group).enable_corruption = False
     env_cfg.action_delay_range = None  # the targets the env applies are the step's own
-    agent_cfg["trainer"]["close_environment_at_exit"] = False
-    agent_cfg["agent"]["experiment"]["write_interval"] = 0
-    agent_cfg["agent"]["experiment"]["checkpoint_interval"] = 0
     env = SkrlVecEnvWrapper(gym.make(args.task, cfg=env_cfg))
     base = env.unwrapped
     robot, imu = base.scene["robot"], base.scene["imu"]
@@ -184,8 +171,9 @@ def main(env_cfg, agent_cfg: dict):
                 obs["arms"][0].double().cpu().numpy())
 
         actions = act(obs, states)
-        a_legs = actions["legs"][0].double().clamp(-10, 10).cpu().numpy()
-        a_arms = actions["arms"][0].double().clamp(-10, 10).cpu().numpy()
+        clip = env_cfg.clip_actions
+        a_legs = actions["legs"][0].double().clamp(-clip, clip).cpu().numpy()
+        a_arms = actions["arms"][0].double().clamp(-clip, clip).cpu().numpy()
         worst["net/legs"] = max(worst["net/legs"], float(np.abs(legs_net(obs["legs"][0].cpu().numpy()) - a_legs).max()))
         worst["net/arms"] = max(worst["net/arms"], float(np.abs(arms_net(obs["arms"][0].cpu().numpy()) - a_arms).max()))
 
@@ -215,6 +203,12 @@ def main(env_cfg, agent_cfg: dict):
               "worst_abs_diff": {k: round(v, 6) for k, v in worst.items()}}
     print(json.dumps(result, indent=1))
     json.dump(result, open(os.path.join(out_dir, "parity.json"), "w"), indent=1)
+    over = {k: v for k, v in worst.items() if v > args.tolerance}
+    if over:
+        print(f"[FAIL] parity: over the tolerance {args.tolerance:g}: {over}")
+        sys.stdout.flush()
+        os._exit(1)
+    print(f"[PASS] parity: every difference within {args.tolerance:g}")
 
 
 if __name__ == "__main__":

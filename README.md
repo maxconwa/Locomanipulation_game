@@ -18,16 +18,21 @@ metrics pass. These are the defaults: `train.py` with no overrides trains the re
 - `source/locomanipulation_game/locomanipulation_game/`
   - `assets/h1_2.py`: the robot: names, the sport stance, the PD actuators and their matched action scales.
   - `data/arm_target_tables_v3.pt`: the arm goals' tables (Git LFS).
-  - `tasks/locomanip_marl/`: the task, `LocoManip-Marl-Direct-v0`.
+  - `tasks/locomanip_marl/`: the tasks. `LocoManip-Marl-Direct-v0`: the legs walk and the arms track. Two cut-down
+    ones on the same env: `LocoManip-LegsOnly-v0` (no arm goals, the arms held at rest; `legs_only_env_cfg.py`) and
+    `LocoManip-ArmsOnly-v0` (the pelvis pinned, every task an arm goal; `arms_only_env_cfg.py`).
     - `locomanip_marl_env_cfg.py`: everything configurable; `scene_cfg.py`: the scene.
     - `locomanip_marl_env.py`: a DirectMARLEnv that runs Isaac Lab's managers, the warm start and the arm goals'
       odometry.
-    - `mdp/`: commands (velocity with the sport-mode metrics; arm goals with their curricula), rewards, actions,
-      observations, curricula, events, terminations.
+    - `mdp/`: commands (velocity with the sport-mode metrics; arm goals with their kernel curriculum), rewards,
+      actions, observations, events, terminations.
     - `recurrent.py`: the LSTM actors and recurrent MAPPO; `golem_safety.py`: GOLEM's e-stops;
-      `run_files.py`: a run's saved state and overrides.
+      `run_files.py`: a run's saved state, task and overrides.
 - `scripts/skrl/`: `train.py`, `play.py`, `eval_scorecard.py` (with `scorecard_metrics.py` and its check against the
-  sport-mode bags, `test_scorecard_sportmode.py`), `export_marl.py`, `deploy_parity.py`.
+  sport-mode bags, `test_scorecard_sportmode.py`), `eval_arms.py` (the arms' reach, hold and vibration),
+  `export_marl.py`, `deploy_parity.py`.
+- `scripts/build_amp_reference.py`, `scripts/fit_sport_gait.py`: build the AMP motion references and the sport-gait
+  reference under `data/` from their sources.
 - `scripts/train_candidate.sh`: train seeds, then score, export and check each one.
 - `agent_scripts/`: the CPU checks of an export: `hw_stress_mujoco.py` (MuJoCo under measured hardware effects),
   `hw_bag_replay.py` (the deploy controller on recorded robot bags), and `hw_deploy_template.yaml`.
@@ -53,6 +58,7 @@ The CPU checks run in a second python with mujoco, torch, numpy, pyyaml, pin and
 ```bash
 # one run (600k policy steps = 12500 updates of 48, about 21 h on an RTX 4090)
 python scripts/skrl/train.py --headless --max_iterations 12500 --name <name> --seed 42
+# the other tasks: --task LocoManip-LegsOnly-v0 or --task LocoManip-ArmsOnly-v0
 # or the whole pipeline for seeds 42 and 43: train, scorecard, export, deploy parity, MuJoCo stress, bag replays
 bash scripts/train_candidate.sh <name> 42 43        # SMOKE=30 for a 30-update smoke test
 
@@ -74,9 +80,10 @@ python scripts/skrl/play.py --checkpoint <run>/checkpoints/agent_<N>.pt
 The scorecard's targets are sport mode's: turn sense >= 0.99, speed ratio >= 0.90, turn ratio >= 0.90, cos >= 0.95,
 angular error <= 0.05 rad/s, linear error <= 0.15 m/s.
 
-The evaluation scripts rebuild the env a run trained in from the current defaults plus its saved overrides
-(`<run>/params/hydra_overrides.txt`); an override whose key the current config no longer has is dropped (its value is
-now the default) and listed. Runs from before the 2026-10-25 cleanup on other recipes need the `pre-cleanup` tag.
+The evaluation and export scripts rebuild the env a run trained in: its task (`<run>/params/task.txt`), the current
+defaults and its saved overrides (`<run>/params/hydra_overrides.txt`); an override whose key the current config no
+longer has is dropped (its value is now the default) and listed. A run from before 2026-11-16 did not record its
+task: pass `--task` for a legs-only or arms-only one (the scripts say when they assume the walking task). Runs from before the 2026-10-25 cleanup on other recipes need the `pre-cleanup` tag.
 
 While training, the robot walks on flat ground, unpushed, with the arms held at rest by their IK alone, until the
 warm-start gate passes (training's sport-mode metrics: cos >= 0.8, turn sense >= 0.9, linear error <= 0.2 m/s, angular

@@ -64,7 +64,6 @@ RIGHT_ARM_JOINT_NAMES = ARM_JOINT_NAMES[7:]
 LEFT_EE_BODY = "left_wrist_yaw_link"
 RIGHT_EE_BODY = "right_wrist_yaw_link"
 ARM_COMMAND = "arm_targets"
-TERRAIN_MAX_TRACKING_ERROR = 0.4  # m/s, the navigation velocity error under which an ending episode counts as tracked
 
 # Each agent is charged for the self-contact pairs that include one of its links.
 LEGS_OWN_LINKS = [PELVIS_LINK_NAME] + LOWER_LINK_NAMES
@@ -80,16 +79,12 @@ SIM_DT = 0.002            # physics 500 Hz, as ALMI-Open
 DECIMATION = 5            # policy 100 Hz, as sport mode
 # Each env's joint targets reach the robot this many physics substeps late (0-20 ms), drawn at every reset
 ACTION_DELAY_RANGE = (0, 10)
-GOAL_BONUS = 5.0          # paid once per reached goal (sync_derived sets the per-second weight)
 # The arm goals' tables (ArmTargetsCommandCfg.table_file), built at the table stance (TABLE_PELVIS_HEIGHT)
 ARM_TARGET_TABLE = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data",
                                                  "arm_target_tables_v3.pt"))
 # Sport mode's leg-joint motion by gait phase and velocity (scripts/fit_sport_gait.py, the legs' sport_gait term)
 SPORT_GAIT_REFERENCE = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data",
                                                      "sport_gait_reference.npz"))
-# lambda: the legs' reward includes this share of the arms' command-following terms (the arms take none of the
-# legs': their cycle-mean yaw term diluted the arms' own). 0: the legs' arms_* terms have weight 0 and drop out.
-REWARD_SHARE_TO_LEGS = 0.0
 CLIP_ACTIONS = 10.0       # the env clamps every raw policy action to +-this
 TORQUE_HEADROOM = 0.85    # targets ask for at most this share of a joint's effort limit (the e-stop trips at 0.9)
 KNEE_VALGUS_MARGIN = 0.02  # m: each knee may sit this far inside its hip-ankle line before knee_valgus charges
@@ -152,7 +147,6 @@ class MarlCommandsCfg:
         # in place, 20% walk sideways, 60% uniform over the full ranges)
         pure_turn_prob=0.2,
         pure_lateral_prob=0.2,
-        small_command_prob=0.0,
         lin_vel_stds=LIN_VEL_STDS,
         ang_vel_stds=ANG_VEL_STDS,
     )
@@ -168,7 +162,6 @@ class MarlCommandsCfg:
         standing_height=TABLE_PELVIS_HEIGHT,
         resampling_time_range=(4.0, 4.0),
         # standing goals only: the depth curriculum stays at level 0 (no crouch goals), so the pelvis-height band holds
-        levels=0,
         fine_pos_stds=FINE_POS_STDS,
         rot_stds=ROT_STDS,
         table_file=ARM_TARGET_TABLE,
@@ -423,8 +416,8 @@ class ArmsRewardsCfg:
     right_ee_pos = _arm_tracking(1, mdp.arm_target_pos_exp, 0.25)
     right_ee_pos_fine = _arm_tracking_annealed(1, mdp.arm_target_pos_exp_annealed)
     right_ee_quat = _arm_tracking_annealed(1, mdp.arm_target_quat_exp_annealed)
-    # GOAL_BONUS per goal (sync_derived sets the per-second weight)
-    goal_reached = RewTerm(func=mdp.arm_goal_reached, weight=GOAL_BONUS, params={"command_name": ARM_COMMAND})
+    # cfg.goal_bonus per goal: sync_derived sets the per-second weight
+    goal_reached = RewTerm(func=mdp.arm_goal_reached, weight=1.0, params={"command_name": ARM_COMMAND})
     alive = RewTerm(func=mdp.is_alive, weight=0.15)
     arm_goal_yaw_rate = RewTerm(
         func=mdp.yaw_rate_l2_during_arm_goal, weight=-2.0, params={"arm_command_name": ARM_COMMAND}
@@ -450,21 +443,10 @@ class ArmsRewardsCfg:
     )
 
 
-# The arms' command-following terms, which the legs share in.
-ARM_TRACKING_TERMS = ["left_ee_pos", "left_ee_pos_fine", "left_ee_quat",
-                      "right_ee_pos", "right_ee_pos_fine", "right_ee_quat", "goal_reached"]
-
-
 @configclass
 class MarlRewardsCfg:
     legs: LegsRewardsCfg = LegsRewardsCfg()
     arms: ArmsRewardsCfg = ArmsRewardsCfg()
-
-    def __post_init__(self):
-        # logged as Episode_Reward/legs/arms_<term>
-        for name in ARM_TRACKING_TERMS:
-            term: RewTerm = getattr(self.arms, name)
-            setattr(self.legs, f"arms_{name}", term.replace(weight=REWARD_SHARE_TO_LEGS * term.weight))
 
 
 @configclass
@@ -520,8 +502,8 @@ class MarlTerminationsCfg:
 
 @configclass
 class MarlCurriculumCfg:
-    # flat ground (every env on the terrain's row 0) and no pushes: no terrain or push curriculum
-    arm_target_levels = CurrTerm(func=mdp.arm_target_levels, params={"command_name": ARM_COMMAND})
+    # these two only log: the kernel stages move in the command terms. Flat ground, no pushes: no curriculum on them
+    arm_kernels = CurrTerm(func=mdp.arm_kernels, params={"command_name": ARM_COMMAND})
     velocity_kernels = CurrTerm(func=mdp.velocity_kernels, params={"command_name": "base_velocity"})
 
 
@@ -566,7 +548,10 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     state_checkpoint_path: str | None = None
     """A saved curriculum state to start from (the scripts fill it in from an skrl checkpoint)."""
     state_save_every: int = 9600
-    """Policy steps between curriculum-state saves: the skrl checkpoint interval."""
+    """Policy steps between curriculum-state saves. scripts/skrl/train.py sets it to the run's skrl checkpoint
+    interval: a checkpoint evaluated with another step's curriculum state is not the policy that was trained."""
+    goal_bonus: float = 5.0
+    """Paid once per reached arm goal (sync_derived sets rewards.arms.goal_reached's per-second weight from it)."""
     # While training, every task is navigation and the arms' residual is off until the robot walks well enough: the
     # sport-mode metrics on training's own navigation (ModalVelocityCommand.sport_metrics, sampled actions) within
     # these thresholds, warm_start_sport_checks checks in a row warm_start_sport_every steps apart; or at
@@ -612,17 +597,16 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     """The stand/walk gate: a command whose norm over (vx, vy, wz) is under this counts as standing (gait phase 0,
     both feet down); sport mode steps on any input."""
 
-    @property
-    def policy_dt(self) -> float:
-        return self.decimation * self.sim.dt
-
     def sync_derived(self):
         """What follows from other fields, for their values after the command line's overrides (__post_init__ runs
-        before them, so train.py and the env call this again): the physics-rate settings and the goal bonus per
-        second."""
+        before them, so train.py and the env call this again): the physics-rate settings, the goal bonus per second
+        and the joint targets' limits. An override of a field written here is lost: train.py refuses the run."""
         self.sync_physics_rate()
-        self.rewards.arms.goal_reached.weight = GOAL_BONUS / self.policy_dt
-        self.rewards.legs.arms_goal_reached.weight = REWARD_SHARE_TO_LEGS * GOAL_BONUS / self.policy_dt
+        self.rewards.arms.goal_reached.weight = self.goal_bonus / (self.decimation * self.sim.dt)
+        # every joint target inside GOLEM's position e-stop range (written to the cfg so params/env.yaml records it)
+        envelope = {name: list(bounds) for name, bounds in position_envelope(self.golem_estop).items()}
+        self.actions.joint_pos.joint_limits = envelope
+        self.actions.arm_pos.joint_limits = envelope
 
     def sync_physics_rate(self):
         """The sensor periods and render interval for sim.dt and decimation."""
@@ -643,7 +627,3 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
         self.sync_derived()
         self.viewer.eye = (4.0, 4.0, 2.5)
         self.viewer.lookat = (0.0, 0.0, 1.0)
-        # every joint target inside GOLEM's position e-stop range (written here so params/env.yaml records it)
-        envelope = {name: list(bounds) for name, bounds in position_envelope(self.golem_estop).items()}
-        self.actions.joint_pos.joint_limits = envelope
-        self.actions.arm_pos.joint_limits = envelope

@@ -27,7 +27,6 @@ Writes <out>/summary.md, summary.json and replay.npz.
 
 import argparse
 import collections
-import glob
 import json
 import os
 import sys
@@ -35,7 +34,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import yaml
 
 REPO = Path(__file__).resolve().parents[1]
 LEGS_GROUPS = [("acc", 3), ("gyro", 3), ("gravity", 3), ("cmd", 3), ("arm_goal", 1), ("ee_targets", 14),
@@ -73,6 +71,9 @@ parser.add_argument("--sim_seeds", type=int, default=0, help="MuJoCo reference r
 parser.add_argument("--out", default=None)
 args = parser.parse_args()
 
+sys.path.insert(0, str(REPO))
+from mujoco_evals.common import load_deploy_cfg  # noqa: E402
+
 sys.path.insert(0, os.path.join(args.golem, "core_ws/src/lmg_deploy"))
 from lmg_deploy.controller import ARM_START, NUM_JOINTS, MarlController, RobotState  # noqa: E402
 from lmg_deploy.kinematics import ArmKinematics  # noqa: E402
@@ -85,12 +86,7 @@ from rosbags.typesys import Stores, get_types_from_msg, get_typestore  # noqa: E
 
 
 def load_cfg(folder: str) -> dict:
-    yamls = [p for p in glob.glob(os.path.join(folder, "*.yaml")) if os.path.basename(p) != "export.yaml"]
-    cfg = yaml.safe_load(open(yamls[0] if yamls else args.template))
-    cfg.update(yaml.safe_load(open(os.path.join(folder, "export.yaml"))) or {})
-    cfg.setdefault("legs", {}).setdefault("policy", "legs.pt")
-    cfg.setdefault("arms", {}).setdefault("policy", "arms.pt")
-    return cfg
+    return load_deploy_cfg(folder, template=args.template)
 
 
 class Probe:

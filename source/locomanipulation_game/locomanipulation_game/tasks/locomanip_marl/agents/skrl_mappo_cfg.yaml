@@ -100,7 +100,10 @@ agent:
   kl_threshold:
     legs: 0.03
     arms: 0.0
-  # Not the arms: bootstrapping time-outs through their value scaler fed back into it.
+  # Not the arms. The reason given for it is gone (bootstrapping time-outs through their value scaler fed back into
+  # it: the scaler is off now, no_value_preprocessor). With it off, skrl's GAE does not cut the trace at a time-out:
+  # the next episode's values leak into the last steps' advantages. Kept as the arms' runs were trained; untested the
+  # other way.
   time_limit_bootstrap:
     legs: True
     arms: False

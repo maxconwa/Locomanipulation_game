@@ -265,3 +265,28 @@ fixing before it is tried again.
 - The legs' per-step reward stays floored at 0 in every run; changes shape behaviour through weights only.
 - Logs: `logs/sportmode_ablations/` (train_/eval_ logs per tag, queue logs, status.tsv); runs in
   `logs/skrl/locomanip_marl/*_sm_<tag>`, scorecards in each run's `checkpoints/scorecard_<step>.{json,md}`.
+
+## 2026-11-16: audit fixes and cleanup (applies to every run from here on)
+
+What changed in the code that a comparison with earlier runs has to know:
+
+- Evaluation scripts now zero an env's LSTM state when it is reset (they did not: a fallen env went on with its last
+  episode's state). The velocity phase of the scorecard is unchanged for a run without falls (LegsBalanceAmp_s42 @
+  200160: every tracking number identical); numbers after a fall differ.
+- The GOLEM monitor no longer looks twice at the state a step ends in: `Safety/estop_*` and the scorecard's e-stop
+  share fall a little (the same checkpoint: 0.176% -> 0.164% of steps), and a trip that starts two steps after
+  another is charged again.
+- A run records its task (`params/task.txt`); the scripts build that task, not the walking task by default.
+- `train.py` refuses an override that `sync_derived` would replace, saves the curriculum state at the checkpoints'
+  steps whatever `state_save_every` says, and the GOLEM margins' overrides now move the joint targets' limits.
+- An agent's log-std floor below the yaml's -3.0 now takes effect without an `agent.models.policy.min_log_std`
+  override (ArmsOnly: 0.03, as V10 and V11 had by hand).
+- The swing-height reward is 0, not NaN, where the height scan misses the ground.
+- Removed, all inert in every task: the push and terrain curricula, the arm goals' depth levels (`levels` was 0) and
+  goal-distance stages (`goal_scales` was (1.0,)), small commands (`small_command_prob` 0), the legs' share of the
+  arms' reward (0), seven unused reward functions. `ArmTargetsCommandCfg.z_min_start` is `z_min`; the curriculum
+  term `arm_target_levels` is `arm_kernels` (TensorBoard: `Curriculum/arm_kernels/*`).
+- The ArmsOnly export carries the integrated residual, the pose-error integral and the run's residual cutoff, and
+  `mujoco_evals` runs them.
+- Not changed: the arms' `time_limit_bootstrap: False` (its comment in the agent yaml), the second agent trained
+  though it cannot act in LegsOnly / ArmsOnly, the effort limits copied into `mujoco_sim.py`.

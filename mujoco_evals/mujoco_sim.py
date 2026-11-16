@@ -196,7 +196,10 @@ class MarlMujoco:
         arms_cfg = settings["arms"]
         self.policy_dt = float(settings["control_dt"])
         self.substeps = int(round(self.policy_dt / m.opt.timestep))
-        self.residual_alpha = 1.0 - math.exp(-2.0 * math.pi * float(arms_cfg["residual_cutoff_hz"]) * self.policy_dt)
+        cutoff = float(settings.get("residual_cutoff_hz", arms_cfg["residual_cutoff_hz"]))  # the run's, else the template's
+        self.residual_alpha = 1.0 - math.exp(-2.0 * math.pi * cutoff * self.policy_dt)
+        self.ik_damping = float(settings.get("ik_damping", arms_cfg.get("ik_damping", 0.05)))
+        self.clip_actions = float(settings.get("clip_actions", 10.0))
         self.leg_scale = np.asarray(settings.get("leg_action_scales", settings["legs"]["action_scale"]), float) * np.ones(12)
         if "legs" not in actors:
             self.leg_scale = np.zeros(12)
@@ -208,6 +211,10 @@ class MarlMujoco:
         self.n_arm_actions = 28 if self.arm_ik and self.arm_ik.get("posture_actions", True) else 14
         # IKPostureArmAction's freeze_residual_on_goal: the residual latched once the wrists settle on the command
         self.freeze = (self.arm_ik or {}).get("freeze")
+        # its residual_integrate ({gain, leak_s, clamp}: the residual integrated, not low-passed) and integral ({gain,
+        # leak_s, clamp}: the measured wrists' pose error integrated onto the target once it has stopped)
+        self.residual_integrate = (self.arm_ik or {}).get("residual_integrate")
+        self.integral_cfg = (self.arm_ik or {}).get("integral")
         # its posture from the goal table's row nearest the command (export's arm_seed_table, an absolute path here)
         self.seed_table = None
         if self.arm_ik and self.arm_ik.get("posture_from_command"):
@@ -303,6 +310,7 @@ class MarlMujoco:
         self.ik_q = d.qpos[self.qadr][self.arm_idx].copy()  # arm_ik.trajectory: the target's own last value
         self.traj_v = np.zeros(14)  # arm_ik.trajectory_max_vel: the target's velocity (rad/s)
         self.frozen, self.settled_steps = False, 0  # arm_ik.freeze
+        self.integral = np.zeros(14)  # arm_ik.integral: the pose error's integral (rad)
         self._seeds_for = None
         self.arm_mode = False
         self.believed = self.rest_b.copy()
@@ -353,14 +361,20 @@ class MarlMujoco:
 
     # -- actions
     def process_actions(self, a_legs: np.ndarray, a_arms: np.ndarray):
-        a_legs, a_arms = np.clip(a_legs, -10, 10), np.clip(a_arms, -10, 10)
+        clip = self.clip_actions
+        a_legs, a_arms = np.clip(a_legs, -clip, clip), np.clip(a_arms, -clip, clip)
         idx = self.leg_idx
         t = np.clip(self.default[idx] + self.leg_scale * a_legs, self.lower[idx], self.upper[idx])
         lo, hi = self._torque_bounds(idx)
         self.applied[idx] = np.clip(t, lo, hi)
         # arms
         if not self.frozen:
-            self.residual = self.residual + self.residual_alpha * (a_arms - self.residual)
+            if self.residual_integrate:
+                c = self.residual_integrate
+                leak = math.exp(-self.policy_dt / c["leak_s"])
+                self.residual = np.clip(leak * self.residual + c["gain"] * a_arms, -c["clamp"], c["clamp"])
+            else:
+                self.residual = self.residual + self.residual_alpha * (a_arms - self.residual)
         m, d = self.m, self.d
         p, qr = self.root()
         Rr = np.zeros(9)
@@ -379,7 +393,9 @@ class MarlMujoco:
             else:
                 ik = self._synchronized_step(posture)
             self.ik_q = np.clip(ik, self.lower[idx], self.upper[idx])
-            t = np.clip(self.ik_q + self.gravity_target_offset(Rr) + self.arm_scale * self.residual[:14],
+            if self.integral_cfg:
+                self._update_integral(posture, Rr)
+            t = np.clip(self.ik_q + self.gravity_target_offset(Rr) + self.integral + self.arm_scale * self.residual[:14],
                         self.lower[idx], self.upper[idx])
             lo, hi = self._torque_bounds(idx)
             self.applied[idx] = np.clip(t, lo, hi)
@@ -400,7 +416,7 @@ class MarlMujoco:
             if self.arm_ik:
                 ik[sl] = ik[sl] + self._posture_step(J, err, ik[sl], self.residual[14:][sl], self.arm_idx[sl])
                 continue
-            step = J.T @ np.linalg.solve(J @ J.T + 0.05 ** 2 * np.eye(6), err)
+            step = J.T @ np.linalg.solve(J @ J.T + self.ik_damping ** 2 * np.eye(6), err)
             ik[sl] = ik[sl] + np.clip(step, -self.max_ik_step, self.max_ik_step)
         idx = self.arm_idx
         self.ik_q = np.clip(ik, self.lower[idx], self.upper[idx])  # where trajectory would start from
@@ -408,6 +424,27 @@ class MarlMujoco:
         lo, hi = self._torque_bounds(idx)
         self.applied[idx] = np.clip(t, lo, hi)
         self.applied[12] = 0.0                                    # torso held at default by its own actuator
+
+    def _update_integral(self, posture: np.ndarray, R_pelvis: np.ndarray):
+        """mdp.IKPostureArmAction._update_integral: leak the pose-error integral; where the target has stopped at the
+        posture, add gain x each arm's weighted DLS step on its measured wrist's error; clamp."""
+        c, ik = self.integral_cfg, self.arm_ik
+        arrived = np.abs(self.ik_q - posture).max() < 1e-4 and np.abs(self.traj_v).max() < 1e-3
+        self.integral *= math.exp(-self.policy_dt / c["leak_s"])
+        if arrived:
+            m, d = self.m, self.d
+            cur = self.wrist_poses_b()
+            weight = np.r_[np.ones(3), np.full(3, ik["rot_weight"])]
+            jacp, jacr = np.zeros((3, m.nv)), np.zeros((3, m.nv))
+            for arm in range(2):
+                mujoco.mj_jacBodyCom(m, d, jacp, jacr, self.wrists[arm])  # as PhysX's (process_actions' comment)
+                J = np.vstack([R_pelvis.T @ jacp[:, self.arm_cols[arm]], R_pelvis.T @ jacr[:, self.arm_cols[arm]]])
+                tgt = self.believed[arm]
+                err = np.r_[tgt[:3] - cur[arm, :3], axis_angle(qmul(tgt[3:], qconj(cur[arm, 3:])))]
+                Jw = J * weight[:, None]
+                step = Jw.T @ np.linalg.solve(Jw @ Jw.T + ik["ik_damping"] ** 2 * np.eye(6), err * weight)
+                self.integral[7 * arm:7 * arm + 7] += c["gain"] * step
+        self.integral = np.clip(self.integral, -c["clamp"], c["clamp"])
 
     def _update_freeze(self, posture: np.ndarray):
         """mdp.IKPostureArmAction._update_freeze: latch the residual once the target has stopped at the posture and both

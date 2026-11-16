@@ -39,13 +39,15 @@ An Isaac Lab external project (a DirectMARLEnv trained with skrl MAPPO) — sepa
 from `ALMI_RL`.
 
 - **Activate the env first:** `conda activate env_isaaclab`
-- **The task lives in**
-  `source/locomanipulation_game/locomanipulation_game/tasks/locomanip_marl/`
-  (`LocoManip-Marl-Direct-v0`); its defaults are the sport-mode recipe (README).
-- **Train:** `python scripts/skrl/train.py --headless`; runs go to
+- **The tasks live in**
+  `source/locomanipulation_game/locomanipulation_game/tasks/locomanip_marl/`:
+  `LocoManip-Marl-Direct-v0` (its defaults are the sport-mode recipe, README), and
+  `LocoManip-LegsOnly-v0` and `LocoManip-ArmsOnly-v0` on the same env.
+- **Train:** `python scripts/skrl/train.py --headless [--task <id>]`; runs go to
   `logs/skrl/locomanip_marl/`. The whole pipeline (train, scorecard, export,
   checks): `scripts/train_candidate.sh`.
-- **Evaluate:** `scripts/skrl/eval_scorecard.py` (Isaac); the CPU checks of an
+- **Evaluate:** `scripts/skrl/eval_scorecard.py`, `eval_arms.py` (Isaac; they
+  read the run's task from `<run>/params/task.txt`); the CPU checks of an
   export, `agent_scripts/hw_stress_mujoco.py` and `hw_bag_replay.py`, run in a
   separate python with mujoco (on `mujoco_evals/`).
 - Older recipes (the paper's reach evaluation, the whole-body baseline, the
