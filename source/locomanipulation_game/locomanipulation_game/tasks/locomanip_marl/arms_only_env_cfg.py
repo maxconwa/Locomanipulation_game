@@ -5,7 +5,8 @@ The two-agent task (locomanip_marl_env_cfg.py) with only the arms acting and lea
   places it (x, y, yaw drawn as the walking task's) but upright and at the stance height;
 - the legs hold their default pose: their action scale is 0 and their reward terms are off, so the legs agent's
   actions do nothing (it is still trained, on the fall and GOLEM-trip penalties alone);
-- every task is a standing arm goal (arm_goal_prob 1, the velocity command zero), from the first step: the walking
+- every task is a standing arm goal (arm_goal_prob 1, the velocity command zero), each lasting a drawn 4-8 s
+  (ARMS_GOAL_TIME_RANGE; 4 s up to ArmsOnly200k_s42), from the first step: the walking
   task's warm-start gate needs walking, which a pinned robot never does, so its deadline opens it at step 1 with no
   ramp, and the arms' residual is at full gain from then on;
 - the arms' fresh actor starts with its last layer scaled by 0.01 and its bias zeroed (policy_output_init_scale), so
@@ -43,8 +44,6 @@ The two-agent task (locomanip_marl_env_cfg.py) with only the arms acting and lea
   the seed is only the nearest row's and the residual has to close the gap, as for a commanded pose on the robot:
   the trajectory alone reaches 7.7% of goals a quarter of the way out (63 mm). A curriculum from near the rest pose
   outward (ArmTargetsCommandCfg.goal_scales) is left off: near goals are off the rows, the hardest here;
-- a style reward from an adversarial motion prior on the arms (mdp.amp_arm_style; LAFAN1's walk, dance and fight
-  clips, build_amp_reference.py --arms), ramped in over ARMS_STYLE_RAMP;
 - the arms' std stays at or above ARMS_MIN_STD (policy_log_std_bounds): ArmsOnlyIK_s42 (11-10) went from 0.2 to the
   yaml's floor, 0.05, by 70k steps, and its reach stopped rising at 40k (33.5% reached at 40k, 33.3% at 60k).
 
@@ -53,7 +52,9 @@ end, 49% of wrists within 5 cm, 12% of goals reached; ~9% of goals end with a ha
 trajectory, 2%. ArmsOnly_s42 (11-10, stopped at 109k) trained on a pinned pelvis before the IK's Jacobian indexing knew a fixed base: the IK didn't track
 (632 mm), and the arms learned to park out of the penalties' way (764 mm at 100k).
 
-The arms' observations and rewards are the walking task's, with the style added, and a reward for holding still on
+The arms' actor sees the wrist targets, the joints, its last action and the wrists' poses and errors: not the IMU
+(acceleration, gyro, gravity), the velocity command or the gait clock (ARMS_DROPPED_OBS), which a pinned, standing
+robot holds constant or as noise (the critic's state keeps them). The rewards are the walking task's, and a reward for holding still on
 the goal (ARMS_HOLD_STILL): ArmsOnlyV3_s42 (11-11) reached 98% / 88% of table / off-table goals at 20k but swayed 3-4 mm
 RMS in the hold, its joints at 0.26 rad/s, where the trajectory alone holds without jitter; nothing paid stillness.
 The reward didn't change it (ArmsOnlyV4_s42 / V5_s42, 11-11: at 60k the sway 4.7 mm and the joints at 0.34 rad/s, the IK
@@ -90,13 +91,12 @@ mm with the 0.05 rad clamp, which saturated off the table. Every policy's std ro
 """
 
 import math
-import os
 
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
-from locomanipulation_game.assets.h1_2 import ARM_JOINT_NAMES, CL_ASSETS_DIR
+from locomanipulation_game.assets.h1_2 import CL_ASSETS_DIR
 
 from . import mdp
 from .locomanip_marl_env_cfg import FINE_POS_STDS, ROT_STDS, ArmsRewardsCfg, LocoManipMarlEnvCfg, MarlRewardsCfg
@@ -124,9 +124,12 @@ ARMS_REACH_POS_TOL = 0.002  # m
 ARMS_REACH_ROT_TOL = math.radians(5.0)
 ARMS_OFFTABLE_SCALES = (0.25, 1.0)
 ARMS_REST_GOAL_PROB = 0.1
+ARMS_GOAL_TIME_RANGE = (4.0, 8.0)  # s: each goal's duration, drawn
+# the walking task's shared observation terms the arms' actor doesn't get here
+ARMS_DROPPED_OBS = ("base_lin_acc", "base_ang_vel", "projected_gravity", "velocity_commands", "gait_phase",
+                    "gait_phase_cos")
 ARMS_KINEMATICS_URDF = str(CL_ASSETS_DIR / "ros_assets" / "h1_2_magpie.urdf")
 ARMS_KINEMATICS_SPHERES = str(CL_ASSETS_DIR / "curobo_assets" / "h1_2_magpie_curobo.yml")
-ARMS_STYLE_RAMP = (20_000, 60_000)
 
 # on the goal, each wrist moving at most ARMS_HOLD_STILL_TOL per policy step (0.1 mm: 1 cm/s at 100 Hz) is paid in full,
 # e^-1 of it at ARMS_HOLD_STILL_SCALE beyond (mdp.arm_hold_still); at two tracking terms' weight. With a 0.2 mm scale
@@ -139,16 +142,6 @@ ARMS_HOLD_STILL_GATE = (0.05, 0.35)  # m, rad
 ARMS_HOLD_STILL = RewTerm(func=mdp.arm_hold_still, weight=2.0, params={
     "command_name": "arm_targets", "tolerance": ARMS_HOLD_STILL_TOL, "scale": ARMS_HOLD_STILL_SCALE,
     "pos_tol": ARMS_HOLD_STILL_GATE[0], "rot_tol": ARMS_HOLD_STILL_GATE[1]})
-
-ARMS_AMP_REFERENCE = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data",
-                                                   "amp_lafan1_h1_2_arms.npz"))
-# the style at a sixth of the six tracking terms' combined weight (1 each per second), the discriminator as the legs'
-ARMS_AMP_STYLE = RewTerm(func=mdp.amp_arm_style, weight=1.0, params={
-    "joint_cfg": SceneEntityCfg("robot", joint_names=ARM_JOINT_NAMES, preserve_order=True),
-    "reference": ARMS_AMP_REFERENCE,
-    "hidden": (1024, 512), "lr": 1e-5, "weight_decay": 1e-4, "grad_penalty": 10.0, "logit_reg": 0.05,
-    "update_every": 48, "num_updates": 4, "batch_size": 8192, "buffer_size": 400_000, "frame_stride": 3,
-    "style_ramp": ARMS_STYLE_RAMP})
 
 
 def _fixed(func, arm: int, **params) -> RewTerm:
@@ -167,13 +160,13 @@ ARMS_PRECISION_ACTION_RATE = -0.05
 # arms_integrate (ArmsOnlyEnvCfg): the arms' exploration
 ARMS_INTEGRATE_INITIAL_STD = 0.1
 ARMS_INTEGRATE_MIN_STD = 0.03
-# the arms' observation noise at arms_obs_noise_scale 1 (the walking task's)
-ARMS_OBS_NOISE = {"wrist_poses": 0.005, "wrist_errors": 0.005, "joint_pos": 0.01, "joint_vel": 1.5}
+# the arms' observation noise at arms_obs_noise_scale 1 (the walking task's). The measured wrist poses carry none
+# (user 2026-11-19; the walking task's 0.005, as every run up to ArmsObs200k_s42)
+ARMS_OBS_NOISE = {"wrist_errors": 0.005, "joint_pos": 0.01, "joint_vel": 1.5}
 
 
 @configclass
 class ArmsOnlyArmsRewardsCfg(ArmsRewardsCfg):
-    amp_style = ARMS_AMP_STYLE
     hold_still = ARMS_HOLD_STILL
     left_ee_pos_k20 = _fixed(mdp.arm_target_pos_exp, 0, std=ARMS_PRECISION_POS_STDS["k20"])
     left_ee_pos_k5 = _fixed(mdp.arm_target_pos_exp, 0, std=ARMS_PRECISION_POS_STDS["k5"])
@@ -207,7 +200,7 @@ class ArmsOnlyEnvCfg(LocoManipMarlEnvCfg):
 
     # Variants for the command line (sync_derived applies them after the overrides; V9 had 1.0, False, False):
     arms_obs_noise_scale: float = 1.0
-    """The arms' wrist and joint observation noise times this (ARMS_OBS_NOISE at 1)."""
+    """The arms' wrist-error and joint observation noise times this (ARMS_OBS_NOISE at 1)."""
     arms_integrate: bool = True
     """The residual integrated, not low-passed (IKPostureArmActionCfg.residual_integrate), the arms' std starting at
     ARMS_INTEGRATE_INITIAL_STD with a floor of ARMS_INTEGRATE_MIN_STD."""
@@ -247,11 +240,15 @@ class ArmsOnlyEnvCfg(LocoManipMarlEnvCfg):
         # each goal's seed solved for the goal itself, goals whose seed or path collide drawn again, some rest goals
         arm.seed_solve, arm.collision_check, arm.rest_goal_prob = True, True, ARMS_REST_GOAL_PROB
         arm.reach_pos_tol, arm.reach_rot_tol = ARMS_REACH_POS_TOL, ARMS_REACH_ROT_TOL
+        arm.resampling_time_range = ARMS_GOAL_TIME_RANGE
         arm.fine_pos_stds, arm.rot_stds = ARMS_FINE_POS_STDS, ARMS_ROT_STDS
         arm.kinematics_urdf, arm.kinematics_spheres = ARMS_KINEMATICS_URDF, ARMS_KINEMATICS_SPHERES
         # every task is an arm goal: the observations drop the flag that says so
         for group in (self.observations.arms, self.observations.legs, self.observations.critic):
             group.arm_goal = None
+        for name in ARMS_DROPPED_OBS:
+            setattr(self.observations.arms, name, None)
+        self.observations.arms.wrist_poses.noise = None
         self.sync_derived()
 
     def sync_derived(self):

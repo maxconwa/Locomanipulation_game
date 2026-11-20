@@ -166,7 +166,8 @@ def main(env_cfg, agent_cfg: dict):
         sync()
         kin.update(state.q)
         common = ctrl._common_obs(state)
-        compare("legs", LEGS, np.concatenate([common, ctrl.legs_last]), obs["legs"][0].double().cpu().numpy())
+        legs_common = common if ctrl.legs_see_ee_targets else ctrl._common_obs(state, ee_targets=False)
+        compare("legs", LEGS, np.concatenate([legs_common, ctrl.legs_last]), obs["legs"][0].double().cpu().numpy())
         compare("arms", ARMS, np.concatenate([common, ctrl.arms_last, ctrl._wrist_poses(), ctrl._wrist_errors()]),
                 obs["arms"][0].double().cpu().numpy())
 

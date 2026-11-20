@@ -192,6 +192,14 @@ def arm_hold_still(env: ManagerBasedRLEnv, command_name: str, tolerance: float, 
     return torch.exp(-excess / scale) * (on_goal & term.arm_mode)
 
 
+def joint_power_l1(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Mechanical power over asset_cfg's joints (W): sum of |applied torque x joint velocity|. Zero for a joint held
+    still, whatever torque holds it: a standing crouch is the torque terms', not this one's."""
+    data = env.scene[asset_cfg.name].data
+    return torch.sum(torch.abs(data.applied_torque[:, asset_cfg.joint_ids] * data.joint_vel[:, asset_cfg.joint_ids]),
+                     dim=1)
+
+
 def yaw_rate_l2_during_arm_goal(env: ManagerBasedRLEnv, arm_command_name: str) -> torch.Tensor:
     """Squared pelvis yaw rate during an arm goal: turning moves the world-fixed targets in the pelvis frame."""
     yaw_rate = env.scene["robot"].data.root_ang_vel_b[:, 2]
@@ -295,6 +303,8 @@ def feet_swing_height_tracking_exp(
     command_name: str = "base_velocity",
     terrain_sensor_cfg: SceneEntityCfg | None = None,
     std: float = 0.03,
+    loose_std: float = 0.1,
+    loose_weight: float = 0.0,
 ) -> torch.Tensor:
     """sin(pi * s) * exp(-(foot_z - reference)^2 / std^2) per foot in its swing phase, summed over the feet; stance
     feet give 0.
@@ -304,6 +314,10 @@ def feet_swing_height_tracking_exp(
     it) and weighted by the reference's own lift share sin(pi * s): at the swing's ends the reference sits at
     rest_height, where a dragged foot matches it (unweighted, that paid a dragged foot 0.31 of a full lift; weighted,
     0.15 at std 0.03, and 0.54 at half the lift height). 0 where every ray of the scan missed the ground.
+
+    loose_weight (0: off) is the share of the kernel given to a second, looser one at loose_std, for lifts several
+    std high: at a 15 cm lift the 0.03 kernel alone paid a foot lifting 0-6 cm 0.02-0.06 of a full lift, no slope to
+    climb (LegsLift15_200k_s42 never lifted); half of it at 0.1 pays 0.15 dragged, 0.33 at 6 cm, 0.74 at 12 cm.
     """
     asset = env.scene[asset_cfg.name]
     foot_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
@@ -315,7 +329,9 @@ def feet_swing_height_tracking_exp(
     lift_share = torch.sin(torch.pi * progress)
     reference = rest_height + lift_height * lift_share
     # ground_height is NaN where every ray missed: no reward there, as base_height_band (a NaN stops the run)
-    kernel = torch.nan_to_num(torch.exp(-torch.square(foot_z - reference) / std**2), nan=0.0)
+    error_sq = torch.square(foot_z - reference)
+    kernel = (1.0 - loose_weight) * torch.exp(-error_sq / std**2) + loose_weight * torch.exp(-error_sq / loose_std**2)
+    kernel = torch.nan_to_num(kernel, nan=0.0)
     return torch.sum(lift_share * kernel * swing, dim=1)
 
 

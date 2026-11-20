@@ -50,8 +50,6 @@ class LocoManipMarlEnv(DirectMARLEnv):
         # its reset; None: every episode max_episode_length (episode_length_range_s None)
         self.episode_limit = (torch.full((self.num_envs,), self.max_episode_length, device=self.device)
                               if cfg.episode_length_range_s is not None else None)
-        # metrics the mdp terms log each step (mdp.amp_style's discriminator)
-        self.term_log: dict[str, torch.Tensor] = {}
 
         # After super() has started the sim, in ManagerBasedRLEnv.load_managers' order: observations read commands
         # and actions, rewards read terminations.
@@ -204,7 +202,6 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._obs_buf = {g: self.observation_manager.compute_group(g) for g in groups}
         self.extras.setdefault("log", {}).update(self._warm_start_log)
         self.extras["log"].update(self.golem_log)
-        self.extras["log"].update(self.term_log)
         return {agent: self._obs_buf[agent] for agent in self.cfg.possible_agents}
 
     def _get_states(self) -> torch.Tensor:
@@ -350,13 +347,12 @@ class LocoManipMarlEnv(DirectMARLEnv):
 
     def save_state(self):
         """Save the curriculum state (the arm and velocity commands' kernel stages, whether the arm goals have
-        started, the reward terms' learned state) to <log_dir>/curriculum/state_<step>.pt and state_latest.pt: a resumed or evaluated run
+        started) to <log_dir>/curriculum/state_<step>.pt and state_latest.pt: a resumed or evaluated run
         starts from it (cfg.state_checkpoint_path)."""
         env_state = {
             "arm_targets": self._arm_command.state_dict(),
             "base_velocity": self.command_manager.get_term("base_velocity").state_dict(),
             "arm_goals_enabled": self._arm_command.goals_enabled,
-            "reward_terms": {key: term.checkpoint_state() for key, term in self._stateful_reward_terms().items()},
         }
         directory = os.path.join(self.cfg.log_dir, "curriculum")
         os.makedirs(directory, exist_ok=True)
@@ -364,14 +360,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
             torch.save({"env_state": env_state}, os.path.join(directory, name))
 
     def _load_state(self, state: dict):
-        """The kernel stages, the end of the warm start and the reward terms' state saved by save_state."""
+        """The kernel stages and the end of the warm start saved by save_state."""
         self._arm_command.load_state_dict(state["arm_targets"])
         self.command_manager.get_term("base_velocity").load_state_dict(state["base_velocity"])
         self._arm_command.goals_enabled |= state["arm_goals_enabled"]
-        for key, term in self._stateful_reward_terms().items():
-            if key in state.get("reward_terms", {}):
-                term.load_checkpoint_state(state["reward_terms"][key])
-                print(f"[INFO] Restored reward term state: {key}")
         print(
             f"[INFO] Restored curriculum: arm kernel stage {self._arm_command.kernel_stage}, arm goals"
             f" {self._arm_command.goals_enabled}, velocity kernel stages lin"
@@ -381,13 +373,6 @@ class LocoManipMarlEnv(DirectMARLEnv):
     """
     Helpers.
     """
-
-    def _stateful_reward_terms(self) -> dict:
-        """agent/term -> the class reward terms that carry learned state (checkpoint_state; mdp.amp_style)."""
-        return {f"{agent}/{name}": cfg.func
-                for agent, manager in self.reward_managers.items()
-                for name, cfg in zip(manager._term_names, manager._term_cfgs)
-                if hasattr(cfg.func, "checkpoint_state")}
 
     def _refresh_sensors_after_reset(self, env_ids: Sequence[int]):
         """Make the IMU read the reset state, not the robot's last pose before the reset.

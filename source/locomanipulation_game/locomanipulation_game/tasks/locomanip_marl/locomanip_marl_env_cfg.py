@@ -332,6 +332,8 @@ class LegsRewardsCfg:
         "command_name": "base_velocity",
         "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
         "std": 0.03,
+        "loose_std": 0.1,
+        "loose_weight": 0.0,  # the looser kernel's share: off at this lift height
     })
     # each foot's contact at the clock's stance or swing: at most 2 per second at weight 1, 1.1 with both feet down
     contact = RewTerm(func=mdp.contact_matches_phase, weight=0.5,
@@ -372,6 +374,9 @@ class LegsRewardsCfg:
                            params={"asset_cfg": SceneEntityCfg("robot", joint_names=ANKLE_JOINT_NAMES)})
     ankle_action_rate = RewTerm(func=mdp.ankle_action_rate_l2, weight=-0.05,
                                 params={"asset_cfg": SceneEntityCfg("robot", joint_names=ANKLE_JOINT_NAMES)})
+    # the legs' mechanical power (W); off by default, a run turns it on (env.rewards.legs.energy.weight=-1e-3: about
+    # the torque term's size at 100-150 W of walking)
+    energy = RewTerm(func=mdp.joint_power_l1, weight=0.0, params={"asset_cfg": _LEGS})
     # --- safety
     dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-5.0, params={"asset_cfg": _LEGS})
     feet_contact_forces = RewTerm(func=mdp.feet_contact_forces, weight=-0.01,

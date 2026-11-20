@@ -31,8 +31,7 @@ metrics pass. These are the defaults: `train.py` with no overrides trains the re
 - `scripts/skrl/`: `train.py`, `play.py`, `eval_scorecard.py` (with `scorecard_metrics.py` and its check against the
   sport-mode bags, `test_scorecard_sportmode.py`), `eval_arms.py` (the arms' reach, hold and vibration),
   `export_marl.py`, `deploy_parity.py`.
-- `scripts/build_amp_reference.py`, `scripts/fit_sport_gait.py`: build the AMP motion references and the sport-gait
-  reference under `data/` from their sources.
+- `scripts/fit_sport_gait.py`: builds the sport-gait reference under `data/` from its source.
 - `scripts/train_candidate.sh`: train seeds, then score, export and check each one.
 - `agent_scripts/`: the CPU checks of an export: `hw_stress_mujoco.py` (MuJoCo under measured hardware effects),
   `hw_bag_replay.py` (the deploy controller on recorded robot bags), and `hw_deploy_template.yaml`.
