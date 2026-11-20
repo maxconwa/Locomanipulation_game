@@ -27,7 +27,6 @@ import argparse
 import glob
 import os
 import re
-import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -112,6 +111,7 @@ task = args.task or (task_file.read_text().strip() if task_file.is_file() else N
 if task is None:
     print("[WARNING] the run does not record its task (trained before 2026-11-16) and --task is not given:"
           " export.yaml's source.task is left empty")
+sizes = {}  # agent -> (inputs, actions), for the policy yaml
 for agent in ("legs", "arms"):
     pre, policy = ckpt[agent]["observation_preprocessor"], ckpt[agent]["policy"]
     if "lstm.weight_ih_l0" not in policy:
@@ -126,6 +126,7 @@ for agent in ("legs", "arms"):
                            1e-8, 5.0, clip_actions,
                            cell_cap=float(policy["cell_cap_value"][0]) if "cell_cap_value" in policy else 0.0).eval()
     torch.jit.script(actor).save(os.path.join(args.out, f"{agent}.pt"))
+    sizes[agent] = (n, net[-1].out_features)
     print(f"{agent}: {n} obs -> LSTM {layers}x{hidden}{' + skip' if actor.skip_observations else ''}"
           f"{f' (c capped at {actor.cell_cap:g})' if actor.cell_cap > 0 else ''} -> {net[-1].out_features} actions")
 
@@ -163,5 +164,15 @@ if (export.get("arm_ik") or {}).get("posture_from_command"):
 with open(os.path.join(args.out, "export.yaml"), "w") as f:
     yaml.safe_dump(export, f, sort_keys=False)
 name = os.path.basename(os.path.normpath(args.out))
-shutil.copyfile(TEMPLATE, os.path.join(args.out, f"{name}.yaml"))
+# the policy template with each actor's sizes set to its network's (the template's are an older layout's)
+text = open(TEMPLATE).read()
+for agent, (n_obs, n_act) in sizes.items():
+    block = re.search(rf"^{agent}:\n(?:[ #].*\n)*", text, re.M)
+    if block is None:
+        raise SystemExit(f"{TEMPLATE}: no {agent}: block")
+    part = re.sub(r"^(  num_obs: )\d+.*$", rf"\g<1>{n_obs}", block.group(0), count=1, flags=re.M)
+    part = re.sub(r"^(  num_actions: )\d+.*$", rf"\g<1>{n_act}", part, count=1, flags=re.M)
+    text = text[:block.start()] + part + text[block.end():]
+with open(os.path.join(args.out, f"{name}.yaml"), "w") as f:
+    f.write(text)
 print(f"wrote {args.out}: legs.pt arms.pt {name}.yaml export.yaml")

@@ -170,11 +170,9 @@ def main(env_cfg, agent_cfg: dict):
         state = env_state()
         sync()
         kin.update(state.q)
-        common = ctrl._common_obs(state)
-        legs_common = common if ctrl.legs_see_ee_targets else ctrl._common_obs(state, ee_targets=False)
-        compare("legs", LEGS, np.concatenate([legs_common, ctrl.legs_last]), obs["legs"][0].double().cpu().numpy())
-        compare("arms", ARMS, np.concatenate([common, ctrl.arms_last, ctrl._wrist_poses(), ctrl._wrist_errors()]),
-                obs["arms"][0].double().cpu().numpy())
+        deploy_obs = ctrl.observations(state)  # each agent's terms as the export lists them
+        compare("legs", LEGS, deploy_obs["legs"], obs["legs"][0].double().cpu().numpy())
+        compare("arms", ARMS, deploy_obs["arms"], obs["arms"][0].double().cpu().numpy())
 
         actions = act(obs, states)
         clip = env_cfg.clip_actions

@@ -172,6 +172,10 @@ def read_deploy_settings(run_dir: Path) -> dict:
                            for axis in ("lin_vel_x", "lin_vel_y", "ang_vel_z")},
         "command_filter_tau": float(velocity.get("command_filter_tau", 0.0)),
         "arm_goals": float(env["commands"]["arm_targets"]["arm_goal_prob"]) > 0.0,
+        # LocoManip-Marl-Direct-v0's arm goals (ArmTargetsCommandCfg): riding on the pelvis (pelvis_fixed_goals), and
+        # the velocity command live through them (independent_of_legs); written only when set
+        **({"arm_goal_frame": "pelvis"} if env["commands"]["arm_targets"].get("pelvis_fixed_goals") else {}),
+        **({"arm_goal_keeps_walking": True} if env["commands"]["arm_targets"].get("independent_of_legs") else {}),
         # each actor's observation terms in order (MarlMujoco builds the vectors from them)
         **{f"{agent}_obs_terms": [name for name, term in env["observations"][agent].items()
                                   if isinstance(term, dict) and "func" in term] for agent in ("legs", "arms")},
