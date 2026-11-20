@@ -280,6 +280,16 @@ class MarlMujoco:
         self.rng = np.random.default_rng(0)
         self.gyro_lowpass = GyroLowpass(imu["gyro_lowpass_hz"]) if imu.get("gyro_lowpass_hz") else None
         self._gyro = None
+        # LocoManip-Marl-Direct-v0 (ArmTargetsCommandCfg.pelvis_fixed_goals, independent_of_legs): an arm goal rides
+        # on the pelvis, and the velocity command runs through it. The caller sets it.
+        self.pelvis_goals = False
+        # /lowstate's torso IMU (export imu.source lowstate): its quaternion reads this rotation when level (the
+        # trained bias range's centre; set imu_bias_deg to move it) and its noise is the model's, not the head's
+        self.lowstate = imu.get("source") == "lowstate"
+        self.imu_bias_deg = ({k: 0.5 * (lo + hi) for k, (lo, hi) in imu["quat_bias_deg"].items()} if self.lowstate
+                             else {"roll": 0.0, "pitch": 0.0, "yaw": 0.0})
+        if self.lowstate:
+            self.NOISE = {**self.NOISE, "ang_vel": 0.03, "grav": 0.0017}
 
     # -- state
     def reset(self, rng: np.random.Generator):
@@ -338,6 +348,13 @@ class MarlMujoco:
         acc = d.sensordata[self.s_acc:self.s_acc + 3].copy()
         gyro = self._raw_gyro() if self.gyro_lowpass is None else self._gyro.copy()
         R = d.site_xmat[self.imu_site].reshape(3, 3)
+        b = {k: math.radians(v) for k, v in self.imu_bias_deg.items()}
+        if any(b.values()):  # the reported orientation: the true one times the bias rotation (body frame, x-y-z)
+            cr, sr, cp, sp, cy, sy = (f(b[k]) for k in ("roll", "pitch", "yaw") for f in (math.cos, math.sin))
+            rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+            ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+            rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+            R = R @ (rz @ ry @ rx)
         grav = R.T @ np.array([0.0, 0.0, -1.0])
         return acc, gyro, grav
 
@@ -562,7 +579,7 @@ class MarlMujoco:
     def _update_odometry(self):
         """During an arm goal, move the believed command by the pelvis's true motion since the last step."""
         p, q = self.root()
-        if self.arm_mode:
+        if self.arm_mode and not self.pelvis_goals:
             pp, pq = self._prev_root
             dp, dq = qrot(qconj(pq), p - pp), qmul(qconj(pq), q)
             self.believed = np.stack([relative(dp, dq, b) for b in self.believed])
@@ -575,7 +592,7 @@ class MarlMujoco:
     def _filter_command(self):
         if self.cmd_alpha is None:
             return
-        if self.arm_mode:
+        if self.arm_mode and not self.pelvis_goals:
             self.cmd_filtered[:] = 0.0
         else:
             self.cmd_filtered += self.cmd_alpha * (np.asarray(self.vel_cmd, float) - self.cmd_filtered)

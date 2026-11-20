@@ -138,7 +138,8 @@ _ACTUATORS = {
     "feet": _pd(ANKLE_JOINT_NAMES, {".*_ankle_pitch_joint": 60.0, ".*_ankle_roll_joint": 40.0}, 9.0,
                 {".*_ankle_pitch_joint": 80.0, ".*_ankle_roll_joint": 40.0},
                 {".*_ankle_pitch_joint": 1.5, ".*_ankle_roll_joint": 0.4}),
-    "torso": _pd([TORSO_JOINT_NAME], 200.0, 23.0, {"torso_joint": 600.0}, {"torso_joint": 6.0}),
+    # torso kp 500, not sport mode's 600: golem_safety's kp_max is 500, so the robot runs it at 500 anyway
+    "torso": _pd([TORSO_JOINT_NAME], 200.0, 23.0, {"torso_joint": 500.0}, {"torso_joint": 6.0}),
     "arms": _pd(ARM_JOINT_NAMES,
                 {".*_shoulder_pitch_joint": 40.0, ".*_shoulder_roll_joint": 40.0, ".*_shoulder_yaw_joint": 18.0,
                  ".*_elbow_joint": 18.0, ".*_wrist_.*_joint": 19.0},
@@ -147,7 +148,7 @@ _ACTUATORS = {
                 {".*_shoulder_pitch_joint": 250.0, ".*_shoulder_roll_joint": 400.0, ".*_shoulder_yaw_joint": 80.0,
                  ".*_elbow_joint": 80.0, ".*_wrist_.*_joint": 20.0},
                 {".*_shoulder_pitch_joint": 6.0, ".*_shoulder_roll_joint": 10.0, ".*_shoulder_yaw_joint": 2.0,
-                 ".*_elbow_joint": 2.0, ".*_wrist_.*_joint": 0.5}),
+                 ".*_elbow_joint": 2.0, ".*_wrist_.*_joint": 1.0}),  # wrist kd 1.0, not 0.5: suspected of the arms' pre-pose shake
     # Locked open by stiff implicit drives, which hold each hinge at default in place of the missing linkage
     # constraint (an explicit PD at 2 ms would not hold them stably).
     "grippers": ImplicitActuatorCfg(

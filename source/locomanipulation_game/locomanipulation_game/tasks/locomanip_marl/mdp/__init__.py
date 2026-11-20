@@ -11,5 +11,6 @@ from .curriculums import *  # noqa: F401, F403
 from .dynamics import *  # noqa: F401, F403
 from .imu import *  # noqa: F401, F403
 from .observations import *  # noqa: F401, F403
+from .prepose import *  # noqa: F401, F403
 from .rewards import *  # noqa: F401, F403
 from .terminations import *  # noqa: F401, F403

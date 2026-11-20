@@ -11,10 +11,24 @@ observations, all from the export's settings) and adds the perturbations (CONDIT
                  amplitude
   delay_ms       the joint targets this late; torso_kg: added to the torso; enc: encoder offsets on the legs (rad)
   hang_s         held on the gantry (feet 8 cm up) this long, then lowered onto the feet over LOWER_S
-Per job (one condition, profile, plant and seed) one robot for --seconds; jobs run in parallel processes.
+  prepose        the engage from lmg_deploy's pre-pose (pp_* conditions; GOLEM's marl_deploy_node._prepose and
+                 controller.reset, the sequence of sagged_engage.py of 2026-11-20): on the gantry, lowered onto the
+                 feet with a rope carrying `rope` of the weight, the pre-pose easing to the start pose, then the
+                 policy engaged with the deploy's reset; the rope kept or released (`release`) at the engage. Starts:
+                   hung     engaged on the gantry, feet 8 cm up; lowered PP_HUNG_HOLD_S later
+                   settled  the default pose on the feet
+                   bag      the robot's measured pre-pose at its 2026-11-20 engage (data/bag_engage_q.npy)
+                   random   a draw from the training's pre-pose range (PREPOSE_JOINT_RANGES; per seed)
+                 Run for PP_AFTER_S with a zero command; scored on the first 0.5 s and the stance after (pp table)
+  imu_pitch, vib_k   for an export on the torso IMU (export imu.source lowstate): the quaternion's pitch bias (deg;
+                 default the trained range's centre), and its gyro's vibration tied to leg motion, x TORSO_GYRO_PER_DQ
+Per job (one condition, profile, plant and seed) one robot for --seconds; jobs run in parallel processes. --video COND
+renders one job of COND (seed 0) to an mp4 instead.
 
     python agent_scripts/hw_stress_mujoco.py --export <policies/name> --label <name> [--seeds 8] [--plants robocasa,isaac]
         [--conditions ...] [--profiles zero,small,small60] [--workers 24]
+    python agent_scripts/hw_stress_mujoco.py --export <...> --label <name> --conditions pp   (the pre-pose grid)
+    python agent_scripts/hw_stress_mujoco.py --export <...> --label <name> --video pp_bag_release
 
 Writes logs/hw_stress_mujoco/<label>/summary.json and summary.md. Any python with mujoco, torch, numpy and pyyaml.
 """
@@ -72,8 +86,20 @@ CONDITIONS = {
     "lstm_reset_legs": {"lstm_reset_s": 10.0, "lstm_reset_which": "legs"},
     "lstm_reset_arms": {"lstm_reset_s": 10.0, "lstm_reset_which": "arms"},
 }
+# the pre-pose grid: each start with the rope kept and released, with the hardware effects and the torso IMU's
+# vibration at x4 (sagged_engage.py's --head-res 4 matched the bag's input); the bag's pose and the settled one also at
+# the quaternion bias range's ends
+PP_STARTS = ("hung", "settled", "bag", "random")
+for _start in PP_STARTS:
+    for _rope in ("keep", "release"):
+        CONDITIONS[f"pp_{_start}_{_rope}"] = dict(_HW, prepose=_start, release=_rope == "release", vib_k=4.0)
+for _start in ("settled", "bag"):
+    for _pitch in (-3.6, -2.0):
+        CONDITIONS[f"pp_{_start}_release_pitch{_pitch:+.1f}"] = dict(_HW, prepose=_start, release=True, vib_k=4.0,
+                                                                      imu_pitch=_pitch)
 NOMINAL = {"strength": 1.0, "gain": 1.0, "dq_lag": 0.0, "gyro_k": 0.0, "delay_ms": 10.0, "torso_kg": 0.0, "enc": 0.0,
-           "hang_s": 0.0, "lstm_reset_s": 0.0, "lstm_reset_which": "both"}
+           "hang_s": 0.0, "lstm_reset_s": 0.0, "lstm_reset_which": "both", "prepose": "", "rope": 0.4,
+           "release": False, "imu_pitch": None, "vib_k": 0.0}
 HANG_LIFT, LOWER_S = 0.08, 1.0
 GYRO_RMS_PER_DQ_RMS = 3.4
 LAG_IDX = [ALL_NAMES.index(f"{s}_{j}_joint") for s in ("left", "right") for j in ("hip_pitch", "knee")]
@@ -82,6 +108,21 @@ KNEE_IDX = [ALL_NAMES.index(n) for n in ("left_knee_joint", "right_knee_joint")]
 FALL_TILT, FALL_HEIGHT = 0.8, 0.55
 FLOOR_MARGIN, FLOOR_HOLD_S = 0.1, 0.5
 STAND_WINDOW = (2.0, 10.0)
+# the pre-pose engage (sagged_engage.py's sequence): s on the gantry, s lowering, s easing to the start pose, the
+# engage's time, s run after it; the hung start stays on the gantry this long after its engage
+PP_HANG_S, PP_LOWER_S, PP_EASE_S, PP_ENGAGE_S, PP_AFTER_S, PP_HUNG_HOLD_S = 1.5, 1.0, 2.0, 8.0, 8.0, 2.0
+PP_TETHER_K, PP_TETHER_D = 1500.0, 300.0  # N/m, N s/m: the rope's horizontal pull back to where it took over
+BAG_ENGAGE_Q = REPO / "agent_scripts" / "data" / "bag_engage_q.npy"  # 27 joint angles, policy order (rad)
+# the training's pre-pose joint offsets (locomanip_marl_env_cfg.PREPOSE_JOINT_RANGES; rad from the default pose)
+PREPOSE_JOINT_RANGES = {"ankle_pitch": (-0.3, 0.15), "ankle_roll": (-0.1, 0.1), "knee": (-0.1, 0.2), "hip": (-0.1, 0.1),
+                        "torso": (-0.05, 0.05), "shoulder": (-0.15, 0.15), "elbow": (-0.15, 0.15), "wrist": (-0.15, 0.15)}
+# the torso IMU's gyro vibration: rad/s rms per rad/s rms of leg joint speed at vib_k 1 (on the robot 0.4-0.8 rad/s
+# while the legs thrashed at a few rad/s); and the lowstate model's noise and lag (lowstate_imu.LowstateImuCfg)
+TORSO_GYRO_PER_DQ = 0.2
+TORSO_GYRO_AXES = np.array([0.6, 1.0, 0.4])
+LOWSTATE_QUAT_NOISE_DEG, LOWSTATE_LAG_MS, LOWSTATE_GYRO_NOISE = 0.1, 10.0, 0.02
+# the pp table's pass marks
+PP_MAX_MEAN_JUMP, PP_MAX_TORQUE_SHARE, PP_MAX_KNEE_OFFSET, PP_MAX_AT_LIMIT = 0.03, 0.85, 0.15, 0.05
 
 
 class Recurrent:
@@ -129,9 +170,30 @@ class StressMujoco(MarlMujoco):
         self.res_freq = 20.0 + rng.uniform()
         self.res_phase = 2 * math.pi * rng.uniform()
         self.torso_body = torso
+        # the torso IMU as /lowstate reports it: the quaternion lagged and biased, the gyro biased, noisy and shaken
+        imu = deploy.get("imu") or {}
+        self.lowstate = imu.get("source") == "lowstate"
+        if self.lowstate:
+            bias = {k: 0.5 * (lo + hi) for k, (lo, hi) in imu["quat_bias_deg"].items()}
+            if f["imu_pitch"] is not None:
+                bias["pitch"] = f["imu_pitch"]
+            self.imu_bias_deg = bias
+            r, pt, y = (math.radians(bias[k]) for k in ("roll", "pitch", "yaw"))
+            rx = np.array([[1, 0, 0], [0, math.cos(r), -math.sin(r)], [0, math.sin(r), math.cos(r)]])
+            ry = np.array([[math.cos(pt), 0, math.sin(pt)], [0, 1, 0], [-math.sin(pt), 0, math.cos(pt)]])
+            rz = np.array([[math.cos(y), -math.sin(y), 0], [math.sin(y), math.cos(y), 0], [0, 0, 1]])
+            self.R_bias = rz @ ry @ rx
+            self.gyro_bias = rng.uniform(-1, 1, 3) * np.array([0.005, 0.005, 0.02])
+            self.NOISE = {**self.NOISE, "ang_vel": 0.0, "grav": 0.0}  # the model's own noise instead
+            self.R_hist = deque(maxlen=int(round(LOWSTATE_LAG_MS / 1000 / m.opt.timestep)) + 1)
+        self.weight = float(m.body_mass.sum() * -m.opt.gravity[2])
+        self.rope_share, self.rope_anchor = 0.0, None
+        self.pp_held = None  # the pre-pose's gantry: callable t -> pelvis height or None
 
     def held_z(self):
         """The gantry's pelvis height now, or None once let go."""
+        if self.pp_held is not None:
+            return self.pp_held(self.sub * self.m.opt.timestep)
         if self.f["hang_s"] <= 0:
             return None
         t = self.sub * self.m.opt.timestep
@@ -152,6 +214,31 @@ class StressMujoco(MarlMujoco):
             self.d.qpos[2] += HANG_LIFT
             mujoco.mj_forward(self.m, self.d)
         self.qd_hist.append(self.d.qvel[self.vadr].copy())
+        if self.lowstate:
+            self.R_hist.clear()
+            self.R_hist.append(self.d.site_xmat[self.imu_site].reshape(3, 3).copy())
+
+    def imu(self):
+        if not self.lowstate:
+            return super().imu()
+        R = self.R_hist[0] @ self.R_bias  # lag substeps old once the deque is full
+        n = np.radians(LOWSTATE_QUAT_NOISE_DEG) * self.rng.standard_normal(2)
+        cr, sr, cp, sp = math.cos(n[0]), math.sin(n[0]), math.cos(n[1]), math.sin(n[1])
+        R = R @ (np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]]) @ np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]]))
+        gyro = self._gyro.copy() if self.gyro_lowpass is not None else self._raw_gyro()
+        return np.zeros(3), gyro, R.T @ np.array([0.0, 0.0, -1.0])
+
+    def rope(self):
+        """The pre-pose's rope on the pelvis: rope_share of the weight up and a soft horizontal tether."""
+        d = self.d
+        d.xfrc_applied[self.pelvis] = 0.0
+        if self.rope_share <= 0.0:
+            self.rope_anchor = None
+            return
+        if self.rope_anchor is None:
+            self.rope_anchor = d.qpos[0:2].copy()
+        d.xfrc_applied[self.pelvis, 0:2] = -PP_TETHER_K * (d.qpos[0:2] - self.rope_anchor) - PP_TETHER_D * d.qvel[0:2]
+        d.xfrc_applied[self.pelvis, 2] = self.rope_share * self.weight
 
     # the motor: what it measures (q + encoder offset) and how strong it is
     def measured_q(self) -> np.ndarray:
@@ -174,6 +261,7 @@ class StressMujoco(MarlMujoco):
             self.targets.append(self.applied.copy())
             target = self.targets[0]  # delay substeps old once the deque is full
             d.ctrl[self.act_id] = self.pd_torque(target)
+            self.rope()
             mujoco.mj_step(m, d)
             held = self.held_z()
             if held is not None:
@@ -183,13 +271,19 @@ class StressMujoco(MarlMujoco):
             qd = d.qvel[self.vadr].copy()
             self.qd_hist.append(qd)
             self.sub += 1
+            # the legs' motion, rad/s rms over 0.1 s: what drives the structure-borne shake
+            self.leg_rms += m.opt.timestep / 0.1 * (math.sqrt(np.mean(qd[:12] ** 2)) - self.leg_rms)
+            wave = math.sin(2 * math.pi * self.res_freq * self.sub * m.opt.timestep + self.res_phase)
+            if self.lowstate:
+                self.R_hist.append(d.site_xmat[self.imu_site].reshape(3, 3).copy())
             if self.gyro_lowpass is not None:
                 u = self._raw_gyro()
                 if self.f["gyro_k"] > 0 and self.head:
-                    alpha = m.opt.timestep / 0.1
-                    self.leg_rms += alpha * (math.sqrt(np.mean(qd[:12] ** 2)) - self.leg_rms)
                     amp = self.f["gyro_k"] * GYRO_RMS_PER_DQ_RMS * math.sqrt(2) * self.leg_rms
-                    u[1] += amp * math.sin(2 * math.pi * self.res_freq * self.sub * m.opt.timestep + self.res_phase)
+                    u[1] += amp * wave
+                if self.lowstate:
+                    u += self.gyro_bias + LOWSTATE_GYRO_NOISE * self.rng.standard_normal(3)
+                    u += self.f["vib_k"] * TORSO_GYRO_PER_DQ * math.sqrt(2) * self.leg_rms * wave * TORSO_GYRO_AXES
                 self._gyro = self.gyro_lowpass(u, m.opt.timestep)
         self.last_tau = self.pd_torque(self.applied)
 
@@ -213,10 +307,152 @@ def command(t: float, profile: str) -> np.ndarray:
     return np.array([vx, 0.01, 0.04])
 
 
+def prepose_pose(sim: StressMujoco, start: str, rng: np.random.Generator) -> np.ndarray:
+    """The joint angles (policy order) the pre-pose eases to before the engage."""
+    if start == "bag":
+        return np.load(BAG_ENGAGE_Q).astype(float)
+    if start != "random":
+        return sim.default.copy()
+    q = sim.default.copy()
+    for i, name in enumerate(ALL_NAMES):
+        for key, (lo, hi) in PREPOSE_JOINT_RANGES.items():
+            if key in name:
+                q[i] += rng.uniform(lo, hi)
+                break
+    return np.clip(q, sim.lower, sim.upper)
+
+
+def run_prepose_job(job, video: str | None = None):
+    """One pre-pose engage (module docstring, prepose): the sequence, the engage, PP_AFTER_S of policy."""
+    torch.set_num_threads(1)
+    export, deploy, cond, profile, plant, seed, seconds = job
+    f = dict(NOMINAL, **CONDITIONS[cond])
+    actors = {a: Recurrent(torch.jit.load(os.path.join(export, f"{a}.pt"), map_location="cpu").eval())
+              for a in ("legs", "arms")}
+    rng = np.random.default_rng(seed)
+    sim = StressMujoco(actors, f, deploy, plant, rng)
+    sim.reset(rng)
+    d, start, DT = sim.d, f["prepose"], sim.policy_dt
+    d.qpos[sim.qadr], d.qvel[:] = sim.default, 0.0
+    mujoco.mj_forward(sim.m, d)
+    sim.hold_pose = d.qpos[0:7].copy()
+    d.qpos[2] += HANG_LIFT
+    mujoco.mj_forward(sim.m, d)
+    lowered = PP_ENGAGE_S + PP_HUNG_HOLD_S if start == "hung" else PP_HANG_S
+    sim.pp_held = lambda t: (sim.hold_pose[2] + HANG_LIFT if t < lowered else
+                             sim.hold_pose[2] + HANG_LIFT * (1 - (t - lowered) / PP_LOWER_S) if t < lowered + PP_LOWER_S
+                             else None)
+    pose = prepose_pose(sim, start, rng)
+    if sim.lowstate:
+        sim.R_hist.clear()
+        sim.R_hist.append(d.site_xmat[sim.imu_site].reshape(3, 3).copy())
+    writer = renderer = None
+    if video:
+        import imageio
+        W, H = 640, 544
+        sim.m.vis.global_.offwidth, sim.m.vis.global_.offheight = max(W, sim.m.vis.global_.offwidth), max(H, sim.m.vis.global_.offheight)
+        renderer = mujoco.Renderer(sim.m, H, W)
+        cams = []
+        for az in (90.0, 180.0):  # side, front
+            c = mujoco.MjvCamera()
+            c.type, c.trackbodyid, c.distance, c.elevation, c.azimuth = mujoco.mjtCamera.mjCAMERA_TRACKING, sim.pelvis, 3.2, -12.0, az
+            cams.append(c)
+        writer = imageio.get_writer(video, fps=50, codec="libx264", quality=8, macro_block_size=8)
+    engaged, obs, rec, k = False, None, [], 0
+    fell_t, w0 = None, None
+    total = PP_ENGAGE_S + PP_AFTER_S
+    with torch.no_grad():
+        while k * DT < total:
+            t = k * DT
+            on_feet = t >= lowered + PP_LOWER_S
+            sim.rope_share = (f["rope"] if on_feet and not (engaged and f["release"]) else 0.0)
+            if start == "hung" and on_feet and f["release"]:
+                sim.rope_share = 0.0
+            if not engaged and t >= PP_ENGAGE_S:
+                # lmg_deploy's controller.reset: LSTM zeroed, the previous actions the measured offsets, the arms'
+                # residual zero and their IK from the measured angles, a zero command at the gait clock's start
+                for a in actors.values():
+                    a.reset_state()
+                q = sim.measured_q()
+                sim.applied[:] = q
+                sim.residual[:] = 0.0
+                sim.ik_q = q[sim.arm_idx].copy()
+                sim.traj_v[:] = 0.0
+                sim.integral[:] = 0.0
+                sim.steps, sim.cmd_filtered[:], sim.vel_cmd = 0, 0.0, np.zeros(3)
+                engaged = True
+                obs = sim.observations()
+                w0 = np.linalg.norm(sim.wrist_poses_b()[:, :3] - sim.believed[:, :3], axis=1).mean()
+            prev = sim.applied.copy()
+            if engaged:
+                obs = sim.step(obs)
+            else:
+                # the pre-pose at the policy's gains: the default pose, eased to the start pose once on the feet
+                t0 = PP_HANG_S + PP_LOWER_S + 0.5
+                wgt = 0.0 if start in ("settled", "hung") else float(np.clip((t - t0) / PP_EASE_S, 0.0, 1.0))
+                sim.applied[:] = sim.default + wgt * (pose - sim.default)
+                sim.physics_step()
+            jump = np.abs(sim.applied - prev)
+            q = sim.measured_q()
+            tilt = sim.tilt()
+            rec.append({"t": t - PP_ENGAGE_S, "engaged": engaged, "jump_legs": jump[:12].copy(), "jump_arms": jump[13:].copy(),
+                        "tau_share": float(np.max(np.abs(sim.last_tau[:12]) / sim.effort[:12])),
+                        "knee_off": float(np.abs(q[KNEE_IDX] - sim.default[KNEE_IDX]).mean()),
+                        "target": sim.applied[:12].copy(), "tilt": tilt, "z": float(d.qpos[2]),
+                        "wrist_err": float(np.linalg.norm(sim.wrist_poses_b()[:, :3] - sim.believed[:, :3], axis=1).mean())})
+            if engaged and fell_t is None and (tilt > FALL_TILT or d.qpos[2] < FALL_HEIGHT):
+                fell_t = t - PP_ENGAGE_S
+            if writer is not None and k % max(1, int(round(1 / 50 / DT))) == 0:
+                import cv2
+                frames = []
+                for c in cams:
+                    renderer.update_scene(d, c)
+                    frames.append(renderer.render().copy())
+                img = np.concatenate(frames, axis=1)
+                if not engaged:
+                    phase = ("PRE-POSE: on gantry" if not on_feet and t < lowered else "PRE-POSE: lowering" if not on_feet
+                             else f"PRE-POSE: rope {f['rope']:.0%}" + ("" if start in ("settled", "hung") else f", easing to the {start} pose"))
+                else:
+                    phase = f"POLICY ENGAGED +{t - PP_ENGAGE_S:.2f} s" + (" (rope released)" if f["release"] else f" (rope {f['rope']:.0%})")
+                lines = [f"{cond}  {os.path.basename(os.path.normpath(export))}", f"t = {t:5.2f} s   {phase}",
+                         f"leg target jump this step: max {jump[:12].max():.2f} rad   max leg torque {rec[-1]['tau_share']:.0%} of limit",
+                         f"knees off default {rec[-1]['knee_off']:.2f} rad   tilt {math.degrees(tilt):4.1f} deg" + ("   FELL" if fell_t is not None else "")]
+                for i, line in enumerate(lines):
+                    y = 26 + 24 * i
+                    cv2.putText(img, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+                    cv2.putText(img, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+                writer.append_data(img)
+            k += 1
+            if fell_t is not None and t - PP_ENGAGE_S > fell_t + 1.5:
+                break
+    if writer is not None:
+        writer.close()
+    eng = [r for r in rec if r["engaged"]]
+    first = [r for r in eng if r["t"] < 0.5]
+    after = [r for r in eng if r["t"] >= 2.0]
+    T = np.array([r["target"] for r in after]) if after else np.zeros((0, 12))
+    lo, hi = sim.lower[:12], sim.upper[:12]
+    at_limit = float(((np.abs(T - lo) < 2e-3) | (np.abs(T - hi) < 2e-3)).any(1).mean()) if len(T) else None
+    err = lambda s: next((r["wrist_err"] for r in eng if r["t"] >= s), None)  # noqa: E731
+    return {"cond": cond, "profile": profile, "plant": plant, "seed": seed, "prepose": True,
+            "fell": fell_t is not None, "fall_t": fell_t,
+            "first_mean_jump": float(np.mean([r["jump_legs"].mean() for r in first])),
+            "first_max_jump": float(np.max([r["jump_legs"].max() for r in first])),
+            "first_torque_share": float(np.max([r["tau_share"] for r in first])),
+            "knee_off": float(np.mean([r["knee_off"] for r in after])) if after else None,
+            "at_limit": at_limit,
+            "pre_knee_off": float(np.mean([r["knee_off"] for r in rec if not r["engaged"] and r["t"] > -0.5])),
+            "wrist_err_mm": [1000 * x if x is not None else None for x in (w0, err(0.25), err(0.5), err(1.0))],
+            "arm_max_jump": float(np.max([r["jump_arms"].max() for r in eng])),
+            "max_tilt_deg": float(math.degrees(max(r["tilt"] for r in eng)))}
+
+
 def run_job(job):
     torch.set_num_threads(1)
     export, deploy, cond, profile, plant, seed, seconds = job
     f = dict(NOMINAL, **CONDITIONS[cond])
+    if f["prepose"]:
+        return run_prepose_job(job)
     actors = {a: Recurrent(torch.jit.load(os.path.join(export, f"{a}.pt"), map_location="cpu").eval())
               for a in ("legs", "arms")}
     rng = np.random.default_rng(seed)
@@ -306,14 +542,27 @@ def main():
     parser.add_argument("--seconds", type=float, default=30.0)
     parser.add_argument("--workers", type=int, default=max(os.cpu_count() - 4, 1))
     parser.add_argument("--out", default=None)
+    parser.add_argument("--video", default=None, help="render one job of this pp_* condition (seed 0) to an mp4")
     args = parser.parse_args()
     deploy = load_deploy_cfg(args.export)
+    out = Path(args.out or REPO / "logs/hw_stress_mujoco" / args.label)
+    if args.video:
+        out.mkdir(parents=True, exist_ok=True)
+        path = str(out / f"{args.video}.mp4")
+        plant = args.plants.split(",")[0]
+        r = run_prepose_job((os.path.abspath(args.export), deploy, args.video, "zero", plant, 0, 0.0), video=path)
+        print(json.dumps(r), flush=True)
+        print(f"[stress-mj] wrote {path}", flush=True)
+        return
     head = deploy.get("imu", {}).get("frame", "imu_link") != "imu_link"
-    names = args.conditions.split(",") if args.conditions else list(CONDITIONS)
+    names = args.conditions.split(",") if args.conditions else [c for c in CONDITIONS if not c.startswith("pp_")]
+    if "pp" in names:  # the pre-pose grid
+        names = [c for c in names if c != "pp"] + [c for c in CONDITIONS if c.startswith("pp_")]
     if not head:
-        names = [c for c in names if not CONDITIONS[c].get("gyro_k")]
+        names = [c for c in names if not (CONDITIONS[c].get("gyro_k") and not CONDITIONS[c].get("prepose"))]
     jobs = [(os.path.abspath(args.export), deploy, c, p, pl, s, args.seconds) for c in names
-            for p in args.profiles.split(",") for pl in args.plants.split(",") for s in range(args.seeds)]
+            for p in (["zero"] if CONDITIONS[c].get("prepose") else args.profiles.split(","))
+            for pl in args.plants.split(",") for s in range(args.seeds)]
     print(f"[stress-mj] {args.label}: {len(jobs)} jobs on {args.workers} workers", flush=True)
     with Pool(args.workers) as pool:
         results = []
@@ -322,8 +571,25 @@ def main():
             if (i + 1) % 50 == 0:
                 print(f"[stress-mj] {i + 1}/{len(jobs)}", flush=True)
 
-    cells = {}
-    for c in names:
+    cells, pp_cells = {}, {}
+    for c in [c for c in names if CONDITIONS[c].get("prepose")]:
+        for pl in args.plants.split(","):
+            rs = [r for r in results if r["cond"] == c and r["plant"] == pl]
+            med = lambda k: float(np.median([r[k] for r in rs if r[k] is not None])) if any(r[k] is not None for r in rs) else None  # noqa: E731
+            worst = lambda k: float(np.max([r[k] for r in rs if r[k] is not None])) if any(r[k] is not None for r in rs) else None  # noqa: E731
+            cell = {"runs": len(rs), "fell_pct": 100 * float(np.mean([r["fell"] for r in rs])),
+                    "first_mean_jump": med("first_mean_jump"), "first_mean_jump_worst": worst("first_mean_jump"),
+                    "first_max_jump": worst("first_max_jump"), "first_torque_share": worst("first_torque_share"),
+                    "knee_off": med("knee_off"), "knee_off_worst": worst("knee_off"), "at_limit": worst("at_limit"),
+                    "pre_knee_off": med("pre_knee_off"), "arm_max_jump": worst("arm_max_jump"),
+                    "max_tilt_deg": worst("max_tilt_deg"),
+                    "wrist_err_mm": np.median([r["wrist_err_mm"] for r in rs], axis=0).tolist()}
+            cell["pass"] = bool(cell["fell_pct"] == 0 and cell["first_mean_jump_worst"] <= PP_MAX_MEAN_JUMP
+                                and cell["first_torque_share"] <= PP_MAX_TORQUE_SHARE
+                                and (cell["knee_off_worst"] or 0.0) <= PP_MAX_KNEE_OFFSET
+                                and (cell["at_limit"] or 0.0) < PP_MAX_AT_LIMIT)
+            pp_cells[f"{c}/{pl}"] = cell
+    for c in [c for c in names if not CONDITIONS[c].get("prepose")]:
         for pl in args.plants.split(","):
             for p in args.profiles.split(","):
                 rs = [r for r in results if r["cond"] == c and r["plant"] == pl and r["profile"] == p]
@@ -342,10 +608,10 @@ def main():
                     "lstm_c_end": float(np.mean([r["lstm_c_end"] for r in rs])),
                     "last_ankle_target": np.mean([r["last_ankle_target"] for r in rs], axis=0).tolist(),
                 }
-    out = Path(args.out or REPO / "logs/hw_stress_mujoco" / args.label)
     out.mkdir(parents=True, exist_ok=True)
     json.dump({"label": args.label, "export": os.path.abspath(args.export), "seeds": args.seeds,
-               "seconds": args.seconds, "cells": cells, "runs": results}, open(out / "summary.json", "w"), indent=1)
+               "seconds": args.seconds, "cells": cells, "pp_cells": pp_cells, "runs": results},
+              open(out / "summary.json", "w"), indent=1, default=float)
 
     def fmt(v, f="{:.2f}"):
         if v is None:
@@ -364,6 +630,20 @@ def main():
                   f" {fmt(r['knee_tau'], '{:.0f}')} | {fmt(r['left_share'])} | {fmt(r['imbalance'])} |"
                   f" {fmt(r['ankle_target'])} | {fmt(r['roll_deg'], '{:.1f}')} |"
                   f" {r['lstm_c_5s']:.3f} / {r['lstm_c_end']:.3f} | {fmt(r['last_ankle_target'])} |")
+    if pp_cells:
+        md += ["", f"Pre-pose engage (zero command; the first 0.5 s after the engage, the stance from 2 s on). Pass: no"
+               f" fall, mean leg target jump <= {PP_MAX_MEAN_JUMP} rad (worst seed), leg torque <= {PP_MAX_TORQUE_SHARE}"
+               f" of the limit, knees within {PP_MAX_KNEE_OFFSET} rad of default, targets at a limit"
+               f" < {PP_MAX_AT_LIMIT:.0%} of steps.", "",
+               "| cell | pass | fell % | 0.5 s mean jump med / worst | 0.5 s max jump | 0.5 s torque/limit | knee off"
+               " med / worst | at limit | knee off pre-pose | wrist err mm at 0/0.25/0.5/1 s | arm max jump | max tilt deg |",
+               "|" + "---|" * 12]
+        for key, r in pp_cells.items():
+            md.append(f"| {key} | {'yes' if r['pass'] else 'NO'} | {r['fell_pct']:.0f} | {fmt(r['first_mean_jump'], '{:.3f}')} /"
+                      f" {fmt(r['first_mean_jump_worst'], '{:.3f}')} | {fmt(r['first_max_jump'])} |"
+                      f" {fmt(r['first_torque_share'])} | {fmt(r['knee_off'])} / {fmt(r['knee_off_worst'])} |"
+                      f" {fmt(r['at_limit'], '{:.1%}')} | {fmt(r['pre_knee_off'])} | {fmt(r['wrist_err_mm'], '{:.0f}')} |"
+                      f" {fmt(r['arm_max_jump'])} | {fmt(r['max_tilt_deg'], '{:.1f}')} |")
     (out / "summary.md").write_text("\n".join(md) + "\n")
     print("\n".join(md), flush=True)
     print(f"[stress-mj] wrote {out}", flush=True)

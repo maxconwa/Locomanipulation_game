@@ -43,6 +43,9 @@ parser.add_argument("--task", default=None, help="Default: the task the run was 
 parser.add_argument("--num_envs", type=int, default=64)
 parser.add_argument("--goals", type=int, default=8, help="Arm goals per env.")
 parser.add_argument("--seed", type=int, default=7)
+parser.add_argument("--walk", action="store_true",
+                    help="Leave the velocity command as the task draws it (LocoManip-Marl-Direct-v0: the arms scored"
+                         " while the legs walk); default: every env stands.")
 parser.add_argument("--out", default=None, help="Directory for the files (default: beside the checkpoint).")
 parser.add_argument("--offtable", action="store_true",
                     help="Every goal off the table rows (moved U[offtable_scale_range] toward the rest pose); files"
@@ -152,13 +155,17 @@ def main(env_cfg, agent_cfg: dict):
     env_cfg.sim.device = args_cli.device
     env_cfg.seed = args_cli.seed
     evaluation_cfgs(env_cfg, agent_cfg, checkpoint, run_dir)
+    # nominal starts, comparable with runs before the pre-pose resets (the engage is checked in hw_stress_mujoco.py)
+    if getattr(env_cfg.events, "prepose", None) is not None:
+        env_cfg.events.prepose.params["prob"] = 0.0
     env_cfg.episode_length_s = 1.0e4
     env_cfg.episode_length_range_s = None
     arm_cfg, vel_cfg = env_cfg.commands.arm_targets, env_cfg.commands.base_velocity
     arm_cfg.arm_goal_prob = 1.0
     arm_cfg.resampling_time_range, arm_cfg.nav_time_range = (1.0e6, 1.0e6), (1.0e6, 1.0e6)
     arm_cfg.debug_vis = vel_cfg.debug_vis = False
-    vel_cfg.resampling_time_range, vel_cfg.rel_standing_envs = (1.0e6, 1.0e6), 1.0
+    if not args_cli.walk:
+        vel_cfg.resampling_time_range, vel_cfg.rel_standing_envs = (1.0e6, 1.0e6), 1.0
 
     env = SkrlVecEnvWrapper(gym.make(args_cli.task, cfg=env_cfg))
     base = env.unwrapped

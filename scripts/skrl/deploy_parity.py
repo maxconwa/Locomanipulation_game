@@ -81,7 +81,12 @@ def main(env_cfg, agent_cfg: dict):
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.sim.device = args.device
     evaluation_cfgs(env_cfg, agent_cfg, args.checkpoint, RUN_DIR)
-    env_cfg.events.imu_mount = None  # the deploy reads the same, unperturbed sensor
+    # the deploy reads the same, unperturbed sensor: the torso IMU model's bias, noise, lag and vibration off
+    imu_model = env_cfg.lowstate_imu
+    imu_model.quat_bias_deg = {"roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0)}
+    imu_model.quat_noise_deg, imu_model.quat_lag_s, imu_model.gyro_noise = 0.0, (0.0, 0.0), 0.0
+    imu_model.gyro_bias, imu_model.vibration_per_target_rate = (0.0, 0.0, 0.0), 0.0
+    env_cfg.events.prepose = None  # the nominal resets
     if args.arm_goal_prob is not None:
         env_cfg.commands.arm_targets.arm_goal_prob = args.arm_goal_prob
     for group in ("legs", "arms"):
@@ -105,7 +110,7 @@ def main(env_cfg, agent_cfg: dict):
 
     class DeployGyro:
         """The env's gyro low-pass wrapped: env 0's raw IMU samples also go through lmg_deploy's GyroLowpass (as
-        marl_deploy_node filters /livox/imu), whose output the controller gets as RobotState.gyro."""
+        marl_deploy_node filters its IMU's gyro), whose output the controller gets as RobotState.gyro."""
 
         def __init__(self, env_filter):
             self.inner = env_filter
@@ -128,7 +133,7 @@ def main(env_cfg, agent_cfg: dict):
                                             float(np.abs(self.value - out[0].double().cpu().numpy()).max()))
             return out
 
-    base.gyro_lowpass = deploy_gyro = DeployGyro(base.gyro_lowpass)
+    base.lowstate_imu.gyro_lowpass = deploy_gyro = DeployGyro(base.lowstate_imu.gyro_lowpass)
 
     def env_state(i: int = 0) -> RobotState:
         d = robot.data

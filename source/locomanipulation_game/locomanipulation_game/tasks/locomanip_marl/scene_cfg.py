@@ -94,12 +94,11 @@ class TerrainSceneCfg(InteractiveSceneCfg):
         debug_vis=True,
         mesh_prim_paths=["/World/ground"],
     )
-    # The head's Livox MID-360 IMU chip, the frame of GOLEM's /livox/imu: livox_link/livox_imu_link, which CL_Assets
-    # ed592de places with its measured lever arm and the chip's 0.68 deg tilt (torso_link -> chip: pitch 9.45 deg).
-    # debug_vis also makes the sensor compute at every physics substep (SensorBase.update), which the gyro low-pass
-    # samples.
+    # The torso IMU, the frame of /lowstate's imu_state: imu_link, fixed to torso_link at (-0.04452, -0.01891, 0.27756)
+    # m, unrotated (GOLEM's URDF, CL_Assets). debug_vis also makes the sensor compute at every physics substep
+    # (SensorBase.update), which the env's IMU model (lowstate_imu.py) samples.
     imu = ImuCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/livox_link/livox_imu_link",
+        prim_path="{ENV_REGEX_NS}/Robot/imu_link",
         debug_vis=True,
     )
     def __post_init__(self):

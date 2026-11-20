@@ -171,6 +171,40 @@ def base_height_band(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, min_hei
     return torch.nan_to_num(torch.exp(-outside * 100.0), nan=0.0)
 
 
+def joint_offset_band(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, max_offset: float, scale: float = 0.05,
+                      command_name: str | None = None) -> torch.Tensor:
+    """In [0, 1]: the mean over asset_cfg's joints of 1 within max_offset (rad) of the default pose, exp(-x / scale) at
+    x rad beyond it. With command_name, paid only while standing is commanded (0 otherwise)."""
+    data = env.scene[asset_cfg.name].data
+    offset = (data.joint_pos[:, asset_cfg.joint_ids] - data.default_joint_pos[:, asset_cfg.joint_ids]).abs()
+    score = torch.exp(-torch.clamp(offset - max_offset, min=0.0) / scale).mean(dim=1)
+    if command_name is not None:
+        score = score * standing_command(env, env.command_manager.get_command(command_name)).float()
+    return score
+
+
+def target_near_bounds(env: ManagerBasedRLEnv, action_name: str, margin: float,
+                       joint_weights: dict[str, float] | None = None) -> torch.Tensor:
+    """A cost: per joint of action_name's term (mdp.BoundedJointPositionAction), ((margin - d) / margin)^2 for a target
+    d rad inside its position bound (target_limits, GOLEM's e-stop range) with d < margin, 1 at the bound, times its
+    joint weight (joint_weights: name pattern -> weight; 1 for the rest), summed."""
+    term = env.action_manager.get_term(action_name)
+    target = term._applied
+    room = torch.minimum(target - term._lower, term._upper - target)
+    cost = torch.square(torch.clamp((margin - room) / margin, min=0.0, max=1.0))
+    if joint_weights:
+        weights = getattr(term, "_near_bound_weights", None)
+        if weights is None:
+            weights = torch.ones(len(term._joint_names), device=env.device)
+            for pattern, weight in joint_weights.items():
+                for i, name in enumerate(term._joint_names):
+                    if re.fullmatch(pattern, name):
+                        weights[i] = weight
+            term._near_bound_weights = weights
+        cost = cost * weights
+    return torch.sum(cost, dim=1)
+
+
 def arm_goal_reached(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     """1 on the step after both wrists were first held on the goal: a one-off bonus, so finishing pays more than
     hovering just outside the tolerance."""

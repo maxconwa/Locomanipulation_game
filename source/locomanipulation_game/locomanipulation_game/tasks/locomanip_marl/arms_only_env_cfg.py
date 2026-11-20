@@ -126,7 +126,7 @@ ARMS_OFFTABLE_SCALES = (0.25, 1.0)
 ARMS_REST_GOAL_PROB = 0.1
 ARMS_GOAL_TIME_RANGE = (4.0, 8.0)  # s: each goal's duration, drawn
 # the walking task's shared observation terms the arms' actor doesn't get here
-ARMS_DROPPED_OBS = ("base_lin_acc", "base_ang_vel", "projected_gravity", "velocity_commands", "gait_phase",
+ARMS_DROPPED_OBS = ("base_ang_vel", "projected_gravity", "velocity_commands", "gait_phase",
                     "gait_phase_cos")
 ARMS_KINEMATICS_URDF = str(CL_ASSETS_DIR / "ros_assets" / "h1_2_magpie.urdf")
 ARMS_KINEMATICS_SPHERES = str(CL_ASSETS_DIR / "curobo_assets" / "h1_2_magpie_curobo.yml")

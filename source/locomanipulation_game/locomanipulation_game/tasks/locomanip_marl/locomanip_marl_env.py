@@ -35,7 +35,7 @@ from isaaclab.managers import (
 from isaaclab.utils.math import quat_apply_inverse, subtract_frame_transforms
 
 from .golem_safety import GolemEstopMonitor
-from .imu_filter import GyroLowpass
+from .lowstate_imu import LowstateImu
 from .locomanip_marl_env_cfg import ARM_COMMAND, LocoManipMarlEnvCfg
 
 
@@ -50,6 +50,11 @@ class LocoManipMarlEnv(DirectMARLEnv):
         # its reset; None: every episode max_episode_length (episode_length_range_s None)
         self.episode_limit = (torch.full((self.num_envs,), self.max_episode_length, device=self.device)
                               if cfg.episode_length_range_s is not None else None)
+
+        # the torso IMU as /lowstate reports it (mdp.lowstate_gyro, mdp.lowstate_projected_gravity read it; before the
+        # observation manager): one sample per physics substep, /lowstate's 500 Hz
+        self.lowstate_imu = LowstateImu(self.cfg.lowstate_imu, self.cfg.gyro_lowpass_hz, self.physics_dt, self.num_envs,
+                                        self.device)
 
         # After super() has started the sim, in ManagerBasedRLEnv.load_managers' order: observations read commands
         # and actions, rewards read terminations.
@@ -129,10 +134,14 @@ class LocoManipMarlEnv(DirectMARLEnv):
             ]
             print(f"[INFO] Action delay: {low}-{high} physics substeps per env, drawn at each reset")
 
-        # -- the policy's gyro low-pass (mdp.imu_ang_vel_lowpass reads its output): one sample per physics substep,
-        # the IMU's rate, as the deploy filters /livox/imu
-        self.gyro_lowpass = GyroLowpass(self.cfg.gyro_lowpass_hz, self.physics_dt, self.num_envs, self.device)
-        print(f"[INFO] Gyro low-pass: {self.cfg.gyro_lowpass_hz:g} Hz Butterworth at {1.0 / self.physics_dt:.0f} Hz")
+        # -- the pre-pose resets' gantry (mdp.prepose_reset, the events' prepose term; None without it)
+        prepose = getattr(self.cfg.events, "prepose", None)
+        self._prepose = self.event_manager.get_term_cfg("prepose").func if prepose is not None else None
+
+        # -- the legs' target rate drives the torso IMU's vibration
+        self._legs_term = self.action_manager.get_term("joint_pos")
+        self._prev_leg_target = self._legs_term._applied.clone()
+        print(f"[INFO] Torso IMU (/lowstate): {self.cfg.lowstate_imu}; gyro low-pass {self.cfg.gyro_lowpass_hz:g} Hz")
 
     """
     DirectMARLEnv hooks.
@@ -145,6 +154,9 @@ class LocoManipMarlEnv(DirectMARLEnv):
             # a NaN joint target hangs the PhysX solver
             raise RuntimeError(f"Non-finite actions at step {self.common_step_counter}")
         self.action_manager.process_action(joint_action.clamp(-self.cfg.clip_actions, self.cfg.clip_actions))
+        target = self._legs_term.processed_actions
+        self.lowstate_imu.target_rate = (target - self._prev_leg_target).square().mean(dim=1).sqrt()
+        self._prev_leg_target = target.clone()
         # the policies observe what they asked for (applied_actions); the robot gets it _delay_steps substeps late
         for term, history in zip(self._delay_terms, self._target_history):
             history[:] = history.roll(1, dims=1)
@@ -154,7 +166,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
     def _apply_action(self) -> None:
         if self._substep > 0:
             # the IMU sample the previous substep left; the step's last one is taken in _get_observations
-            self.gyro_lowpass(self.scene["imu"].data.ang_vel_b)
+            self._sample_imu()
             # the state the previous substep left (mdp.golem_estop checks the last one's; at substep 0 that is the
             # state it has already checked: a second look counted its trip on this step too, and the stale flag then
             # hid the next real trip's start from the penalty)
@@ -166,6 +178,9 @@ class LocoManipMarlEnv(DirectMARLEnv):
             rows = torch.arange(self.num_envs, device=self.device)
             for term, history in zip(self._delay_terms, self._target_history):
                 term._processed_actions = history[rows, back]
+        if self._prepose is not None:
+            t = (self.episode_length_buf * self.cfg.decimation + self._substep) * self.physics_dt
+            self._prepose.apply_support(t)
         self._substep += 1
         self.action_manager.apply_action()
 
@@ -203,8 +218,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
         return rewards
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
-        # the last substep's IMU sample (after a reset, the refreshed reading the filter restarts from)
-        self.gyro_lowpass(self.scene["imu"].data.ang_vel_b)
+        # the last substep's IMU sample (after a reset, the refreshed reading the model restarts from)
+        self._sample_imu()
         self._update_odometry()
         self.command_manager.compute(dt=self.step_dt)
         groups = list(self.cfg.possible_agents) + ["critic"]
@@ -228,7 +243,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
             self.episode_limit[ids] = steps.clamp(max=self.max_episode_length).long()
         self._refresh_sensors_after_reset(env_ids)
         self._fresh[env_ids] = True
-        self.gyro_lowpass.reset(env_ids)
+        self.lowstate_imu.reset(env_ids)
         self.golem_monitor.reset(env_ids)
         self._golem_tripped_prev[env_ids] = False
         for prev in self._golem_tripped_by_prev.values():
@@ -237,6 +252,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
         log = {}
         log.update(self.observation_manager.reset(env_ids))
         log.update(self.action_manager.reset(env_ids))
+        self._prev_leg_target[env_ids] = self._legs_term._applied[env_ids]  # the measured pose, the first rate's base
         if self._target_history:
             low, high = self.cfg.action_delay_range
             self._delay_steps[env_ids] = torch.randint(low, high + 1, (len(env_ids),), device=self.device)
@@ -247,6 +263,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
                 log[key.replace("Episode_Reward/", f"Episode_Reward/{agent}/", 1)] = value
         log.update(self.curriculum_manager.reset(env_ids))
         log.update(self.command_manager.reset(env_ids))
+        if self._prepose is not None:
+            log.update(self._hand_over(torch.as_tensor(env_ids, device=self.device)))
         log.update(self.event_manager.reset(env_ids))
         log.update(self.termination_manager.reset(env_ids))
         # skrl logs only one-element tensors; the managers also return floats
@@ -254,6 +272,34 @@ class LocoManipMarlEnv(DirectMARLEnv):
             key: value if isinstance(value, torch.Tensor) else torch.tensor(float(value), device=self.device)
             for key, value in log.items()
         }
+
+    def _hand_over(self, env_ids: torch.Tensor) -> dict[str, torch.Tensor]:
+        """At the pre-pose resets (mdp.prepose_reset), what lmg_deploy's reset hands the policies besides what every
+        reset already does: a zero velocity command (and low-pass) until its next resample, and the targets before
+        the first policy step at the default pose, the pre-pose's hold, not the measured one."""
+        ids = env_ids[self._prepose.active[env_ids]]
+        if len(ids) > 0:
+            velocity = self.command_manager.get_term("base_velocity")
+            velocity.vel_command_b[ids] = 0.0
+            velocity.vel_command_filtered[ids] = 0.0
+            velocity.is_standing_env[ids] = True
+            default = self._robot.data.default_joint_pos[ids]
+            for term, history in zip(self._delay_terms, self._target_history):
+                history[ids] = default[:, term._joint_ids].unsqueeze(1)
+        prepose = self._prepose.active[env_ids].float()
+        supported = (self._prepose.share0[env_ids] > 0.0).float()
+        return {"Prepose/reset_share": prepose.mean(), "Prepose/supported_share": supported.mean()}
+
+    def _sample_imu(self):
+        """One /lowstate IMU sample of the current physics state (lowstate_imu.LowstateImu.sample)."""
+        data = self.scene["imu"].data
+        self.lowstate_imu.sample(data.quat_w, data.ang_vel_b)
+
+    def support_share(self) -> torch.Tensor:
+        """Per env, the share of the robot's weight a pre-pose gantry carries now (mdp.prepose_reset; 0 without it)."""
+        if self._prepose is None:
+            return torch.zeros(self.num_envs, device=self.device)
+        return self._prepose.support_share(self.episode_length_buf * self.step_dt)
 
     """
     Arm-command odometry and the warm start.

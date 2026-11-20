@@ -9,8 +9,9 @@ arm-goal flag (always 0 here; the critic's state drops it too), and on top of it
   p1 0.267, p99 0.441, standing 0.297-0.338; knees lateral, KNEE_DISTANCE_RANGE (0.286, 0.376), stepping p1 0.284,
   p99 0.394; feet fore-aft while standing is commanded |dx| <= 0.05, the bags' standing p99 0.047;
 - a standing band on the feet's load split, 1 up to 60/40;
-- the mechanical-power penalty on (energy, -1e-3 per W) and the pelvis-height band off (LegsEnergy200k_s42's recipe:
-  it tracks sport mode's turns as well as with the band, in a deeper crouch).
+- the mechanical-power penalty on (energy, -1e-3 per W). The pelvis-height band stays on: off (LegsEnergy200k_s42's
+  recipe, the defaults 11-19 to 11-20) the policy tracked as well but stood in a deep crouch, knees 1.5-1.6 rad, and
+  LegsEnergyDefault200k_s43 failed its real engage from it (2026-11-20).
 
 Why each is there: with the total feet distance banded, the standing stance turned from side by side to one foot
 ahead at a constant 0.40 m (LegsPass_s42, with and without a LAFAN1 style reward, ~120k steps) and walking lost its step-through
@@ -61,8 +62,7 @@ def set_legs_task(cfg):
     # no task is an arm goal: the flag that says so is always 0 (the arms' actor keeps it: lmg_deploy's layout)
     cfg.observations.legs.arm_goal = None
     cfg.observations.critic.arm_goal = None
-    # LegsEnergy200k_s42's recipe: no pelvis-height band, the legs' mechanical power penalised
-    cfg.rewards.legs.base_height.weight = 0.0
+    # the legs' mechanical power penalised (the pelvis-height band kept: without it the stance crouched)
     cfg.rewards.legs.energy.weight = -1e-3
 
 

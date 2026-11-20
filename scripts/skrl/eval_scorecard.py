@@ -233,11 +233,16 @@ def main(env_cfg, agent_cfg: dict):
     env_cfg.sim.device = args_cli.device
     env_cfg.seed = args_cli.seed
     evaluation_cfgs(env_cfg, agent_cfg, checkpoint, run_dir)
+    # nominal starts, comparable with runs before the pre-pose resets (the engage is checked in hw_stress_mujoco.py)
+    if getattr(env_cfg.events, "prepose", None) is not None:
+        env_cfg.events.prepose.params["prob"] = 0.0
     env_cfg.episode_length_s = 1.0e4
     env_cfg.episode_length_range_s = None  # a run trained on drawn episode lengths: one long episode here
     arm_cfg, vel_cfg = env_cfg.commands.arm_targets, env_cfg.commands.base_velocity
-    arm_cfg.arm_goal_prob = 0.0
-    arm_cfg.resampling_time_range, arm_cfg.nav_time_range = (1.0e6, 1.0e6), (1.0e6, 1.0e6)
+    if not arm_cfg.independent_of_legs:
+        arm_cfg.arm_goal_prob = 0.0
+        arm_cfg.resampling_time_range, arm_cfg.nav_time_range = (1.0e6, 1.0e6), (1.0e6, 1.0e6)
+    # else (LocoManip-Marl-Direct-v0): the arms keep their own goals, on their own timer, while the legs are scored
     arm_cfg.debug_vis = vel_cfg.debug_vis = False
     vel_cfg.resampling_time_range, vel_cfg.rel_standing_envs = (1.0e6, 1.0e6), 0.0
 

@@ -60,6 +60,10 @@ cpu_checks() {  # $1 run name, $2 export dir, $3 out dir
   python agent_scripts/hw_stress_mujoco.py --export "$export" --label "${name}_small60" \
     --conditions nominal,hw,hang,hang_hw,strength085 --profiles small60 --seeds 8 --seconds 80 --workers 12 \
     > "$dir/stress_small60.log" 2>&1 || bad+=" stress_small60.log"
+  # the export gate's engage from the robot's pre-pose (the pp_* grid: hung, settled, the 2026-11-20 bag's sagged
+  # pose, random draws; rope kept and released; hw and the torso IMU's vibration; the quaternion bias range's ends)
+  python agent_scripts/hw_stress_mujoco.py --export "$export" --label "${name}_prepose" --conditions pp \
+    --plants robocasa --seeds 4 --workers 12 > "$dir/stress_prepose.log" 2>&1 || bad+=" stress_prepose.log"
   for bag in mid360v2_deploy mid360v2_deploy_2; do
     PYTHONPATH=$ROSBAGS_PATH python agent_scripts/hw_bag_replay.py --bag "$BAGS/$bag" --deployed mid360v2 \
       --golem "$GOLEM" --policy "mid360v2=logs/deploy_baselines/mid360v2" --policy "$name=$export" \

@@ -27,11 +27,13 @@ def episode_limit_reached(env: LocoManipMarlEnv) -> torch.Tensor:
 def pelvis_contact_or_tilt(env: LocoManipMarlEnv, sensor_cfg: SceneEntityCfg, max_roll: float,
                            max_pitch: float) -> torch.Tensor:
     """unitree_rl_gym's fall check (LeggedRobot.check_termination): a contact force over 1 N on sensor_cfg's bodies
-    (the pelvis) in this step's last substep, or the pelvis rolled past max_roll or pitched past max_pitch (rad)."""
+    (the pelvis) in this step's last substep, or the pelvis rolled past max_roll or pitched past max_pitch (rad). Not
+    while a pre-pose gantry carries any of the robot's weight (env.support_share; mdp.prepose_reset)."""
     sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     contact = torch.any(sensor.data.net_forces_w[:, sensor_cfg.body_ids].norm(dim=-1) > 1.0, dim=1)
     roll, pitch, _ = euler_xyz_from_quat(env.scene["robot"].data.root_quat_w)
-    return contact | (wrap_to_pi(roll).abs() > max_roll) | (wrap_to_pi(pitch).abs() > max_pitch)
+    fell = contact | (wrap_to_pi(roll).abs() > max_roll) | (wrap_to_pi(pitch).abs() > max_pitch)
+    return fell & ~(env.support_share() > 0.0)
 
 
 def golem_estop(env: LocoManipMarlEnv) -> torch.Tensor:

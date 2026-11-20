@@ -37,14 +37,24 @@ def _yaml_load_any(text: str):
 def read_imu(run_dir: Path) -> dict:
     """The IMU a run trained with: {"frame": the robot frame it sits on, "offset": [x, y, z] in it (m)}, plus
     "gyro_lowpass_hz" when the policy read its gyro through the low-pass (imu_filter.GyroLowpass; lmg_deploy applies
-    it only when the key is present)."""
+    it only when the key is present). Runs on the torso IMU as /lowstate reports it (env cfg lowstate_imu,
+    lowstate_imu.py) add "source": "lowstate" (the deploy reads /lowstate's imu_state as reported, no trim),
+    "quat_bias_deg" (the quaternion bias ranges trained, roll / pitch / yaw: [lo, hi]) and "acc" ("dropped" when no
+    actor reads the accelerometer)."""
     env = _yaml_load_any((Path(run_dir) / "params" / "env.yaml").read_text())
     imu = (env.get("scene") or {}).get("imu") or {}
     frame = str(imu.get("prim_path", "/imu_link")).rsplit("/", 1)[-1]
     pos = ((imu.get("offset") or {}).get("pos")) or [0.0, 0.0, 0.0]
     out = {"frame": frame, "offset": [round(float(v), 6) for v in pos]}
+    lowstate = env.get("lowstate_imu")
+    if lowstate:
+        out = {"source": "lowstate", **out,
+               "quat_bias_deg": {k: [float(v) for v in lowstate["quat_bias_deg"][k]] for k in ("roll", "pitch", "yaw")}}
     if env.get("gyro_lowpass_hz"):
         out["gyro_lowpass_hz"] = float(env["gyro_lowpass_hz"])
+    if lowstate:
+        actors = [(env.get("observations") or {}).get(agent) or {} for agent in ("legs", "arms")]
+        out["acc"] = "raw" if any(group.get("base_lin_acc") for group in actors) else "dropped"
     return out
 
 

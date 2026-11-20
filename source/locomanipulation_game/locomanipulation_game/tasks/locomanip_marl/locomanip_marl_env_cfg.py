@@ -17,7 +17,8 @@ stride, stepping on any command over 0.03. The policy runs at 100 Hz
 over 500 Hz physics with an explicit PD (the torque computed every physics step and clipped at the effort limit) and
 0-20 ms of action delay. Joint targets are clipped inside GOLEM's position e-stop range and bounded by PD torque;
 GOLEM's e-stops are checked and charged (golem_safety.py). Domain randomization: motor gains and strength, friction and
-torso mass (all drawn at each reset), the IMU's mount and bias, observation noise. Flat ground, no pushes. Episodes
+torso mass (all drawn at each reset), the torso IMU's bias, lag and noise as /lowstate reports it (lowstate_imu.py),
+observation noise; a third of the resets from the robot's pre-pose range (mdp/prepose.py). Flat ground, no pushes. Episodes
 have drawn lengths (uniform, 90-300 s).
 """
 
@@ -57,6 +58,7 @@ from locomanipulation_game.assets.h1_2 import (
 
 from . import mdp
 from .golem_safety import GOLEM_TARGET_CLIP, GolemEstopCfg, position_envelope
+from .lowstate_imu import LowstateImuCfg
 from .scene_cfg import SELF_CONTACT_LINK_NAMES, SELF_CONTACT_SENSOR_NAMES, TerrainSceneCfg
 
 LEFT_ARM_JOINT_NAMES = ARM_JOINT_NAMES[:7]
@@ -98,6 +100,10 @@ FEET_DISTANCE_RANGE = (0.28, 0.45)
 # base_height's band (m): the sport stance's pelvis height, 4 cm lower to 2 cm higher. Without it the legs crouched,
 # the pelvis at 0.77 m and the knees at 1.86 rad by 200k steps (AlwaysStepBand_s42)
 BASE_HEIGHT_RANGE = (STANCE_PELVIS_HEIGHT - 0.04, STANCE_PELVIS_HEIGHT + 0.02)
+# knee_standing's band (rad) about the default knee angle, 0.697
+KNEE_STANDING_OFFSET = 0.15
+# target_near_bounds's margin (rad): the cost grows from this far inside a target bound
+TARGET_BOUND_MARGIN = 0.05
 # mdp.golem_limits: the measured joints are charged within GOLEM_POSITION_MARGIN (rad) of GOLEM's position e-stops,
 # and for |dq| or the motor torque beyond GOLEM_RATE_MARGIN of its velocity or torque e-stop
 GOLEM_POSITION_MARGIN = 0.03
@@ -112,13 +118,9 @@ GOLEM_RATE_MARGIN = 0.8
 # kernels' stds per stage, narrowed as the arm goals' errors fall.
 FINE_POS_STDS = (0.10, 0.07, 0.05, 0.035, 0.025, 0.018, 0.012)  # m
 ROT_STDS = (0.5, 0.4, 0.3, 0.22, 0.16, 0.12, 0.08)               # rad
-# The MID-360 IMU (scene.imu at livox_imu_link). Its gyro is low-passed against the head's 20 Hz resonance, as GOLEM's
-# deploy does; its mount and accelerometer bias are drawn per env at each reset.
+# The torso IMU as /lowstate reports it (scene.imu at imu_link; lowstate_imu.py, LocoManipMarlEnvCfg.lowstate_imu).
+# Its gyro is low-passed at this cutoff, as GOLEM's deploy low-passes its IMU's gyro (export.yaml imu.gyro_lowpass_hz)
 GYRO_LOWPASS_HZ = 8.0
-IMU_MOUNT_PITCH_DEG = 1.5
-IMU_MOUNT_ROLL_DEG = 0.75
-IMU_MOUNT_YAW_DEG = 0.75
-IMU_ACC_BIAS_G = 0.01
 # The velocity-tracking kernel curriculum (ModalVelocityCommand._judge_kernels): stage 0 is unitree_rl_gym's std 0.5,
 # under which standing still against a 0.4 m/s command keeps 53% of the linear reward; narrowed as the errors fall.
 LIN_VEL_STDS = (0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1)  # m/s
@@ -126,8 +128,18 @@ LIN_VEL_STDS = (0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1)  # m/s
 ANG_VEL_STDS = (1.5, 1.0, 0.7, 0.5, 0.4, 0.3, 0.2)  # rad/s
 # knee_valgus's bodies: hip, knee, ankle per leg, left then right
 VALGUS_LINK_NAMES = [f"{side}_{link}_link" for side in ("left", "right") for link in ("hip_roll", "knee", "ankle_pitch")]
+# The pre-pose resets (MarlEventCfg.prepose, mdp/prepose.py): their share, and each joint group's offset from the
+# default pose (rad). Against the robot's pre-pose on 2026-11-20: hung, errors up to 0.12 (elbows +0.08, wrist pitch
+# +0.075); lowered onto its feet under the hoist, ankle pitches -0.17 / -0.21, max error 0.215, torso 5 deg forward
+PREPOSE_PROB = 1.0 / 3.0
+PREPOSE_JOINT_RANGES = {
+    ".*_ankle_pitch_joint": (-0.3, 0.15), ".*_ankle_roll_joint": (-0.1, 0.1), ".*_knee_joint": (-0.1, 0.2),
+    ".*_hip_.*_joint": (-0.1, 0.1), "torso_joint": (-0.05, 0.05), ".*_(shoulder_.*|elbow)_joint": (-0.15, 0.15),
+    ".*_wrist_.*_joint": (-0.15, 0.15)}
 # the motors' gain and strength draws (mdp.randomize_actuator_scales)
-ACTUATOR_SCALES = {"gain_range": (0.8, 1.2), "strength_range": (0.85, 1.15)}
+# The real ankles give about 0.2 rad under 13-17 Nm at kp 80 through their parallel linkage (2026-11-20's pre-pose):
+# softer than the MJCF's, so their gains are drawn wider and lower than the rest's
+ACTUATOR_SCALES = {"joint_gain_ranges": {".*_ankle_.*_joint": (0.5, 1.2)}, "gain_range": (0.8, 1.2), "strength_range": (0.85, 1.15)}
 
 
 @configclass
@@ -198,10 +210,6 @@ class MarlActionsCfg:
     )
 
 
-def _imu(func, noise: float) -> ObsTerm:
-    return ObsTerm(func=func, params={"asset_cfg": SceneEntityCfg("imu")}, noise=Unoise(n_min=-noise, n_max=noise))
-
-
 def _joints(func, noise: float) -> ObsTerm:
     return ObsTerm(
         func=func,
@@ -219,11 +227,10 @@ class MarlObservationsCfg:
     class ProprioCfg(ObsGroup):
         """What both actors see. The deploy controller builds the same vector, term by term."""
 
-        # the accelerometer with its drawn bias, the gyro low-passed as the deploy does, noise after (the env's
-        # randomize_imu_mount and gyro_lowpass); projected gravity raw
-        base_lin_acc = _imu(mdp.imu_lin_acc_biased, 0.5)
-        base_ang_vel = _imu(mdp.imu_ang_vel_lowpass, 0.2)
-        projected_gravity = _imu(mdp.imu_projected_gravity, 0.05)
+        # the torso IMU as /lowstate reports it, its bias, noise, lag and vibration in the model (lowstate_imu.py):
+        # the gyroscope low-passed as the deploy does, gravity from the firmware's quaternion; no accelerometer
+        base_ang_vel = ObsTerm(func=mdp.lowstate_gyro)
+        projected_gravity = ObsTerm(func=mdp.lowstate_projected_gravity)
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
         arm_goal = ObsTerm(func=mdp.arm_goal_active, params={"command_name": ARM_COMMAND})
         ee_targets = ObsTerm(func=mdp.arm_targets_in_root_xyzw, params={"command_name": ARM_COMMAND})
@@ -252,7 +259,7 @@ class MarlObservationsCfg:
     @configclass
     class CriticCfg(ObsGroup):
         """The env state both critics see: the actors' observations once each, as the true quantities (the pelvis's
-        velocities and gravity for the head IMU's readings, the true arm targets for the believed ones), no noise."""
+        velocities and gravity for the torso IMU's readings, the true arm targets for the believed ones), no noise."""
 
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
@@ -363,13 +370,20 @@ class LegsRewardsCfg:
     base_height = RewTerm(func=mdp.base_height_band, weight=0.5, params={
         "sensor_cfg": SceneEntityCfg("height_scanner"), "min_height": BASE_HEIGHT_RANGE[0],
         "max_height": BASE_HEIGHT_RANGE[1]})
+    # standing, the knees within KNEE_STANDING_OFFSET of the default pose: at most 1 per second. Without the height
+    # band LegsEnergyDefault200k_s43 stood with knees at 1.46-1.61 rad (default 0.70); with it, LegsObs200k_s42 0.90
+    knee_standing = RewTerm(func=mdp.joint_offset_band, weight=1.0, params={
+        "asset_cfg": SceneEntityCfg("robot", joint_names=".*_knee_joint"), "max_offset": KNEE_STANDING_OFFSET,
+        "command_name": "base_velocity"})
     # --- effort and smoothness. The rate terms are on raw actions: x4 for 100 Hz (a smooth trajectory's per-step
     # change halves) and x the mean squared ratio of the matched scales to the earlier ones (0.62), so a joint-target
     # change costs what it did
     torques = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-5, params={"asset_cfg": _LEGS})
     dof_vel = RewTerm(func=mdp.joint_vel_l2, weight=-1.0e-3, params={"asset_cfg": _LEGS})
     dof_acc = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7, params={"asset_cfg": _LEGS})
-    action_rate = RewTerm(func=mdp.action_term_rate_l2, weight=-0.025, params={"action_name": LEGS_ACTION})
+    # x4 since 2026-11-20 (was -0.025): the real loop amplified the targets' step-to-step changes ~2.5x over MuJoCo
+    # (LegsEnergyDefault200k_s43's engage, 0.18 rad per step), so the trained ones must be that much tamer
+    action_rate = RewTerm(func=mdp.action_term_rate_l2, weight=-0.1, params={"action_name": LEGS_ACTION})
     ankle_torque = RewTerm(func=mdp.joint_torques_l2, weight=-5.0e-5,
                            params={"asset_cfg": SceneEntityCfg("robot", joint_names=ANKLE_JOINT_NAMES)})
     ankle_action_rate = RewTerm(func=mdp.ankle_action_rate_l2, weight=-0.05,
@@ -379,6 +393,11 @@ class LegsRewardsCfg:
     energy = RewTerm(func=mdp.joint_power_l1, weight=0.0, params={"asset_cfg": _LEGS})
     # --- safety
     dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-5.0, params={"asset_cfg": _LEGS})
+    # the targets off their bounds (GOLEM's e-stop range): 1 per joint at a bound, falling to 0 TARGET_BOUND_MARGIN in,
+    # the ankle rolls x3. LegsEnergyDefault200k_s43 rested its ankle roll targets on their +-0.22 rad bound 47% of its
+    # real engage (96-99% in MuJoCo); golem_limits, on the measured joints, and action_beyond_clip didn't stop it
+    target_near_bounds = RewTerm(func=mdp.target_near_bounds, weight=-1.0, params={
+        "action_name": LEGS_ACTION, "margin": TARGET_BOUND_MARGIN, "joint_weights": {".*_ankle_roll_joint": 3.0}})
     feet_contact_forces = RewTerm(func=mdp.feet_contact_forces, weight=-0.01,
                                   params={"sensor_cfg": _FEET_CONTACT, "max_force": 1400.0, "window": 3})
     self_collision = RewTerm(func=mdp.self_contacts_involving, weight=-1.0,
@@ -479,10 +498,22 @@ class MarlEventCfg:
     reset_joints = EventTerm(func=mdp.reset_joints_by_offset, mode="reset", params={
         "asset_cfg": SceneEntityCfg("robot", joint_names=LOWER_JOINT_NAMES + ARM_JOINT_NAMES, preserve_order=True),
         "position_range": (-0.05, 0.05), "velocity_range": (-0.1, 0.1)})
-    # the MID-360 chip's mount, beyond what CL_Assets measured, and its accelerometer's horizontal bias
-    imu_mount = EventTerm(func=mdp.randomize_imu_mount, mode="reset", params={
-        "roll_deg": IMU_MOUNT_ROLL_DEG, "pitch_deg": IMU_MOUNT_PITCH_DEG, "yaw_deg": IMU_MOUNT_YAW_DEG,
-        "acc_bias_g": IMU_ACC_BIAS_G})
+    # a share of the resets (PREPOSE_PROB) redrawn from the states lmg_deploy hands the real robot to the policy in:
+    # its pre-pose, settled or not, on the floor, sagged under a hoist or hung from it (mdp/prepose.py). After
+    # reset_base and reset_joints, whose draws it overrides; every task inherits it
+    prepose = EventTerm(func=mdp.prepose_reset, mode="reset", params={
+        "asset_cfg": SceneEntityCfg("robot"),
+        "prob": PREPOSE_PROB,
+        "joint_ranges": PREPOSE_JOINT_RANGES,
+        "sag_prob": 0.4, "sag_ankle": 0.3, "sag_knee": 0.2,
+        "fast_vel_prob": 0.3, "fast_vel": 0.5,
+        "pitch_range": (-math.radians(5.0), math.radians(10.0)), "roll_range": (-math.radians(5.0), math.radians(5.0)),
+        "clearance": 0.003,
+        "hung_prob": 0.25, "partial_prob": 0.35, "partial_share_range": (0.2, 0.9), "lift_range": (0.0, 0.08),
+        "release_now_prob": 0.5, "keep_range": (1.0, 3.0), "release_duration_range": (0.0, 2.0),
+        "feet_body_names": FOOT_LINK_NAMES, "support_body": "torso_link", "support_point": (0.0, 0.0, 0.55),
+        "support_stiffness": 3000.0, "support_damping": 400.0, "tether_stiffness": 200.0, "tether_damping": 100.0,
+    })
     # the motors' kp/kd and strength per env and joint, drawn at each reset
     actuator_scales = EventTerm(func=mdp.randomize_actuator_scales, mode="reset", params=dict(ACTUATOR_SCALES))
     # frames without an inertial in the URDF, which the USD import gave 1 kg each
@@ -541,7 +572,9 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     )
     golem_estop_penalty: float = -1.0
     gyro_lowpass_hz: float = GYRO_LOWPASS_HZ
-    """Hz: the policy's gyro low-pass (imu_filter.GyroLowpass, as lmg_deploy filters /livox/imu)."""
+    """Hz: the policy's gyro low-pass (imu_filter.GyroLowpass, as lmg_deploy filters its IMU's gyro)."""
+    lowstate_imu: LowstateImuCfg = LowstateImuCfg()
+    """The torso IMU's per-reset bias, noise, lag and vibration draws (lowstate_imu.py)."""
 
     episode_length_range_s: tuple[float, float] | None = (90.0, 300.0)
     """s: each episode's length is drawn at its reset uniformly from this range, at most episode_length_s
