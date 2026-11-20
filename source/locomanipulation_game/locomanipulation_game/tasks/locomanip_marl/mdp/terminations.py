@@ -37,11 +37,12 @@ def pelvis_contact_or_tilt(env: LocoManipMarlEnv, sensor_cfg: SceneEntityCfg, ma
 def golem_estop(env: LocoManipMarlEnv) -> torch.Tensor:
     """Never ends the episode: a termination term so it runs once per step, after the physics substeps. The env's
     GOLEM e-stop monitor (golem_safety.py) has checked every substep but the last; this checks the last, keeps the
-    step's trips (env.golem_tripped, which the env charges cfg.golem_estop_penalty on a trip's first step) and its log,
-    and clears the flags."""
+    step's trips (env.golem_tripped, and per agent env.golem_tripped_by: the env charges the agent whose joint tripped
+    cfg.golem_estop_penalty on its trip's first step) and its log, and clears the flags."""
     monitor = env.golem_monitor
     monitor.update()
     env.golem_tripped = monitor.tripped().clone()
+    env.golem_tripped_by = {agent: monitor.tripped_by(agent).clone() for agent in env.golem_tripped_by}
     env.golem_log = monitor.log()
     monitor.clear()
     return torch.zeros_like(env.golem_tripped)

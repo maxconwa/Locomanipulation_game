@@ -533,7 +533,8 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     terminations: MarlTerminationsCfg = MarlTerminationsCfg()
     curriculum: MarlCurriculumCfg = MarlCurriculumCfg()
     # GOLEM's e-stops. Every joint target is clipped 0.02 rad inside GOLEM's edges (the ankle rolls 0.04); trips are
-    # logged under Safety/ and cost golem_estop_penalty on each trip's first step, without ending the episode (ending it stalled training: most episodes ended on a trip)
+    # logged under Safety/ and cost the agent whose joint tripped (the torso: both) golem_estop_penalty on the trip's
+    # first step, without ending the episode (ending it stalled training: most episodes ended on a trip)
     golem_estop: GolemEstopCfg = GolemEstopCfg(
         position_margin=0.02,
         joint_position_margins={".*_ankle_roll_joint": (GOLEM_ANKLE_ROLL_TARGET_MARGIN, GOLEM_ANKLE_ROLL_TARGET_MARGIN)},

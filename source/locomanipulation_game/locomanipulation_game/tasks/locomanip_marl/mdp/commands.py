@@ -243,7 +243,7 @@ class ModalVelocityCommand(UniformVelocityCommand):
         self.ang_kernel_stage = min(max(int(state["ang_kernel_stage"]), 0), len(self.cfg.ang_vel_stds) - 1)
 
     def _arm_mode(self) -> torch.Tensor:
-        return self._env.command_manager.get_term(self.cfg.arm_command_name).arm_mode
+        return self._env.command_manager.get_term(self.cfg.arm_command_name).legs_arm_mode
 
     def _resample_command(self, env_ids: Sequence[int]):
         self._end_segments(torch.as_tensor(env_ids, device=self.device))
@@ -570,6 +570,12 @@ class ArmTargetsCommand(CommandTerm):
     Frames and errors.
     """
 
+    @property
+    def legs_arm_mode(self) -> torch.Tensor:
+        """arm_mode as the legs' task sees it (the velocity command, the legs' reward terms): all False with
+        cfg.independent_of_legs."""
+        return torch.zeros_like(self.arm_mode) if self.cfg.independent_of_legs else self.arm_mode
+
     def standing_frame_w(self) -> tuple[torch.Tensor, torch.Tensor]:
         """(origin, yaw-only quaternion) of the standing frame in world."""
         origin = self.robot.data.root_pos_w.clone()
@@ -581,6 +587,8 @@ class ArmTargetsCommand(CommandTerm):
     def targets_w(self) -> torch.Tensor:
         """True targets in world, (num_envs, num_arms, 7): the anchor for an arm goal, the rest pose on the pelvis
         otherwise."""
+        if self.cfg.pelvis_fixed_goals:  # the command itself, on the pelvis (the rest pose while navigating)
+            return _apply(self.robot.data.root_pos_w, self.robot.data.root_quat_w, self.believed_b)
         rest = self.rest_pose_b.unsqueeze(0).expand(self.num_envs, -1, -1)
         rest_w = _apply(self.robot.data.root_pos_w, self.robot.data.root_quat_w, rest)
         return torch.where(self.arm_mode.view(-1, 1, 1), self.anchor_w, rest_w)
@@ -612,7 +620,9 @@ class ArmTargetsCommand(CommandTerm):
     def apply_pelvis_motion(self, delta_pos: torch.Tensor, delta_quat: torch.Tensor, env_mask: torch.Tensor):
         """Re-express the arm-goal commands of env_mask's envs after the pelvis moved by (delta_pos, delta_quat), in
         the previous pelvis frame. A world-fixed target obeys T_prev o c_prev = T_new o c_new, so
-        c_new = delta^-1 o c_prev."""
+        c_new = delta^-1 o c_prev. With cfg.pelvis_fixed_goals the command rides on the pelvis: unchanged."""
+        if self.cfg.pelvis_fixed_goals:
+            return
         mask = env_mask & self.arm_mode
         moved = _relative(delta_pos, delta_quat, self.believed_b)
         self.believed_b[mask] = moved[mask]
@@ -824,7 +834,8 @@ class ArmTargetsCommand(CommandTerm):
 
         root_pos, root_quat = self.robot.data.root_pos_w, self.robot.data.root_quat_w
         believed_w = _apply(root_pos, root_quat, self.believed_b)
-        self.metrics["command_drift"] = torch.norm(believed_w[..., :3] - self.anchor_w[..., :3], dim=-1).mean(1) * arm
+        drift = torch.norm(believed_w[..., :3] - self.anchor_w[..., :3], dim=-1).mean(1) * arm
+        self.metrics["command_drift"] = torch.zeros_like(drift) if self.cfg.pelvis_fixed_goals else drift
 
         within = (pos_error < self.cfg.reach_pos_tol).all(dim=1) & (rot_error < self.cfg.reach_rot_tol).all(dim=1)
         step_dt = self._env.step_dt
@@ -867,7 +878,8 @@ class ArmTargetsCommand(CommandTerm):
             self.believed_b[nav_ids] = self.rest_pose_b
             self.seed_q[nav_ids] = self._default_arm_q
             self.time_left[nav_ids] = torch.empty(len(nav_ids), device=self.device).uniform_(*self.cfg.nav_time_range)
-            velocity._resample(nav_ids)
+            if not self.cfg.independent_of_legs:
+                velocity._resample(nav_ids)
 
         # -- arm goal: _draw_arm_goals's; with collision_check, collision_retries more candidates per env, the first
         # whose seed, and the straight joint-space path to it from the arms' measured angles, are clear of collisions
@@ -875,9 +887,10 @@ class ArmTargetsCommand(CommandTerm):
         m = len(arm_ids)
         if m == 0:
             return
-        velocity.vel_command_b[arm_ids] = 0.0
-        velocity.vel_command_filtered[arm_ids] = 0.0
         cfg = self.cfg
+        if not cfg.independent_of_legs:
+            velocity.vel_command_b[arm_ids] = 0.0
+            velocity.vel_command_filtered[arm_ids] = 0.0
         if not cfg.collision_check:
             goal = self._draw_arm_goals(arm_ids)
         else:
@@ -909,7 +922,11 @@ class ArmTargetsCommand(CommandTerm):
         needs_crouch = (targets_s[..., 2] < self._standing_min_z).any(dim=1)
 
         origin, quat = self.standing_frame_w()
-        if self._at_reset:
+        if cfg.pelvis_fixed_goals:
+            # the standing-frame poses are the pelvis-frame command: place them on the pelvis as it is (believed_b
+            # below is then the drawn pose; anchor_w is only where that was at the event)
+            origin, quat = self.robot.data.root_pos_w.clone(), self.robot.data.root_quat_w
+        elif self._at_reset:
             # the height scan still shows where the robot was before the reset teleported it
             origin[arm_ids, 2] = self._env.scene.env_origins[arm_ids, 2] + self.cfg.standing_height
         anchor = _apply(origin[arm_ids], quat[arm_ids], targets_s)
@@ -1063,6 +1080,13 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     arm_goal_prob over these; 0: at once (the falls then spike to 85-99%)."""
     nav_time_range: tuple[float, float] = (4.0, 8.0)
     """s: a navigation task's duration."""
+    independent_of_legs: bool = False
+    """The arm goals leave the legs' task alone: no event zeroes or resamples the velocity command (it resamples on
+    its own timer), and the legs' terms never see an arm goal (legs_arm_mode is all False)."""
+    pelvis_fixed_goals: bool = False
+    """An arm goal rides on the pelvis instead of staying in the world: the pose drawn in the standing frame is the
+    pelvis-frame command for the whole goal, whatever the pelvis does (what a pinned pelvis's goal is). The pelvis's
+    motion then doesn't move the command (apply_pelvis_motion)."""
     reach_pos_tol: float = 0.05
     reach_rot_tol: float = 0.35
     reach_hold_s: float = 1.0

@@ -91,6 +91,10 @@ def position_envelope(cfg: GolemEstopCfg) -> dict[str, tuple[float, float]]:
     return out
 
 
+LEG_JOINT_PREFIXES = ("left_hip", "right_hip", "left_knee", "right_knee", "left_ankle", "right_ankle")
+ARM_JOINT_PREFIXES = ("left_s", "right_s", "left_e", "right_e", "left_w", "right_w")
+
+
 class GolemEstopMonitor:
     """Per-env, per-cause e-stop flags, ORed over the physics substeps of a policy step."""
 
@@ -109,6 +113,12 @@ class GolemEstopMonitor:
         self.dq_max = vel * vel_ratio * cfg.velocity_margin
         self.tau_max = tau * tau_ratio * cfg.torque_margin
         self.flags = {c: torch.zeros(num_envs, dtype=torch.bool, device=device) for c in CAUSES}
+        # per agent, the envs one of whose joints tripped (any cause); a joint of neither agent (the torso) is both's
+        owner = {"legs": torch.tensor([n.startswith(LEG_JOINT_PREFIXES) for n in GOLEM_JOINT_NAMES], device=device),
+                 "arms": torch.tensor([n.startswith(ARM_JOINT_PREFIXES) for n in GOLEM_JOINT_NAMES], device=device)}
+        shared = ~(owner["legs"] | owner["arms"])
+        self._agent_joints = {agent: mask | shared for agent, mask in owner.items()}
+        self.agent_flags = {agent: torch.zeros(num_envs, dtype=torch.bool, device=device) for agent in owner}
         self.joint_hits = {c: torch.zeros(len(GOLEM_LIMITS), device=device) for c in CAUSES}
         self._skip_torque = torch.ones(num_envs, dtype=torch.bool, device=device)
         print(f"[INFO] GolemEstopMonitor ({GOLEM_PRESET}, velocity x{cfg.velocity_margin}, torque x{cfg.torque_margin},"
@@ -127,6 +137,9 @@ class GolemEstopMonitor:
             "torque": (self._motor_torque().abs() > self.tau_max) & ~self._skip_torque.unsqueeze(1),
         }
         self._skip_torque[:] = False
+        any_cause = bad["position"] | bad["velocity"] | bad["torque"]
+        for agent, mask in self._agent_joints.items():
+            self.agent_flags[agent] |= any_cause[:, mask].any(dim=1)
         for cause, joints in bad.items():
             hit = joints.any(dim=1)
             self.joint_hits[cause] += (joints & (hit & ~self.flags[cause]).unsqueeze(1)).float().sum(dim=0)
@@ -141,12 +154,16 @@ class GolemEstopMonitor:
     def tripped(self) -> torch.Tensor:
         return self.flags["velocity"] | self.flags["position"] | self.flags["torque"]
 
+    def tripped_by(self, agent: str) -> torch.Tensor:
+        """The envs where one of agent's joints ("legs" or "arms"; the torso counts for both) tripped."""
+        return self.agent_flags[agent]
+
     def clear(self):
-        for flag in self.flags.values():
+        for flag in (*self.flags.values(), *self.agent_flags.values()):
             flag.zero_()
 
     def reset(self, env_ids):
-        for flag in self.flags.values():
+        for flag in (*self.flags.values(), *self.agent_flags.values()):
             flag[env_ids] = False
         self._skip_torque[env_ids] = True
 
@@ -155,8 +172,7 @@ class GolemEstopMonitor:
         out = {f"Safety/estop_{c}": self.flags[c].float().mean() for c in CAUSES}
         for c in CAUSES:
             hits = self.joint_hits[c]
-            for group, prefix in (("legs", ("left_hip", "right_hip", "left_knee", "right_knee", "left_ankle", "right_ankle")),
-                                  ("torso", ("torso",)), ("arms", ("left_s", "right_s", "left_e", "right_e", "left_w", "right_w"))):
+            for group, prefix in (("legs", LEG_JOINT_PREFIXES), ("torso", ("torso",)), ("arms", ARM_JOINT_PREFIXES)):
                 mask = torch.tensor([n.startswith(prefix) for n in GOLEM_JOINT_NAMES], device=hits.device)
                 out[f"Safety/{c}_trips_{group}"] = hits[mask].sum()
             hits.zero_()

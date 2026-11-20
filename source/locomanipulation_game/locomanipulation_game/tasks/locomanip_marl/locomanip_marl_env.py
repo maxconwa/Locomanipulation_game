@@ -82,6 +82,9 @@ class LocoManipMarlEnv(DirectMARLEnv):
         # this step's GOLEM e-stop trips (mdp.golem_estop) and the last step's, for the penalty on a trip's first step
         self.golem_tripped = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._golem_tripped_prev = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # the same per agent: the envs where one of its own joints tripped (the torso is both's)
+        self.golem_tripped_by = {agent: torch.zeros_like(self.golem_tripped) for agent in self.cfg.possible_agents}
+        self._golem_tripped_by_prev = {agent: torch.zeros_like(self.golem_tripped) for agent in self.cfg.possible_agents}
 
         group_dims = self.observation_manager.group_obs_dim
         self.cfg.observation_spaces = {agent: group_dims[agent][0] for agent in self.cfg.possible_agents}
@@ -178,19 +181,25 @@ class LocoManipMarlEnv(DirectMARLEnv):
 
     def _get_rewards(self) -> dict[str, torch.Tensor]:
         terminated = self.termination_manager.terminated.float()
-        # a GOLEM e-stop trip costs golem_estop_penalty once, on its first step, after the floor as a fall's penalty does
-        # (from the start: held back to the end of the warm start, a policy tripped on 11% of its steps)
+        # a GOLEM e-stop trip costs the agent whose joint tripped golem_estop_penalty once, on its first step, after the
+        # floor as a fall's penalty does (from the start: held back to the end of the warm start, a policy tripped on
+        # 11% of its steps). The other agent pays nothing for it
         new_trip = self.golem_tripped & ~self._golem_tripped_prev
         self._golem_tripped_prev = self.golem_tripped.clone()
-        trip_cost = self.cfg.golem_estop_penalty * new_trip.float()
         self.golem_log["Safety/trip_starts"] = new_trip.float().mean()
+        trip_cost = {}
+        for agent, tripped in self.golem_tripped_by.items():
+            new = tripped & ~self._golem_tripped_by_prev[agent]
+            self._golem_tripped_by_prev[agent] = tripped.clone()
+            trip_cost[agent] = self.cfg.golem_estop_penalty * new.float()
+            self.golem_log[f"Safety/trip_starts_{agent}"] = new.float().mean()
         rewards = {}
         for agent, manager in self.reward_managers.items():
             reward = manager.compute(dt=self.step_dt)
             if torch.isnan(reward).any():
                 bad = torch.isnan(manager._step_reward).any(dim=0).nonzero(as_tuple=True)[0].tolist()
                 raise RuntimeError(f"NaN in {agent} reward terms {[manager._term_names[i] for i in bad]}")
-            rewards[agent] = torch.clamp(reward, min=0.0) + self.cfg.termination_penalty * terminated + trip_cost
+            rewards[agent] = torch.clamp(reward, min=0.0) + self.cfg.termination_penalty * terminated + trip_cost[agent]
         return rewards
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
@@ -222,6 +231,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self.gyro_lowpass.reset(env_ids)
         self.golem_monitor.reset(env_ids)
         self._golem_tripped_prev[env_ids] = False
+        for prev in self._golem_tripped_by_prev.values():
+            prev[env_ids] = False
 
         log = {}
         log.update(self.observation_manager.reset(env_ids))

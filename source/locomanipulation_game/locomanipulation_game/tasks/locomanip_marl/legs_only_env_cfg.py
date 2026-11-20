@@ -53,6 +53,19 @@ class LegsOnlyLegsRewardsCfg(LegsRewardsCfg):
         "max_imbalance": 0.1, "command_name": "base_velocity"})
 
 
+def set_legs_task(cfg):
+    """The legs' own settings on cfg, whose rewards.legs is a LegsOnlyLegsRewardsCfg (this task's, and
+    LocoManip-Marl-Direct-v0's, marl_direct_env_cfg.py)."""
+    # the wrist targets never leave the rest pose: the legs' actor doesn't see them (the critic's state keeps them)
+    cfg.observations.legs.ee_targets = None
+    # no task is an arm goal: the flag that says so is always 0 (the arms' actor keeps it: lmg_deploy's layout)
+    cfg.observations.legs.arm_goal = None
+    cfg.observations.critic.arm_goal = None
+    # LegsEnergy200k_s42's recipe: no pelvis-height band, the legs' mechanical power penalised
+    cfg.rewards.legs.base_height.weight = 0.0
+    cfg.rewards.legs.energy.weight = -1e-3
+
+
 @configclass
 class LegsOnlyRewardsCfg(MarlRewardsCfg):
     legs: LegsOnlyLegsRewardsCfg = LegsOnlyLegsRewardsCfg()
@@ -67,11 +80,4 @@ class LegsOnlyEnvCfg(LocoManipMarlEnvCfg):
         # no arm goals; the arms at their rest pose by IK alone
         self.commands.arm_targets.arm_goal_prob = 0.0
         self.actions.arm_pos.residual_gain = 0.0
-        # the wrist targets never leave the rest pose: the legs' actor doesn't see them (the critic's state keeps them)
-        self.observations.legs.ee_targets = None
-        # no task is an arm goal: the flag that says so is always 0 (the arms' actor keeps it: lmg_deploy's layout)
-        self.observations.legs.arm_goal = None
-        self.observations.critic.arm_goal = None
-        # LegsEnergy200k_s42's recipe: no pelvis-height band, the legs' mechanical power penalised
-        self.rewards.legs.base_height.weight = 0.0
-        self.rewards.legs.energy.weight = -1e-3
+        set_legs_task(self)

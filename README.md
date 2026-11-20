@@ -18,9 +18,10 @@ metrics pass. These are the defaults: `train.py` with no overrides trains the re
 - `source/locomanipulation_game/locomanipulation_game/`
   - `assets/h1_2.py`: the robot: names, the sport stance, the PD actuators and their matched action scales.
   - `data/arm_target_tables_v3.pt`: the arm goals' tables (Git LFS).
-  - `tasks/locomanip_marl/`: the tasks. `LocoManip-Marl-Direct-v0`: the legs walk and the arms track. Two cut-down
-    ones on the same env: `LocoManip-LegsOnly-v0` (no arm goals, the arms held at rest; `legs_only_env_cfg.py`) and
-    `LocoManip-ArmsOnly-v0` (the pelvis pinned, every task an arm goal; `arms_only_env_cfg.py`).
+  - `tasks/locomanip_marl/`: the tasks, on one env. `LocoManip-LegsOnly-v0` (the legs walk, no arm goals, the arms
+    held at rest; `legs_only_env_cfg.py`), `LocoManip-ArmsOnly-v0` (the pelvis pinned, every task an arm goal;
+    `arms_only_env_cfg.py`) and `LocoManip-Marl-Direct-v0` (both at once on a free pelvis, each agent on exactly its
+    own task, neither's depending on the other's; `marl_direct_env_cfg.py`).
     - `locomanip_marl_env_cfg.py`: everything configurable; `scene_cfg.py`: the scene.
     - `locomanip_marl_env.py`: a DirectMARLEnv that runs Isaac Lab's managers, the warm start and the arm goals'
       odometry.

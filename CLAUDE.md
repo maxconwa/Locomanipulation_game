@@ -41,8 +41,9 @@ from `ALMI_RL`.
 - **Activate the env first:** `conda activate env_isaaclab`
 - **The tasks live in**
   `source/locomanipulation_game/locomanipulation_game/tasks/locomanip_marl/`:
-  `LocoManip-Marl-Direct-v0` (its defaults are the sport-mode recipe, README), and
-  `LocoManip-LegsOnly-v0` and `LocoManip-ArmsOnly-v0` on the same env.
+  `LocoManip-LegsOnly-v0` and `LocoManip-ArmsOnly-v0` (one agent's task each), and
+  `LocoManip-Marl-Direct-v0` (both at once, each agent on its own task; `marl_direct_env_cfg.py`).
+  `locomanip_marl_env_cfg.py` is their shared base (the sport-mode recipe, README).
 - **Train:** `python scripts/skrl/train.py --headless [--task <id>]`; runs go to
   `logs/skrl/locomanip_marl/`. The whole pipeline (train, scorecard, export,
   checks): `scripts/train_candidate.sh`.

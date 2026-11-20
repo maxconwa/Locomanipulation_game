@@ -247,7 +247,7 @@ class sport_gait_exp(_CycleMean):
         error = torch.sum(torch.square(swing - self.swing(env, command_name)), dim=1)
         if std_end is not None:
             std += (std_end - std) * min(env.common_step_counter / max(std_steps, 1), 1.0)
-        arm = env.command_manager.get_term(arm_command_name).arm_mode
+        arm = env.command_manager.get_term(arm_command_name).legs_arm_mode
         return torch.exp(-error / std**2) * (~arm).float()
 
 

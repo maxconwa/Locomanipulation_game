@@ -4,7 +4,7 @@ The two-agent task (locomanip_marl_env_cfg.py) with only the arms acting and lea
 - the pelvis is pinned in the world at the stance height (fix_root_link), so nothing has to balance; the reset still
   places it (x, y, yaw drawn as the walking task's) but upright and at the stance height;
 - the legs hold their default pose: their action scale is 0 and their reward terms are off, so the legs agent's
-  actions do nothing (it is still trained, on the fall and GOLEM-trip penalties alone);
+  actions do nothing (it is still trained, on the fall penalty and its own joints' GOLEM-trip penalty alone);
 - every task is a standing arm goal (arm_goal_prob 1, the velocity command zero), each lasting a drawn 4-8 s
   (ARMS_GOAL_TIME_RANGE; 4 s up to ArmsOnly200k_s42), from the first step: the walking
   task's warm-start gate needs walking, which a pinned robot never does, so its deadline opens it at step 1 with no
@@ -188,7 +188,7 @@ class ArmsOnlyRewardsCfg(MarlRewardsCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        # the legs' reward terms off (the env still charges them a fall and a GOLEM trip, which cannot move them here)
+        # the legs' reward terms off (the env still charges them a fall and their own joints' GOLEM trips)
         for name, term in list(vars(self.legs).items()):
             if isinstance(term, RewTerm):
                 setattr(self.legs, name, None)
