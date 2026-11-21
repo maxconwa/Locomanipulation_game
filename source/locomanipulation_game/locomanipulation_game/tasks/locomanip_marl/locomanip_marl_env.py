@@ -178,9 +178,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
             rows = torch.arange(self.num_envs, device=self.device)
             for term, history in zip(self._delay_terms, self._target_history):
                 term._processed_actions = history[rows, back]
-        if self._prepose is not None:
-            t = (self.episode_length_buf * self.cfg.decimation + self._substep) * self.physics_dt
-            self._prepose.apply_support(t)
+        if self._prepose is not None and self._substep == 0:
+            # the rope's force, set once per policy step and held over its substeps (set every substep it cost ~6 ms
+            # each, ~30 ms per step, about a fifth of the step; the rope's ~1 Hz dynamics don't need 500 Hz)
+            self._prepose.apply_support(self.episode_length_buf * self.step_dt)
         self._substep += 1
         self.action_manager.apply_action()
 

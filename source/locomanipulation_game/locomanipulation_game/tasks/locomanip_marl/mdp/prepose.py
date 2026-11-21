@@ -19,7 +19,7 @@ prepose_reset (a reset event after reset_base and reset_joints) redraws a share 
   as on the hoist; at the waist it tumbled), share x (m g + k_z (z_anchor - z) - c_z v_z), never pushing, with a soft
   horizontal tether to the anchor; it carries
   its share until release_start (0 with release_now_prob, else U(keep_range)) and lets go over U(release_duration_range)
-  s. The env applies it every physics substep (apply_support) and the fall check ignores an env while it carries any
+  s. The env sets it once per policy step (apply_support) and the fall check ignores an env while it carries any
   weight (support_share > 0). The rewards are unchanged under it.
 
 A fixed base (LocoManip-ArmsOnly-v0's pinned pelvis) keeps its upright pose and gets no gantry: only the joints are

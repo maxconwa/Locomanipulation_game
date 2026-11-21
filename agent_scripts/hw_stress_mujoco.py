@@ -17,7 +17,8 @@ observations, all from the export's settings) and adds the perturbations (CONDIT
                  policy engaged with the deploy's reset; the rope kept or released (`release`) at the engage. Starts:
                    hung     engaged on the gantry, feet 8 cm up; lowered PP_HUNG_HOLD_S later
                    settled  the default pose on the feet
-                   bag      the robot's measured pre-pose at its 2026-11-20 engage (data/bag_engage_q.npy)
+                   bag      the robot's measured pre-pose at its 2026-11-20 11:57 engage (data/bag_engage_q.npy)
+                   bag1449  the one at its 14:49 engage (data/bag_engage_q_1449.npy: unsettled, 0.16 rad off)
                    random   a draw from the training's pre-pose range (PREPOSE_JOINT_RANGES; per seed)
                  Run for PP_AFTER_S with a zero command; scored on the first 0.5 s and the stance after (pp table)
   imu_pitch, vib_k   for an export on the torso IMU (export imu.source lowstate): the quaternion's pitch bias (deg;
@@ -89,7 +90,7 @@ CONDITIONS = {
 # the pre-pose grid: each start with the rope kept and released, with the hardware effects and the torso IMU's
 # vibration at x4 (sagged_engage.py's --head-res 4 matched the bag's input); the bag's pose and the settled one also at
 # the quaternion bias range's ends
-PP_STARTS = ("hung", "settled", "bag", "random")
+PP_STARTS = ("hung", "settled", "bag", "bag1449", "random")
 for _start in PP_STARTS:
     for _rope in ("keep", "release"):
         CONDITIONS[f"pp_{_start}_{_rope}"] = dict(_HW, prepose=_start, release=_rope == "release", vib_k=4.0)
@@ -112,7 +113,10 @@ STAND_WINDOW = (2.0, 10.0)
 # engage's time, s run after it; the hung start stays on the gantry this long after its engage
 PP_HANG_S, PP_LOWER_S, PP_EASE_S, PP_ENGAGE_S, PP_AFTER_S, PP_HUNG_HOLD_S = 1.5, 1.0, 2.0, 8.0, 8.0, 2.0
 PP_TETHER_K, PP_TETHER_D = 1500.0, 300.0  # N/m, N s/m: the rope's horizontal pull back to where it took over
-BAG_ENGAGE_Q = REPO / "agent_scripts" / "data" / "bag_engage_q.npy"  # 27 joint angles, policy order (rad)
+# 27 joint angles, policy order (rad), at the robot's engages of 2026-11-20 (lmg_legsenergy200k_s43_2026-11-20_1157 and
+# _1449, the last 20 ms before each)
+BAG_ENGAGE_Q = {"bag": REPO / "agent_scripts" / "data" / "bag_engage_q.npy",
+                "bag1449": REPO / "agent_scripts" / "data" / "bag_engage_q_1449.npy"}
 # the training's pre-pose joint offsets (locomanip_marl_env_cfg.PREPOSE_JOINT_RANGES; rad from the default pose)
 PREPOSE_JOINT_RANGES = {"ankle_pitch": (-0.3, 0.15), "ankle_roll": (-0.1, 0.1), "knee": (-0.1, 0.2), "hip": (-0.1, 0.1),
                         "torso": (-0.05, 0.05), "shoulder": (-0.15, 0.15), "elbow": (-0.15, 0.15), "wrist": (-0.15, 0.15)}
@@ -309,8 +313,8 @@ def command(t: float, profile: str) -> np.ndarray:
 
 def prepose_pose(sim: StressMujoco, start: str, rng: np.random.Generator) -> np.ndarray:
     """The joint angles (policy order) the pre-pose eases to before the engage."""
-    if start == "bag":
-        return np.load(BAG_ENGAGE_Q).astype(float)
+    if start in BAG_ENGAGE_Q:
+        return np.load(BAG_ENGAGE_Q[start]).astype(float)
     if start != "random":
         return sim.default.copy()
     q = sim.default.copy()
