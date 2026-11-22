@@ -141,6 +141,13 @@ def xyzw(pose):
 
 # ---------------------------------------------------------------- the sim
 
+
+def imu_bias_ranges(imu: dict) -> dict:
+    """The torso IMU's trained orientation bias ranges in an export's imu block (deg, roll / pitch / yaw: [lo, hi]):
+    the calibration's error for imu.orientation calibrated (residual_deg), the raw offset otherwise (quat_bias_deg)."""
+    calibrated = imu.get("orientation", "raw") == "calibrated"
+    return {k: tuple(v) for k, v in imu["residual_deg" if calibrated else "quat_bias_deg"].items()}
+
 class GyroLowpass:
     """lmg_deploy.livox_imu.GyroLowpass: per axis, a 2nd-order Butterworth at cutoff_hz, exact ZOH discretization over
     each sample's dt, started (and restarted by reset) at x = (u, 0)."""
@@ -283,10 +290,12 @@ class MarlMujoco:
         # LocoManip-Marl-Direct-v0 (ArmTargetsCommandCfg.pelvis_fixed_goals, independent_of_legs): an arm goal rides
         # on the pelvis, and the velocity command runs through it. The caller sets it.
         self.pelvis_goals = False
-        # /lowstate's torso IMU (export imu.source lowstate): its quaternion reads this rotation when level (the
-        # trained bias range's centre; set imu_bias_deg to move it) and its noise is the model's, not the head's
+        # /lowstate's torso IMU (export imu.source lowstate): its quaternion, as the policy reads it, reads this
+        # rotation when level (the trained range's centre; set imu_bias_deg to move it): for imu.orientation
+        # calibrated what lmg_deploy's calibration leaves (residual_deg, 0 at its centre), for raw the offset itself
+        # (quat_bias_deg); its noise is the model's, not the head's
         self.lowstate = imu.get("source") == "lowstate"
-        self.imu_bias_deg = ({k: 0.5 * (lo + hi) for k, (lo, hi) in imu["quat_bias_deg"].items()} if self.lowstate
+        self.imu_bias_deg = ({k: 0.5 * (lo + hi) for k, (lo, hi) in imu_bias_ranges(imu).items()} if self.lowstate
                              else {"roll": 0.0, "pitch": 0.0, "yaw": 0.0})
         if self.lowstate:
             self.NOISE = {**self.NOISE, "ang_vel": 0.03, "grav": 0.0017}

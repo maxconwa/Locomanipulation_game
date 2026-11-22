@@ -19,8 +19,12 @@ prepose_reset (a reset event after reset_base and reset_joints) redraws a share 
   as on the hoist; at the waist it tumbled), share x (m g + k_z (z_anchor - z) - c_z v_z), never pushing, with a soft
   horizontal tether to the anchor; it carries
   its share until release_start (0 with release_now_prob, else U(keep_range)) and lets go over U(release_duration_range)
-  s. The env sets it once per policy step (apply_support) and the fall check ignores an env while it carries any
-  weight (support_share > 0). The rewards are unchanged under it.
+  s. A share of the hung ones (lower_prob) is lowered first, as the hoist does before it is unhooked: from
+  U(lower_start_range) s the anchor comes down over U(lower_duration_range) s by the feet's lift plus a slack of
+  U(lower_slack_range) m (the rope's spring then carries less: at k_z 3000 N/m, 0.2 m of slack takes about 600 N off),
+  and the rope lets go U(settle_range) s after the lowering ends. The env sets the force once per policy step
+  (apply_support) and the fall check ignores an env while the rope is attached (support_share > 0). The rewards are
+  unchanged under it.
 
 A fixed base (LocoManip-ArmsOnly-v0's pinned pelvis) keeps its upright pose and gets no gantry: only the joints are
 drawn.
@@ -81,7 +85,8 @@ class prepose_reset(ManagerTermBase):
         self.active = torch.zeros(n, dtype=torch.bool, device=dev)
         self.share0, self.weight = zeros(), zeros()
         self.release_start, self.release_duration = zeros(), zeros()
-        self.anchor = torch.zeros(n, 3, device=dev)
+        self.anchor = torch.zeros(n, 3, device=dev)  # where the hook was at the reset (anchor_at: where it is now)
+        self.lower_start, self.lower_duration, self.lower_drop = zeros(), zeros(), zeros()
         self._forces = torch.zeros(n, 1, 3, device=dev)
         self._torques = torch.zeros(n, 1, 3, device=dev)
         self._pushing = False
@@ -95,12 +100,15 @@ class prepose_reset(ManagerTermBase):
                  joint_ranges: dict, sag_prob: float, sag_ankle: float, sag_knee: float, fast_vel_prob: float,
                  fast_vel: float, pitch_range: tuple, roll_range: tuple, clearance: float, hung_prob: float,
                  partial_prob: float, partial_share_range: tuple, lift_range: tuple, release_now_prob: float,
-                 keep_range: tuple, release_duration_range: tuple, feet_body_names: list, support_body: str,
+                 keep_range: tuple, release_duration_range: tuple, lower_prob: float, lower_start_range: tuple,
+                 lower_duration_range: tuple, lower_slack_range: tuple, settle_range: tuple, feet_body_names: list,
+                 support_body: str,
                  support_point: tuple, support_stiffness: float, support_damping: float, tether_stiffness: float, tether_damping: float):
         robot, dev = self.robot, env.device
         env_ids = torch.as_tensor(env_ids, device=dev)
         self.active[env_ids] = False
         self.share0[env_ids] = 0.0
+        self.lower_drop[env_ids] = 0.0
         ids = env_ids[torch.rand(len(env_ids), device=dev) < prob]
         m = len(ids)
         if m == 0:
@@ -150,11 +158,18 @@ class prepose_reset(ManagerTermBase):
 
         # -- the gantry
         self.share0[ids] = torch.where(hung, 1.0, torch.where(partial, u(*partial_share_range, m), 0.0))
-        masses = robot.root_physx_view.get_masses()[ids.cpu()].sum(dim=1).to(dev)
+        masses = env.physx_body_props()[0][ids.cpu()].sum(dim=1).to(dev)
         self.weight[ids] = masses * GRAVITY
         now = torch.rand(m, device=dev) < release_now_prob
         self.release_start[ids] = torch.where(now, 0.0, u(*keep_range, m))
         self.release_duration[ids] = u(*release_duration_range, m)
+        # the hoist lowering some of the hung ones onto their feet, the release after it
+        lowered = hung & (torch.rand(m, device=dev) < lower_prob)
+        self.lower_start[ids] = u(*lower_start_range, m)
+        self.lower_duration[ids] = u(*lower_duration_range, m)
+        self.lower_drop[ids] = torch.where(lowered, lift + u(*lower_slack_range, m), 0.0)
+        after = self.lower_start[ids] + self.lower_duration[ids] + u(*settle_range, m)
+        self.release_start[ids] = torch.where(lowered, after, self.release_start[ids])
         # the anchor where the hook is now: the rope at rest there (the base only moved up since the links' poses)
         hook = self._hook()[0][ids]
         self.anchor[ids] = hook + (pose[:, :3] - robot.data.root_link_pos_w[ids])
@@ -178,6 +193,14 @@ class prepose_reset(ManagerTermBase):
         vel = data.body_link_lin_vel_w[:, b] + torch.cross(data.body_link_ang_vel_w[:, b], arm, dim=1)
         return pos, vel
 
+    def anchor_at(self, t: torch.Tensor) -> torch.Tensor:
+        """Each env's rope anchor at episode time t (s): where the hook was at the reset, lowered by lower_drop over
+        [lower_start, lower_start + lower_duration] (0 for the envs not lowered)."""
+        lowered = ((t - self.lower_start) / self.lower_duration.clamp(min=1e-6)).clamp(0.0, 1.0)
+        anchor = self.anchor.clone()
+        anchor[:, 2] -= self.lower_drop * lowered
+        return anchor
+
     def support_share(self, t: torch.Tensor) -> torch.Tensor:
         """The share of the weight each env's rope carries at episode time t (s): share0 until release_start, then
         down to 0 over release_duration."""
@@ -199,8 +222,9 @@ class prepose_reset(ManagerTermBase):
             return
         k_z, c_z, k_xy, c_xy = self._gains
         pos, vel = self._hook()
-        lift = share * (self.weight + k_z * (self.anchor[:, 2] - pos[:, 2]) - c_z * vel[:, 2])
-        tether = share.unsqueeze(1) * (k_xy * (self.anchor[:, :2] - pos[:, :2]) - c_xy * vel[:, :2])
+        anchor = self.anchor_at(t)
+        lift = share * (self.weight + k_z * (anchor[:, 2] - pos[:, 2]) - c_z * vel[:, 2])
+        tether = share.unsqueeze(1) * (k_xy * (anchor[:, :2] - pos[:, :2]) - c_xy * vel[:, :2])
         self._forces[:, 0, 2] = torch.where(carrying, lift.clamp(min=0.0), 0.0)
         self._forces[:, 0, :2] = torch.where(carrying.unsqueeze(1), tether, 0.0)
         lever = pos - self.robot.data.body_com_pos_w[:, self._support_body]

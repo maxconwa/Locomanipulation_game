@@ -1,10 +1,11 @@
-"""The scene: one H1-2 per env on ALMI-Open's rough terrain, its contact sensors, height scan and head IMU."""
+"""The scene: one H1-2 per env on ALMI-Open's rough terrain, its contact sensors and head IMU (the ground's height
+under the robot comes from a map of the terrain, terrain.py, not a height scan)."""
 
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensorCfg, ImuCfg, RayCasterCfg, patterns
+from isaaclab.sensors import ContactSensorCfg, ImuCfg
 from isaaclab.terrains import TerrainGeneratorCfg, TerrainImporterCfg
 from isaaclab.terrains.height_field import HfRandomUniformTerrainCfg
 from isaaclab.terrains.height_field.hf_terrains import random_uniform_terrain
@@ -13,7 +14,8 @@ from isaaclab.utils import configclass
 
 from locomanipulation_game.assets.h1_2 import COLLISION_LINK_NAMES, H1_2_MAGPIE_CFG
 
-HEIGHT_SCAN_RAISE = 20.0
+from .terrain import KeptMeshTerrainImporter
+
 SELF_CONTACT_LINK_NAMES = COLLISION_LINK_NAMES[:-1]
 SELF_CONTACT_SENSOR_NAMES = [f"self_contact_{link}" for link in SELF_CONTACT_LINK_NAMES]
 # placeholder: LocoManipMarlEnvCfg.sync_physics_rate sets it to one slot per physics substep of a policy step
@@ -63,6 +65,7 @@ TERRAINS_ROUGH_CFG = TerrainGeneratorCfg(
 @configclass
 class TerrainSceneCfg(InteractiveSceneCfg):
     terrain = TerrainImporterCfg(
+        class_type=KeptMeshTerrainImporter,  # keeps the mesh for the ground's height map (terrain.py)
         prim_path="/World/ground",
         terrain_type="generator",
         terrain_generator=TERRAINS_ROUGH_CFG,
@@ -86,14 +89,6 @@ class TerrainSceneCfg(InteractiveSceneCfg):
         prim_path="/World/light",
         spawn=sim_utils.DomeLightCfg(intensity=750.0, color=(0.75, 0.75, 0.75)),
     )
-    height_scanner = RayCasterCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/pelvis",
-        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, HEIGHT_SCAN_RAISE)),
-        ray_alignment="yaw",
-        pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=(1.6, 1.0)),
-        debug_vis=True,
-        mesh_prim_paths=["/World/ground"],
-    )
     # The torso IMU, the frame of /lowstate's imu_state: imu_link, fixed to torso_link at (-0.04452, -0.01891, 0.27756)
     # m, unrotated (GOLEM's URDF, CL_Assets). debug_vis also makes the sensor compute at every physics substep
     # (SensorBase.update), which the env's IMU model (lowstate_imu.py) samples.
@@ -101,6 +96,7 @@ class TerrainSceneCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/Robot/imu_link",
         debug_vis=True,
     )
+
     def __post_init__(self):
         # PhysX filters one body against many, never many against many, so each
         # link gets its own sensor. Each filters only against the links after it

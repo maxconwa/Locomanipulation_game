@@ -16,7 +16,7 @@ from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 
 from ..golem_safety import GOLEM_LIMITS
-from .commands import ground_height
+from ..terrain import ground_height
 from .legs_rewards import STANCE_THRESHOLD, leg_phase, standing_command
 
 if TYPE_CHECKING:
@@ -161,14 +161,13 @@ def arm_target_pos_capped(env: ManagerBasedRLEnv, command_name: str, arm: int, c
     return pos_error[:, arm].clamp(max=cap)
 
 
-def base_height_band(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, min_height: float,
-                     max_height: float) -> torch.Tensor:
-    """In [0, 1]: 1 while the pelvis's height above the scanned ground is within [min_height, max_height], exp(-100 x)
-    at x m outside (0.37 at 1 cm, 0.05 at 3 cm), 0 where every ray missed. A reward for staying in the band only, as
+def base_height_band(env: ManagerBasedRLEnv, min_height: float, max_height: float) -> torch.Tensor:
+    """In [0, 1]: 1 while the pelvis's height above the ground (terrain.py) is within [min_height, max_height],
+    exp(-100 x) at x m outside (0.37 at 1 cm, 0.05 at 3 cm). A reward for staying in the band only, as
     body_pair_distance_band."""
-    height = env.scene["robot"].data.root_pos_w[:, 2] - ground_height(env.scene.sensors[sensor_cfg.name])
+    height = env.scene["robot"].data.root_pos_w[:, 2] - ground_height(env)
     outside = torch.clamp(min_height - height, min=0.0) + torch.clamp(height - max_height, min=0.0)
-    return torch.nan_to_num(torch.exp(-outside * 100.0), nan=0.0)
+    return torch.exp(-outside * 100.0)
 
 
 def joint_offset_band(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, max_offset: float, scale: float = 0.05,
@@ -335,7 +334,7 @@ def feet_swing_height_tracking_exp(
     rest_height: float,
     lift_height: float,
     command_name: str = "base_velocity",
-    terrain_sensor_cfg: SceneEntityCfg | None = None,
+    above_ground: bool = False,
     std: float = 0.03,
     loose_std: float = 0.1,
     loose_weight: float = 0.0,
@@ -343,11 +342,11 @@ def feet_swing_height_tracking_exp(
     """sin(pi * s) * exp(-(foot_z - reference)^2 / std^2) per foot in its swing phase, summed over the feet; stance
     feet give 0.
 
-    s is the swing's progress on the gait clock and the reference rest_height + lift_height * sin(pi * s) over the
-    scanned ground (terrain_sensor_cfg). The error is two-sided (the foot goes to the reference's height, not past
+    s is the swing's progress on the gait clock and the reference rest_height + lift_height * sin(pi * s), over the
+    ground under the pelvis with above_ground (terrain.py), else over z = 0. The error is two-sided (the foot goes to the reference's height, not past
     it) and weighted by the reference's own lift share sin(pi * s): at the swing's ends the reference sits at
     rest_height, where a dragged foot matches it (unweighted, that paid a dragged foot 0.31 of a full lift; weighted,
-    0.15 at std 0.03, and 0.54 at half the lift height). 0 where every ray of the scan missed the ground.
+    0.15 at std 0.03, and 0.54 at half the lift height).
 
     loose_weight (0: off) is the share of the kernel given to a second, looser one at loose_std, for lifts several
     std high: at a 15 cm lift the 0.03 kernel alone paid a foot lifting 0-6 cm 0.02-0.06 of a full lift, no slope to
@@ -355,14 +354,13 @@ def feet_swing_height_tracking_exp(
     """
     asset = env.scene[asset_cfg.name]
     foot_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
-    if terrain_sensor_cfg is not None:
-        foot_z = foot_z - ground_height(env.scene.sensors[terrain_sensor_cfg.name]).unsqueeze(1)
+    if above_ground:
+        foot_z = foot_z - ground_height(env).unsqueeze(1)
     phase = leg_phase(env, command_name)
     swing = phase >= STANCE_THRESHOLD
     progress = ((phase - STANCE_THRESHOLD) / (1.0 - STANCE_THRESHOLD)).clamp(0.0, 1.0)
     lift_share = torch.sin(torch.pi * progress)
     reference = rest_height + lift_height * lift_share
-    # ground_height is NaN where every ray missed: no reward there, as base_height_band (a NaN stops the run)
     error_sq = torch.square(foot_z - reference)
     kernel = (1.0 - loose_weight) * torch.exp(-error_sq / std**2) + loose_weight * torch.exp(-error_sq / loose_std**2)
     kernel = torch.nan_to_num(kernel, nan=0.0)

@@ -8,7 +8,10 @@ actions, residual filter), and compares:
   networks       the exported legs.pt / arms.pt on the env's observation vs skrl's mean action (clamped)
   targets        the deploy joint targets for the env's action vs the targets the env applied
   gyro_lowpass   lmg_deploy's gyro low-pass on env 0's IMU samples vs the env's
-and writes the worst differences per term to <out>/parity.json. Exits 1 when any is over --tolerance. The arm goals' odometry is FAST-LIO's on the robot and
+For an export on the calibrated torso IMU (export.yaml imu.orientation: calibrated) the controller gets an IMU
+calibration (--imu_calibration_deg) and the quaternion the robot would report with that offset, so the observations
+also check lmg_deploy's calibration against the level quaternion the env reads.
+Writes the worst differences per term to <out>/parity.json. Exits 1 when any is over --tolerance. The arm goals' odometry is FAST-LIO's on the robot and
 the true motion here: not compared.
 
     python scripts/skrl/deploy_parity.py --checkpoint <run>/checkpoints/agent_<N>.pt --export <export dir> \
@@ -34,17 +37,22 @@ parser.add_argument("--tolerance", type=float, default=2.0e-3,
 parser.add_argument("--num_envs", type=int, default=4)
 parser.add_argument("--steps", type=int, default=600)
 parser.add_argument("--arm_goal_prob", type=float, default=None, help="Share of events that are arm goals; default: the task's.")
+parser.add_argument("--imu_calibration_deg", default="0.3,-2.4,0.5",
+                    help="roll,pitch,yaw: the offset a calibrated export's robot is given (its quaternion reads this level)")
 parser.add_argument("--out", default=None)
 AppLauncher.add_app_launcher_args(parser)
 args, hydra_args = parser.parse_known_args()
 args.headless = True
 app = AppLauncher(args).app
 
+import math  # noqa: E402
+
 import gymnasium as gym  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from locomanipulation_game.tasks.locomanip_marl.recurrent import MarlRunner  # noqa: E402
 
+from isaaclab.utils.math import quat_from_euler_xyz, quat_mul  # noqa: E402
 from isaaclab_rl.skrl import SkrlVecEnvWrapper  # noqa: E402
 from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 
@@ -74,7 +82,16 @@ def main(env_cfg, agent_cfg: dict):
                         extra_frames=[cfg["slam_frame"]])
     legs_net = load_network(os.path.join(args.export, cfg["legs"]["policy"]), cfg["legs"]["num_obs"], cfg["legs"]["num_actions"])
     arms_net = load_network(os.path.join(args.export, cfg["arms"]["policy"]), cfg["arms"]["num_obs"], cfg["arms"]["num_actions"])
-    ctrl = MarlController(cfg, kin, legs_net, arms_net)
+    # a calibrated export: the robot's quaternion carries an offset lmg_deploy's calibration takes back out
+    calibrated = (cfg.get("imu") or {}).get("orientation") == "calibrated"
+    roll, pitch, yaw = (float(v) for v in args.imu_calibration_deg.split(","))
+    if calibrated:
+        ctrl = MarlController(cfg, kin, legs_net, arms_net, imu_calibration={
+            "roll_deg": roll, "pitch_deg": pitch, "yaw_deg": yaw, "rotate_gyro": False})
+        offset_q = quat_from_euler_xyz(*(torch.tensor([math.radians(v)]) for v in (roll, pitch, yaw)))
+        print(f"[INFO] calibrated IMU: the robot's quaternion reads roll {roll}, pitch {pitch}, yaw {yaw} deg level")
+    else:
+        ctrl = MarlController(cfg, kin, legs_net, arms_net)
     out_dir = args.out or os.path.join(args.export, "parity")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -139,8 +156,14 @@ def main(env_cfg, agent_cfg: dict):
         d = robot.data
         gyro = deploy_gyro.value if deploy_gyro.value is not None else imu.data.ang_vel_b[i].double().cpu().numpy()
         return RobotState(q=d.joint_pos[i, ids].double().cpu().numpy(), dq=d.joint_vel[i, ids].double().cpu().numpy(),
-                          quat=imu.data.quat_w[i].double().cpu().numpy(),
+                          quat=reported_quat(imu.data.quat_w[i]),
                           gyro=gyro, acc=imu.data.lin_acc_b[i].double().cpu().numpy())
+
+    def reported_quat(quat_w: torch.Tensor) -> np.ndarray:
+        """The quaternion /lowstate would give: the true one, times the calibration's offset for a calibrated export."""
+        if calibrated:
+            quat_w = quat_mul(quat_w.unsqueeze(0), offset_q.to(quat_w.device))[0]
+        return quat_w.double().cpu().numpy()
 
     def sync(i: int = 0):
         ctrl.mode = Mode.ARM if bool(arm.arm_mode[i]) else Mode.NAV

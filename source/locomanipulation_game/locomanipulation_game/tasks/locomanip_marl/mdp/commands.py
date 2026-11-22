@@ -22,7 +22,7 @@ from isaaclab.envs.mdp.commands import UniformVelocityCommand, UniformVelocityCo
 from isaaclab.managers import CommandTerm, CommandTermCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.markers.config import FRAME_MARKER_CFG
-from isaaclab.sensors import ContactSensor, RayCaster
+from isaaclab.sensors import ContactSensor
 from isaaclab.utils import configclass
 from isaaclab.utils.math import (
     axis_angle_from_quat,
@@ -36,6 +36,7 @@ from isaaclab.utils.math import (
     yaw_quat,
 )
 
+from ..terrain import ground_height
 from .arm_kinematics import ArmKinematics
 from .legs_rewards import standing_command
 
@@ -49,15 +50,6 @@ __all__ = [
     "ModalVelocityCommandCfg",
     "ground_height",
 ]
-
-
-def ground_height(scanner: RayCaster) -> torch.Tensor:
-    """Mean height of the scan's ray hits, ignoring rays that missed (inf); nan for an env where every ray missed."""
-    hits = scanner.data.ray_hits_w[..., 2]
-    finite = torch.isfinite(hits)
-    total = torch.where(finite, hits, torch.zeros_like(hits)).sum(dim=1)
-    count = finite.sum(dim=1)
-    return torch.where(count > 0, total / count.clamp(min=1), torch.full_like(total, float("nan")))
 
 
 def _apply(pos_a, quat_a, pose_b):
@@ -459,7 +451,6 @@ class ArmTargetsCommand(CommandTerm):
         super().__init__(cfg, env)
 
         self.robot: Articulation = env.scene[cfg.asset_name]
-        self.scanner: RayCaster = env.scene.sensors[cfg.height_scanner_name]
         self.num_arms = len(cfg.body_names)
         self.body_ids = [self.robot.find_bodies(name)[0][0] for name in cfg.body_names]
         shape = (self.num_envs, self.num_arms, 7)
@@ -579,9 +570,7 @@ class ArmTargetsCommand(CommandTerm):
     def standing_frame_w(self) -> tuple[torch.Tensor, torch.Tensor]:
         """(origin, yaw-only quaternion) of the standing frame in world."""
         origin = self.robot.data.root_pos_w.clone()
-        ground = ground_height(self.scanner)
-        # an env whose scan missed entirely: fall back to the pelvis height
-        origin[:, 2] = torch.where(torch.isnan(ground), origin[:, 2], ground + self.cfg.standing_height)
+        origin[:, 2] = ground_height(self._env) + self.cfg.standing_height
         return origin, yaw_quat(self.robot.data.root_quat_w)
 
     def targets_w(self) -> torch.Tensor:
@@ -821,14 +810,12 @@ class ArmTargetsCommand(CommandTerm):
         rest = 1.0 - arm
         self._rest_steps += rest
         self._rest_pos_err += pos_error.mean(dim=1) * rest
-        ground = ground_height(self.scanner)
-        counted = arm * torch.isfinite(ground).float()
-        pelvis_drop = torch.nan_to_num(self.cfg.standing_height - (self.robot.data.root_pos_w[:, 2] - ground), nan=0.0)
-        self._crouch_n += counted
-        self._crouch_t += self.target_drop * counted
-        self._crouch_p += pelvis_drop * counted
+        pelvis_drop = self.cfg.standing_height - (self.robot.data.root_pos_w[:, 2] - ground_height(self._env))
+        self._crouch_n += arm
+        self._crouch_t += self.target_drop * arm
+        self._crouch_p += pelvis_drop * arm
         # the pelvis below the table stance while navigating (the sport stance stands 2.3 cm lower)
-        walking = (1.0 - arm) * torch.isfinite(ground).float()
+        walking = 1.0 - arm
         self._nav_n += walking
         self._nav_p += pelvis_drop * walking
 
@@ -1067,7 +1054,6 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     """Per arm, bodies that must have no contact for a table sample to count."""
     contact_sensor_name: str = "contact_forces"
     collision_force_threshold: float = 1.0
-    height_scanner_name: str = "height_scanner"
     standing_height: float = MISSING
     """Pelvis height above the ground of the stance the tables were built at: the standing frame's origin."""
 

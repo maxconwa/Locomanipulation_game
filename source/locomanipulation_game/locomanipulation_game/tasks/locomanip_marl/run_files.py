@@ -103,10 +103,45 @@ def evaluation_cfgs(env_cfg, agent_cfg: dict, checkpoint: str, run_dir: str):
     checkpoint, nothing logged or saved."""
     env_cfg.log_dir = run_dir
     env_cfg.training = False
+    run_imu(env_cfg, run_dir)
     env_cfg.state_checkpoint_path = state_checkpoint_for(checkpoint)
     agent_cfg["trainer"]["close_environment_at_exit"] = False
     agent_cfg["agent"]["experiment"]["write_interval"] = 0
     agent_cfg["agent"]["experiment"]["checkpoint_interval"] = 0
+
+
+def run_imu(env_cfg, run_dir: str) -> None:
+    """Give env_cfg the torso IMU orientation model the run trained with (<run>/params/env.yaml lowstate_imu): its
+    orientation and bias ranges. A run from before 2026-11-21 trained on the raw quaternion's offset (orientation
+    "raw", its own quat_bias_deg) and runs that way on the robot; scored on today's calibrated default it would read an
+    attitude about 2.8 deg off the one it learned."""
+    import yaml
+
+    if getattr(env_cfg, "lowstate_imu", None) is None:
+        return
+    path = os.path.join(run_dir, "params", "env.yaml")
+    if not os.path.isfile(path):
+        return
+
+    class Loader(yaml.SafeLoader):  # Isaac Lab's dump_yaml writes python/* tags
+        pass
+
+    def any_tag(loader, suffix, node):
+        if isinstance(node, yaml.MappingNode):
+            return loader.construct_mapping(node, deep=True)
+        if isinstance(node, yaml.SequenceNode):
+            return loader.construct_sequence(node, deep=True)
+        return loader.construct_scalar(node)
+
+    Loader.add_multi_constructor("tag:yaml.org,2002:python/", any_tag)
+    Loader.add_multi_constructor("!", any_tag)
+    saved = (yaml.load(open(path).read(), Loader=Loader) or {}).get("lowstate_imu")
+    if not saved:
+        return
+    imu = env_cfg.lowstate_imu
+    imu.orientation = saved.get("orientation", "raw")
+    imu.quat_bias_deg = {k: tuple(float(v) for v in saved["quat_bias_deg"][k]) for k in ("roll", "pitch", "yaw")}
+    print(f"[INFO] torso IMU as the run trained: orientation {imu.orientation}, bias {imu.quat_bias_deg}")
 
 
 def env_override_keys(overrides: list[str]) -> list[str]:

@@ -38,9 +38,11 @@ def read_imu(run_dir: Path) -> dict:
     """The IMU a run trained with: {"frame": the robot frame it sits on, "offset": [x, y, z] in it (m)}, plus
     "gyro_lowpass_hz" when the policy read its gyro through the low-pass (imu_filter.GyroLowpass; lmg_deploy applies
     it only when the key is present). Runs on the torso IMU as /lowstate reports it (env cfg lowstate_imu,
-    lowstate_imu.py) add "source": "lowstate" (the deploy reads /lowstate's imu_state as reported, no trim),
-    "quat_bias_deg" (the quaternion bias ranges trained, roll / pitch / yaw: [lo, hi]) and "acc" ("dropped" when no
-    actor reads the accelerometer)."""
+    lowstate_imu.py) add "source": "lowstate", "orientation" and its bias ranges (roll / pitch / yaw: [lo, hi]), and
+    "acc" ("dropped" when no actor reads the accelerometer). "orientation": "calibrated" (since 2026-11-21): lmg_deploy
+    applies the robot's IMU calibration before the policy reads the quaternion, and "residual_deg" is the calibration
+    error trained; "raw" (the runs before, whose env.yaml has no orientation): the deploy reads the quaternion as
+    reported, and "quat_bias_deg" is the offset trained."""
     env = _yaml_load_any((Path(run_dir) / "params" / "env.yaml").read_text())
     imu = (env.get("scene") or {}).get("imu") or {}
     frame = str(imu.get("prim_path", "/imu_link")).rsplit("/", 1)[-1]
@@ -48,8 +50,10 @@ def read_imu(run_dir: Path) -> dict:
     out = {"frame": frame, "offset": [round(float(v), 6) for v in pos]}
     lowstate = env.get("lowstate_imu")
     if lowstate:
-        out = {"source": "lowstate", **out,
-               "quat_bias_deg": {k: [float(v) for v in lowstate["quat_bias_deg"][k]] for k in ("roll", "pitch", "yaw")}}
+        orientation = lowstate.get("orientation", "raw")
+        ranges = {k: [float(v) for v in lowstate["quat_bias_deg"][k]] for k in ("roll", "pitch", "yaw")}
+        out = {"source": "lowstate", **out, "orientation": orientation,
+               ("residual_deg" if orientation == "calibrated" else "quat_bias_deg"): ranges}
     if env.get("gyro_lowpass_hz"):
         out["gyro_lowpass_hz"] = float(env["gyro_lowpass_hz"])
     if lowstate:

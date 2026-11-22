@@ -4,7 +4,8 @@ The IMU is imu_link, fixed to torso_link at (-0.04452, -0.01891, 0.27756) m, unr
 scene["imu"]. /lowstate gives at 500 Hz the firmware filter's quaternion (imu_link to world), the gyroscope and the
 accelerometer. The actors read:
 - projected_gravity from the quaternion: the true orientation lag_s ago (drawn per reset), times a bias rotation drawn
-  per reset (body frame: what it reads when the torso is level), times a small noise rotation each step;
+  per reset (body frame: what it reads when the torso is level; with orientation "calibrated", the default, a small
+  zero-centred one, the error left after lmg_deploy's per-robot calibration), times a small noise rotation each step;
 - base_ang_vel from the gyroscope: the true rate plus a bias drawn per reset, noise, and a vibration that grows with
   the legs' target rate (the torso's shake when the legs bang-bang), through the deploy's 8 Hz low-pass
   (imu_filter.GyroLowpass), sampled at every physics substep as /lowstate's 500 Hz;
@@ -16,7 +17,11 @@ Measured on the robot (lmg_legsenergy200k_s43_2026-11-20_1157, still on the hois
 pitch -3.2 to -3.4 deg and roll -0.05 to +0.2 deg against the head MID-360's; its noise 0.02-0.07 deg; the gyroscope's
 bias about (-0.001, +0.0045, +0.005 to +0.015) rad/s and noise (0.012, 0.009, 0.010-0.023) rad/s; during the thrash
 the torso gyro's std 0.4-0.8 rad/s. Pitch is positive nose down, roll positive tilting right (Isaac's x-y-z Euler).
-GOLEM applies no trim to a policy trained on this model (export.yaml imu.source: lowstate).
+Since 2026-11-21 the static offset is removed on the robot, not learned: lmg_deploy rotates /lowstate's quaternion by
+the robot's measured calibration before the policy reads it, and training draws only the calibration's error, +-1 deg
+(orientation "calibrated"; export.yaml imu.orientation: calibrated, imu.residual_deg). Runs before then trained on the
+offset itself (pitch -3.6..-2.0) and run on the raw quaternion (orientation "raw"; their exports carry quat_bias_deg
+and no orientation key); lmg_deploy applies no calibration to those.
 """
 
 from __future__ import annotations
@@ -35,9 +40,13 @@ from .imu_filter import GyroLowpass
 class LowstateImuCfg:
     """The model's draws (the module docstring); every range is drawn uniformly per env at each reset."""
 
-    quat_bias_deg: dict[str, tuple[float, float]] = {"roll": (-0.6, 0.4), "pitch": (-3.6, -2.0), "yaw": (-1.0, 1.0)}
-    """What the quaternion reads with the torso level: centred on the measured pitch -2.8 (-2.3 to -3.3 by the two
-    references) and roll -0.1, with a margin."""
+    orientation: str = "calibrated"
+    """"calibrated": the deploy removes the robot's static offset (lmg_deploy's IMU calibration) and quat_bias_deg is
+    what is left of it; "raw": the policy reads /lowstate's quaternion as reported and quat_bias_deg is the offset
+    itself (the runs before 2026-11-21: roll (-0.6, 0.4), pitch (-3.6, -2.0), centred on the measured pitch -2.8)."""
+    quat_bias_deg: dict[str, tuple[float, float]] = {"roll": (-1.0, 1.0), "pitch": (-1.0, 1.0), "yaw": (-1.0, 1.0)}
+    """What the quaternion reads with the torso level, after the deploy's calibration: its error, zero-centred. The
+    references for the offset disagree by about 1 deg (pitch -2.3 by the torso's accelerometer, -3.3 by the head's)."""
     quat_noise_deg: float = 0.1
     """Std of a fresh roll and pitch noise rotation each policy step (measured 0.02-0.07)."""
     quat_lag_s: tuple[float, float] = (0.0, 0.02)
@@ -60,6 +69,8 @@ class LowstateImu:
     """num_envs torso IMUs (LowstateImuCfg). sample() at every physics substep; the outputs at the policy step."""
 
     def __init__(self, cfg: LowstateImuCfg, gyro_lowpass_hz: float, physics_dt: float, num_envs: int, device):
+        if cfg.orientation not in ("calibrated", "raw"):
+            raise ValueError(f"LowstateImuCfg.orientation must be 'calibrated' or 'raw', not {cfg.orientation!r}")
         self.cfg, self.dt, self.n, self.device = cfg, float(physics_dt), num_envs, device
         self.depth = int(math.ceil(cfg.quat_lag_s[1] / physics_dt)) + 1
         self._quat_hist = torch.zeros(num_envs, self.depth, 4, device=device)

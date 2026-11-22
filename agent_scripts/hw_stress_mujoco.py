@@ -21,8 +21,10 @@ observations, all from the export's settings) and adds the perturbations (CONDIT
                    bag1449  the one at its 14:49 engage (data/bag_engage_q_1449.npy: unsettled, 0.16 rad off)
                    random   a draw from the training's pre-pose range (PREPOSE_JOINT_RANGES; per seed)
                  Run for PP_AFTER_S with a zero command; scored on the first 0.5 s and the stance after (pp table)
-  imu_pitch, vib_k   for an export on the torso IMU (export imu.source lowstate): the quaternion's pitch bias (deg;
-                 default the trained range's centre), and its gyro's vibration tied to leg motion, x TORSO_GYRO_PER_DQ
+  imu_pitch, vib_k   for an export on the torso IMU (export imu.source lowstate): the quaternion's pitch bias as the
+                 policy reads it ("lo" / "hi": the trained range's ends; default its centre): for imu.orientation
+                 calibrated the error lmg_deploy's calibration leaves, for raw the offset itself; and its gyro's
+                 vibration tied to leg motion, x TORSO_GYRO_PER_DQ
 Per job (one condition, profile, plant and seed) one robot for --seconds; jobs run in parallel processes. --video COND
 renders one job of COND (seed 0) to an mp4 instead.
 
@@ -53,7 +55,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 from mujoco_evals.common import load_deploy_cfg  # noqa: E402
 from mujoco_evals.mujoco_sim import (  # noqa: E402
-    ALL_NAMES, MarlMujoco, mjcf_path, qrot)
+    ALL_NAMES, MarlMujoco, imu_bias_ranges, mjcf_path, qrot)
 
 # the conditions; hw: the measured hardware effects together
 _HW = {"strength": 0.85, "dq_lag": 12.0, "gyro_k": 1.0, "delay_ms": 20.0, "enc": 0.02}
@@ -89,15 +91,15 @@ CONDITIONS = {
 }
 # the pre-pose grid: each start with the rope kept and released, with the hardware effects and the torso IMU's
 # vibration at x4 (sagged_engage.py's --head-res 4 matched the bag's input); the bag's pose and the settled one also at
-# the quaternion bias range's ends
+# the ends of the quaternion bias range the export trained on (pitch_lo, pitch_hi)
 PP_STARTS = ("hung", "settled", "bag", "bag1449", "random")
 for _start in PP_STARTS:
     for _rope in ("keep", "release"):
         CONDITIONS[f"pp_{_start}_{_rope}"] = dict(_HW, prepose=_start, release=_rope == "release", vib_k=4.0)
 for _start in ("settled", "bag"):
-    for _pitch in (-3.6, -2.0):
-        CONDITIONS[f"pp_{_start}_release_pitch{_pitch:+.1f}"] = dict(_HW, prepose=_start, release=True, vib_k=4.0,
-                                                                      imu_pitch=_pitch)
+    for _end in ("lo", "hi"):
+        CONDITIONS[f"pp_{_start}_release_pitch_{_end}"] = dict(_HW, prepose=_start, release=True, vib_k=4.0,
+                                                               imu_pitch=_end)
 NOMINAL = {"strength": 1.0, "gain": 1.0, "dq_lag": 0.0, "gyro_k": 0.0, "delay_ms": 10.0, "torso_kg": 0.0, "enc": 0.0,
            "hang_s": 0.0, "lstm_reset_s": 0.0, "lstm_reset_which": "both", "prepose": "", "rope": 0.4,
            "release": False, "imu_pitch": None, "vib_k": 0.0}
@@ -178,9 +180,10 @@ class StressMujoco(MarlMujoco):
         imu = deploy.get("imu") or {}
         self.lowstate = imu.get("source") == "lowstate"
         if self.lowstate:
-            bias = {k: 0.5 * (lo + hi) for k, (lo, hi) in imu["quat_bias_deg"].items()}
+            ranges = imu_bias_ranges(imu)
+            bias = {k: 0.5 * (lo + hi) for k, (lo, hi) in ranges.items()}
             if f["imu_pitch"] is not None:
-                bias["pitch"] = f["imu_pitch"]
+                bias["pitch"] = ranges["pitch"][0 if f["imu_pitch"] == "lo" else 1]
             self.imu_bias_deg = bias
             r, pt, y = (math.radians(bias[k]) for k in ("roll", "pitch", "yaw"))
             rx = np.array([[1, 0, 0], [0, math.cos(r), -math.sin(r)], [0, math.sin(r), math.cos(r)]])

@@ -92,6 +92,7 @@ mm with the 0.05 rad clamp, which saturated off the table. Every policy's std ro
 
 import math
 
+from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
@@ -99,7 +100,8 @@ from isaaclab.utils import configclass
 from locomanipulation_game.assets.h1_2 import CL_ASSETS_DIR
 
 from . import mdp
-from .locomanip_marl_env_cfg import FINE_POS_STDS, ROT_STDS, ArmsRewardsCfg, LocoManipMarlEnvCfg, MarlRewardsCfg
+from .locomanip_marl_env_cfg import (_WRISTS, ARMS_ACTION, FINE_POS_STDS, ROT_STDS, ArmsRewardsCfg, LocoManipMarlEnvCfg,
+                                     MarlRewardsCfg)
 
 ARMS_OUTPUT_INIT_SCALE = 0.01
 ARMS_INITIAL_STD = 0.2
@@ -249,6 +251,14 @@ class ArmsOnlyEnvCfg(LocoManipMarlEnvCfg):
         for name in ARMS_DROPPED_OBS:
             setattr(self.observations.arms, name, None)
         self.observations.arms.wrist_poses.noise = None
+        # the world model's state: the arm action's own (mdp.IKPostureArmAction: the trajectory's target and velocity,
+        # the pose-error integral, the residual) and the wrists' poses
+        world = self.observations.world
+        for name, attr, relative in (("arm_ik_q", "_ik_q", True), ("arm_integral", "_integral", False),
+                                     ("arm_residual", "_residual", False), ("arm_traj_v", "_traj_v", False)):
+            setattr(world, name, ObsTerm(func=mdp.action_term_state, params={
+                "action_name": ARMS_ACTION, "attr": attr, "relative_to_default": relative}))
+        world.ee_poses = ObsTerm(func=mdp.body_pose_in_root_xyzw, params={"asset_cfg": _WRISTS})
         self.sync_derived()
 
     def sync_derived(self):
