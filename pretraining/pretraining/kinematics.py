@@ -109,6 +109,9 @@ class ForwardKinematics:
 
         self._origin_pos, self._origin_quat, self._axis = (
             table(tree.origin_pos), table(tree.origin_quat), table(tree.axis))
+        # The axes again as Python floats (exact copies of the float32 entries) for the joint quaternion: torch 2.7's
+        # inductor emits a Triton load of a constant row inside torch.cat that Triton 3.3 refuses to compile.
+        self._axis_values = [tuple(float(v) for v in row) for row in self._axis.tolist()]
         self._body_names = list(body_names)
         self.joint_names = list(tree.joint_names)
 
@@ -146,7 +149,8 @@ class ForwardKinematics:
             w = ang[parent]
             if col >= 0:
                 half = (joint_pos[..., col] / 2).unsqueeze(-1)
-                q = quat_mul(q, torch.cat([half.cos(), half.sin() * self._axis[k]], dim=-1))
+                s, axis = half.sin(), self._axis_values[k]
+                q = quat_mul(q, torch.cat([half.cos(), s * axis[0], s * axis[1], s * axis[2]], dim=-1))
                 w = w + quat_apply(q, self._axis[k].expand(*batch, 3)) * joint_vel[..., col : col + 1]
             pos.append(p), quat.append(q), lin.append(v), ang.append(w)
         return tuple(torch.stack([x[r] for r in self._rows], dim=-2) for x in (pos, quat, lin, ang))

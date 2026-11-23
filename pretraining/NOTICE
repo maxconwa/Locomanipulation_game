@@ -8,13 +8,16 @@ commit they come from.
   src/h12_train/tasks.py and the joint ranges of src/h12_train/robot/xmls/h1_2_magpie.xml); the fps and joint-name checks of
   pretraining/motions.py (src/h12_train/scripts/motion_files.py); the env composition of
   pretraining/tasks/track_env_cfg.py (src/h12_train/tasks.py: h12_flat_tracking_env_cfg, apply_gencoord,
-  h12_sensor_actor_group).
+  h12_sensor_actor_group); pretraining/marl/{actors,config,learner,representation,rewards,runner,runs,wm_env}.py
+  (src/h12_train/marl/ at the same paths, stage 1 only; the stage-1 goal and tool-frame helpers of
+  src/h12_train/marl/goals.py in pretraining/marl/{rewards,wm_env}.py) and the stage-1 cases of
+  pretraining/tests/test_two_agent.py (tests/{test_two_agent,test_runs}.py).
 - SuperMimic (HybridRobotics, commit 7e94b07): Apache License 2.0. Ported from it:
   pretraining/supermimic/goal_window.py (goal-window constants and helpers of src/supermimic/representations.py,
   quat_to_rot6d of src/supermimic/utils/helpers.py); the full-state and goal terms of
   pretraining/tasks/observations.py and the groups of pretraining/tasks/track_env_cfg.py
   (src/supermimic/tasks/env_cfgs.py); pretraining/supermimic/{models,replay_buffer,representations (GenCoord only),
-  sim_context}.py, learners/{learner_utils,policy_learner,wm_learner}.py, envs/{world_model_env,motion_tracking_env}.py,
+  sim_context}.py, tasks/task_spec.py, learners/{learner_utils,policy_learner,wm_learner}.py, envs/{world_model_env,motion_tracking_env}.py,
   runners/reset_sampling.py, runners/base_runner.py (BaseRunnerCfg, WorldModel, build_world_model, Ratio, BaseRunner
   of src/supermimic/runners/supermimic_runner.py) and utils/{helpers,gencoord_helpers,tracking_reward,logger,
   wandb_artifacts}.py, from the same paths under src/supermimic/.
