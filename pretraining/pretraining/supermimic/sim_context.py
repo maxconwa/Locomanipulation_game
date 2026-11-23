@@ -1,6 +1,7 @@
 # Ported from SuperMimic (HybridRobotics, commit 7e94b07, Apache-2.0), src/supermimic/sim_context.py. Changes: the
 # specs read Isaac Lab's articulation (PhysX shape material, COM offset from the USD COM, env.encoder_bias) instead of
-# env.sim.model; events are configclass attributes, not dict entries.
+# env.sim.model, the friction and COM once at bind (start-up events, checked) and cached; events are configclass
+# attributes, not dict entries.
 """Per-env sim-context conditioning for the world model."""
 
 from __future__ import annotations
@@ -48,6 +49,16 @@ class SimContextSpec(ABC):
         ...
 
     @staticmethod
+    def _startup_event(env: ManagerBasedRlEnv, name: str):
+        """The event cfg ``name``, which must be start-up mode: its values are read once and cached."""
+        event_cfg = getattr(env.cfg.events, name, None)
+        if event_cfg is None:
+            raise RuntimeError(f"{name}: no event '{name}' on env.cfg.events")
+        if event_cfg.mode != "startup":
+            raise RuntimeError(f"{name}: the event is mode={event_cfg.mode!r}; the cached read needs 'startup'")
+        return event_cfg
+
+    @staticmethod
     def _body_ids(asset, body_names) -> list[int]:
         """Articulation body indices of ``body_names``, in their order (PhysX views index bodies this way)."""
         return asset.find_bodies(list(body_names), preserve_order=True)[0]
@@ -58,6 +69,8 @@ class FootFrictionSpec(SimContextSpec):
 
     The ``foot_friction`` event writes one value per env to every shape of the
     foot bodies (mjlab's ``shared_random=True``); we read from the first match.
+    Read once from PhysX in ``bind()`` and cached on the env device: this assumes
+    a start-up-mode event (``bind()`` raises otherwise).
     """
 
     name = "foot_friction"
@@ -65,12 +78,10 @@ class FootFrictionSpec(SimContextSpec):
 
     def __init__(self) -> None:
         self._shape_idx: int | None = None
-        self._asset_name: str | None = None
+        self._value: torch.Tensor | None = None
 
     def bind(self, env: ManagerBasedRlEnv) -> list[tuple[float, float]]:
-        event_cfg = getattr(env.cfg.events, self.name, None)
-        if event_cfg is None:
-            raise RuntimeError(f"FootFrictionSpec: no event '{self.name}' on env.cfg.events")
+        event_cfg = self._startup_event(env, self.name)
         params = event_cfg.params
         ranges = params["friction_range"]
 
@@ -83,49 +94,47 @@ class FootFrictionSpec(SimContextSpec):
         matches = _shape_slices(asset, self._body_ids(asset, asset_cfg.body_names))
         if not matches:
             raise ValueError(f"FootFrictionSpec: no shapes in '{asset_cfg.name}' on {asset_cfg.body_names!r}")
-        self._asset_name = asset_cfg.name
         self._shape_idx = matches[0]
+        materials = asset.root_physx_view.get_material_properties()  # (E, shapes, 3), cpu
+        self._value = materials[:, self._shape_idx : self._shape_idx + 1, 0].to(env.device)
         return [ranges]
 
     def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
-        if self._shape_idx is None:
+        if self._value is None:
             raise RuntimeError("FootFrictionSpec.read() called before bind()")
-        materials = env.scene[self._asset_name].root_physx_view.get_material_properties()  # (E, shapes, 3), cpu
-        return materials[:, self._shape_idx : self._shape_idx + 1, 0].to(env.device)
+        return self._value
 
 
 class CoMOffsetSpec(SimContextSpec):
     """Per-env offset of the body's COM from its USD COM, in the body frame (mjlab's ``body_ipos``
-    offset; Isaac Lab's ``randomize_rigid_body_com`` adds it to the PhysX COM)."""
+    offset; Isaac Lab's ``randomize_rigid_body_com`` adds it to the PhysX COM). Read once from PhysX in ``bind()``
+    and cached on the env device: this assumes a start-up-mode event (``bind()`` raises otherwise)."""
 
     name = "base_com"
     dim = 3
 
     def __init__(self) -> None:
         self._body_id: int | None = None
-        self._asset_name: str | None = None
-        self._default_com: torch.Tensor | None = None
+        self._value: torch.Tensor | None = None
 
     def bind(self, env: ManagerBasedRlEnv) -> list[tuple[float, float]]:
-        event_cfg = getattr(env.cfg.events, self.name, None)
-        if event_cfg is None:
-            raise RuntimeError(f"CoMOffsetSpec: no event '{self.name}' on env.cfg.events")
+        event_cfg = self._startup_event(env, self.name)
         params = event_cfg.params
         ranges = params["com_range"]
         asset_cfg = params["asset_cfg"]
         if len(asset_cfg.body_names) != 1:
             raise ValueError(f"CoMOffsetSpec: expected exactly 1 body_name, got {asset_cfg.body_names!r}")
         asset = env.scene[asset_cfg.name]
-        self._asset_name = asset_cfg.name
         self._body_id = self._body_ids(asset, asset_cfg.body_names)[0]
-        self._default_com = _usd_center_of_mass(asset.root_physx_view.link_paths[0][self._body_id])
+        default_com = _usd_center_of_mass(asset.root_physx_view.link_paths[0][self._body_id])
+        coms = asset.root_physx_view.get_coms()  # (E, bodies, 7) pos + quat, cpu
+        self._value = (coms[:, self._body_id, :3] - default_com).to(env.device)
         return [ranges.get(axis, (0.0, 0.0)) for axis in ("x", "y", "z")]
 
     def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
-        if self._body_id is None:
+        if self._value is None:
             raise RuntimeError("CoMOffsetSpec.read() called before bind()")
-        coms = env.scene[self._asset_name].root_physx_view.get_coms()  # (E, bodies, 7) pos + quat, cpu
-        return (coms[:, self._body_id, :3] - self._default_com).to(env.device)
+        return self._value
 
 
 class EncoderBiasSpec(SimContextSpec):

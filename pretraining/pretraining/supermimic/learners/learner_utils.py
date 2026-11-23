@@ -1,6 +1,7 @@
 # Ported from SuperMimic (HybridRobotics, commit 7e94b07, Apache-2.0), src/supermimic/learners/learner_utils.py.
-# Changes: Muon from torch or, on torch < 2.9, learners/muon.py; CUDA-graph capture behind CUDA_GRAPHS, falling back
-# to eager updates (one warning) if capture fails.
+# Changes: Muon from torch or, on torch < 2.9, learners/muon.py; CUDA-graph capture behind CUDA_GRAPHS: a failed
+# capture turns it off and continues eagerly (one warning) if the CUDA RNG still works, else raises a RuntimeError
+# at once (rerun with PRETRAINING_CUDA_GRAPHS=0).
 """Shared learner utilities."""
 
 from __future__ import annotations
@@ -20,7 +21,9 @@ from pretraining.supermimic.learners.muon import Muon as _Muon
 Muon = getattr(torch.optim, "Muon", _Muon)
 
 CUDA_GRAPHS = os.environ.get("PRETRAINING_CUDA_GRAPHS", "1") != "0"
-"""Capture updates as CUDA graphs. A capture that fails on this torch build turns it off, with one warning."""
+"""Capture updates as CUDA graphs (``PRETRAINING_CUDA_GRAPHS=0`` turns it off). A capture that fails turns it off:
+if the CUDA RNG still works, updates continue eagerly after one warning; if the failed capture left the RNG unusable
+(torch 2.7 does), a RuntimeError is raised at once, telling to rerun with ``PRETRAINING_CUDA_GRAPHS=0``."""
 
 _log = logging.getLogger(__name__)
 
@@ -138,8 +141,8 @@ class CapturedUpdate:
                 try:
                     with torch.cuda.graph(graph, pool=pool, stream=stream):
                         self._outputs = self._fn(self._inputs)
-                except Exception as e:  # capture unsupported on this torch build: run every update eagerly
-                    _disable_cuda_graphs(e)
+                except Exception as e:  # capture unsupported: eager if the RNG survived, else fail fast
+                    _disable_cuda_graphs(e, state[0].device)
                     return self._fn(inputs)
                 self._graph, self._identity = graph, _identity(self._state())
             elif _identity(state) != self._identity:
@@ -149,9 +152,17 @@ class CapturedUpdate:
             return self._outputs
 
 
-def _disable_cuda_graphs(error: Exception) -> None:
-    """Turn capture off for the process, warning once."""
+def _disable_cuda_graphs(error: Exception, device: torch.device) -> None:
+    """Turn capture off for the process, warning once; raise if the failed capture broke the CUDA RNG."""
     global CUDA_GRAPHS
+    try:
+        torch.rand(1, device=device)
+    except RuntimeError:
+        CUDA_GRAPHS = False
+        raise RuntimeError(
+            f"CUDA-graph capture failed ({type(error).__name__}: {error}) and left the CUDA RNG unusable for the rest "
+            "of the process; rerun with PRETRAINING_CUDA_GRAPHS=0"
+        ) from error
     if CUDA_GRAPHS:
         _log.warning("CUDA-graph capture failed (%s: %s); updates run eagerly", type(error).__name__, error)
     CUDA_GRAPHS = False

@@ -323,31 +323,53 @@ from pretraining.supermimic.learners.learner_utils import CapturedUpdate
 logging.basicConfig(stream=sys.stdout, level=logging.WARNING, format="%(message)s")
 learner_utils.CUDA_GRAPHS = True
 weight = torch.zeros(3, device="cuda")
+if sys.argv[1] == "rng_intact":  # capture refused before it begins: the RNG is untouched
+    def refuse(*args, **kwargs):
+        raise RuntimeError("capture refused")
+    torch.cuda.graph = refuse
 
 def update(inputs):  # a host sync: legal eagerly, illegal under capture
     weight.add_(inputs["x"])
     return {"sum": torch.tensor(float(weight.sum()), device="cuda")}
 
 captured = CapturedUpdate(update, lambda: [weight], warmup=1)
-sums = [float(captured(TensorDict({"x": torch.ones(3, device="cuda")}))["sum"]) for _ in range(4)]
+sums = []
+try:
+    for _ in range(4):
+        sums.append(float(captured(TensorDict({"x": torch.ones(3, device="cuda")}))["sum"]))
+except RuntimeError as e:
+    print("RAISED", e, "CAUSE", type(e.__cause__).__name__)
 print("SUMS", sums, "FLAG", learner_utils.CUDA_GRAPHS)
 """
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-graph capture needs a GPU")
-def test_captured_update_falls_back_to_eager_when_capture_fails():
-    # In its own process: on torch 2.7 a failed capture leaves the CUDA RNG unusable for the rest of the process.
+def _run_fallback(case):
     import subprocess
     import sys
     from pathlib import Path
 
     out = subprocess.run(
-        [sys.executable, "-c", _FALLBACK_SCRIPT], capture_output=True, text=True, timeout=300,
+        [sys.executable, "-c", _FALLBACK_SCRIPT, case], capture_output=True, text=True, timeout=300,
         cwd=Path(__file__).resolve().parents[1],
     )
     assert out.returncode == 0, out.stderr
-    assert "SUMS [3.0, 6.0, 9.0, 12.0] FLAG False" in out.stdout  # every call updated, eagerly after the failure
-    assert out.stdout.count("CUDA-graph capture failed") == 1
+    return out.stdout
+
+
+# In their own processes: on torch 2.7 a failed capture leaves the CUDA RNG unusable for the rest of the process.
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-graph capture needs a GPU")
+def test_captured_update_falls_back_to_eager_when_capture_fails_and_the_rng_survives():
+    out = _run_fallback("rng_intact")
+    assert "SUMS [3.0, 6.0, 9.0, 12.0] FLAG False" in out  # every call updated, eagerly after the failure
+    assert out.count("CUDA-graph capture failed") == 1 and "RAISED" not in out
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-graph capture needs a GPU")
+def test_captured_update_fails_fast_when_the_failed_capture_breaks_the_rng():
+    out = _run_fallback("rng_broken")
+    assert "RAISED CUDA-graph capture failed" in out and "PRETRAINING_CUDA_GRAPHS=0" in out
+    assert "CAUSE RuntimeError" in out  # the capture error, chained
+    assert "SUMS [3.0] FLAG False" in out  # the warm-up update ran; nothing after the failed capture
 
 
 # --- simulator ---------------------------------------------------------------------------------------------------
@@ -393,6 +415,25 @@ def test_sim_context_binds_and_reads_normalised_values(env):
     assert values.std(0).min() > 0, "a column is constant across envs: it does not read the randomized value"
     # the encoder-bias columns are the event's bias, denormalised
     torch.testing.assert_close(ctx.denormalize(values, ctx.find("encoder_bias")), env.encoder_bias)
+    # friction and COM offset are cached at bind: they are PhysX's values
+    robot = env.scene["robot"]
+    friction = ctx.denormalize(values, ctx.find("foot_friction"))
+    assert friction.device == env.encoder_bias.device
+    materials = robot.root_physx_view.get_material_properties()
+    assert any(torch.equal(friction[:, 0].cpu(), materials[:, k, 0]) for k in range(materials.shape[1]))
+    torso = robot.body_names.index("torso_link")
+    com_offset = ctx.denormalize(values, ctx.find("base_com")).cpu()
+    coms = robot.root_physx_view.get_coms()[:, torso, :3]
+    torch.testing.assert_close(coms - com_offset, (coms[:1] - com_offset[:1]).expand(NUM_ENVS, 3), atol=1e-6, rtol=0)  # one USD COM
+    # the cache needs start-up events
+    for name in ("foot_friction", "base_com"):
+        event = getattr(env.cfg.events, name)
+        event.mode = "reset"
+        try:
+            with pytest.raises(RuntimeError, match="startup"):
+                SimContext.from_env(env)
+        finally:
+            event.mode = "startup"
 
 
 @pytest.mark.sim
