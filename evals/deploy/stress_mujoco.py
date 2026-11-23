@@ -54,6 +54,7 @@ import torch
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from evals.mujoco.common import load_deploy_cfg  # noqa: E402
+from evals.mujoco.policy import Recurrent  # noqa: E402, F401  (bag_replay uses H.Recurrent)
 from evals.mujoco.sim import (  # noqa: E402
     ALL_NAMES, MarlMujoco, imu_bias_ranges, mjcf_path, qrot)
 
@@ -129,31 +130,6 @@ TORSO_GYRO_AXES = np.array([0.6, 1.0, 0.4])
 LOWSTATE_QUAT_NOISE_DEG, LOWSTATE_LAG_MS, LOWSTATE_GYRO_NOISE = 0.1, 10.0, 0.02
 # the pp table's pass marks
 PP_MAX_MEAN_JUMP, PP_MAX_TORQUE_SHARE, PP_MAX_KNEE_OFFSET, PP_MAX_AT_LIMIT = 0.03, 0.85, 0.15, 0.05
-
-
-class Recurrent:
-    """An exported actor called as actor(obs[None]) -> action[None], carrying its LSTM state."""
-
-    def __init__(self, net):
-        self.net = net
-        self.recurrent = hasattr(net, "hidden_size")
-        if self.recurrent:
-            self.h = torch.zeros(net.num_layers, 1, net.hidden_size)
-            self.c = torch.zeros_like(self.h)
-
-    def __call__(self, x):
-        if not self.recurrent:
-            return self.net(x)
-        a, self.h, self.c = self.net(x, self.h, self.c)
-        return a
-
-    def reset_state(self):
-        if self.recurrent:
-            self.h.zero_()
-            self.c.zero_()
-
-    def state_norm(self) -> float:
-        return float(self.c.abs().mean()) if self.recurrent else 0.0
 
 
 class StressMujoco(MarlMujoco):

@@ -183,13 +183,14 @@ class MarlMujoco:
     NOISE = {"lin_acc": 0.5, "ang_vel": 0.2, "grav": 0.05, "jpos": 0.01, "jvel": 1.5, "wrist": 0.005}
 
     def __init__(self, actors: dict, settings: dict, physics: str = "robocasa", assets: Path = C.DEFAULT_ASSETS,
-                 model: mujoco.MjModel | None = None, pinned: bool = False):
+                 model: mujoco.MjModel | None = None, pinned: bool = False, arms_hold_zero: bool = False):
         # model: the CL_Assets MJCF compiled with changes that leave the robot's joints untouched; default as it is.
         # pinned: the pelvis held still where each reset leaves it, upright (LocoManip-ArmsOnly-v0's fix_root_link), by
         # a weld (with_pelvis_weld; a model passed in needs it, pinned_model).
         # actors without "legs": no legs policy, the legs held at their default pose; without "arms": the arms' residual
-        # 0, the IK alone
+        # 0, the IK alone; arms_hold_zero (evals: a legs eval with no arms policy): every arm joint's target 0 rad, no IK
         self.pinned, self._pin = pinned, None
+        self.arms_hold_zero = arms_hold_zero
         if model is None:
             model = pinned_model(assets) if pinned else mujoco.MjModel.from_xml_path(str(mjcf_path(assets)))
         self.m = model
@@ -394,6 +395,10 @@ class MarlMujoco:
         lo, hi = self._torque_bounds(idx)
         self.applied[idx] = np.clip(t, lo, hi)
         # arms
+        if self.arms_hold_zero:
+            self.applied[self.arm_idx] = np.clip(0.0, self.lower[self.arm_idx], self.upper[self.arm_idx])
+            self.applied[12] = 0.0
+            return
         if not self.frozen:
             if self.residual_integrate:
                 c = self.residual_integrate

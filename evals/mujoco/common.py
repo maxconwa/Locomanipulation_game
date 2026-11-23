@@ -200,6 +200,8 @@ def load_deploy_cfg(export_dir: str, config: str | None = None, template: str | 
         raise FileNotFoundError(f"{export_dir}: no deploy yaml beside export.yaml")
     cfg = yaml.safe_load(open(path))
     cfg.update(yaml.safe_load(open(os.path.join(export_dir, "export.yaml"))) or {})
+    if cfg.get("arm_seed_table") and not os.path.isabs(cfg["arm_seed_table"]):  # the export's own copy
+        cfg["arm_seed_table"] = os.path.join(export_dir, cfg["arm_seed_table"])
     cfg.setdefault("legs", {}).setdefault("policy", "legs.pt")
     cfg.setdefault("arms", {}).setdefault("policy", "arms.pt")
     return cfg
