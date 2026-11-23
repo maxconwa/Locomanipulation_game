@@ -47,6 +47,18 @@ def rp_of(q):
 
 
 def leg_qpos_addrs(model_path):
+    """The 12 leg joints' places in the recorded qpos: from joint_qpos.json (run.sh asks the sim's own mujoco), else
+    from model.mjb (needs this mujoco to read that version's file)."""
+    names_file = os.path.join(os.path.dirname(model_path), "joint_qpos.json")
+    if os.path.isfile(names_file):
+        places = json.load(open(names_file))
+        out = []
+        for n in LEG_NAMES:
+            hits = [v for k, v in places.items() if k.endswith(n)]
+            if not hits:
+                return None
+            out.append(hits[0])
+        return np.array(out)
     import mujoco
     m = mujoco.MjModel.from_binary_path(model_path)
     names = [mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_JOINT, j) or "" for j in range(m.njnt)]

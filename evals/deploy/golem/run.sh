@@ -69,6 +69,13 @@ sim_test_run_ros 1500 "ros2 launch golem_bringup lmg_sim.launch.py start_positio
     wait \$LAUNCH
     exit \$rc"
 sim_test_stop_sim
+# the legs' places in the recorded qpos, by the sim's own mujoco (model.mjb is its version's format)
+"${COMPOSE[@]}" run --rm -T --no-deps robocasa python3 -c "
+import json, mujoco
+m = mujoco.MjModel.from_binary_path('/out/model.mjb')
+names = [mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_JOINT, j) or '' for j in range(m.njnt)]
+json.dump({n: int(m.jnt_qposadr[j]) for j, n in enumerate(names) if n}, open('/out/joint_qpos.json', 'w'))
+" > "$OUT/joint_qpos.log" 2>&1 || echo "[lmg_evals] could not read the joints' places (see joint_qpos.log)" >&2
 # the containers wrote as root
 "${COMPOSE[@]}" run --rm -T --no-deps --entrypoint chown robocasa -R "$(id -u):$(id -g)" /out >/dev/null 2>&1 || true
 set +e
