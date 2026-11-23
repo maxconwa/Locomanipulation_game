@@ -205,10 +205,10 @@ def _roll_batch(env, u, cmd, motion, tables, limits, actors, history_length, cli
 
             # the reference after the step (clamped: a clip that has ended is no longer scored)
             frames = torch.minimum(starts + t + 1, starts + lengths - 1)
-            ref_body = motion.body_pos_w[frames]
+            ref_body = motion.body_state(frames)[0]  # one FK pass for both errors
             err = {
                 "body_pos_err_m": torch.norm(state["body_pos"] - ref_body, dim=-1).mean(-1),
-                "pelvis_pos_err_m": torch.norm(state["pelvis_pos"] - motion.body_pos_w[frames, cmd.motion_anchor_body_index], dim=-1),
+                "pelvis_pos_err_m": torch.norm(state["pelvis_pos"] - ref_body[:, cmd.motion_anchor_body_index], dim=-1),
                 "joint_err_rad": (state["q"] - motion.joint_pos[frames]).abs().mean(-1),
             }
             flags = safety_flags(

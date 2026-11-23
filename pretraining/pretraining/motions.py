@@ -1,5 +1,6 @@
-"""Reference motions: checks a motion directory and loads its clips, concatenated, with the tracked bodies' poses
-and velocities computed by forward kinematics at load.
+"""Reference motions: checks a motion directory and loads its clips, concatenated; the tracked bodies' poses and
+velocities are computed by forward kinematics on demand, for the frames asked for (the full dataset's bodies would
+not fit in GPU memory).
 
 ``MotionLoader`` keeps the attributes and ``body_state`` of mjlab's (mjlab_research, commit 6ea3e57,
 ``src/mjlab/tasks/tracking/mdp/commands.py``) and loads ``.npz`` clips the same way (sorted, concatenated, cumulative
@@ -57,25 +58,29 @@ class MotionLoader:
         else:
             files = check_motion_dir(motion_dir)
         clips = [dict(np.load(f)) for f in files]
+        lengths = [clip["joint_pos"].shape[0] for clip in clips]
 
-        def field(name: str) -> torch.Tensor:
-            arr = np.concatenate([clip[name] for clip in clips])
-            return torch.from_numpy(arr).to(device=device, dtype=torch.float32)
+        def field(name: str) -> torch.Tensor:  # assembled on the CPU, moved to the device once
+            arr = np.concatenate([clip[name] for clip in clips]).astype(np.float32, copy=False)
+            return torch.from_numpy(arr).to(device=device)
 
         self.files = files
         self.fps = FPS
         self.fk = fk
         self.joint_pos, self.joint_vel, self.root_pos_w, self.root_quat_w, self.root_lin_vel_w, self.root_ang_vel_w = (
             field(name) for name in _FIELDS)
+        del clips
         self.time_step_total = self.joint_pos.shape[0]
-        lengths = torch.tensor([clip["joint_pos"].shape[0] for clip in clips], device=device)
+        lengths = torch.tensor(lengths, device=device)
         self.motion_ends = torch.cumsum(lengths, 0)
         self.motion_starts = self.motion_ends - lengths
-        self.body_pos_w, self.body_quat_w, self.body_lin_vel_w, self.body_ang_vel_w = fk(
-            self.root_pos_w, self.root_quat_w, self.joint_pos, self.root_lin_vel_w, self.root_ang_vel_w,
-            self.joint_vel)
+        bodies = len(fk.body_names)
+        self.body_pos_w = LazyBodyField(self, 0, "body_pos_w", (self.time_step_total, bodies, 3))
+        self.body_quat_w = LazyBodyField(self, 1, "body_quat_w", (self.time_step_total, bodies, 4))
+        self.body_lin_vel_w = LazyBodyField(self, 2, "body_lin_vel_w", (self.time_step_total, bodies, 3))
+        self.body_ang_vel_w = LazyBodyField(self, 3, "body_ang_vel_w", (self.time_step_total, bodies, 3))
 
-    def body_state(self, frames: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def body_state(self, frames: torch.Tensor | int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """World positions, wxyz quaternions, linear and angular velocities of the
         tracked bodies at ``frames``, without env origins."""
         return self.fk(
@@ -86,3 +91,35 @@ class MotionLoader:
             self.root_ang_vel_w[frames],
             self.joint_vel[frames],
         )
+
+
+class LazyBodyField:
+    """One of ``body_state``'s outputs, indexed as the precomputed ``(frames, bodies, d)`` tensor would be, but
+    computed by forward kinematics for the indexed frames only. Supports ``[frames]`` and ``[frames, body]`` with
+    ``frames`` an int or an integer tensor of any shape and ``body`` an int or a 0-d integer tensor; anything else
+    raises TypeError. Every indexing runs FK: callers reading several fields on the same frames call ``body_state``
+    once instead."""
+
+    def __init__(self, motion: MotionLoader, output: int, name: str, shape: tuple[int, int, int]):
+        self._motion, self._output, self._name, self.shape = motion, output, name, torch.Size(shape)
+
+    def __getitem__(self, key) -> torch.Tensor:
+        frames, body = (key if isinstance(key, tuple) and len(key) == 2 else (key, None))
+        if isinstance(key, tuple) and len(key) != 2:
+            self._refuse(key)
+        if not _is_index(frames) or (body is not None and not (_is_index(body) and torch.as_tensor(body).dim() == 0)):
+            self._refuse(key)
+        value = self._motion.body_state(frames)[self._output]
+        return value if body is None else value[..., body, :]
+
+    def _refuse(self, key):
+        raise TypeError(f"motion.{self._name}[{key!r}]: only [frames] and [frames, body] are computed lazily, with "
+                        "integer frame indices (int or integer tensor) and a single body index")
+
+
+def _is_index(x) -> bool:
+    if isinstance(x, bool):
+        return False
+    if isinstance(x, int):
+        return True
+    return isinstance(x, torch.Tensor) and not x.is_floating_point() and x.dtype != torch.bool and not x.is_complex()

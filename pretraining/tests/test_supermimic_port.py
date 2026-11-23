@@ -455,6 +455,15 @@ def test_gencoord_binds_to_the_env_and_its_bodies_match_the_motion_command(env):
     full = obs["full_state"]
     pos, *_ = rep.world_frame_bodies(rep.extract_aux_state(full), rep.represent(full))
     torch.testing.assert_close(pos + env.scene.env_origins[:, None], cmd.body_pos_w, atol=1e-4, rtol=0)
+    # the command's reference bodies follow time_steps changed in place (its one-FK-pass-per-step cache)
+    def direct():
+        return cmd.motion.body_state(cmd.time_steps.clone())
+    torch.testing.assert_close(cmd.body_quat_w, direct()[1], atol=0, rtol=0)
+    cmd.time_steps.add_(1).clamp_(max=cmd.motion.time_step_total - 1)
+    torch.testing.assert_close(cmd.body_quat_w, direct()[1], atol=0, rtol=0)
+    torch.testing.assert_close(cmd.anchor_lin_vel_w, direct()[2][:, cmd.motion_anchor_body_index], atol=0, rtol=0)
+    cmd.time_steps[0] = 0
+    torch.testing.assert_close(cmd.body_ang_vel_w, direct()[3], atol=0, rtol=0)
 
 
 @pytest.mark.sim

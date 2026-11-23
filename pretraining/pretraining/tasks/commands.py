@@ -100,37 +100,46 @@ class MotionCommand(CommandTerm):
     def joint_vel(self) -> torch.Tensor:
         return self.motion.joint_vel[self.time_steps]
 
+    def _reference_bodies(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The motion's tracked bodies at ``time_steps``: one forward-kinematics pass, reused until ``time_steps`` is
+        replaced or changed in place (its version counter)."""
+        key = (self.time_steps, self.time_steps._version)
+        cached = getattr(self, "_reference_cache", None)
+        if cached is None or cached[0][0] is not key[0] or cached[0][1] != key[1]:
+            self._reference_cache = (key, self.motion.body_state(self.time_steps))
+        return self._reference_cache[1]
+
     @property
     def body_pos_w(self) -> torch.Tensor:
-        return self.motion.body_pos_w[self.time_steps] + self._env.scene.env_origins[:, None, :]
+        return self._reference_bodies()[0] + self._env.scene.env_origins[:, None, :]
 
     @property
     def body_quat_w(self) -> torch.Tensor:
-        return self.motion.body_quat_w[self.time_steps]
+        return self._reference_bodies()[1]
 
     @property
     def body_lin_vel_w(self) -> torch.Tensor:
-        return self.motion.body_lin_vel_w[self.time_steps]
+        return self._reference_bodies()[2]
 
     @property
     def body_ang_vel_w(self) -> torch.Tensor:
-        return self.motion.body_ang_vel_w[self.time_steps]
+        return self._reference_bodies()[3]
 
     @property
     def anchor_pos_w(self) -> torch.Tensor:
-        return self.motion.body_pos_w[self.time_steps, self.motion_anchor_body_index] + self._env.scene.env_origins
+        return self._reference_bodies()[0][:, self.motion_anchor_body_index] + self._env.scene.env_origins
 
     @property
     def anchor_quat_w(self) -> torch.Tensor:
-        return self.motion.body_quat_w[self.time_steps, self.motion_anchor_body_index]
+        return self._reference_bodies()[1][:, self.motion_anchor_body_index]
 
     @property
     def anchor_lin_vel_w(self) -> torch.Tensor:
-        return self.motion.body_lin_vel_w[self.time_steps, self.motion_anchor_body_index]
+        return self._reference_bodies()[2][:, self.motion_anchor_body_index]
 
     @property
     def anchor_ang_vel_w(self) -> torch.Tensor:
-        return self.motion.body_ang_vel_w[self.time_steps, self.motion_anchor_body_index]
+        return self._reference_bodies()[3][:, self.motion_anchor_body_index]
 
     @property
     def robot_joint_pos(self) -> torch.Tensor:

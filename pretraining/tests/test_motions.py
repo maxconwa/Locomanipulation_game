@@ -54,3 +54,37 @@ def test_refuses_wrong_fps_or_joint_order(tmp_path):
     np.savez(bad, **{**clip, "joint_names": clip["joint_names"][::-1]})
     with pytest.raises(ValueError, match=f"{bad.name}.*joint_names"):
         check_motion_dir(tmp_path / "order")
+
+
+def _direct(motion, fk, frames):
+    return fk(motion.root_pos_w[frames], motion.root_quat_w[frames], motion.joint_pos[frames],
+              motion.root_lin_vel_w[frames], motion.root_ang_vel_w[frames], motion.joint_vel[frames])
+
+
+def test_lazy_body_attributes_equal_direct_fk(tmp_path, fk):
+    write_clips(tmp_path, n=3, frames=40)
+    motion = MotionLoader(tmp_path, fk, "cpu")
+    g = torch.Generator().manual_seed(0)
+    boundaries = torch.tensor([0, 39, 40, 79, 80, 119])  # first and last frames of each clip
+    attrs = ("body_pos_w", "body_quat_w", "body_lin_vel_w", "body_ang_vel_w")
+    for frames in (boundaries, torch.randint(0, 120, (5, 3), generator=g), torch.randint(0, 120, (2, 3, 4), generator=g),
+                   torch.tensor(7), 7):
+        direct = _direct(motion, fk, frames)
+        for name, want in zip(attrs, direct):
+            torch.testing.assert_close(getattr(motion, name)[frames], want, atol=0, rtol=0)
+            for body in (0, 5, torch.tensor(13)):
+                torch.testing.assert_close(getattr(motion, name)[frames, body], want[..., body, :], atol=0, rtol=0)
+        for got, want in zip(motion.body_state(frames), direct):
+            torch.testing.assert_close(got, want, atol=0, rtol=0)
+    assert motion.body_pos_w.shape == (120, len(TRACKED_BODIES), 3)
+    for bad in (slice(0, 3), (boundaries, 0, 1), ..., (boundaries, slice(None)), torch.tensor([True, False])):
+        with pytest.raises(TypeError, match="body_pos_w"):
+            motion.body_pos_w[bad]
+
+
+def test_loader_holds_nothing_frames_by_bodies(tmp_path, fk):
+    write_clips(tmp_path, n=3, frames=40)
+    motion = MotionLoader(tmp_path, fk, "cpu")
+    for name, value in vars(motion).items():
+        if isinstance(value, torch.Tensor):
+            assert value.dim() < 2 or value.shape[:2] != (120, len(TRACKED_BODIES)), name
