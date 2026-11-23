@@ -21,3 +21,7 @@
 **/logs/*
 **/outputs/*
 *.tmp
+
+# Motion data, runs and reference copies at the repository root: derived from AMASS and SMPL-X
+# (non-commercial licences), never committed or redistributed (pretraining/README.md).
+/data/
