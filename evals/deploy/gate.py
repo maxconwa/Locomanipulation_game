@@ -48,10 +48,13 @@ def run(cmd, log: Path, env=None, cwd=REPO) -> int:
 
 
 def tail(log: Path, n=3) -> str:
+    """The log's last error line (an exception's message), else its last n lines."""
     try:
-        return " / ".join(line.strip() for line in open(log, errors="replace").read().strip().splitlines()[-n:])
+        lines = open(log, errors="replace").read().strip().splitlines()
     except OSError:
         return "(no log)"
+    errors = [ln.strip() for ln in lines if ln.lstrip().split(":")[0].endswith(("Error", "Exception", "SystemExit"))]
+    return errors[-1][:400] if errors else " / ".join(ln.strip() for ln in lines[-n:])
 
 
 def check_metric_code(a, g, d: Path):
