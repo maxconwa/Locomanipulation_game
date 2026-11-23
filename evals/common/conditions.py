@@ -2,7 +2,8 @@
 
 DEFAULTS holds, per backend and body, what the scorecards run with unless a flag overrides it. The legs' are the ones
 the 200k runs' history was scored with (logs/candidates/200k_v2/progress.sh: 84 envs, no wrist phase, nominal motors,
-seed 7), so that history joins the new points. stamp() records the conditions, a hash of them (the plots join points
+seed 7); that history, imported with the arms held by their IK (not at 0 rad), still differs in its stamp and is drawn
+apart (hollow) in the plots. stamp() records the conditions, a hash of them (the plots join points
 with equal hashes) and the code's commit (not hashed: the env's code changes between runs, the eval doesn't).
 """
 

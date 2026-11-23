@@ -155,6 +155,19 @@ def score(out_dir: str, gate: dict) -> dict:
                                     "lin_err": tr.get("lin_err_mean"), "ang_err": tr.get("ang_err_mean"),
                                     "stepping_share": float(step_mask[m].mean()) if m.any() else float("nan"),
                                     "pass": bool(ok and m.any())})
+        # what arrived on /cmd_vel against what the driver meant (another publisher, e.g. Nav2's velocity_smoother,
+        # would make the scores the driver's artifact)
+        dn = os.path.join(out_dir, "drive.npz")
+        if os.path.isfile(dn):
+            got = np.load(dn)["cmds"]
+            got = got[(got[:, 1] >= t0) & (got[:, 1] <= t1)]
+            want = np.array([cmd[max(np.searchsorted(grid, x) - 1, 0)] for x in got[:, 1]]) if len(got) else got
+            # a message within 0.1 s of a segment change may be either side of it
+            near = np.array([min(abs(x - e["sim"]) for e in segs) < 0.1 for x in got[:, 1]]) if len(got) else []
+            off = (np.abs(got[:, 2:5] - want).max(1) > 1e-3) & ~near if len(got) else np.array([])
+            check("/cmd_vel carried only the program", len(got) > 0 and off.mean() <= 0.01,
+                  f"{int(off.sum())} of {len(got)} messages off the program; publishers"
+                  f" {info.get('cmd_vel_publishers')}")
         missing = [mv for mv in moves if not moves[mv].any()]
         check("every move followed (cos v, turn sense)", all(mv["pass"] for mv in result["moves"]) and not missing,
               ", ".join(f"{mv['move']} cos {mv['cos_v']:.2f} sense {mv['turn_sense']:.2f}" for mv in result["moves"])

@@ -31,13 +31,22 @@ INK, MUTED, GRID, SPINE, SURFACE, REF, BAND = "#0b0b0b", "#52514e", "#e4e3df", "
 DASH = (0, (5, 3))
 
 
-def reference(run_dirs: list[Path], backend: str, body: str) -> tuple[dict | None, Path | None]:
-    """The first of the runs' IK-only scorecards (scorecard_ik_only.json: the arms' reference), or (None, None)."""
+def reference(run_dirs: list[Path], backend: str, body: str, like: dict | None = None) -> tuple[dict | None, Path | None]:
+    """The arms' reference (scorecard_ik_only.json, the IK alone): the run's own, else a compared run's, else the
+    newest of any run on the same task; (None, None) if there is none."""
     for r in run_dirs:
         f = outputs.eval_dir(runs.name(r), backend, body) / "scorecard_ik_only.json"
         if f.is_file():
             return json.load(open(f)), f
-    return None, None
+    t = runs.task(run_dirs[0]) if run_dirs else None
+    found = []
+    for f in sorted(outputs.EVALS_ROOT.glob(f"*/{backend}/{body}/scorecard_ik_only.json"), reverse=True):
+        res = json.load(open(f))
+        if res.get("task") == t:  # the task the reference was taken on (older runs did not record theirs)
+            found.append((res, f))
+    # prefer one taken like the run's own scorecards (as many envs and goals)
+    same = [(r, f) for r, f in found if like and (r.get("num_envs"), r.get("goals")) == (like.get("num_envs"), like.get("goals"))]
+    return (same or found or [(None, None)])[0]
 
 
 def scorecards(run_dir: Path, backend: str, body: str, row_fn, ref: dict | None = None) -> list[dict]:
@@ -117,9 +126,13 @@ def eval_figure(run_dir: Path, prior: list[Path], backend: str, body: str, keys:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    ref, ref_path = reference([run_dir] + prior, backend, body)
+    own = scorecards(run_dir, backend, body, row_fn)
+    ref, ref_path = reference([run_dir] + prior, backend, body, own[-1] if own else None)
     if ref_path is not None:
         print(f"[plots] reference: {ref_path}")
+        ref_run = ref_path.parents[2].name
+        if ref_run != runs.name(run_dir):
+            baseline_label = f"{baseline_label} ({runs.short(ref_run)}'s run)"
     cards_by_run = {r: scorecards(r, backend, body, row_fn, ref) for r in [run_dir] + prior}
     if not cards_by_run[run_dir]:
         print(f"[plots] no scorecards for {runs.short(run_dir)} in {outputs.eval_dir(runs.name(run_dir), backend, body)}")
