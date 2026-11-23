@@ -113,7 +113,11 @@ def main(env_cfg, agent_cfg: dict):
     arm_cfg.debug_vis, vel_cfg.debug_vis = ARMS, LEGS
     vel_cfg.resampling_time_range, vel_cfg.rel_standing_envs = (1.0e6, 1.0e6), 0.0
     env_cfg.viewer.origin_type, env_cfg.viewer.asset_name, env_cfg.viewer.env_index = "asset_root", "robot", 0
-    env_cfg.viewer.eye, env_cfg.viewer.lookat = (1.2, 3.0, 1.3), (0.0, 0.0, 0.6)  # front-side: the arrows read
+    # the robot starts facing +x (no drawn yaw), the camera front-left of it at hip height, the whole body in view
+    reset_base = getattr(env_cfg.events, "reset_base", None)
+    if reset_base is not None and "pose_range" in reset_base.params:
+        reset_base.params["pose_range"] = {**reset_base.params["pose_range"], "yaw": (0.0, 0.0)}
+    env_cfg.viewer.eye, env_cfg.viewer.lookat = (2.2, 2.6, 0.5), (0.0, 0.0, -0.2)
     env_cfg.viewer.resolution = (1280, 720)
 
     env = SkrlVecEnvWrapper(gym.make(task, cfg=env_cfg, render_mode="rgb_array"))
