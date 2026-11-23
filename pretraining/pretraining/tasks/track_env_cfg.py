@@ -30,6 +30,7 @@ from pretraining.constants import (
 )
 from pretraining.robot import H1_2_PRETRAIN_CFG, MASSLESS_FRAME_FIX
 from pretraining.tasks import events, observations, rewards, terminations
+from pretraining.tasks.actions import BiasedJointPositionActionCfg
 from pretraining.tasks.commands import MotionCommandCfg
 
 DEFAULT_MOTION_DIR = str(Path(__file__).resolve().parents[3] / "data" / "motions" / "h12_amass")
@@ -88,7 +89,8 @@ class CommandsCfg:
 
 @configclass
 class ActionsCfg:
-    joint_pos = mdp.JointPositionActionCfg(
+    # targets shifted by -encoder bias when applied, as mjlab's
+    joint_pos = BiasedJointPositionActionCfg(
         asset_name="robot",
         joint_names=list(JOINT_NAMES),
         scale=dict(ACTION_SCALE),

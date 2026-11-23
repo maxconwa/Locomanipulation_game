@@ -139,6 +139,16 @@ def test_targets_are_clipped_to_golem_limits(env):
 
 
 @pytest.mark.sim
+def test_applied_targets_are_shifted_by_the_encoder_bias(env):
+    env.reset()
+    env.step(torch.rand(NUM_ENVS, 27, device=env.device) * 2 - 1)
+    term = env.action_manager.get_term("joint_pos")
+    applied = env.scene["robot"].data.joint_pos_target[:, _joint_ids(env)]
+    assert env.encoder_bias.abs().max() > 0
+    torch.testing.assert_close(applied, term.processed_actions - env.encoder_bias)
+
+
+@pytest.mark.sim
 def test_motion_end_terminates_and_resets(env):
     env.reset()
     cmd = env.command_manager.get_term("motion")
