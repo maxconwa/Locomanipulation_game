@@ -123,6 +123,39 @@ class TwoAgentRunnerCfg(BaseRunnerCfg):
     """Iterations a resumed run collects into its empty replay buffer before updating."""
 
 
+def safety_flags(
+    limits: JointLimits,
+    q: torch.Tensor,
+    dq: torch.Tensor,
+    q_next: torch.Tensor,
+    dq_next: torch.Tensor,
+    target: torch.Tensor,
+    torque: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Return, per env (bool), which of golem_safety's estop limits a step crossed, by joint group (``Safety/*``).
+
+    ``q, dq``: the pre-step joint state; ``q_next, dq_next``: the post-step one; ``target``: the actuator's position
+    target (the clipped processed action less the encoder bias); ``torque``: the applied joint torque at the step's
+    last substep. Velocity: the post-step ``|dq|``; torque: the PD demand of the target on the pre-step state (the
+    first substep's, as the world model's penalty); force: the applied torque at its effort limit.
+    """
+    force = torque.abs() / limits.effort
+    vel, tau = estop_ratios(limits, q, dq, dq_next, target)
+    # Room (rad) to the nearer estop position limit; negative past it.
+    room = torch.minimum(q_next - limits.q_low, limits.q_high - q_next)
+    out = {}
+    for a in AGENTS:
+        sl = JOINT_SLICES[a]
+        out[f"{a}_force_saturated"] = force[:, sl].max(-1).values >= SATURATED
+        least = room[:, sl].min(-1).values
+        out[f"{a}_q_over_estop"] = least < 0.0
+        out[f"{a}_q_within_{ESTOP_POSITION_BAND}"] = least < ESTOP_POSITION_BAND
+        for level in ESTOP_LOG_LEVELS:
+            out[f"{a}_dq_over_{level}"] = vel[:, sl].max(-1).values > level
+            out[f"{a}_tau_demand_over_{level}"] = tau[:, sl].max(-1).values > level
+    return out
+
+
 class TwoAgentRunner(BaseRunner[TwoAgentRunnerCfg]):
     """Sim collection and the training loop."""
 
@@ -257,22 +290,10 @@ class TwoAgentRunner(BaseRunner[TwoAgentRunnerCfg]):
         robot = self.env.unwrapped.scene["robot"]
         # The actuator's target: the clipped processed action less the encoder bias.
         target = self.action_manager.get_term("joint_pos")._processed_actions - encoder_bias(self.env.unwrapped)
-        force = robot.data.applied_torque[:, self.motion_cmd.joint_ids].abs() / self.joint_limits.effort
-        vel, tau = estop_ratios(self.joint_limits, q, dq, dq_next, target)
-        # Room (rad) to the nearer estop position limit; negative past it.
-        room = torch.minimum(q_next - self.joint_limits.q_low, self.joint_limits.q_high - q_next)
+        torque = robot.data.applied_torque[:, self.motion_cmd.joint_ids]
         alive = (~dones.bool()).float()
-        for a in AGENTS:
-            sl = JOINT_SLICES[a]
-            counts = {f"{a}_force_saturated": force[:, sl].max(-1).values >= SATURATED}
-            least = room[:, sl].min(-1).values
-            counts[f"{a}_q_over_estop"] = least < 0.0
-            counts[f"{a}_q_within_{ESTOP_POSITION_BAND}"] = least < ESTOP_POSITION_BAND
-            for level in ESTOP_LOG_LEVELS:
-                counts[f"{a}_dq_over_{level}"] = vel[:, sl].max(-1).values > level
-                counts[f"{a}_tau_demand_over_{level}"] = tau[:, sl].max(-1).values > level
-            for k, v in counts.items():
-                self._safety[k] = self._safety.get(k, 0.0) + (v.float() * alive).sum()
+        for k, v in safety_flags(self.joint_limits, q, dq, q_next, dq_next, target, torque).items():
+            self._safety[k] = self._safety.get(k, 0.0) + (v.float() * alive).sum()
         self._safety_steps = self._safety_steps + alive.sum()
 
     def _after_step(self, next_states, dones, motion_times, rewards, terminated) -> None:
