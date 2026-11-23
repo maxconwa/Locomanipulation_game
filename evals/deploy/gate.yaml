@@ -1,0 +1,34 @@
+# The deploy gate's thresholds (evals/deploy/gate.py). Starting values (2026-11-22), to be tuned once runs have been
+# seen; a check that cannot run on the machine's GOLEM / bags / GPU is NOT RUN and fails the gate.
+
+golem:                       # evals/deploy/golem: the export under lmg_deploy in GOLEM's RoboCasa sim
+  min_cos_v: 0.90            # per move with a linear command: direction cos(commanded, actual), stride-averaged
+  min_turn_sense: 0.95       # per move with a turn command: share of samples turning the commanded way
+  fall_tilt_rad: 1.0         # a fall: the pelvis tilted past this, or below fall_height_m, after the band's release
+  fall_height_m: 0.55
+  max_lowcmd_writers: 1      # only golem_safety writes /lowcmd
+  arm_reach_m: 0.05          # arm goals (an export that takes them): both wrists within this at the goal's end
+  min_arm_reached: 1.0       # share of goals reached
+
+parity:                      # evals/deploy/parity.py (Isaac): the deploy controller against the training env
+  tolerance: 2.0e-3          # every term's worst difference (its own default)
+
+bag_replay:                  # evals/deploy/bag_replay.py: real bags through the deploy controller
+  bags: [mid360v2_deploy, mid360v2_deploy_2]
+  bags_dir: ~/bags/mid360v2_failure_2026-10-20
+  deployed: mid360v2         # the policy that ran when the bags were recorded
+  deployed_export: logs/deploy_baselines/mid360v2
+  max_target_median: 1.0e-3  # rad: the deployed policy's replayed leg targets against the recorded ones
+  max_target_p99: 1.0e-2
+  max_outside_sim_c: 0.01    # the candidate: share of steps whose LSTM cell state leaves the simulated range
+  sim_seeds: 4
+
+stress:                      # evals/deploy/stress_mujoco.py
+  zero_fall_cells: [nominal, hw, hang, hang_hw]   # conditions whose cells must not fall at all (standard grid)
+  long_conditions: [nominal, hw_no_gyro, hw, hang, hang_hw]   # 180 s stands, zero command: no falls
+  small60_conditions: [nominal, hw, hang, hang_hw, strength085]  # a small command after a 60 s stand: no falls
+  seeds: 8
+  pp_seeds: 4                # the pre-pose engage grid: every cell passes its own marks
+
+metric_code:                 # evals/deploy/test_sportmode_metrics.py: the metric code reproduces the report
+  required: true

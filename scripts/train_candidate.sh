@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Train a deploy candidate and check it: for each seed, train (the defaults are the recipe), score it on the
-# sport-mode scorecard (and the wrist phase) at the last checkpoint and at MID, export it, check the deploy controller
-# against the env (deploy_parity, which fails over its tolerance), then on the CPU, while the next seed trains: the MuJoCo stress tests (standard,
-# 180 s stands, a small command after a 60 s stand) and the replay of the Mid360v2 failure bags beside the deployed
-# Mid360v2. One Isaac process at a time on the GPU.
+# Train a deploy candidate and check it: for each seed, train (the defaults are the recipe), score its legs on the
+# Isaac scorecard (evals/isaac/legs) at the last checkpoint and at MID, export it, then the deploy gate
+# (evals/deploy/gate.py, thresholds in evals/deploy/gate.yaml): parity on the GPU in line, then on the CPU, while the
+# next seed trains, the MuJoCo stress grids, the pre-pose engage grid, the bag replays and the metric code; with
+# GOLEM_RUN=1 also the run in GOLEM's RoboCasa sim (docker, GPU) in line. One Isaac process at a time on the GPU.
 #
 #   bash scripts/train_candidate.sh [name] [seed ...]           (default: Candidate, seeds 42 43; e.g. in tmux)
 #   SMOKE=<updates> bash scripts/train_candidate.sh              (one seed, into logs/skrl/smoke, no checks)
 #   ITERATIONS=<updates> MID=<step> OVERRIDES="<hydra args>" ...  (a shorter run, its scorecard step, its overrides)
 #
 # Exits 1 when any step of any seed failed (each is a FAILED line in the status file). Status lines in
-# logs/candidates/status.txt; per run: logs/candidates/<name>_s<seed>/ (logs, the export in a folder
-# of the same name, parity, replays);
-# stress results in logs/hw_stress_mujoco/<name>_s<seed>*. Isaac in conda env_isaaclab; the CPU checks in an env with
-# mujoco, torch, pin, pyyaml and rosbags (CPU_ENV, default base; ROSBAGS_PATH is put on its PYTHONPATH if set).
+# logs/candidates/status.txt; per run: logs/candidates/<name>_s<seed>/ (logs, the export in a folder of the same
+# name, the gate's reports gate_gpu/ and gate_cpu/ with each check's output); scorecards in logs/evals/<run>/. A gate
+# FAIL or NOT RUN is a FAILED line. Isaac in conda env_isaaclab; the gate in an env with mujoco, torch, pin, pyyaml and
+# rosbags (CPU_ENV, default base; ROSBAGS_PATH is put on its PYTHONPATH if set).
 set -u
 cd "$(dirname "$0")/.."
 REPO=$PWD
@@ -22,8 +22,8 @@ STATUS=$OUT/status.txt
 CONDA_SH=${CONDA_SH:-$( [ -f $HOME/miniconda3/etc/profile.d/conda.sh ] && echo $HOME/miniconda3 || echo $HOME/anaconda3)/etc/profile.d/conda.sh}
 CPU_ENV=${CPU_ENV:-base}
 GOLEM=${GOLEM:-$HOME/GOLEM}
-BAGS=${BAGS:-$HOME/bags/mid360v2_failure_2026-10-20}
-ROSBAGS_PATH=${ROSBAGS_PATH:-}
+# the bags the gate replays: evals/deploy/gate.yaml bag_replay
+export ROSBAGS_PATH=${ROSBAGS_PATH:-}
 source "$CONDA_SH"
 mkdir -p "$OUT"
 
@@ -48,32 +48,14 @@ FAILED=$OUT/.failed_$NAME.$$   # one line per failed step, the background CPU ch
 note() { [ -z "${SMOKE:-}" ] && echo "$(date '+%F %T') $*" >> "$STATUS"; echo "$(date '+%F %T') $*"; }
 fail() { echo "$*" >> "$FAILED"; note "$* FAILED"; }
 
-cpu_checks() {  # $1 run name, $2 export dir, $3 out dir
-  local name=$1 export=$2 dir=$3
-  local bad=""
+cpu_checks() {  # $1 run name, $2 checkpoint, $3 export dir, $4 out dir: the gate's CPU checks
+  local name=$1 ckpt=$2 export=$3 dir=$4
   conda activate "$CPU_ENV"
-  python -m evals.deploy.stress_mujoco --export "$export" --label "$name" --seeds 8 --workers 12 \
-    > "$dir/stress.log" 2>&1 || bad+=" stress.log"
-  python -m evals.deploy.stress_mujoco --export "$export" --label "${name}_long" \
-    --conditions nominal,hw_no_gyro,hw,hang,hang_hw --profiles zero --seeds 8 --seconds 180 --workers 12 \
-    > "$dir/stress_long.log" 2>&1 || bad+=" stress_long.log"
-  python -m evals.deploy.stress_mujoco --export "$export" --label "${name}_small60" \
-    --conditions nominal,hw,hang,hang_hw,strength085 --profiles small60 --seeds 8 --seconds 80 --workers 12 \
-    > "$dir/stress_small60.log" 2>&1 || bad+=" stress_small60.log"
-  # the export gate's engage from the robot's pre-pose (the pp_* grid: hung, settled, the 2026-11-20 bag's sagged
-  # pose, random draws; rope kept and released; hw and the torso IMU's vibration; the quaternion bias range's ends)
-  python -m evals.deploy.stress_mujoco --export "$export" --label "${name}_prepose" --conditions pp \
-    --plants robocasa --seeds 4 --workers 12 > "$dir/stress_prepose.log" 2>&1 || bad+=" stress_prepose.log"
-  for bag in mid360v2_deploy mid360v2_deploy_2; do
-    PYTHONPATH=$ROSBAGS_PATH python -m evals.deploy.bag_replay --bag "$BAGS/$bag" --deployed mid360v2 \
-      --golem "$GOLEM" --policy "mid360v2=logs/deploy_baselines/mid360v2" --policy "$name=$export" \
-      --sim_seeds 4 --out "$dir/replay_$bag" > "$dir/replay_$bag.log" 2>&1 || bad+=" replay_$bag.log"
-  done
-  # (a check that ran says nothing here about what it found: read its summary)
-  if [ -n "$bad" ]; then
-    fail "$name: CPU checks that did not run to the end (see $dir/):$bad"
+  if GOLEM=$GOLEM python -m evals.deploy.gate --checkpoint "$ckpt" --export "$export" --out "$dir/gate_cpu" \
+      --only metric_code,stress,bag_replay > "$dir/gate_cpu.log" 2>&1; then
+    note "$name: deploy gate, CPU checks PASS ($dir/gate_cpu/report.md)"
   else
-    note "$name: CPU checks ran (stress: logs/hw_stress_mujoco/$name*, replays: $dir/replay_*)"
+    fail "$name: deploy gate, CPU checks (see $dir/gate_cpu/report.md)"
   fi
 }
 
@@ -95,9 +77,8 @@ for seed in "${SEEDS[@]}"; do
   note "$name: trained ($run, kernel failures $kernels)"
   [ -n "${SMOKE:-}" ] && continue
   for step in $FINAL $MID; do
-    # the motors nominal, as the reference scorecards were taken
+    # the pinned conditions (evals/common/conditions.py: nominal motors, 84 envs), into logs/evals/<run>/isaac/legs
     python -m evals.isaac.legs.get_scorecard --checkpoint "$run/checkpoints/agent_$step.pt" --headless \
-      "env.events.actuator_scales.params.gain_range=[1.0,1.0]" "env.events.actuator_scales.params.strength_range=[1.0,1.0]" \
       > "$dir/scorecard_$step.log" 2>&1
     code=$?
     kernels=$(grep -ac 'fail to launch kernel' "$dir/scorecard_$step.log")
@@ -110,11 +91,13 @@ for seed in "${SEEDS[@]}"; do
   export=$dir/$name   # a candidate export; lmg_deploy's policies/h12 takes one only when chosen
   if python scripts/skrl/export_marl.py --checkpoint "$run/checkpoints/agent_$FINAL.pt" --out "$export" \
       > "$dir/export.log" 2>&1; then
-    python -m evals.deploy.parity --checkpoint "$run/checkpoints/agent_$FINAL.pt" --export "$export" \
-      --deploy_pkg "$GOLEM/core_ws/src/lmg_deploy" --out "$dir/parity" > "$dir/parity.log" 2>&1 \
-      || fail "$name: deploy parity (over its tolerance, or it did not run; see $dir/parity.log)"
-    note "$name: exported to $export; CPU checks start in the background"
-    (cpu_checks "$name" "$export" "$dir") &
+    gpu_checks=parity
+    [ "${GOLEM_RUN:-0}" = 1 ] && gpu_checks=parity,golem
+    (conda activate "$CPU_ENV" && GOLEM=$GOLEM python -m evals.deploy.gate --checkpoint "$run/checkpoints/agent_$FINAL.pt" \
+      --export "$export" --out "$dir/gate_gpu" --only "$gpu_checks" > "$dir/gate_gpu.log" 2>&1) \
+      || fail "$name: deploy gate, $gpu_checks (see $dir/gate_gpu/report.md)"
+    note "$name: exported to $export; the gate's CPU checks start in the background"
+    (cpu_checks "$name" "$run/checkpoints/agent_$FINAL.pt" "$export" "$dir") &
   else
     fail "$name: export (see $dir/export.log)"
   fi

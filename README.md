@@ -59,18 +59,15 @@ python scripts/skrl/train.py --headless --max_iterations 12500 --name <name> --s
 # or the whole pipeline for seeds 42 and 43: train, scorecard, export, deploy parity, MuJoCo stress, bag replays
 bash scripts/train_candidate.sh <name> 42 43        # SMOKE=30 for a 30-update smoke test
 
-# the sport-mode scorecard and the wrist phase (motors nominal) -> <run>/checkpoints/scorecard_<N>.{json,md}
-python -m evals.isaac.legs.get_scorecard --checkpoint <run>/checkpoints/agent_<N>.pt --headless \
-    'env.events.actuator_scales.params.gain_range=[1.0,1.0]' 'env.events.actuator_scales.params.strength_range=[1.0,1.0]'
+# scorecards, plots, videos (evals/README.md) -> logs/evals/<run>/
+python -m evals.isaac.legs.get_scorecard --run <name>       # every checkpoint; the arms' twin: evals.isaac.arms
+python -m evals.isaac.legs.get_plot --run <name>            # against the newest prior runs and sport mode
+python -m evals.mujoco.get_video --legs <run>/checkpoints/agent_<N>.pt
 # export for lmg_deploy: legs.pt, arms.pt, h12.yaml (the template), export.yaml (what the run trained with); empty
 # policies/h12 first: it holds one policy
 python scripts/skrl/export_marl.py --checkpoint <run>/checkpoints/agent_<N>.pt --out ~/GOLEM/core_ws/src/lmg_deploy/policies/h12
-# the deploy controller against the env, step by step
-python -m evals.deploy.parity --checkpoint <run>/checkpoints/agent_<N>.pt --export <export dir> --headless
-# CPU: MuJoCo stress tests and the replay of a robot bag
-python -m evals.deploy.stress_mujoco --export <export dir> --label <name>
-python -m evals.deploy.bag_replay --bag <bag> --deployed mid360v2 \
-    --policy mid360v2=logs/deploy_baselines/mid360v2 --policy <name>=<export dir> --sim_seeds 4
+# the deploy gate: parity, MuJoCo stress, bag replay, GOLEM's sim; PASS/FAIL (evals/deploy/gate.yaml)
+python -m evals.deploy.gate --checkpoint <run>/checkpoints/agent_<N>.pt
 python scripts/skrl/play.py --checkpoint <run>/checkpoints/agent_<N>.pt
 ```
 
