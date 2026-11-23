@@ -57,7 +57,6 @@ from locomanipulation_game.assets.h1_2 import (
 )
 
 from . import mdp
-from .goals import EPISODE_TIME_CLIP_S
 from .golem_safety import GOLEM_TARGET_CLIP, GolemEstopCfg, position_envelope
 from .lowstate_imu import LowstateImuCfg
 from .scene_cfg import SELF_CONTACT_LINK_NAMES, SELF_CONTACT_SENSOR_NAMES, TerrainSceneCfg
@@ -293,41 +292,9 @@ class MarlObservationsCfg:
             self.enable_corruption = False
             self.concatenate_terms = True
 
-    @configclass
-    class WorldCfg(ObsGroup):
-        """A world model's state (SuperMimic; LocoManipMarlEnv.world_state): the true state in the pelvis frame, no
-        noise, enough with the episode's draws (sim_context.py) and the actions to predict the next step. Never an
-        agent's observation or the env state: the spaces and the PPO runs don't see it. The first six terms are the
-        critic's own. Tasks add their own the way they edit the other groups (ArmsOnly: the arm action's state)."""
-
-        pelvis_height = ObsTerm(func=mdp.pelvis_height_above_ground)
-        projected_gravity = ObsTerm(func=mdp.projected_gravity)
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
-        joint_pos = _joints(mdp.joint_pos_rel, 0.0)
-        joint_vel = _joints(mdp.joint_vel_rel, 0.0)
-        # every action term's targets still on their way to the robot (the 0-20 ms delay reaches back 2 steps)
-        joint_targets = ObsTerm(func=mdp.joint_target_history)
-        # the gyro's low-pass is state: what the actors read of it next step depends on it
-        lowstate_gyro = ObsTerm(func=mdp.lowstate_gyro)
-        feet_pos = ObsTerm(func=mdp.body_pos_in_root, params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=FOOT_LINK_NAMES, preserve_order=True)})
-        feet_force_z = ObsTerm(func=mdp.contact_force_z_mean, params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FOOT_LINK_NAMES, preserve_order=True)})
-        # the velocity tracking rewards read the velocity's gait-cycle mean
-        cycle_velocity = ObsTerm(func=mdp.cycle_mean_velocity, params={"command_name": "base_velocity"})
-        support_share = ObsTerm(func=mdp.gantry_support_share)
-        gantry_hook_offset = ObsTerm(func=mdp.gantry_hook_offset)
-        episode_time = ObsTerm(func=mdp.episode_time, params={"max_time": EPISODE_TIME_CLIP_S})
-
-        def __post_init__(self):
-            self.enable_corruption = False
-            self.concatenate_terms = True
-
     legs: LegsCfg = LegsCfg()
     arms: ArmsCfg = ArmsCfg()
     critic: CriticCfg = CriticCfg()
-    world: WorldCfg = WorldCfg()
 
 
 _SELF_CONTACT_PARAMS = {

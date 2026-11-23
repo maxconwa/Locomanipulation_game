@@ -5,8 +5,7 @@ them onto the per-agent dicts:
 
     actions:      one ActionManager, the agents' terms concatenated in possible_agents order (cfg.agent_action_terms);
                   with cfg.action_delay_range each env's joint targets reach the robot that many physics substeps late
-    observations: agent -> its observation group; the env state is the `critic` group; the `world` group, computed
-                  with them, is a world model's state (world_state; never an agent's observation or the env state)
+    observations: agent -> its observation group; the env state is the `critic` group
     rewards:      agent -> its own RewardManager, floored at 0, plus termination_penalty on terminating steps and
                   golem_estop_penalty on the step a GOLEM e-stop trip starts
     dones:        one TerminationManager, shared (one body, one episode)
@@ -16,11 +15,6 @@ episode's length is drawn at its reset (cfg.episode_length_range_s). While train
 the robot walks like sport mode (cfg.warm_start_*, _update_warm_start); then the arm goals start. GolemEstopMonitor
 (golem_safety.py) checks GOLEM's e-stops after every physics substep; trips are logged and charged, never end an
 episode.
-
-For a world model (SuperMimic, supermimic/) the env also exposes world_state() (the `world` group), sim_context() (the
-episode's randomization draws, sim_context.py), goal_state(agent) (goals.py), task_rewards (each agent's reward
-without the fall penalty), trip_events (per agent, whether a GOLEM e-stop trip of its started this step: the
-golem_estop_penalty in task_rewards) and obs_noise_scale(agent) (each actor observation's noise half-width).
 """
 
 from __future__ import annotations
@@ -39,14 +33,10 @@ from isaaclab.managers import (
     TerminationManager,
 )
 from isaaclab.utils.math import quat_apply_inverse, subtract_frame_transforms
-from isaaclab.utils.noise import UniformNoiseCfg
 
-from . import goals
 from .golem_safety import GolemEstopMonitor
 from .lowstate_imu import LowstateImu
 from .locomanip_marl_env_cfg import ARM_COMMAND, LocoManipMarlEnvCfg
-from .mdp.observations import target_history_depth
-from .sim_context import SimContext
 
 
 class LocoManipMarlEnv(DirectMARLEnv):
@@ -65,10 +55,6 @@ class LocoManipMarlEnv(DirectMARLEnv):
         # observation manager): one sample per physics substep, /lowstate's 500 Hz
         self.lowstate_imu = LowstateImu(self.cfg.lowstate_imu, self.cfg.gyro_lowpass_hz, self.physics_dt, self.num_envs,
                                         self.device)
-        # -- the pre-pose resets' gantry (mdp.prepose_reset, the events' prepose term; None without it): before the
-        # observation manager, whose world group reads its share
-        prepose = getattr(self.cfg.events, "prepose", None)
-        self._prepose = self.event_manager.get_term_cfg("prepose").func if prepose is not None else None
 
         # After super() has started the sim, in ManagerBasedRLEnv.load_managers' order: observations read commands
         # and actions, rewards read terminations.
@@ -133,14 +119,6 @@ class LocoManipMarlEnv(DirectMARLEnv):
             self._load_state(torch.load(self.cfg.state_checkpoint_path, map_location=self.device, weights_only=False)["env_state"])
 
         self._obs_buf: dict[str, torch.Tensor] = {}
-        # the groups computed every step: the agents', the env state's and, if the cfg has it, the world model's
-        self._obs_groups = list(self.cfg.possible_agents) + ["critic"]
-        if "world" in self.observation_manager.active_terms:
-            self._obs_groups.append("world")
-        # each agent's reward this step without the fall penalty, and whether a GOLEM e-stop trip of its started
-        # this step (charged golem_estop_penalty in task_rewards) (_get_rewards)
-        self.task_rewards: dict[str, torch.Tensor] = {}
-        self.trip_events: dict[str, torch.Tensor] = {}
 
         # -- action delay: per action term, the last targets, newest first; per env, how many substeps late they apply
         self._delay_terms = [self.action_manager.get_term(name) for name in self.action_manager.active_terms]
@@ -149,20 +127,21 @@ class LocoManipMarlEnv(DirectMARLEnv):
         if self.cfg.action_delay_range is not None:
             low, high = self.cfg.action_delay_range
             self._delay_steps = torch.randint(low, high + 1, (self.num_envs,), device=self.device)
-            depth = target_history_depth(self.cfg.action_delay_range, self.cfg.decimation)
+            depth = -(-high // self.cfg.decimation)  # a delay of d substeps reaches back ceil(d / decimation) steps
             self._target_history = [
                 self._robot.data.joint_pos[:, term._joint_ids].unsqueeze(1).repeat(1, depth + 1, 1).clone()
                 for term in self._delay_terms
             ]
             print(f"[INFO] Action delay: {low}-{high} physics substeps per env, drawn at each reset")
 
+        # -- the pre-pose resets' gantry (mdp.prepose_reset, the events' prepose term; None without it)
+        prepose = getattr(self.cfg.events, "prepose", None)
+        self._prepose = self.event_manager.get_term_cfg("prepose").func if prepose is not None else None
+
         # -- the legs' target rate drives the torso IMU's vibration
         self._legs_term = self.action_manager.get_term("joint_pos")
         self._prev_leg_target = self._legs_term._applied.clone()
         print(f"[INFO] Torso IMU (/lowstate): {self.cfg.lowstate_imu}; gyro low-pass {self.cfg.gyro_lowpass_hz:g} Hz")
-
-        # -- the episode's randomization draws (sim_context.py), last: it reads the delay, the IMU and the gantry
-        self._sim_context = SimContext(self)
 
     """
     DirectMARLEnv hooks.
@@ -228,7 +207,6 @@ class LocoManipMarlEnv(DirectMARLEnv):
         for agent, tripped in self.golem_tripped_by.items():
             new = tripped & ~self._golem_tripped_by_prev[agent]
             self._golem_tripped_by_prev[agent] = tripped.clone()
-            self.trip_events[agent] = new
             trip_cost[agent] = self.cfg.golem_estop_penalty * new.float()
             self.golem_log[f"Safety/trip_starts_{agent}"] = new.float().mean()
         rewards = {}
@@ -237,10 +215,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
             if torch.isnan(reward).any():
                 bad = torch.isnan(manager._step_reward).any(dim=0).nonzero(as_tuple=True)[0].tolist()
                 raise RuntimeError(f"NaN in {agent} reward terms {[manager._term_names[i] for i in bad]}")
-            # the reward without the fall's penalty (a world model predicts it, and the fall apart): floored at 0, the
-            # trip cost
-            self.task_rewards[agent] = torch.clamp(reward, min=0.0) + trip_cost[agent]
-            rewards[agent] = self.task_rewards[agent] + self.cfg.termination_penalty * terminated
+            rewards[agent] = torch.clamp(reward, min=0.0) + self.cfg.termination_penalty * terminated + trip_cost[agent]
         return rewards
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
@@ -248,7 +223,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._sample_imu()
         self._update_odometry()
         self.command_manager.compute(dt=self.step_dt)
-        self._obs_buf = {g: self.observation_manager.compute_group(g) for g in self._obs_groups}
+        groups = list(self.cfg.possible_agents) + ["critic"]
+        self._obs_buf = {g: self.observation_manager.compute_group(g) for g in groups}
         self.extras.setdefault("log", {}).update(self._warm_start_log)
         self.extras["log"].update(self.golem_log)
         return {agent: self._obs_buf[agent] for agent in self.cfg.possible_agents}
@@ -296,9 +272,6 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._legs_term.start_blend(env_ids, held)
         log.update(self.event_manager.reset(env_ids))
         log.update(self.termination_manager.reset(env_ids))
-        # the episode's draws are all in by now (the reset events', the delay's, the IMU's, the gantry's)
-        if getattr(self, "_sim_context", None) is not None:
-            self._sim_context.refresh(env_ids)
         # skrl logs only one-element tensors; the managers also return floats
         self.extras["log"] = {
             key: value if isinstance(value, torch.Tensor) else torch.tensor(float(value), device=self.device)
@@ -348,48 +321,6 @@ class LocoManipMarlEnv(DirectMARLEnv):
         if self._prepose is None:
             return torch.zeros(self.num_envs, device=self.device)
         return self._prepose.support_share(self.episode_length_buf * self.step_dt)
-
-    """
-    World-model hooks (SuperMimic, supermimic/).
-    """
-
-    def world_state(self) -> torch.Tensor:
-        """(num_envs, S): this step's `world` observation group (MarlObservationsCfg.WorldCfg), the true state in the
-        pelvis frame, no noise; computed with the agents' observations."""
-        return self._obs_buf["world"]
-
-    def sim_context(self) -> torch.Tensor:
-        """(num_envs, C): each env's randomization draws for its episode (sim_context.SIM_CONTEXT_TERMS), constant
-        between its resets."""
-        return self._sim_context.xi
-
-    def goal_state(self, agent: str) -> torch.Tensor:
-        """(num_envs, Gs): agent's goal state now (goals.goal_state)."""
-        return goals.goal_state(self, agent)
-
-    def obs_noise_scale(self, agent: str) -> torch.Tensor:
-        """(obs_dim,): the half-width of the uniform noise on each dimension of agent's observation (the observation
-        manager's term cfgs, times each term's scale; 0 for terms without noise), to add the sensors' noise back to a
-        noise-free observation."""
-        manager = self.observation_manager
-        widths = []
-        for term_cfg, dims in zip(manager._group_obs_term_cfgs[agent], manager._group_obs_term_dim[agent]):
-            noise = term_cfg.noise
-            if noise is None:
-                width = torch.zeros(dims, device=self.device)
-            elif isinstance(noise, UniformNoiseCfg) and noise.operation == "add":
-                low = torch.as_tensor(noise.n_min, dtype=torch.float, device=self.device)
-                high = torch.as_tensor(noise.n_max, dtype=torch.float, device=self.device)
-                width = (0.5 * (high - low)).expand(dims).clone()
-            else:
-                raise NotImplementedError(f"obs_noise_scale: {agent}'s noise {type(noise).__name__}")
-            if term_cfg.scale is not None:
-                width = width * torch.as_tensor(term_cfg.scale, dtype=torch.float, device=self.device).abs()
-            widths.append(width.reshape(-1))
-        widths = torch.cat(widths)
-        if widths.numel() != manager.group_obs_dim[agent][0]:
-            raise ValueError(f"obs_noise_scale: {widths.numel()} widths for {agent}'s {manager.group_obs_dim[agent]}")
-        return widths
 
     """
     Arm-command odometry and the warm start.
