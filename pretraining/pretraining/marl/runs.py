@@ -54,19 +54,24 @@ def atomic_write_text(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-def config_from_dict(cls, data: dict):
+def config_from_dict(cls, data: dict, strict: bool = False, _where: str = ""):
     """Return a ``cls`` dataclass from its ``dataclasses.asdict`` form, nested dataclasses and tuples included.
 
-    Keys ``cls`` does not have are ignored; missing ones keep their defaults.
+    Missing keys keep their defaults. Keys ``cls`` does not have are ignored (an older run's
+    ``run.json``), or with ``strict`` refused with a ``ValueError`` naming them (a config file).
     """
     hints = typing.get_type_hints(cls)
+    if strict:
+        unknown = sorted(set(data) - {f.name for f in dataclasses.fields(cls)})
+        if unknown:
+            raise ValueError(f"unknown {cls.__name__} key(s): {', '.join(_where + k for k in unknown)}")
     kwargs = {}
     for f in dataclasses.fields(cls):
         if f.name not in data:
             continue
         value, hint = data[f.name], hints[f.name]
         if dataclasses.is_dataclass(hint) and isinstance(value, dict):
-            value = config_from_dict(hint, value)
+            value = config_from_dict(hint, value, strict, f"{_where}{f.name}.")
         elif typing.get_origin(hint) is tuple and isinstance(value, list):
             value = tuple(value)
         kwargs[f.name] = value

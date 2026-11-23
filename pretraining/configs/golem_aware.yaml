@@ -1,0 +1,72 @@
+# Stage-1 fine-tune with the estop position penalty: the settings of h12_train's amass_s1_golem_aware run (amass_s1's,
+# with rewards.estop.position -20 and 20000 more iterations). runs_dir, run_name, seed and wandb_* come from the command line or the defaults.
+#   python -m pretraining.scripts.train --config pretraining/configs/golem_aware.yaml --run-name <name> --fine-tune-from <stage-1 run dir>
+num_envs: 5120
+runner:
+  headless: true
+  buffer_size: 1000
+  representation: gencoord
+  actor_obs: proprio
+  log_interval: 10
+  save_interval: 32000
+  history_length: 1
+  termination_softness: 0.05
+  dynamics_hidden_dims: [2048, 2048, 2048]
+  wm:
+    lr: 0.0002
+    num_batches: 10
+    batch_size: 2048
+    horizon: 8
+    nominal_error_root_pose_pos: 0.01
+    nominal_error_root_pose_ori: 0.02
+    nominal_error_joint_pos: 0.1
+    nominal_error_joint_vel: 3.14
+    nominal_error_body_pos: 0.05
+    nominal_error_body_rot: 0.1
+    nominal_error_body_vel: 1.0
+    nominal_error_body_avel: 3.14
+  max_iterations: 20000  # iterations of the fine-tune itself: it continues the source run's count
+  replay_ratio: 16
+  latent_dim: 32
+  actor_hidden_dims: [2048, 1024, 512, 256]
+  critic_hidden_dims: [256, 128]
+  command_hidden_dims: [512, 256]
+  policy:
+    lr: 0.0002
+    num_batches: 1
+    batch_size: 1024
+    horizon: 32
+    gamma: 0.99
+    survival_masking: true
+    beta2: 0.95
+    grad_clip_value: 0.1
+    lam: 0.95
+  sampling_mode: return
+  return_sampler:
+    gamma: 0.99
+    horizon: 20
+    memory: 256
+    steepness: 25.0
+    explore: 0.5
+    keep: 0.1
+  max_seconds: 0.0
+  checkpoint_interval_s: 3600.0
+  keep_checkpoints: 40
+  resume_warmup: 50
+rewards:
+  legs_root_pos: {weight: 0.5, std: 0.3}
+  legs_root_ori: {weight: 0.5, std: 0.4}
+  legs_body_pos: {weight: 1.0, std: 0.3}
+  legs_body_ori: {weight: 1.0, std: 0.4}
+  legs_body_lin_vel: {weight: 1.0, std: 1.0}
+  legs_body_ang_vel: {weight: 1.0, std: 3.14}
+  arms_body_pos: {weight: 1.0, std: 0.15}
+  arms_body_ori: {weight: 1.0, std: 0.4}
+  arms_ee_pos: {weight: 1.0, std: 0.1}
+  arms_ee_ori: {weight: 0.5, std: 0.4}
+  estop:
+    margin: 0.9
+    velocity: -5.0
+    torque: -5.0
+    position: -20.0
+    position_margin: 0.05

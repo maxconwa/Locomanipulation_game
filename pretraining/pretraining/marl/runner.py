@@ -508,6 +508,14 @@ class TwoAgentRunner(BaseRunner[TwoAgentRunnerCfg]):
                     num_collected_steps=collected,
                 )
                 progress.append(row)
+                print(
+                    " ".join(
+                        f"{k} {row[k]:.4g}" if isinstance(row.get(k), float) else f"{k} {row.get(k, '-')}"
+                        for k in ("iteration", "wall_s", "s_per_iteration", "peak_gpu_gb", "Loss/state",
+                                  "Metrics/motion/error_body_pos")
+                    ),
+                    flush=True,
+                )
                 log_count += 1
                 t0 = time.time()
                 wm_time = policy_time = 0.0

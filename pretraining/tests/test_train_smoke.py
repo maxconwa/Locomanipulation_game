@@ -1,4 +1,4 @@
-"""Smoke tests of the scripts on the stand-in env: the cross-check."""
+"""Smoke tests of the scripts on the stand-in env: the cross-check, the replay rollout and training."""
 
 from __future__ import annotations
 
@@ -125,10 +125,152 @@ def test_rollout_scores_a_reference_replay_near_zero(sim_app, tmp_path):
         finally:
             env.close()
     for r in results[0.02]:
-        print("step 0", r["clip"], r["body_pos_err_m"], r["pelvis_pos_err_m"], r["joint_err_rad"])
         assert r["steps"] == 1 and r["ended_by"] == "time_cap"
         assert r["body_pos_err_m"] < 0.02 and r["pelvis_pos_err_m"] < 0.02 and r["joint_err_rad"] < 0.02
     for r in results[0.2]:
-        print("full", r["clip"], r["ended_by"], r["steps"], r["body_pos_err_m"], r["pelvis_pos_err_m"], r["joint_err_rad"])
         assert r["steps"] == 10 and r["ended_by"] == "time_cap"
         assert r["joint_err_rad"] < REPLAY_JOINT_ERR
+
+
+# Training (scripts/train.py), run as a subprocess: each launch starts its own Isaac app.
+
+TRAIN_TIMEOUT_S = 600
+TRAIN_ENVS = 64
+SMALL_CONFIG = """\
+num_envs: 4096  # more than the tests use: --num-envs overrides it
+runner:
+  buffer_size: 50
+  actor_obs: proprio
+  log_interval: 1
+  save_interval: 100000
+  checkpoint_interval_s: 100000.0
+  resume_warmup: 2
+  replay_ratio: 4
+  actor_hidden_dims: [64, 64]
+  critic_hidden_dims: [32]
+  dynamics_hidden_dims: [64, 64]
+  wm: {num_batches: 1, batch_size: 64, horizon: 2}
+  policy: {batch_size: 32, horizon: 4}
+rewards:
+  estop: {velocity: -5.0}
+"""
+
+
+def _train(tmp_path, *args, ok=True):
+    """Run ``python -m pretraining.scripts.train *args`` with the runs root in ``tmp_path``; kill its process group
+    on timeout. Returns the completed process; ``ok`` asserts exit 0, ``ok=False`` a non-zero exit."""
+    import signal
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    env = dict(os.environ, PRETRAINING_RUNS_DIR=str(tmp_path / "runs"), PRETRAINING_CUDA_GRAPHS="0",
+               WANDB_MODE="disabled")
+    cmd = [sys.executable, "-m", "pretraining.scripts.train", *map(str, args)]
+    proc = subprocess.Popen(cmd, cwd=Path(__file__).resolve().parents[1], env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    try:
+        out, _ = proc.communicate(timeout=TRAIN_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        out, _ = proc.communicate()
+        pytest.fail(f"train.py timed out after {TRAIN_TIMEOUT_S} s:\n{out[-4000:]}")
+    proc.stdout_text = out
+    if ok:
+        assert proc.returncode == 0, out[-4000:]
+    else:
+        assert proc.returncode != 0, out[-4000:]
+    return proc
+
+
+def _train_setup(tmp_path):
+    """Stand-in clips and the small config file; returns (clip files, config path)."""
+    files = write_clips(tmp_path / "motions", n=3, frames=120)
+    config = tmp_path / "small.yaml"
+    config.write_text(SMALL_CONFIG)
+    return files, config
+
+
+def _iterations(run_dir):
+    with open(run_dir / "progress.csv") as fh:
+        return [int(r["iteration"]) for r in csv.DictReader(fh)]
+
+
+@pytest.mark.sim
+def test_smoke_training_writes_a_run_refuses_its_directory_and_fine_tunes(tmp_path):
+    """A new run (64 envs, fewer than the config's num_envs and than the batch sizes of base.yaml would need) writes
+    the run files and run.json (env count, config content, motion files, seed); a second start on the same name is
+    refused; a config with an unknown key is refused naming it; a fine-tune starts a new run from the first one's
+    checkpoint with its own rewards, continuing the iteration count (as h12_train's amass_s1_golem_aware)."""
+    import yaml
+
+    files, config = _train_setup(tmp_path)
+    common = ["--config", config, "--motion-dir", tmp_path / "motions", "--num-envs", TRAIN_ENVS]
+    proc = _train(tmp_path, *common, "--run-name", "a", "--max-iterations", 30, "--seed", 5)
+    run = tmp_path / "runs" / "a"
+    assert str(run) in proc.stdout_text
+    assert "s_per_iteration" in proc.stdout_text and "peak_gpu_gb" in proc.stdout_text
+    for name in ("run.json", "progress.csv", "actors.pt", "critics.pt", "world_model.pt", "checkpoint.pt"):
+        assert (run / name).exists(), name
+    meta = json.loads((run / "run.json").read_text())
+    assert meta["num_envs"] == TRAIN_ENVS
+    assert meta["config"] == yaml.safe_load(SMALL_CONFIG)
+    assert meta["motion_files"] == [str(f.resolve()) for f in files]
+    assert meta["runner"]["seed"] == 5 and meta["runner"]["wm"]["batch_size"] == 64
+    assert meta["rewards"]["estop"]["position"] == 0.0
+    assert _iterations(run) == list(range(30))
+    with open(run / "progress.csv") as fh:
+        losses = [float(r["Loss/state"]) for r in csv.DictReader(fh) if r.get("Loss/state")]
+    assert losses and all(math.isfinite(v) for v in losses)
+
+    # the same run name again: refused before the app starts, naming the directory; nothing in it changed
+    before = (run / "run.json").read_text()
+    proc = _train(tmp_path, *common, "--run-name", "a", "--max-iterations", 30, ok=False)
+    assert str(run) in proc.stdout_text and "exists" in proc.stdout_text
+    assert (run / "run.json").read_text() == before
+
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(SMALL_CONFIG.replace("  wm: {", "  wm: {batch_sise: 3, "))
+    proc = _train(tmp_path, "--config", bad, "--motion-dir", tmp_path / "motions", "--run-name", "bad", ok=False)
+    assert "wm.batch_sise" in proc.stdout_text and not (tmp_path / "runs" / "bad").exists()
+
+    # fine-tune: 5 iterations of a new run from a's checkpoint with the estop position term on
+    tuned_cfg = tmp_path / "tuned.yaml"
+    tuned_cfg.write_text(SMALL_CONFIG.replace("estop: {velocity: -5.0}", "estop: {velocity: -5.0, position: -20.0}")
+                         .replace("log_interval: 1", "log_interval: 1\n  max_iterations: 5"))
+    _train(tmp_path, "--config", tuned_cfg, "--motion-dir", tmp_path / "motions", "--num-envs", TRAIN_ENVS,
+           "--run-name", "b", "--fine-tune-from", run)
+    tuned = tmp_path / "runs" / "b"
+    meta = json.loads((tuned / "run.json").read_text())
+    assert meta["fine_tuned_from"] == f"{run} at iteration 29"
+    assert meta["resumed"][0]["iteration"] == 30
+    assert meta["rewards"]["estop"]["position"] == -20.0 and meta["config"]["runner"]["max_iterations"] == 5
+    assert meta["runner"]["max_iterations"] == 35
+    assert _iterations(tuned) == list(range(35))  # a's curves, then the fine-tune's
+    assert json.loads((tuned / "checkpoint.json").read_text())["iteration"] == 34
+    assert _iterations(run) == list(range(30)) and (run / "run.json").read_text() == before  # the source untouched
+
+
+@pytest.mark.sim
+def test_resume_after_a_wall_time_stop_continues_the_iteration_count(tmp_path):
+    """A run stopped by --max-seconds saves and exits 0; --resume continues it to --max-iterations, the count
+    carrying on, with only --max-iterations / --max-seconds taken from the command line."""
+    _, config = _train_setup(tmp_path)
+    proc = _train(tmp_path, "--config", config, "--motion-dir", tmp_path / "motions", "--num-envs", TRAIN_ENVS,
+                  "--run-name", "r", "--max-iterations", 100000, "--max-seconds", 40)
+    run = tmp_path / "runs" / "r"
+    stopped = json.loads((run / "checkpoint.json").read_text())["iteration"]
+    assert 1 <= stopped < 99999  # stopped by the clock (the first iterations compile: slow), proc.stdout_text[-2000:]
+    assert _iterations(run)[-1] == stopped
+    proc = _train(tmp_path, "--resume", run, "--max-iterations", stopped + 11)
+    assert str(run) in proc.stdout_text
+    its = _iterations(run)
+    assert its == list(range(stopped + 11)) and its[-1] == stopped + 10
+    assert json.loads((run / "checkpoint.json").read_text())["iteration"] == stopped + 10
+    meta = json.loads((run / "run.json").read_text())
+    assert [r["iteration"] for r in meta["resumed"]] == [stopped + 1] and meta["resumed"][0]["wall_s"] > 40
+    assert meta["num_envs"] == TRAIN_ENVS
+
+    # any other option with --resume is refused: the run's settings are its run.json's
+    proc = _train(tmp_path, "--resume", run, "--num-envs", 8, ok=False)
+    assert "--num-envs" in proc.stdout_text
