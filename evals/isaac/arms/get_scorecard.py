@@ -14,7 +14,7 @@ evals/isaac/env.py checks that each agent fits the env.
 
 --ik_only: zero arms actions (the IK and its trajectory alone; the checkpoint only sets the run up): the reference
 the policy's residual is judged against, written as scorecard_ik_only and used as the Reference column of the run's
-other scorecards. --steerability: afterwards, the steerability benchmark's quick suite on the dev split
+other scorecards. --steerability: afterwards (about 1.5 h more), the steerability benchmark's quick suite on the dev split
 (evals/isaac/arms/steerability, its own Isaac process), its summary appended.
 
 Writes logs/evals/<run>/isaac/arms/scorecard_<N>[_offtable][_sampled][_with_<legs run>_<M>].{json,md}.
