@@ -1,0 +1,13 @@
+pretraining: provenance and licences
+
+Files ported or transcribed from upstream code name, in their header, the upstream file and
+commit they come from.
+
+- h12_train (branch supermimic, commit b175f1c) is this repository's own code and under its
+  terms. Transcribed from it: pretraining/constants.py (src/h12_train/robot/h12_constants.py,
+  src/h12_train/tasks.py and the joint ranges of src/h12_train/robot/xmls/h1_2_magpie.xml).
+- SuperMimic (HybridRobotics, commit 7e94b07): Apache License 2.0.
+- mjlab (HybridRobotics' fork mjlab_research, commit 6ea3e57): Apache License 2.0.
+
+The robot model (main's h1_2_magpie USD, from the Correll Lab's CL_Assets and Unitree
+Robotics' H1-2 description) is used from main, not copied; their terms govern it.

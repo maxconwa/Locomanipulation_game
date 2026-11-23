@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pretraining"
+version = "0.1.0"
+description = "Isaac Lab port of h12_train's motion-tracking pretraining for the Unitree H1-2"
+requires-python = ">=3.10"
+# Everything it needs (isaaclab, torch, numpy, pyyaml, locomanipulation_game) is env_isaaclab's.
+dependencies = []
+
+[tool.setuptools]
+packages = ["pretraining"]
