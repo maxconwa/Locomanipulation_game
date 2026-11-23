@@ -290,6 +290,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
         log.update(self.command_manager.reset(env_ids))
         if self._prepose is not None:
             log.update(self._hand_over(torch.as_tensor(env_ids, device=self.device)))
+        # the legs' engage blend starts from the target held before the first step (the pre-pose's hold at its resets)
+        held = (self._target_history[self._delay_terms.index(self._legs_term)][env_ids, 0] if self._target_history
+                else self._legs_term._applied[env_ids])
+        self._legs_term.start_blend(env_ids, held)
         log.update(self.event_manager.reset(env_ids))
         log.update(self.termination_manager.reset(env_ids))
         # the episode's draws are all in by now (the reset events', the delay's, the IMU's, the gantry's)

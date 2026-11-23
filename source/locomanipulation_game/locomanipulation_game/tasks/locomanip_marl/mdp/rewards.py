@@ -36,6 +36,19 @@ def action_term_rate_l2(env: ManagerBasedRLEnv, action_name: str) -> torch.Tenso
     return torch.sum(torch.square(a - prev), dim=1)
 
 
+def engage_target_smooth_exp(env, action_name: str, window_s: float, std: float) -> torch.Tensor:
+    """In the first window_s of an episode from the pre-pose (mdp.prepose_reset), exp(-sum_j dq_j^2 / std^2) for the
+    change dq of the policy's own targets (rad, before the engage blend) since the last step, the first step's from the
+    held target: positive, so the legs' reward floor at 0 never swallows it. 0 elsewhere."""
+    term = env.action_manager.get_term(action_name)
+    prepose = getattr(env, "_prepose", None)
+    if prepose is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    change = (term.policy_target - term.prev_policy_target).square().sum(dim=1)
+    early = (env.episode_length_buf.float() * env.step_dt < window_s) & prepose.active
+    return torch.exp(-change / std ** 2) * early.float()
+
+
 def action_beyond_clip(env, agent: str, action_name: str, clip: float) -> torch.Tensor:
     """How far the agent's raw actions for action_name's joints are beyond the env's clip, plus what that action
     term's position bound cut off, summed over its joints (action units). Nothing else pulls a policy mean back once

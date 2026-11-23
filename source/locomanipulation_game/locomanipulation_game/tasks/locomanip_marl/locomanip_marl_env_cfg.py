@@ -137,6 +137,16 @@ PREPOSE_JOINT_RANGES = {
     ".*_ankle_pitch_joint": (-0.3, 0.15), ".*_ankle_roll_joint": (-0.1, 0.1), ".*_knee_joint": (-0.1, 0.2),
     ".*_hip_.*_joint": (-0.1, 0.1), "torso_joint": (-0.05, 0.05), ".*_(shoulder_.*|elbow)_joint": (-0.15, 0.15),
     ".*_wrist_.*_joint": (-0.15, 0.15)}
+# The engage (2026-11-22): over its first ENGAGE_BLEND_S every episode's leg targets blend from the held one to the
+# policy's, as lmg_deploy does at the engage (mdp.BoundedJointPositionAction); in the first ENGAGE_WINDOW_S after a
+# pre-pose reset the policy's own targets earn engage_smooth for changing little. From a sagged pose LegsDeploy200k_s42
+# and LegsFastEnv60k_s42 moved their mean targets 0.045-0.058 rad per joint per step in the first 0.5 s. The sampled
+# targets' exploration noise (legs std ~0.5, scales 0.125-0.25) alone moves them ~0.14 rad per joint per step, a sum of
+# squares ~0.26 over the 12 joints: at std ENGAGE_SMOOTH_STD it keeps ~60% of the kernel, which is then nearly linear
+# in the mean's squared change, ~18x action_rate's charge on it during the window
+ENGAGE_BLEND_S = 0.5
+ENGAGE_WINDOW_S = 1.0
+ENGAGE_SMOOTH_STD = 0.7
 # the motors' gain and strength draws (mdp.randomize_actuator_scales)
 # The real ankles give about 0.2 rad under 13-17 Nm at kp 80 through their parallel linkage (2026-11-20's pre-pose):
 # softer than the MJCF's, so their gains are drawn wider and lower than the rest's
@@ -194,6 +204,7 @@ class MarlActionsCfg:
         preserve_order=True,
         target_margin=-GOLEM_TARGET_CLIP,
         torque_headroom=TORQUE_HEADROOM,
+        engage_blend_s=ENGAGE_BLEND_S,
     )
     arm_pos = mdp.IKResidualArmActionCfg(
         asset_name="robot",
@@ -416,6 +427,9 @@ class LegsRewardsCfg:
     # x4 since 2026-11-20 (was -0.025): the real loop amplified the targets' step-to-step changes ~2.5x over MuJoCo
     # (LegsEnergyDefault200k_s43's engage, 0.18 rad per step), so the trained ones must be that much tamer
     action_rate = RewTerm(func=mdp.action_term_rate_l2, weight=-0.1, params={"action_name": LEGS_ACTION})
+    # the engage from the pre-pose (ENGAGE_SMOOTH_STD): at most 40 over its first second, ~24 of it under the noise
+    engage_smooth = RewTerm(func=mdp.engage_target_smooth_exp, weight=40.0, params={
+        "action_name": LEGS_ACTION, "window_s": ENGAGE_WINDOW_S, "std": ENGAGE_SMOOTH_STD})
     ankle_torque = RewTerm(func=mdp.joint_torques_l2, weight=-5.0e-5,
                            params={"asset_cfg": SceneEntityCfg("robot", joint_names=ANKLE_JOINT_NAMES)})
     ankle_action_rate = RewTerm(func=mdp.ankle_action_rate_l2, weight=-0.05,

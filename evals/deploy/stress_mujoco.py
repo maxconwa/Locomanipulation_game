@@ -20,7 +20,11 @@ observations, all from the export's settings) and adds the perturbations (CONDIT
                    bag      the robot's measured pre-pose at its 2026-11-20 11:57 engage (data/bag_engage_q.npy)
                    bag1449  the one at its 14:49 engage (data/bag_engage_q_1449.npy: unsettled, 0.16 rad off)
                    random   a draw from the training's pre-pose range (PREPOSE_JOINT_RANGES; per seed)
-                 Run for PP_AFTER_S with a zero command; scored on the first 0.5 s and the stance after (pp table)
+                 Run for PP_AFTER_S with a zero command; scored on the first 0.5 s, 0.5-1 s and the stance after (pp
+                 table). The sag comes from the pre-pose commanding the start pose (this MJCF's ankles are stiffer
+                 than the robot's, which sags under the default pose's command): the jumps count from the measured
+                 pose, the robot's from the default. An export's engage blend (engage_blend_s) starts from that
+                 command, as lmg_deploy's starts from the pre-pose's last
   imu_pitch, vib_k   for an export on the torso IMU (export imu.source lowstate): the quaternion's pitch bias as the
                  policy reads it ("lo" / "hi": the trained range's ends; default its centre): for imu.orientation
                  calibrated the error lmg_deploy's calibration leaves, for raw the offset itself; and its gyro's
@@ -357,6 +361,9 @@ def run_prepose_job(job, video: str | None = None):
                 for a in actors.values():
                     a.reset_state()
                 q = sim.measured_q()
+                # the engage blend (export.yaml engage_blend_s) starts from the last command sent, the pre-pose's
+                sim.blend_from = sim.applied[sim.leg_idx].copy()
+                sim.policy_target = sim.blend_from.copy()
                 sim.applied[:] = q
                 sim.residual[:] = 0.0
                 sim.ik_q = q[sim.arm_idx].copy()
@@ -367,6 +374,7 @@ def run_prepose_job(job, video: str | None = None):
                 obs = sim.observations()
                 w0 = np.linalg.norm(sim.wrist_poses_b()[:, :3] - sim.believed[:, :3], axis=1).mean()
             prev = sim.applied.copy()
+            prev_policy = getattr(sim, "policy_target", sim.applied[:12]).copy()
             if engaged:
                 obs = sim.step(obs)
             else:
@@ -379,6 +387,7 @@ def run_prepose_job(job, video: str | None = None):
             q = sim.measured_q()
             tilt = sim.tilt()
             rec.append({"t": t - PP_ENGAGE_S, "engaged": engaged, "jump_legs": jump[:12].copy(), "jump_arms": jump[13:].copy(),
+                        "jump_policy": np.abs(sim.policy_target - prev_policy) if engaged else np.zeros(12),
                         "tau_share": float(np.max(np.abs(sim.last_tau[:12]) / sim.effort[:12])),
                         "knee_off": float(np.abs(q[KNEE_IDX] - sim.default[KNEE_IDX]).mean()),
                         "target": sim.applied[:12].copy(), "tilt": tilt, "z": float(d.qpos[2]),
@@ -421,6 +430,11 @@ def run_prepose_job(job, video: str | None = None):
             "fell": fell_t is not None, "fall_t": fell_t,
             "first_mean_jump": float(np.mean([r["jump_legs"].mean() for r in first])),
             "first_max_jump": float(np.max([r["jump_legs"].max() for r in first])),
+            # 0.5-1 s after the engage (a blend must not just move the jump past the first 0.5 s), and the policy's own
+            # targets before the engage blend (what the robot would get without it)
+            "second_mean_jump": float(np.mean([r["jump_legs"].mean() for r in eng if 0.5 <= r["t"] < 1.0])),
+            "policy_mean_jump": float(np.mean([r["jump_policy"].mean() for r in first])),
+            "policy_max_jump": float(np.max([r["jump_policy"].max() for r in first])),
             "first_torque_share": float(np.max([r["tau_share"] for r in first])),
             "knee_off": float(np.mean([r["knee_off"] for r in after])) if after else None,
             "at_limit": at_limit,
@@ -563,11 +577,15 @@ def main():
             cell = {"runs": len(rs), "fell_pct": 100 * float(np.mean([r["fell"] for r in rs])),
                     "first_mean_jump": med("first_mean_jump"), "first_mean_jump_worst": worst("first_mean_jump"),
                     "first_max_jump": worst("first_max_jump"), "first_torque_share": worst("first_torque_share"),
+                    "second_mean_jump_worst": worst("second_mean_jump"),
+                    "policy_mean_jump": med("policy_mean_jump"), "policy_mean_jump_worst": worst("policy_mean_jump"),
+                    "policy_max_jump": worst("policy_max_jump"),
                     "knee_off": med("knee_off"), "knee_off_worst": worst("knee_off"), "at_limit": worst("at_limit"),
                     "pre_knee_off": med("pre_knee_off"), "arm_max_jump": worst("arm_max_jump"),
                     "max_tilt_deg": worst("max_tilt_deg"),
                     "wrist_err_mm": np.median([r["wrist_err_mm"] for r in rs], axis=0).tolist()}
             cell["pass"] = bool(cell["fell_pct"] == 0 and cell["first_mean_jump_worst"] <= PP_MAX_MEAN_JUMP
+                                and (cell["second_mean_jump_worst"] or 0.0) <= PP_MAX_MEAN_JUMP
                                 and cell["first_torque_share"] <= PP_MAX_TORQUE_SHARE
                                 and (cell["knee_off_worst"] or 0.0) <= PP_MAX_KNEE_OFFSET
                                 and (cell["at_limit"] or 0.0) < PP_MAX_AT_LIMIT)
@@ -615,15 +633,21 @@ def main():
                   f" {r['lstm_c_5s']:.3f} / {r['lstm_c_end']:.3f} | {fmt(r['last_ankle_target'])} |")
     if pp_cells:
         md += ["", f"Pre-pose engage (zero command; the first 0.5 s after the engage, the stance from 2 s on). Pass: no"
-               f" fall, mean leg target jump <= {PP_MAX_MEAN_JUMP} rad (worst seed), leg torque <= {PP_MAX_TORQUE_SHARE}"
+               f" fall, mean leg target jump <= {PP_MAX_MEAN_JUMP} rad (worst seed) in 0-0.5 s and in 0.5-1 s, leg torque"
+               f" <= {PP_MAX_TORQUE_SHARE}"
                f" of the limit, knees within {PP_MAX_KNEE_OFFSET} rad of default, targets at a limit"
                f" < {PP_MAX_AT_LIMIT:.0%} of steps.", "",
-               "| cell | pass | fell % | 0.5 s mean jump med / worst | 0.5 s max jump | 0.5 s torque/limit | knee off"
+               "The policy's own jump: its leg targets before lmg_deploy's engage blend (export.yaml engage_blend_s; the"
+               " same as the sent ones without it), reported only.", "",
+               "| cell | pass | fell % | 0.5 s mean jump med / worst | 0.5-1 s worst | 0.5 s max jump | policy's own"
+               " 0.5 s mean jump med / worst / max | 0.5 s torque/limit | knee off"
                " med / worst | at limit | knee off pre-pose | wrist err mm at 0/0.25/0.5/1 s | arm max jump | max tilt deg |",
-               "|" + "---|" * 12]
+               "|" + "---|" * 14]
         for key, r in pp_cells.items():
             md.append(f"| {key} | {'yes' if r['pass'] else 'NO'} | {r['fell_pct']:.0f} | {fmt(r['first_mean_jump'], '{:.3f}')} /"
-                      f" {fmt(r['first_mean_jump_worst'], '{:.3f}')} | {fmt(r['first_max_jump'])} |"
+                      f" {fmt(r['first_mean_jump_worst'], '{:.3f}')} | {fmt(r.get('second_mean_jump_worst'), '{:.3f}')} |"
+                      f" {fmt(r['first_max_jump'])} | {fmt(r.get('policy_mean_jump'), '{:.3f}')} /"
+                      f" {fmt(r.get('policy_mean_jump_worst'), '{:.3f}')} / {fmt(r.get('policy_max_jump'))} |"
                       f" {fmt(r['first_torque_share'])} | {fmt(r['knee_off'])} / {fmt(r['knee_off_worst'])} |"
                       f" {fmt(r['at_limit'], '{:.1%}')} | {fmt(r['pre_knee_off'])} | {fmt(r['wrist_err_mm'], '{:.0f}')} |"
                       f" {fmt(r['arm_max_jump'])} | {fmt(r['max_tilt_deg'], '{:.1f}')} |")

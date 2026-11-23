@@ -6,7 +6,8 @@ pinocchio), synced to the env's command state (mode, arm command, velocity comma
 actions, residual filter), and compares:
   observations   both agents', term by term
   networks       the exported legs.pt / arms.pt on the env's observation vs skrl's mean action (clamped)
-  targets        the deploy joint targets for the env's action vs the targets the env applied
+  targets        the deploy joint targets for the env's action vs the targets the env applied (the legs' engage
+                 blend from where the env's started, over the export's engage_blend_s against the env's)
   gyro_lowpass   lmg_deploy's gyro low-pass on env 0's IMU samples vs the env's
 For an export on the calibrated torso IMU (export.yaml imu.orientation: calibrated) the controller gets an IMU
 calibration (--imu_calibration_deg) and the quaternion the robot would report with that offset, so the observations
@@ -174,6 +175,9 @@ def main(env_cfg, agent_cfg: dict):
         ctrl.legs_last = legs_term.applied_actions[i].double().cpu().numpy().copy()
         ctrl.arms_last = arms_term.applied_actions[i].double().cpu().numpy().copy()
         ctrl.residual = arms_term._residual[i].double().cpu().numpy().copy()
+        if hasattr(ctrl, "blend_from"):  # lmg_deploy's engage blend, started where the env's started
+            ctrl.blend_from = (legs_term._blend_from[i].double().cpu().numpy().copy()
+                               if ctrl.engage_blend_steps else None)
 
     def compare(prefix, terms, deploy, trained):
         k = 0
@@ -188,6 +192,8 @@ def main(env_cfg, agent_cfg: dict):
 
     obs, _ = base.reset()
     states = base.state()
+    # the engage blend's length, steps: the export's (lmg_deploy without the blend: none) against the env's
+    worst["engage_blend_steps"] = float(abs(getattr(ctrl, "engage_blend_steps", 0) - legs_term._blend_steps))
     worst["rest_pose"] = float(np.abs(ctrl.rest_pose - arm.rest_pose_b.double().cpu().numpy()).max())
     for _ in range(args.steps):
         state = env_state()
@@ -207,7 +213,10 @@ def main(env_cfg, agent_cfg: dict):
         # the deploy action mapping for the env's actions, from this state
         target = ctrl.default.copy()
         legs = slice(0, NUM_LEGS)
-        target[legs] = ctrl._torque_bound(ctrl._bound(a_legs * ctrl.legs_scale + ctrl.default[legs], legs), state, legs)
+        if hasattr(ctrl, "legs_targets"):  # the controller's own mapping (with its engage blend)
+            target[legs] = ctrl.legs_targets(a_legs, state)
+        else:
+            target[legs] = ctrl._torque_bound(ctrl._bound(a_legs * ctrl.legs_scale + ctrl.default[legs], legs), state, legs)
         ik = state.q[ARM_START:].copy()
         for a in range(ctrl.num_arms):
             cols = kin.arm_cols[a] - ARM_START

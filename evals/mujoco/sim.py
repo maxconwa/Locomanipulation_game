@@ -204,6 +204,9 @@ class MarlMujoco:
         arms_cfg = settings["arms"]
         self.policy_dt = float(settings["control_dt"])
         self.substeps = int(round(self.policy_dt / m.opt.timestep))
+        # lmg_deploy's engage blend (export.yaml engage_blend_s; absent: none): over the first steps after a reset the
+        # legs' target goes from the last command sent (blend_from) to the policy's, linearly, then is bounded
+        self.blend_steps = int(round(float(settings.get("engage_blend_s") or 0.0) / self.policy_dt))
         cutoff = float(settings.get("residual_cutoff_hz", arms_cfg["residual_cutoff_hz"]))  # the run's, else the template's
         self.residual_alpha = 1.0 - math.exp(-2.0 * math.pi * cutoff * self.policy_dt)
         self.ik_damping = float(settings.get("ik_damping", arms_cfg.get("ik_damping", 0.05)))
@@ -327,6 +330,7 @@ class MarlMujoco:
         mujoco.mj_forward(m, d)
         self.applied = d.qpos[self.qadr].copy()
         self.residual = np.zeros(self.n_arm_actions)
+        self.blend_from = self.applied[self.leg_idx].copy()  # the target held before the first step: here the pose
         self.ik_q = d.qpos[self.qadr][self.arm_idx].copy()  # arm_ik.trajectory: the target's own last value
         self.traj_v = np.zeros(14)  # arm_ik.trajectory_max_vel: the target's velocity (rad/s)
         self.frozen, self.settled_steps = False, 0  # arm_ik.freeze
@@ -391,7 +395,11 @@ class MarlMujoco:
         clip = self.clip_actions
         a_legs, a_arms = np.clip(a_legs, -clip, clip), np.clip(a_arms, -clip, clip)
         idx = self.leg_idx
-        t = np.clip(self.default[idx] + self.leg_scale * a_legs, self.lower[idx], self.upper[idx])
+        t = self.default[idx] + self.leg_scale * a_legs
+        self.policy_target = t.copy()  # the policy's own leg targets, before the blend and the bounds
+        if self.steps < self.blend_steps:
+            t = self.blend_from + (self.steps + 1) / self.blend_steps * (t - self.blend_from)
+        t = np.clip(t, self.lower[idx], self.upper[idx])
         lo, hi = self._torque_bounds(idx)
         self.applied[idx] = np.clip(t, lo, hi)
         # arms

@@ -6,6 +6,11 @@ where the PD torque it asks for at the measured state, stiffness (target - q) - 
 torque_headroom of the joint's effort limit (torque_bounds): GOLEM's safety layer e-stops on torque. What the policies
 observe of their action: the legs the applied target in action units, the arms their low-passed residual. The legs'
 beyond_bounds (action units) is what the position bound cut off, for their action_beyond_clip penalty.
+
+The legs' engage blend (engage_blend_s, lmg_deploy's): over the first engage_blend_s of an episode the legs' target goes
+linearly from the target held before it (start_blend; the env passes the delay history's newest, the pre-pose's hold at
+its resets) to the policy's, then is bounded; the legs observe the blended target. policy_target and
+prev_policy_target are the policy's own targets before the blend (engage_target_smooth_exp).
 """
 
 from __future__ import annotations
@@ -98,7 +103,13 @@ class BoundedJointPositionAction(_BoundedTargets):
         super().__init__(cfg, env)
         self._beyond = torch.zeros_like(self._raw_actions)
         self._held = not bool(torch.as_tensor(self._scale).any())
-        self._describe("the default pose held (scale 0): " if self._held else "")
+        self._blend_steps = 0 if self._held else int(round(cfg.engage_blend_s / env.step_dt))
+        self._blend_from = self._applied.clone()  # rad, the engage blend's start
+        self._blend_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)  # policy steps since it
+        self._policy_target = self._applied.clone()
+        self._prev_policy_target = self._applied.clone()
+        self._describe("the default pose held (scale 0): " if self._held else
+                       f"engage blend over {self._blend_steps} steps: " if self._blend_steps else "")
 
     @property
     def applied_actions(self) -> torch.Tensor:
@@ -110,15 +121,44 @@ class BoundedJointPositionAction(_BoundedTargets):
     def beyond_bounds(self) -> torch.Tensor:
         return self._beyond
 
+    @property
+    def policy_target(self) -> torch.Tensor:
+        """The policy's own targets this step (rad), before the engage blend and the bounds."""
+        return self._policy_target
+
+    @property
+    def prev_policy_target(self) -> torch.Tensor:
+        """The policy's own targets the step before; at an episode's first step the held target (start_blend)."""
+        return self._prev_policy_target
+
+    def start_blend(self, env_ids: torch.Tensor, held: torch.Tensor) -> None:
+        """Start the episodes of env_ids from held, (len(env_ids), joints) rad: the target before their first step."""
+        self._blend_from[env_ids] = held
+        self._blend_step[env_ids] = 0
+        self._policy_target[env_ids] = held
+        self._prev_policy_target[env_ids] = held
+
     def process_actions(self, actions: torch.Tensor):
         self._raw_actions[:] = actions
         target = self._raw_actions * self._scale + self._offset
+        self._prev_policy_target = self._policy_target
+        self._policy_target = target.clone()
+        if self._blend_steps:
+            w = ((self._blend_step + 1).float() / self._blend_steps).clamp(max=1.0).unsqueeze(1)
+            target = self._blend_from + w * (target - self._blend_from)
+            self._blend_step += 1
         bounded = self._apply_bounds(target)
         self._beyond = torch.zeros_like(target) if self._held else (target - bounded).abs() / abs(self._scale)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         super().reset(env_ids)
-        self._beyond[slice(None) if env_ids is None else env_ids] = 0.0
+        ids = slice(None) if env_ids is None else env_ids
+        self._beyond[ids] = 0.0
+        # from the measured pose until the env names the held target (start_blend)
+        self._blend_from[ids] = self._applied[ids]
+        self._blend_step[ids] = 0
+        self._policy_target[ids] = self._applied[ids]
+        self._prev_policy_target[ids] = self._applied[ids]
 
 
 @configclass
@@ -131,6 +171,9 @@ class BoundedJointPositionActionCfg(JointPositionActionCfg):
     """joint name -> (low, high) the target must also stay inside (golem_safety.position_envelope)."""
     torque_headroom: float = MISSING
     """Share of the effort limit the PD torque of a target may ask for at the measured state."""
+    engage_blend_s: float = 0.0
+    """s over which an episode's first targets blend from the held target to the policy's (the module docstring);
+    0: none. lmg_deploy blends the same at the engage (export.yaml engage_blend_s)."""
 
 
 class IKResidualArmAction(_BoundedTargets):

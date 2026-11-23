@@ -104,24 +104,21 @@ def evaluation_cfgs(env_cfg, agent_cfg: dict, checkpoint: str, run_dir: str):
     env_cfg.log_dir = run_dir
     env_cfg.training = False
     run_imu(env_cfg, run_dir)
+    run_engage_blend(env_cfg, run_dir)
     env_cfg.state_checkpoint_path = state_checkpoint_for(checkpoint)
     agent_cfg["trainer"]["close_environment_at_exit"] = False
     agent_cfg["agent"]["experiment"]["write_interval"] = 0
     agent_cfg["agent"]["experiment"]["checkpoint_interval"] = 0
 
 
-def run_imu(env_cfg, run_dir: str) -> None:
-    """Give env_cfg the torso IMU orientation model the run trained with (<run>/params/env.yaml lowstate_imu): its
-    orientation and bias ranges. A run from before 2026-11-21 trained on the raw quaternion's offset (orientation
-    "raw", its own quat_bias_deg) and runs that way on the robot; scored on today's calibrated default it would read an
-    attitude about 2.8 deg off the one it learned."""
+def read_run_env(run_dir: str) -> dict | None:
+    """The run's <run>/params/env.yaml as plain dicts and lists (Isaac Lab's python/* tags read as their contents), or
+    None without one."""
     import yaml
 
-    if getattr(env_cfg, "lowstate_imu", None) is None:
-        return
     path = os.path.join(run_dir, "params", "env.yaml")
     if not os.path.isfile(path):
-        return
+        return None
 
     class Loader(yaml.SafeLoader):  # Isaac Lab's dump_yaml writes python/* tags
         pass
@@ -135,13 +132,36 @@ def run_imu(env_cfg, run_dir: str) -> None:
 
     Loader.add_multi_constructor("tag:yaml.org,2002:python/", any_tag)
     Loader.add_multi_constructor("!", any_tag)
-    saved = (yaml.load(open(path).read(), Loader=Loader) or {}).get("lowstate_imu")
+    return yaml.load(open(path).read(), Loader=Loader) or {}
+
+
+def run_imu(env_cfg, run_dir: str) -> None:
+    """Give env_cfg the torso IMU orientation model the run trained with (<run>/params/env.yaml lowstate_imu): its
+    orientation and bias ranges. A run from before 2026-11-21 trained on the raw quaternion's offset (orientation
+    "raw", its own quat_bias_deg) and runs that way on the robot; scored on today's calibrated default it would read an
+    attitude about 2.8 deg off the one it learned."""
+    if getattr(env_cfg, "lowstate_imu", None) is None:
+        return
+    saved = (read_run_env(run_dir) or {}).get("lowstate_imu")
     if not saved:
         return
     imu = env_cfg.lowstate_imu
     imu.orientation = saved.get("orientation", "raw")
     imu.quat_bias_deg = {k: tuple(float(v) for v in saved["quat_bias_deg"][k]) for k in ("roll", "pitch", "yaw")}
     print(f"[INFO] torso IMU as the run trained: orientation {imu.orientation}, bias {imu.quat_bias_deg}")
+
+
+def run_engage_blend(env_cfg, run_dir: str) -> None:
+    """Give env_cfg the legs' engage blend the run trained with (<run>/params/env.yaml actions.joint_pos
+    engage_blend_s; a run from before 2026-11-22 has none and trained without one)."""
+    legs = getattr(getattr(env_cfg, "actions", None), "joint_pos", None)
+    saved = read_run_env(run_dir)
+    if legs is None or saved is None:
+        return
+    blend = float(((saved.get("actions") or {}).get("joint_pos") or {}).get("engage_blend_s") or 0.0)
+    if blend != legs.engage_blend_s:
+        print(f"[INFO] legs' engage blend as the run trained: {blend:g} s")
+    legs.engage_blend_s = blend
 
 
 def env_override_keys(overrides: list[str]) -> list[str]:
