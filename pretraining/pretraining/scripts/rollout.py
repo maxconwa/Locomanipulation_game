@@ -34,10 +34,12 @@ from pretraining.marl.rewards import JointLimits
 from pretraining.marl.runner import safety_flags
 from pretraining.marl.wm_env import ClipTables, arms_goal, legs_goal
 from pretraining.constants import JOINT_NAMES
+from pretraining.supermimic.representations import GenCoordRepresentation
 
 PLAY_TASK = "LocoManip-Pretrain-Track-Play-v0"
-FALL_HEIGHT = 0.5  # m, the pelvis's height above the ground
-FALL_TILT = math.radians(60.0)  # the pelvis's tilt from upright
+# render_stage1.py's fall rule (stage 1's sim terminations' thresholds)
+FALL_HEIGHT = 0.6  # m, the pelvis's height above the ground
+FALL_TILT = 1.0  # rad, the pelvis's tilt from upright
 NOMINAL_FOOT_FRICTION = 0.6  # h12_train's foot geoms' (h12_constants)
 MAX_SECONDS = 10.0
 ENV_TERMINATIONS = ("anchor_pos", "anchor_ori")
@@ -178,7 +180,8 @@ def _roll_batch(env, u, cmd, motion, tables, limits, actors, history_length, cli
             full = obs["full_state"]
             times = cmd.time_steps.clone()
             goals = {
-                "legs": legs_goal(motion, times, full[:, :7]),
+                # the pelvis pose [pos - env origin, quat]: GenCoordRepresentation.extract_aux_state, as collection
+                "legs": legs_goal(motion, times, GenCoordRepresentation.extract_aux_state(None, full)),
                 "arms": arms_goal(tables, times),
             }
             m = u.num_envs

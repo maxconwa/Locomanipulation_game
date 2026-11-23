@@ -79,3 +79,56 @@ def test_crosscheck_runs_on_standins(sim_app, tmp_path):
     # the same clips read back from the list
     again = rollout.choose_clips(motions, 3, seed=7, include=[], clips_file=out / "clips.txt")
     assert [p.stem for p in again] == clips
+
+
+class _ReplayActor(torch.nn.Module):
+    """Commands the clip's next joint pose for one agent's joints: ``(q_ref[t + 1] - default) / scale``."""
+
+    def __init__(self, cmd, joints: slice):
+        super().__init__()
+        from pretraining.constants import ACTION_SCALE, DEFAULT_JOINT_POS, JOINT_NAMES
+
+        self.cmd, self.joints = cmd, joints
+        dev = cmd.device
+        self.default = torch.tensor([DEFAULT_JOINT_POS[j] for j in JOINT_NAMES], device=dev)[joints]
+        self.scale = torch.tensor([ACTION_SCALE[j] for j in JOINT_NAMES], device=dev)[joints]
+
+    def forward(self, td):
+        frames = torch.clamp(self.cmd.time_steps + 1, max=self.cmd.motion.time_step_total - 1)
+        return (self.cmd.motion.joint_pos[frames][:, self.joints] - self.default) / self.scale
+
+
+REPLAY_JOINT_ERR = 0.15  # rad; measured 0.05-0.11 over 0.2 s on the stand-ins (PD lag, the robot off balance)
+
+
+@pytest.mark.sim
+def test_rollout_scores_a_reference_replay_near_zero(sim_app, tmp_path):
+    """Commanding the reference's joint poses tracks them: errors near zero after the first step and a small mean
+    joint error over the first 0.2 s (a frame offset or a frame-of-reference error would show here). Only 0.2 s: the
+    stand-ins' pelvis path is not one the joints alone can produce, and the robot leaves it (anchor termination
+    after 12-31 steps)."""
+    import isaaclab.sim as sim_utils
+
+    import pretraining.tasks  # noqa: F401
+    from pretraining.marl.config import JOINT_SLICES
+    from pretraining.scripts import rollout
+
+    files = write_clips(tmp_path / "motions", n=3, frames=120)
+    results = {}
+    for seconds in (0.02, 0.2):
+        sim_utils.create_new_stage()
+        env = rollout.make_env(files, len(files), "cuda:0", seed=0)
+        cmd = env.unwrapped.command_manager.get_term("motion")
+        actors = {a: _ReplayActor(cmd, JOINT_SLICES[a]) for a in ("legs", "arms")}
+        try:
+            results[seconds] = rollout.rollout(env, actors, 1, seconds)
+        finally:
+            env.close()
+    for r in results[0.02]:
+        print("step 0", r["clip"], r["body_pos_err_m"], r["pelvis_pos_err_m"], r["joint_err_rad"])
+        assert r["steps"] == 1 and r["ended_by"] == "time_cap"
+        assert r["body_pos_err_m"] < 0.02 and r["pelvis_pos_err_m"] < 0.02 and r["joint_err_rad"] < 0.02
+    for r in results[0.2]:
+        print("full", r["clip"], r["ended_by"], r["steps"], r["body_pos_err_m"], r["pelvis_pos_err_m"], r["joint_err_rad"])
+        assert r["steps"] == 10 and r["ended_by"] == "time_cap"
+        assert r["joint_err_rad"] < REPLAY_JOINT_ERR
