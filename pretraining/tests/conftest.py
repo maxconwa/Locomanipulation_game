@@ -24,5 +24,10 @@ def sim_app():
     from isaaclab.app import AppLauncher
 
     if not _APP:
-        _APP.append(AppLauncher(headless=True).app)
+        # Kit reads sys.argv; give it the launcher's own (none) rather than pytest's (-m, -k, -q ...).
+        argv, sys.argv = sys.argv, sys.argv[:1]
+        try:
+            _APP.append(AppLauncher(headless=True).app)
+        finally:
+            sys.argv = argv
     return _APP[0]

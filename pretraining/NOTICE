@@ -6,10 +6,19 @@ commit they come from.
 - h12_train (branch supermimic, commit b175f1c) is this repository's own code and under its
   terms. Transcribed from it: pretraining/constants.py (src/h12_train/robot/h12_constants.py,
   src/h12_train/tasks.py and the joint ranges of src/h12_train/robot/xmls/h1_2_magpie.xml); the fps and joint-name checks of
-  pretraining/motions.py (src/h12_train/scripts/motion_files.py).
-- SuperMimic (HybridRobotics, commit 7e94b07): Apache License 2.0.
+  pretraining/motions.py (src/h12_train/scripts/motion_files.py); the env composition of
+  pretraining/tasks/track_env_cfg.py (src/h12_train/tasks.py: h12_flat_tracking_env_cfg, apply_gencoord,
+  h12_sensor_actor_group).
+- SuperMimic (HybridRobotics, commit 7e94b07): Apache License 2.0. Ported from it:
+  pretraining/supermimic/goal_window.py (goal-window constants and helpers of src/supermimic/representations.py,
+  quat_to_rot6d of src/supermimic/utils/helpers.py); the full-state and goal terms of
+  pretraining/tasks/observations.py and the groups of pretraining/tasks/track_env_cfg.py
+  (src/supermimic/tasks/env_cfgs.py).
 - mjlab (HybridRobotics' fork mjlab_research, commit 6ea3e57): Apache License 2.0. Ported from it:
-  pretraining/kinematics.py (src/mjlab/utils/forward_kinematics.py, its interface), pretraining/motions.py
+  pretraining/kinematics.py (src/mjlab/utils/forward_kinematics.py, its interface), pretraining/tasks/
+  (commands.py, metrics.py, rewards.py, terminations.py and the tracking terms of observations.py from
+  src/mjlab/tasks/tracking/mdp/; events.py from src/mjlab/envs/mdp/dr/{geom,joint}.py; track_env_cfg.py from
+  src/mjlab/tasks/tracking/tracking_env_cfg.py), pretraining/motions.py
   (MotionLoader of src/mjlab/tasks/tracking/mdp/commands.py) and pretraining/math.py
   (src/mjlab/utils/lab_api/math.py, itself Isaac Lab's isaaclab/utils/math.py, BSD-3-Clause, Copyright (c)
   2022-2025 The Isaac Lab Project Developers).
