@@ -21,7 +21,9 @@ another rate than the node's ticks steps on its own clock, on the latest /lowsta
         --policy mid360v2=logs/deploy_baselines/mid360v2 [--policy name=<export dir> ...] \
         [--sim_seeds 4] [--out logs/hw_bag_replay/<bag>]
 
-Any python with numpy, torch, pinocchio, pyyaml, mujoco (for --sim_seeds) and rosbags. Run from the repo root.
+Any python with numpy, torch, pinocchio, pyyaml, mujoco (for --sim_seeds) and rosbags, or GOLEM's ros container
+(a sourced ROS 2 with unitree_hg built: the bags are read with rosbag2_py; evals/deploy/gate.py runs it there). Run
+from the repo root.
 Writes <out>/summary.md, summary.json and replay.npz.
 """
 
@@ -34,6 +36,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 
 REPO = Path(__file__).resolve().parents[2]
 LEGS_GROUPS = [("acc", 3), ("gyro", 3), ("gravity", 3), ("cmd", 3), ("arm_goal", 1), ("ee_targets", 14),
@@ -47,6 +50,9 @@ parser.add_argument("--policy", action="append", required=True, help="name=dir: 
                     "export.yaml + legs.pt / arms.pt) or an export_marl.py output (the template is added)")
 parser.add_argument("--deployed", default=None, help="the --policy name the bag ran, for the target check")
 parser.add_argument("--golem", default=os.path.expanduser("~/GOLEM"))
+parser.add_argument("--imu_calibration_file", default=None,
+                    help="The robot's torso-IMU calibration, as the node reads it (default: GOLEM's lmg_deploy"
+                         " config/imu_calibration.yaml, the h12 entry); used for exports on the calibrated IMU.")
 parser.add_argument("--urdf", default=os.path.join(os.environ.get("CL_ASSETS_DIR", str(REPO / "third_party/CL_Assets")),
                                                    "ros_assets", "h1_2_magpie.urdf"))
 parser.add_argument("--template", default=str(REPO / "evals/deploy/hw_deploy_template.yaml"))
@@ -81,8 +87,19 @@ from lmg_deploy.livox_attitude import LivoxAttitude, in_imu_frame  # noqa: E402
 from lmg_deploy.livox_imu import LIVOX_IMU_FRAME, LivoxImu, livox_to_imu_rotation  # noqa: E402
 from lmg_deploy.networks import load_network  # noqa: E402
 from lmg_deploy.rotations import imu_mount_quat, quat_apply, quat_conjugate, quat_mul, xyzw_to_wxyz  # noqa: E402
-from rosbags.highlevel import AnyReader  # noqa: E402
-from rosbags.typesys import Stores, get_types_from_msg, get_typestore  # noqa: E402
+
+try:  # lmg_deploy from 2026-11-21 on: the robot's torso-IMU calibration, which the node hands its controller
+    from lmg_deploy.imu_calibration import load_calibration  # noqa: E402
+    IMU_CALIBRATION = load_calibration(args.imu_calibration_file or os.path.join(
+        args.golem, "core_ws/src/lmg_deploy/config/imu_calibration.yaml"), "h12")
+    CONTROLLER_KW = {"imu_calibration": IMU_CALIBRATION}
+except ImportError:
+    CONTROLLER_KW = {}
+try:  # the rosbags package where it is installed; else ROS 2's own reader (GOLEM's ros container, gate.py)
+    from rosbags.highlevel import AnyReader  # noqa: E402
+    from rosbags.typesys import Stores, get_types_from_msg, get_typestore  # noqa: E402
+except ImportError:
+    AnyReader = None
 
 
 def load_cfg(folder: str) -> dict:
@@ -129,7 +146,7 @@ class Replayer:
         self.attitude = LivoxAttitude() if args.attitude == "fastlio" else None
         self.probes = {a: Probe(os.path.join(folder, cfg[a]["policy"]), cfg[a]["num_obs"], cfg[a]["num_actions"])
                        for a in ("legs", "arms")}
-        self.ctrl = MarlController(cfg, self.kin, self.probes["legs"], self.probes["arms"])
+        self.ctrl = MarlController(cfg, self.kin, self.probes["legs"], self.probes["arms"], **CONTROLLER_KW)
         # --imu lowstate and the trim were the deployed node's settings; the others read today's node (livox, no trim)
         self.deployed = name == args.deployed
         trim = np.radians(args.imu_trim_deg) if self.deployed else np.zeros(3)
@@ -195,15 +212,39 @@ class Replayer:
         self.times.append(now)
 
 
+WANTED = {"/lowstate", "/livox/imu", "/Odometry", "/cmd_vel", "/safety/lowcmd_lower_in", "/marl_deploy_node/state",
+          "/estop/triggered"}
+
+
+def read_bag_ros2(bag: str):
+    """read_bag with ROS 2's rosbag2_py and rclpy (a sourced ROS 2 with unitree_hg built, e.g. GOLEM's ros container
+    with its core_ws install), in the bag's recorded order."""
+    import rosbag2_py
+    from rclpy.serialization import deserialize_message
+    from rosidl_runtime_py.utilities import get_message
+    meta = yaml.safe_load(open(os.path.join(bag, "metadata.yaml")))["rosbag2_bagfile_information"]
+    reader = rosbag2_py.SequentialReader()
+    reader.open(rosbag2_py.StorageOptions(uri=bag, storage_id=meta.get("storage_identifier", "sqlite3")),
+                rosbag2_py.ConverterOptions(input_serialization_format="cdr", output_serialization_format="cdr"))
+    types = {t.name: t.type for t in reader.get_all_topics_and_types()}
+    reader.set_filter(rosbag2_py.StorageFilter(topics=[t for t in WANTED if t in types]))
+    classes = {topic: get_message(kind) for topic, kind in types.items() if topic in WANTED}
+    while reader.has_next():
+        topic, raw, t = reader.read_next()
+        yield topic, t * 1e-9, deserialize_message(raw, classes[topic])
+
+
 def read_bag(bag: str):
+    if AnyReader is None:
+        yield from read_bag_ros2(bag)
+        return
     store = get_typestore(Stores.ROS2_HUMBLE)
     msgs = Path(args.golem) / "core_ws/src/unitree_ros2/cyclonedds_ws/src/unitree/unitree_hg/msg"
     types = {}
     for p in msgs.glob("*.msg"):
         types.update(get_types_from_msg(p.read_text(), f"unitree_hg/msg/{p.stem}"))
     store.register(types)
-    wanted = {"/lowstate", "/livox/imu", "/Odometry", "/cmd_vel", "/safety/lowcmd_lower_in", "/marl_deploy_node/state",
-              "/estop/triggered"}
+    wanted = WANTED
     with AnyReader([Path(bag)], default_typestore=store) as reader:
         conns = [c for c in reader.connections if c.topic in wanted]
         for conn, t, raw in reader.messages(connections=conns):

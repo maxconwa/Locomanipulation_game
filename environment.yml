@@ -62,9 +62,10 @@ dependencies:
 # (gymnasium, prettytable, tensorboard, hydra-core) so their versions stay
 # Isaac Lab's to choose.
 #
-# The CPU checks (evals/deploy/stress_mujoco.py, bag_replay.py, evals/mujoco) run in
-# another python >= 3.10 with mujoco, torch, numpy, pyyaml, pin (pinocchio) and
-# rosbags, and need GOLEM's lmg_deploy (--golem, default ~/GOLEM).
+# The CPU checks (evals/deploy/stress_mujoco.py, evals/mujoco, the plots) run in
+# another python >= 3.10 with mujoco, torch, numpy, scipy, pyyaml, matplotlib and
+# tensorboard; the bag replay runs in GOLEM's ros container (docker, golem_ros),
+# and the deploy checks need GOLEM (--golem, default ~/GOLEM, kept on main).
 #
 # Then, back in this repository:
 #

@@ -35,20 +35,35 @@ LEG_CHAIN = [([0, 0.0875, -0.1632], 2), ([0, 0.0755, 0], 1), ([0, 0, 0], 0), ([0
 
 
 def tracking_safe(ref, vel, mask, stride: int = REPORT_STRIDE) -> dict:
-    """sportmode.tracking, with what a subset has samples for when it lacks some (no turn, no walk)."""
+    """sportmode.tracking; where a subset lacks the samples one of its numbers needs (no linear command for the
+    direction cos, no turn for the turn sense), each number is computed on its own as tracking() defines it, and the
+    ones without samples are left out."""
     try:
         with np.errstate(all="ignore"):
             return S.tracking(ref, vel, mask, stride)
     except (IndexError, ValueError):
-        m = np.concatenate(mask)
-        if m.sum() == 0:
-            return {"n_samples": 0}
-        from scipy.ndimage import uniform_filter1d
-        r = np.concatenate(ref)
-        v = np.concatenate([uniform_filter1d(x, stride, axis=0) for x in vel])
-        e = (v - r)[m]
-        return {"lin_err_mean": float(np.linalg.norm(e[:, :2], axis=1).mean()),
-                "ang_err_mean": float(np.abs(e[:, 2]).mean())}
+        pass
+    from scipy.ndimage import uniform_filter1d
+    m = np.concatenate(mask)
+    if m.sum() == 0:
+        return {"n_samples": 0}
+    r = np.concatenate(ref)[m]
+    v = np.concatenate([uniform_filter1d(x, stride, axis=0) for x in vel])[m]
+    e = v - r
+    lin, ang = np.linalg.norm(e[:, :2], axis=1), np.abs(e[:, 2])
+    out = {"lin_err_mean": float(lin.mean()), "lin_err_p95": float(np.percentile(lin, 95)),
+           "ang_err_mean": float(ang.mean()), "ang_err_p95": float(np.percentile(ang, 95))}
+    mv = np.linalg.norm(r[:, :2], axis=1) > 0.1
+    if mv.any():
+        rv, vv = r[mv, :2], v[mv, :2]
+        cos = (rv * vv).sum(1) / (np.linalg.norm(rv, axis=1) * np.linalg.norm(vv, axis=1) + 1e-9)
+        out.update(cos_v_mean=float(cos.mean()), cos_v_p10=float(np.percentile(cos, 10)), n_cos_s=float(mv.sum() * DT),
+                   speed_ratio_median=float(np.median(np.linalg.norm(vv, axis=1) / np.linalg.norm(rv, axis=1))))
+    mw = np.abs(r[:, 2]) > 0.1
+    if mw.any():
+        out.update(turn_sign_agree=float((np.sign(r[mw, 2]) == np.sign(v[mw, 2])).mean()), n_turn_s=float(mw.sum() * DT),
+                   turn_ratio_median=float(np.median(v[mw, 2] / r[mw, 2])))
+    return out
 
 
 def score(cmds, vels, masks, stride_samples: int = REPORT_STRIDE, subsets: dict | None = None,

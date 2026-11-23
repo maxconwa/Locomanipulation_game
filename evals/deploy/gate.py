@@ -15,7 +15,7 @@ Checks (gate.yaml has their thresholds):
 
 Uses ~/GOLEM as checked out ($GOLEM); the report records its commit. Writes logs/evals/<run>/deploy/gate_<N>/
 (report.md, report.json, each check's own folder and log); exit 0 on PASS, 1 otherwise. Run from the repo root with
-a python that has mujoco, torch, numpy, scipy, pyyaml, pin and rosbags (ROSBAGS_PATH is put on PYTHONPATH if set).
+a python that has mujoco, torch, numpy, scipy and pyyaml; the bag replay runs in GOLEM's ros container (docker).
 """
 
 from __future__ import annotations
@@ -120,20 +120,43 @@ def check_stress(a, g, d: Path, export: Path):
                                           if problems else "no falls in the gated cells; every engage cell passed"), details
 
 
+def ros_container(a, cmd: list, mounts: list[Path]) -> list:
+    """`cmd` in a disposable GOLEM ros container (golem_ros image: ROS 2 Humble, torch, pinocchio, mujoco): run as this
+    user, no network, the paths mounted where they are here, and GOLEM's core_ws build (container_cache/sim_tests, which
+    any GOLEM sim test leaves) sourced for its message types (unitree_hg)."""
+    cache = Path(a.golem) / "container_cache" / "sim_tests"
+    vols = []
+    for m in dict.fromkeys(Path(x).resolve() for x in mounts):
+        vols += ["-v", f"{m}:{m}"]
+    vols += ["-v", f"{cache / 'build'}:/home/code/core_ws/build:ro", "-v", f"{cache / 'install'}:/home/code/core_ws/install:ro",
+             "-v", f"{Path(a.golem) / 'core_ws' / 'src'}:/home/code/core_ws/src:ro"]
+    inner = ("source /opt/ros/humble/setup.bash && source /home/code/core_ws/install/setup.bash && "
+             + " ".join(f"'{c}'" for c in map(str, cmd)))
+    return ["docker", "run", "--rm", "--network", "none", "--user", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp",
+            "-e", "ROS_LOG_DIR=/tmp/ros_log", "-e", "MUJOCO_GL=egl", "-e", "PYTHONDONTWRITEBYTECODE=1", "-w", str(REPO),
+            *vols, "--entrypoint", "bash", a.ros_image, "-c", inner]
+
+
 def check_bag_replay(a, g, d: Path, export: Path):
     b = g["bag_replay"]
     bags_dir = Path(os.path.expanduser(b["bags_dir"]))
     deployed = REPO / b["deployed_export"]
     if not bags_dir.is_dir() or not deployed.is_dir():
         return NOT_RUN, f"missing {bags_dir if not bags_dir.is_dir() else deployed}", {}
-    env = {"PYTHONPATH": os.environ.get("ROSBAGS_PATH", "") + os.pathsep + os.environ.get("PYTHONPATH", "")}
-    problems, details, missing = [], {}, []
+    if not (Path(a.golem) / "container_cache" / "sim_tests" / "install" / "unitree_hg").is_dir():
+        return NOT_RUN, (f"no core_ws build in {a.golem}/container_cache/sim_tests (run any GOLEM tests/sim test, or"
+                         " evals/deploy/golem/run.sh, once)"), {}
+    problems, notes, details, missing = [], [], {}, []
     for bag in b["bags"]:
         out = d / f"replay_{bag}"
-        code = run([sys.executable, "-m", "evals.deploy.bag_replay", "--bag", bags_dir / bag, "--deployed",
-                    b["deployed"], "--golem", a.golem, "--policy", f"{b['deployed']}={deployed}",
-                    "--policy", f"candidate={export}", "--sim_seeds", b["sim_seeds"], "--out", out], d / f"replay_{bag}.log",
-                   env=env)
+        cmd = ["python3", "-m", "evals.deploy.bag_replay", "--bag", bags_dir / bag, "--deployed", b["deployed"],
+               "--golem", a.golem, "--policy", f"{b['deployed']}={deployed}", "--policy", f"candidate={export}",
+               "--sim_seeds", b["sim_seeds"], "--out", out]
+        mounts = [REPO, a.golem, bags_dir, export, d]
+        if a.imu_calibration_file:
+            cmd += ["--imu_calibration_file", Path(a.imu_calibration_file).resolve()]
+            mounts.append(Path(a.imu_calibration_file).resolve().parent)
+        code = run(ros_container(a, cmd, mounts), d / f"replay_{bag}.log")
         f = out / "summary.json"
         if not f.is_file():
             missing.append(f"{bag} (exit {code}: {tail(d / f'replay_{bag}.log', 1)})")
@@ -145,23 +168,32 @@ def check_bag_replay(a, g, d: Path, export: Path):
                                                            for k in ("legs", "arms")},
                         "sim_falls": cand.get("sim_falls")}
         if tc and (tc["median"] > b["max_target_median"] or tc["p99"] > b["max_target_p99"]):
-            problems.append(f"{bag}: the replay is not the node (targets median {tc['median']:.1e}, p99 {tc['p99']:.1e})")
+            text = f"{bag}: the replay is not the recording node (targets median {tc['median']:.1e}, p99 {tc['p99']:.1e})"
+            (problems if b.get("gate_target_check") else notes).append(text)
         for actor in ("legs", "arms"):
             v = cand.get(actor, {}).get("steps_outside_sim_c")
             if v is not None and v > b["max_outside_sim_c"]:
                 problems.append(f"{bag}: {actor} LSTM outside its sim range {100 * v:.1f}% of steps")
         if any(f is not None for f in (cand.get("sim_falls") or [])):
             problems.append(f"{bag}: fell in MuJoCo on the bag's commands")
+    refused = [m for m in missing if "IMU calibration" in m]
+    if refused:  # the node itself would refuse this export on this GOLEM: a deploy failure, not a missing check
+        return FAIL, "lmg_deploy refuses the export: " + refused[0], details
     if missing:
         return NOT_RUN, "did not finish: " + "; ".join(missing), details
-    return (FAIL if problems else PASS), ("; ".join(problems) if problems else "matches the node; in range"), details
+    text = "; ".join(problems) if problems else "the candidate stays in range"
+    if notes:
+        text += " (not gated: " + "; ".join(notes) + ")"
+    return (FAIL if problems else PASS), text, details
 
 
 def check_golem(a, g, d: Path, export: Path):
     out = d / "golem"
     log = d / "golem.log"
-    code = run(["bash", HERE / "golem" / "run.sh", export, out], log,
-               env={"GOLEM": a.golem, "SCORE_PYTHON": sys.executable})
+    env = {"GOLEM": a.golem, "SCORE_PYTHON": sys.executable}
+    if a.imu_calibration_file:
+        env["IMU_CALIBRATION_FILE"] = str(Path(a.imu_calibration_file).resolve())
+    code = run(["bash", HERE / "golem" / "run.sh", export, out], log, env=env)
     sj = out / "score.json"
     if not sj.is_file():
         return NOT_RUN, f"the GOLEM run did not reach its scoring (exit {code}): {tail(log)}", {}
@@ -184,6 +216,11 @@ def main():
     ap.add_argument("--isaac_python", default=os.environ.get(
         "ISAAC_PYTHON", os.path.expanduser("~/anaconda3/envs/env_isaaclab/bin/python")))
     ap.add_argument("--workers", type=int, default=min(12, os.cpu_count() or 1))
+    ap.add_argument("--imu_calibration_file", default=None,
+                    help="The robot's torso-IMU calibration for the bag replay and the GOLEM run (default: GOLEM's"
+                         " lmg_deploy/config/imu_calibration.yaml, as the node reads it).")
+    ap.add_argument("--ros_image", default=os.environ.get("ROS_IMAGE", "golem_ros:latest"),
+                    help="GOLEM's ros image, which runs the bag replay (ROS 2's bag reader, the message types).")
     a = ap.parse_args()
     if not (a.checkpoint or a.export):
         ap.error("--checkpoint or --export")

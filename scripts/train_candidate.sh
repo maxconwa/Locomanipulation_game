@@ -12,8 +12,8 @@
 # Exits 1 when any step of any seed failed (each is a FAILED line in the status file). Status lines in
 # logs/candidates/status.txt; per run: logs/candidates/<name>_s<seed>/ (logs, the export in a folder of the same
 # name, the gate's reports gate_gpu/ and gate_cpu/ with each check's output); scorecards in logs/evals/<run>/. A gate
-# FAIL or NOT RUN is a FAILED line. Isaac in conda env_isaaclab; the gate in an env with mujoco, torch, pin, pyyaml and
-# rosbags (CPU_ENV, default base; ROSBAGS_PATH is put on its PYTHONPATH if set).
+# FAIL or NOT RUN is a FAILED line. Isaac in conda env_isaaclab; the gate in an env with mujoco, torch, scipy and
+# pyyaml (CPU_ENV, default base); its bag replay runs in GOLEM's ros container (docker). GOLEM: $GOLEM, kept on main.
 set -u
 cd "$(dirname "$0")/.."
 REPO=$PWD
@@ -23,7 +23,6 @@ CONDA_SH=${CONDA_SH:-$( [ -f $HOME/miniconda3/etc/profile.d/conda.sh ] && echo $
 CPU_ENV=${CPU_ENV:-base}
 GOLEM=${GOLEM:-$HOME/GOLEM}
 # the bags the gate replays: evals/deploy/gate.yaml bag_replay
-export ROSBAGS_PATH=${ROSBAGS_PATH:-}
 source "$CONDA_SH"
 mkdir -p "$OUT"
 

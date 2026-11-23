@@ -13,6 +13,7 @@
 # driver (drive.py). GPU needed (the sim's cameras and lidar render with EGL); about 5 minutes.
 #
 # Env: GOLEM (default ~/GOLEM), ROS_DOMAIN_ID (default 196), SIM_IMAGE, ROS_IMAGE (GOLEM's defaults),
+#   IMU_CALIBRATION_FILE: mounted over lmg_deploy's config/imu_calibration.yaml (default: GOLEM's own, as checked out),
 #   SCORE_PYTHON: the python that scores (mujoco, numpy, scipy, yaml; default python3).
 # Exit: 0 when the drive and the scoring pass; 1 when a check fails or a step does; 2 bad arguments; 3 build failure.
 set -eo pipefail
@@ -47,12 +48,18 @@ services:
       - {type: bind, source: "$OUT/policy", target: /home/code/core_ws/src/lmg_deploy/policies/h12, read_only: true}
       - {type: bind, source: "$REPO/evals", target: /home/code/lmg_evals/evals, read_only: true}
 EOF
+if [ -n "${IMU_CALIBRATION_FILE:-}" ]; then
+    cal=$(cd "$(dirname "$IMU_CALIBRATION_FILE")" && pwd)/$(basename "$IMU_CALIBRATION_FILE")
+    printf '      - {type: bind, source: "%s", target: /home/code/core_ws/src/lmg_deploy/config/imu_calibration.yaml, read_only: true}\n' \
+        "$cal" >> "$OUT/lmg_evals_compose.yml"
+fi
 COMPOSE+=(-f "$OUT/lmg_evals_compose.yml")
 {
     echo "golem_commit: $(git -C "$GOLEM" rev-parse HEAD)"
     echo "golem_branch: $(git -C "$GOLEM" rev-parse --abbrev-ref HEAD)"
     echo "lmg_deploy_commit: $(git -C "$GOLEM/core_ws/src/lmg_deploy" log -1 --format=%H -- . 2>/dev/null)"
     echo "export: $EXPORT"
+    echo "imu_calibration_file: ${IMU_CALIBRATION_FILE:-the one in GOLEM}"
 } > "$OUT/lmg_evals.yaml"
 
 echo "[lmg_evals] DDS domain $ROS_DOMAIN_ID, output in $OUT"

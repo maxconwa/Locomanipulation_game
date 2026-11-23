@@ -3,7 +3,7 @@
 Every evaluation of the H1-2 locomanipulation policies: the legs and the arms, alone and together, in Isaac Lab and
 in MuJoCo, and the gate an export passes before it goes on the robot. Run everything from the repo root as
 `python -m evals.<...>` (Isaac ones in `env_isaaclab`; MuJoCo, plots and the gate in a python with mujoco, torch,
-numpy, scipy, pyyaml, matplotlib and tensorboard; the gate's bag replay also needs pin and rosbags).
+numpy, scipy, pyyaml, matplotlib and tensorboard; the gate's bag replay runs in GOLEM's ros container, docker).
 
 ```
 evals/

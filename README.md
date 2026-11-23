@@ -47,8 +47,8 @@ conda activate env_isaaclab
 pip install -e source/locomanipulation_game
 ```
 
-The CPU checks run in a second python with mujoco, torch, numpy, pyyaml, pin and rosbags, and need GOLEM
-(`~/GOLEM`, for `lmg_deploy`).
+The CPU checks run in a second python with mujoco, torch, numpy, scipy, pyyaml, matplotlib and tensorboard; the
+bag replay runs in GOLEM's ros container (docker). They need GOLEM (`~/GOLEM`, kept on main, for `lmg_deploy`).
 
 ## Train, score, export, check
 
