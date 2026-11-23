@@ -11,7 +11,7 @@
 2026-10-20 to 10-23, branch marl-direct (commit 1ff665b). Goal: make the H1-2 legs policy follow velocity commands as well
 as Unitree's sport mode (h1_ai_sport, recorded in the sport-mode bags). Each run trains LocoManip-Marl-Direct-v0 for
 100,008 env steps with one change against base, and is scored at the final checkpoint (agent_100008) and at 50.4k
-(agent_50400) with `scripts/skrl/eval_scorecard.py`.
+(agent_50400) with `scripts/skrl/eval_scorecard.py` (now `evals/isaac/legs/get_scorecard.py`).
 
 Rebuild the tables: `python scripts/sportmode_summary.py --out <file>` (status: `logs/sportmode_ablations/status.tsv`).
 
@@ -72,7 +72,7 @@ flicks, small commands) inside base's command ranges. That is narrower than rang
 scored only on what base also trained. Velocity is scored against the lag-allowed command, raw: no creep correction
 (sport mode's 0.96 cos has its +0.10 m/s forward creep removed; raw it is 0.65). The stride window is the run's own
 gait period. On the sport-mode bags the scorecard reproduces the bag analysis
-(`scripts/skrl/test_scorecard_sportmode.py`, passing after the defaults switch).
+(`scripts/skrl/test_scorecard_sportmode.py`, now `evals/deploy/test_sportmode_metrics.py`, passing after the defaults switch).
 
 **Reference.** Mid360v2 (196.8k steps, the defaults' source), re-scored under the new defaults:
 
@@ -287,6 +287,6 @@ What changed in the code that a comparison with earlier runs has to know:
   arms' reward (0), seven unused reward functions. `ArmTargetsCommandCfg.z_min_start` is `z_min`; the curriculum
   term `arm_target_levels` is `arm_kernels` (TensorBoard: `Curriculum/arm_kernels/*`).
 - The ArmsOnly export carries the integrated residual, the pose-error integral and the run's residual cutoff, and
-  `mujoco_evals` runs them.
+  `mujoco_evals` (now `evals/mujoco`) runs them.
 - Not changed: the arms' `time_limit_bootstrap: False` (its comment in the agent yaml), the second agent trained
   though it cannot act in LegsOnly / ArmsOnly, the effort limits copied into `mujoco_sim.py`.

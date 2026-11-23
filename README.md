@@ -29,14 +29,11 @@ metrics pass. These are the defaults: `train.py` with no overrides trains the re
       actions, observations, events, terminations.
     - `recurrent.py`: the LSTM actors and recurrent MAPPO; `golem_safety.py`: GOLEM's e-stops;
       `run_files.py`: a run's saved state, task and overrides.
-- `scripts/skrl/`: `train.py`, `play.py`, `eval_scorecard.py` (with `scorecard_metrics.py` and its check against the
-  sport-mode bags, `test_scorecard_sportmode.py`), `eval_arms.py` (the arms' reach, hold and vibration),
-  `export_marl.py`, `deploy_parity.py`.
+- `scripts/skrl/`: `train.py`, `play.py`, `export_marl.py`.
 - `scripts/fit_sport_gait.py`: builds the sport-gait reference under `data/` from its source.
 - `scripts/train_candidate.sh`: train seeds, then score, export and check each one.
-- `agent_scripts/`: the CPU checks of an export: `hw_stress_mujoco.py` (MuJoCo under measured hardware effects),
-  `hw_bag_replay.py` (the deploy controller on recorded robot bags), and `hw_deploy_template.yaml`.
-- `mujoco_evals/`: the policy loop in MuJoCo (`mujoco_sim.py`) and the run settings the tools share (`common.py`).
+- `evals/`: every evaluation (`evals/README.md`): `isaac/` and `mujoco/` scorecards, plots and videos for the legs
+  and the arms, and `deploy/`, the deploy gate (GOLEM's sim, parity, bag replay, MuJoCo stress tests).
 - `logs/`: everything the code writes (untracked). Runs go to `logs/skrl/locomanip_marl/<time>_<name>/`.
 
 ## Setup
@@ -63,16 +60,16 @@ python scripts/skrl/train.py --headless --max_iterations 12500 --name <name> --s
 bash scripts/train_candidate.sh <name> 42 43        # SMOKE=30 for a 30-update smoke test
 
 # the sport-mode scorecard and the wrist phase (motors nominal) -> <run>/checkpoints/scorecard_<N>.{json,md}
-python scripts/skrl/eval_scorecard.py --checkpoint <run>/checkpoints/agent_<N>.pt --headless \
+python -m evals.isaac.legs.get_scorecard --checkpoint <run>/checkpoints/agent_<N>.pt --headless \
     'env.events.actuator_scales.params.gain_range=[1.0,1.0]' 'env.events.actuator_scales.params.strength_range=[1.0,1.0]'
 # export for lmg_deploy: legs.pt, arms.pt, h12.yaml (the template), export.yaml (what the run trained with); empty
 # policies/h12 first: it holds one policy
 python scripts/skrl/export_marl.py --checkpoint <run>/checkpoints/agent_<N>.pt --out ~/GOLEM/core_ws/src/lmg_deploy/policies/h12
 # the deploy controller against the env, step by step
-python scripts/skrl/deploy_parity.py --checkpoint <run>/checkpoints/agent_<N>.pt --export <export dir> --headless
+python -m evals.deploy.parity --checkpoint <run>/checkpoints/agent_<N>.pt --export <export dir> --headless
 # CPU: MuJoCo stress tests and the replay of a robot bag
-python agent_scripts/hw_stress_mujoco.py --export <export dir> --label <name>
-python agent_scripts/hw_bag_replay.py --bag <bag> --deployed mid360v2 \
+python -m evals.deploy.stress_mujoco --export <export dir> --label <name>
+python -m evals.deploy.bag_replay --bag <bag> --deployed mid360v2 \
     --policy mid360v2=logs/deploy_baselines/mid360v2 --policy <name>=<export dir> --sim_seeds 4
 python scripts/skrl/play.py --checkpoint <run>/checkpoints/agent_<N>.pt
 ```

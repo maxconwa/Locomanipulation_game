@@ -3,7 +3,7 @@
     python scripts/supermimic/plot_world_model.py <run dir> <out png> [--smooth 15]
 
 One panel per quantity, env policy steps (thousands) on x so it lines up with the PPO runs' progress plots
-(logs/candidates/200k_v2/plot_progress.py draws the walking metrics; this draws what only a SuperMimic run has):
+(evals/isaac/legs/get_plot.py draws the walking metrics; this draws what only a SuperMimic run has):
 the world model's prediction errors against "no better than the mean", its loss terms, the reward and termination
 fits, imagined against simulated returns and survival, the critic and actor, and the time per iteration. Every
 other wm/* tag the run logs (e.g. per-term errors) gets a panel of its own after those. Needs matplotlib, numpy and

@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[2]
 # CL_Assets: CL_ASSETS_DIR, else the checkout's third_party/CL_Assets submodule
 DEFAULT_ASSETS = Path(os.environ.get("CL_ASSETS_DIR", str(REPO / "third_party" / "CL_Assets")))
 # the sole's height in each foot's ankle_roll_link frame (the collision mesh's lowest point)

@@ -52,20 +52,20 @@ cpu_checks() {  # $1 run name, $2 export dir, $3 out dir
   local name=$1 export=$2 dir=$3
   local bad=""
   conda activate "$CPU_ENV"
-  python agent_scripts/hw_stress_mujoco.py --export "$export" --label "$name" --seeds 8 --workers 12 \
+  python -m evals.deploy.stress_mujoco --export "$export" --label "$name" --seeds 8 --workers 12 \
     > "$dir/stress.log" 2>&1 || bad+=" stress.log"
-  python agent_scripts/hw_stress_mujoco.py --export "$export" --label "${name}_long" \
+  python -m evals.deploy.stress_mujoco --export "$export" --label "${name}_long" \
     --conditions nominal,hw_no_gyro,hw,hang,hang_hw --profiles zero --seeds 8 --seconds 180 --workers 12 \
     > "$dir/stress_long.log" 2>&1 || bad+=" stress_long.log"
-  python agent_scripts/hw_stress_mujoco.py --export "$export" --label "${name}_small60" \
+  python -m evals.deploy.stress_mujoco --export "$export" --label "${name}_small60" \
     --conditions nominal,hw,hang,hang_hw,strength085 --profiles small60 --seeds 8 --seconds 80 --workers 12 \
     > "$dir/stress_small60.log" 2>&1 || bad+=" stress_small60.log"
   # the export gate's engage from the robot's pre-pose (the pp_* grid: hung, settled, the 2026-11-20 bag's sagged
   # pose, random draws; rope kept and released; hw and the torso IMU's vibration; the quaternion bias range's ends)
-  python agent_scripts/hw_stress_mujoco.py --export "$export" --label "${name}_prepose" --conditions pp \
+  python -m evals.deploy.stress_mujoco --export "$export" --label "${name}_prepose" --conditions pp \
     --plants robocasa --seeds 4 --workers 12 > "$dir/stress_prepose.log" 2>&1 || bad+=" stress_prepose.log"
   for bag in mid360v2_deploy mid360v2_deploy_2; do
-    PYTHONPATH=$ROSBAGS_PATH python agent_scripts/hw_bag_replay.py --bag "$BAGS/$bag" --deployed mid360v2 \
+    PYTHONPATH=$ROSBAGS_PATH python -m evals.deploy.bag_replay --bag "$BAGS/$bag" --deployed mid360v2 \
       --golem "$GOLEM" --policy "mid360v2=logs/deploy_baselines/mid360v2" --policy "$name=$export" \
       --sim_seeds 4 --out "$dir/replay_$bag" > "$dir/replay_$bag.log" 2>&1 || bad+=" replay_$bag.log"
   done
@@ -96,7 +96,7 @@ for seed in "${SEEDS[@]}"; do
   [ -n "${SMOKE:-}" ] && continue
   for step in $FINAL $MID; do
     # the motors nominal, as the reference scorecards were taken
-    python scripts/skrl/eval_scorecard.py --checkpoint "$run/checkpoints/agent_$step.pt" --headless \
+    python -m evals.isaac.legs.get_scorecard --checkpoint "$run/checkpoints/agent_$step.pt" --headless \
       "env.events.actuator_scales.params.gain_range=[1.0,1.0]" "env.events.actuator_scales.params.strength_range=[1.0,1.0]" \
       > "$dir/scorecard_$step.log" 2>&1
     code=$?
@@ -110,7 +110,7 @@ for seed in "${SEEDS[@]}"; do
   export=$dir/$name   # a candidate export; lmg_deploy's policies/h12 takes one only when chosen
   if python scripts/skrl/export_marl.py --checkpoint "$run/checkpoints/agent_$FINAL.pt" --out "$export" \
       > "$dir/export.log" 2>&1; then
-    python scripts/skrl/deploy_parity.py --checkpoint "$run/checkpoints/agent_$FINAL.pt" --export "$export" \
+    python -m evals.deploy.parity --checkpoint "$run/checkpoints/agent_$FINAL.pt" --export "$export" \
       --deploy_pkg "$GOLEM/core_ws/src/lmg_deploy" --out "$dir/parity" > "$dir/parity.log" 2>&1 \
       || fail "$name: deploy parity (over its tolerance, or it did not run; see $dir/parity.log)"
     note "$name: exported to $export; CPU checks start in the background"

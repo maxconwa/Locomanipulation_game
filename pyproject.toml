@@ -102,7 +102,7 @@ docstring-code-format = true
 
 [tool.pyright]
 
-include = ["source", "scripts", "mujoco_evals"]
+include = ["source", "scripts", "evals"]
 exclude = [
     "**/__pycache__",
     "**/_isaac_sim",

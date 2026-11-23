@@ -47,7 +47,7 @@ The two-agent task (locomanip_marl_env_cfg.py) with only the arms acting and lea
 - the arms' std stays at or above ARMS_MIN_STD (policy_log_std_bounds): ArmsOnlyIK_s42 (11-10) went from 0.2 to the
   yaml's floor, 0.05, by 70k steps, and its reach stopped rising at 40k (33.5% reached at 40k, 33.3% at 60k).
 
-Before the trajectory, the IK alone (residual 0, scripts/skrl/eval_arms.py) on these goals: 130 mm at the goal's
+Before the trajectory, the IK alone (residual 0, evals/isaac/arms/get_scorecard.py) on these goals: 130 mm at the goal's
 end, 49% of wrists within 5 cm, 12% of goals reached; ~9% of goals end with a hand on the pelvis (a "fell"); with the
 trajectory, 2%. ArmsOnly_s42 (11-10, stopped at 109k) trained on a pinned pelvis before the IK's Jacobian indexing knew a fixed base: the IK didn't track
 (632 mm), and the arms learned to park out of the penalties' way (764 mm at 100k).

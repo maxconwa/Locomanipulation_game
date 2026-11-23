@@ -133,7 +133,7 @@ class ModalVelocityCommand(UniformVelocityCommand):
     stage narrows when at least kernel_promote_share hit and widens below kernel_demote_share: the kernels follow the
     error down, so standing still against a walk command stops paying.
 
-    **Sport-mode metrics.** The sport-mode scorecard's tracking numbers (scripts/skrl/scorecard_metrics.py), measured
+    **Sport-mode metrics.** The sport-mode scorecard's tracking numbers (evals/common/legs_metrics.py), measured
     on training's own navigation from the cycle means: a sample every sport_metric_stride steps per env once the
     window is full, sport_settle_s after a resample or reset, while a
     command is given (|vx| or |vy| or |wz| over 0.05). The last sport_metric_samples samples of each kind are kept

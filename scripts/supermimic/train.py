@@ -24,8 +24,8 @@ cfg.lr decays on a cosine over cfg.lr_decay_iters iterations when set. Agents ar
 their action scale is all zero (ArmsOnly), the arms unless actions.arm_pos.residual_gain is 0 (LegsOnly); --agents
 overrides it.
 
-The compatibility contract with the PPO pipeline (scripts/skrl/train.py), so that export_marl.py, eval_scorecard.py,
-eval_arms.py, progress.sh and plot_progress.py work on these runs unchanged:
+The compatibility contract with the PPO pipeline (scripts/skrl/train.py), so that export_marl.py and the evals/ scorecards
+and plots work on these runs unchanged:
 - the run is <logs/skrl/locomanip_marl>/<time>_<name>/ with params/{env.yaml, agent.yaml, hydra_overrides.txt,
   task.txt} (+ supermimic.yaml: the resolved SuperMimicCfg and this script's settings); env.<...> / agent.<...>
   arguments are Hydra overrides exactly as there (saved for the evaluation scripts to replay), and an override of a

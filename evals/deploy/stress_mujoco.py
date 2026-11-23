@@ -1,7 +1,7 @@
 """The hardware-perturbation stress test in MuJoCo: an exported policy (GOLEM lmg_deploy's legs.pt / arms.pt,
 TorchScript, LSTM state carried) on CL_Assets' H1-2 MJCF, the model GOLEM's RoboCasa sim uses, at 500 Hz.
 
-Builds on mujoco_evals.mujoco_sim.MarlMujoco (the env's action bounds, PD, IK, command filter, gait clock and
+Builds on evals.mujoco.sim.MarlMujoco (the env's action bounds, PD, IK, command filter, gait clock and
 observations, all from the export's settings) and adds the perturbations (CONDITIONS):
   plant          robocasa: the MJCF's joint dynamics (damping 10, frictionloss 0.2, armature 0.1, as RoboCasa);
                  isaac: the training plant's (none, armature 0.01)
@@ -28,10 +28,10 @@ observations, all from the export's settings) and adds the perturbations (CONDIT
 Per job (one condition, profile, plant and seed) one robot for --seconds; jobs run in parallel processes. --video COND
 renders one job of COND (seed 0) to an mp4 instead.
 
-    python agent_scripts/hw_stress_mujoco.py --export <policies/name> --label <name> [--seeds 8] [--plants robocasa,isaac]
+    python -m evals.deploy.stress_mujoco --export <policies/name> --label <name> [--seeds 8] [--plants robocasa,isaac]
         [--conditions ...] [--profiles zero,small,small60] [--workers 24]
-    python agent_scripts/hw_stress_mujoco.py --export <...> --label <name> --conditions pp   (the pre-pose grid)
-    python agent_scripts/hw_stress_mujoco.py --export <...> --label <name> --video pp_bag_release
+    python -m evals.deploy.stress_mujoco --export <...> --label <name> --conditions pp   (the pre-pose grid)
+    python -m evals.deploy.stress_mujoco --export <...> --label <name> --video pp_bag_release
 
 Writes logs/hw_stress_mujoco/<label>/summary.json and summary.md. Any python with mujoco, torch, numpy and pyyaml.
 """
@@ -51,10 +51,10 @@ import mujoco
 import numpy as np
 import torch
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mujoco_evals.common import load_deploy_cfg  # noqa: E402
-from mujoco_evals.mujoco_sim import (  # noqa: E402
+from evals.mujoco.common import load_deploy_cfg  # noqa: E402
+from evals.mujoco.sim import (  # noqa: E402
     ALL_NAMES, MarlMujoco, imu_bias_ranges, mjcf_path, qrot)
 
 # the conditions; hw: the measured hardware effects together
@@ -117,8 +117,8 @@ PP_HANG_S, PP_LOWER_S, PP_EASE_S, PP_ENGAGE_S, PP_AFTER_S, PP_HUNG_HOLD_S = 1.5,
 PP_TETHER_K, PP_TETHER_D = 1500.0, 300.0  # N/m, N s/m: the rope's horizontal pull back to where it took over
 # 27 joint angles, policy order (rad), at the robot's engages of 2026-11-20 (lmg_legsenergy200k_s43_2026-11-20_1157 and
 # _1449, the last 20 ms before each)
-BAG_ENGAGE_Q = {"bag": REPO / "agent_scripts" / "data" / "bag_engage_q.npy",
-                "bag1449": REPO / "agent_scripts" / "data" / "bag_engage_q_1449.npy"}
+BAG_ENGAGE_Q = {"bag": REPO / "evals" / "deploy" / "data" / "bag_engage_q.npy",
+                "bag1449": REPO / "evals" / "deploy" / "data" / "bag_engage_q_1449.npy"}
 # the training's pre-pose joint offsets (locomanip_marl_env_cfg.PREPOSE_JOINT_RANGES; rad from the default pose)
 PREPOSE_JOINT_RANGES = {"ankle_pitch": (-0.3, 0.15), "ankle_roll": (-0.1, 0.1), "knee": (-0.1, 0.2), "hip": (-0.1, 0.1),
                         "torso": (-0.05, 0.05), "shoulder": (-0.15, 0.15), "elbow": (-0.15, 0.15), "wrist": (-0.15, 0.15)}

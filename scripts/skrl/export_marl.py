@@ -6,11 +6,11 @@ candidate folder under logs/):
                      LSTM (its cell state capped as in training, c <- s tanh(c / s)) and the MLP's mean, and the env's
                      +-clip_actions clamp, as forward(obs, h, c) -> (action, h, c) with hidden_size and num_layers
                      attributes; the deploy node carries h, c and zeroes them at engage.
-  <name>.yaml        (<name> = the folder's name: h12.yaml in policies/h12) the deploy template (agent_scripts/hw_deploy_template.yaml): what no run changes.
+  <name>.yaml        (<name> = the folder's name: h12.yaml in policies/h12) the deploy template (evals/deploy/hw_deploy_template.yaml): what no run changes.
   export.yaml        what the run trained with, which the node loads over the template: the navigation rest pose
                      (the arm target tables' default_poses), target_limits (joint -> [low, high], the run's clip of
                      every joint target into GOLEM's position e-stop range), gait_phase_cos, imu (the body its IMU
-                     sat on and the gyro low-pass), and (mujoco_evals.common.read_deploy_settings) control_dt, kp, kd,
+                     sat on and the gyro low-pass), and (evals.mujoco.common.read_deploy_settings) control_dt, kp, kd,
                      default_joint_pos, the per-joint action scales, max_ik_step, gait_period, zero_cmd_eps,
                      command_ranges, command_filter_tau and arm_goals (false: the run never trained an arm goal,
                      and the deploy refuses one), arm_ik (mdp.IKPostureArmAction's IK, when the run used it); and the
@@ -37,14 +37,14 @@ import yaml
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from mujoco_evals.common import (  # noqa: E402  (standard library and yaml only)
+from evals.mujoco.common import (  # noqa: E402  (standard library and yaml only)
     _yaml_load_any,
     read_deploy_settings,
     read_imu,
     read_target_limits,
 )
 
-TEMPLATE = REPO / "agent_scripts" / "hw_deploy_template.yaml"
+TEMPLATE = REPO / "evals" / "deploy" / "hw_deploy_template.yaml"
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", required=True)

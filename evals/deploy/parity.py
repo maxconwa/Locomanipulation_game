@@ -14,7 +14,7 @@ also check lmg_deploy's calibration against the level quaternion the env reads.
 Writes the worst differences per term to <out>/parity.json. Exits 1 when any is over --tolerance. The arm goals' odometry is FAST-LIO's on the robot and
 the true motion here: not compared.
 
-    python scripts/skrl/deploy_parity.py --checkpoint <run>/checkpoints/agent_<N>.pt --export <export dir> \
+    python -m evals.deploy.parity --checkpoint <run>/checkpoints/agent_<N>.pt --export <export dir> \
         --deploy_pkg ~/GOLEM/core_ws/src/lmg_deploy [--steps 600] [--out <dir>]
 """
 
@@ -61,7 +61,7 @@ from locomanipulation_game.assets.h1_2 import CL_ASSETS_DIR  # noqa: E402
 from locomanipulation_game.tasks.locomanip_marl.run_files import evaluation_cfgs, replay_run  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from mujoco_evals.common import load_deploy_cfg  # noqa: E402
+from evals.mujoco.common import load_deploy_cfg  # noqa: E402
 
 sys.path.insert(0, args.deploy_pkg)
 from lmg_deploy.controller import ARM_START, NUM_LEGS, MarlController, Mode, RobotState  # noqa: E402

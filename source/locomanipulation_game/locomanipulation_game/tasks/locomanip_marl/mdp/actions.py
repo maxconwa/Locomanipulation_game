@@ -174,6 +174,15 @@ class IKResidualArmAction(_BoundedTargets):
     def applied_actions(self) -> torch.Tensor:
         return self._residual
 
+    def _hold_zero(self, actions: torch.Tensor) -> bool:
+        """cfg.hold_zero (evaluations with no arms policy): every arm joint's target 0 rad, no IK, no residual."""
+        if not self.cfg.hold_zero:
+            return False
+        self._raw_actions[:] = actions
+        self._residual = torch.zeros_like(self._residual)
+        self._apply_bounds(torch.zeros_like(self._applied))
+        return True
+
     def _wrist_and_jacobian(self, arm: int, jacobians: torch.Tensor, to_root: torch.Tensor, root_pos: torch.Tensor,
                             root_quat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """One arm's wrist position (N, 3) and quaternion (N, 4) in the root frame, and its Jacobian (N, 6, arm
@@ -185,6 +194,8 @@ class IKResidualArmAction(_BoundedTargets):
         return ee_pos, ee_quat, torch.cat([torch.bmm(to_root, jac[:, :3]), torch.bmm(to_root, jac[:, 3:])], dim=1)
 
     def process_actions(self, actions: torch.Tensor):
+        if self._hold_zero(actions):
+            return
         self._raw_actions[:] = actions
         # detached: outside skrl's no_grad the recursion would chain the policy's graph across steps
         self._residual = self._residual + self._filter_alpha * (actions.detach() - self._residual)
@@ -230,6 +241,9 @@ class IKResidualArmActionCfg(JointPositionActionCfg):
     """Scale the residual by the arm command's goal_ramp: the IK alone holds the arms until the warm start ends."""
     residual_gain: float = 1.0
     """Times scale (one number, so a run can override it; scale is per joint): 0 holds the arms by the IK alone."""
+    hold_zero: bool = False
+    """Evaluation only (evals/, a legs eval with no arms policy): every arm joint's target is 0 rad, without the IK
+    or the residual. Training never sets it."""
     target_margin: float = MISSING
     joint_limits: dict[str, tuple[float, float]] | None = None
     """joint name -> (low, high) the target must also stay inside (golem_safety.position_envelope)."""
@@ -335,6 +349,8 @@ class IKPostureArmAction(IKResidualArmAction):
         return self._gravity
 
     def process_actions(self, actions: torch.Tensor):
+        if self._hold_zero(actions):
+            return
         cfg, n = self.cfg, self._num_joints
         self._raw_actions[:] = actions
         if cfg.residual_integrate:

@@ -47,10 +47,13 @@ from `ALMI_RL`.
 - **Train:** `python scripts/skrl/train.py --headless [--task <id>]`; runs go to
   `logs/skrl/locomanip_marl/`. The whole pipeline (train, scorecard, export,
   checks): `scripts/train_candidate.sh`.
-- **Evaluate:** `scripts/skrl/eval_scorecard.py`, `eval_arms.py` (Isaac; they
-  read the run's task from `<run>/params/task.txt`); the CPU checks of an
-  export, `agent_scripts/hw_stress_mujoco.py` and `hw_bag_replay.py`, run in a
-  separate python with mujoco (on `mujoco_evals/`).
+- **Evaluate:** everything is in `evals/` (`evals/README.md`), run as
+  `python -m evals.<...>` from the repo root: `evals/isaac/{legs,arms}/` and
+  `evals/mujoco/{legs,arms}/` (`get_scorecard`, `get_plot`), `get_video` in
+  `evals/isaac` and `evals/mujoco`, and `evals/deploy/gate.py` (GOLEM's sim,
+  parity, bag replay, MuJoCo stress tests: PASS/FAIL). Isaac ones read the
+  run's task from `<run>/params/task.txt`; the MuJoCo and deploy ones run in a
+  separate python with mujoco. Results go to `logs/evals/<run>/`.
 - Older recipes (the paper's reach evaluation, the whole-body baseline, the
   learned pelvis estimator) are at the `pre-cleanup` tag.
 - When adding a new task name, keep `LocoManip-` in it: `scripts/list_envs.py:54`

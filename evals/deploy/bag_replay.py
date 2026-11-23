@@ -13,11 +13,11 @@ is the node.
 
 Per policy and actor: the cell state c per unit and step, and the observation as the network normalizes it,
 z = (obs - mean) / std (clamped at +-5 inside the network). With --sim_seeds, the same is logged in MuJoCo
-(hw_stress_mujoco.StressMujoco, nominal conditions on the training plant, at the policy's own rate) driven by the
+(evals.deploy.stress_mujoco.StressMujoco, nominal conditions on the training plant, at the policy's own rate) driven by the
 bag's own velocity commands as the reference range, and the report counts the real steps outside it. A policy at
 another rate than the node's ticks steps on its own clock, on the latest /lowstate.
 
-    python agent_scripts/hw_bag_replay.py --bag <bag dir> --deployed mid360v2 \
+    python -m evals.deploy.bag_replay --bag <bag dir> --deployed mid360v2 \
         --policy mid360v2=logs/deploy_baselines/mid360v2 [--policy name=<export dir> ...] \
         [--sim_seeds 4] [--out logs/hw_bag_replay/<bag>]
 
@@ -35,7 +35,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[2]
 LEGS_GROUPS = [("acc", 3), ("gyro", 3), ("gravity", 3), ("cmd", 3), ("arm_goal", 1), ("ee_targets", 14),
                ("q", 27), ("dq", 27), ("gait", 4), ("last_action", 12)]
 ARMS_GROUPS = LEGS_GROUPS[:-1] + [("last_action", 14), ("wrist_pose", 14), ("wrist_error", 12)]
@@ -49,7 +49,7 @@ parser.add_argument("--deployed", default=None, help="the --policy name the bag 
 parser.add_argument("--golem", default=os.path.expanduser("~/GOLEM"))
 parser.add_argument("--urdf", default=os.path.join(os.environ.get("CL_ASSETS_DIR", str(REPO / "third_party/CL_Assets")),
                                                    "ros_assets", "h1_2_magpie.urdf"))
-parser.add_argument("--template", default=str(REPO / "agent_scripts/hw_deploy_template.yaml"))
+parser.add_argument("--template", default=str(REPO / "evals/deploy/hw_deploy_template.yaml"))
 parser.add_argument("--imu", choices=("livox", "lowstate"), default="livox",
                     help="the deployed policy's IMU. lowstate: LowState.imu_state, as the node did up to GOLEM 8d1eddd "
                          "(2026-10-16 bags); the other policies always read /livox/imu as today's node does")
@@ -72,7 +72,7 @@ parser.add_argument("--out", default=None)
 args = parser.parse_args()
 
 sys.path.insert(0, str(REPO))
-from mujoco_evals.common import load_deploy_cfg  # noqa: E402
+from evals.mujoco.common import load_deploy_cfg  # noqa: E402
 
 sys.path.insert(0, os.path.join(args.golem, "core_ws/src/lmg_deploy"))
 from lmg_deploy.controller import ARM_START, NUM_JOINTS, MarlController, RobotState  # noqa: E402
@@ -307,9 +307,7 @@ def sim_reference(folder: str, cmds: np.ndarray, seeds: int, tick_t: np.ndarray)
     """c and z in MuJoCo (nominal plant, Isaac joint dynamics) driven by the bag's own velocity command (cmds at the
     tick times tick_t, s from engage, held between ticks; the sim steps at the policy's own control_dt), from a zero
     LSTM state on its feet. Also returns each seed's fall time (None: stood)."""
-    sys.path.insert(0, str(REPO / "agent_scripts"))
-    sys.path.insert(0, str(REPO))
-    import hw_stress_mujoco as H
+    from evals.deploy import stress_mujoco as H
 
     cfg = load_cfg(folder)
     out = {"legs": {"c": [], "z": []}, "arms": {"c": [], "z": []}}
