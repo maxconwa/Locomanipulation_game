@@ -1,7 +1,7 @@
 """Reference motions: checks a motion directory and loads its clips, concatenated, with the tracked bodies' poses
 and velocities computed by forward kinematics at load.
 
-``MotionLoader`` keeps the attributes of mjlab's (mjlab_research, commit 6ea3e57,
+``MotionLoader`` keeps the attributes and ``body_state`` of mjlab's (mjlab_research, commit 6ea3e57,
 ``src/mjlab/tasks/tracking/mdp/commands.py``) and loads ``.npz`` clips the same way (sorted, concatenated, cumulative
 ``motion_ends``); the fps and joint-name checks follow h12_train's ``scripts/motion_files.py`` (this repository's own
 code, branch ``supermimic``, commit b175f1c). Importable without Isaac.
@@ -74,3 +74,15 @@ class MotionLoader:
         self.body_pos_w, self.body_quat_w, self.body_lin_vel_w, self.body_ang_vel_w = fk(
             self.root_pos_w, self.root_quat_w, self.joint_pos, self.root_lin_vel_w, self.root_ang_vel_w,
             self.joint_vel)
+
+    def body_state(self, frames: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """World positions, wxyz quaternions, linear and angular velocities of the
+        tracked bodies at ``frames``, without env origins."""
+        return self.fk(
+            self.root_pos_w[frames],
+            self.root_quat_w[frames],
+            self.joint_pos[frames],
+            self.root_lin_vel_w[frames],
+            self.root_ang_vel_w[frames],
+            self.joint_vel[frames],
+        )

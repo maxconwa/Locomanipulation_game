@@ -13,15 +13,22 @@ commit they come from.
   pretraining/supermimic/goal_window.py (goal-window constants and helpers of src/supermimic/representations.py,
   quat_to_rot6d of src/supermimic/utils/helpers.py); the full-state and goal terms of
   pretraining/tasks/observations.py and the groups of pretraining/tasks/track_env_cfg.py
-  (src/supermimic/tasks/env_cfgs.py).
+  (src/supermimic/tasks/env_cfgs.py); pretraining/supermimic/{models,replay_buffer,representations (GenCoord only),
+  sim_context}.py, learners/{learner_utils,policy_learner,wm_learner}.py, envs/{world_model_env,motion_tracking_env}.py,
+  runners/reset_sampling.py, runners/base_runner.py (BaseRunnerCfg, WorldModel, build_world_model, Ratio, BaseRunner
+  of src/supermimic/runners/supermimic_runner.py) and utils/{helpers,gencoord_helpers,tracking_reward,logger,
+  wandb_artifacts}.py, from the same paths under src/supermimic/.
 - mjlab (HybridRobotics' fork mjlab_research, commit 6ea3e57): Apache License 2.0. Ported from it:
   pretraining/kinematics.py (src/mjlab/utils/forward_kinematics.py, its interface), pretraining/tasks/
   (commands.py, metrics.py, rewards.py, terminations.py and the tracking terms of observations.py from
   src/mjlab/tasks/tracking/mdp/; events.py from src/mjlab/envs/mdp/dr/{geom,joint}.py; track_env_cfg.py from
   src/mjlab/tasks/tracking/tracking_env_cfg.py), pretraining/motions.py
-  (MotionLoader of src/mjlab/tasks/tracking/mdp/commands.py) and pretraining/math.py
+  (MotionLoader, with body_state, of src/mjlab/tasks/tracking/mdp/commands.py), EnvAdapter of
+  pretraining/supermimic/runners/base_runner.py (RslRlVecEnvWrapper of src/mjlab/rl/vecenv_wrapper.py) and pretraining/math.py
   (src/mjlab/utils/lab_api/math.py, itself Isaac Lab's isaaclab/utils/math.py, BSD-3-Clause, Copyright (c)
   2022-2025 The Isaac Lab Project Developers).
+- PyTorch (2.15.0): BSD-3-Clause, Copyright (c) Meta Platforms, Inc. and affiliates. Transcribed from it:
+  pretraining/supermimic/learners/muon.py (torch/optim/_muon.py, the Muon optimizer, absent from torch < 2.9).
 
 The robot model (main's h1_2_magpie USD, from the Correll Lab's CL_Assets and Unitree
 Robotics' H1-2 description) is used from main, not copied; their terms govern it.
