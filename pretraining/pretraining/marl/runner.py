@@ -373,6 +373,11 @@ class TwoAgentRunner(BaseRunner[TwoAgentRunnerCfg]):
                         group["lr"] = group["lr"].to(self.device)
         if self._sampler is not None and "return_sampler" in state:
             for k, v in state["return_sampler"].items():
+                if tuple(v.shape) != tuple(getattr(self._sampler, k).shape):
+                    raise ValueError(
+                        f"{path}: the reset sampler's {k} has shape {tuple(v.shape)}, this run's clips give "
+                        f"{tuple(getattr(self._sampler, k).shape)}: the checkpoint was trained on other clips"
+                    )
                 setattr(self._sampler, k, v.to(self.device))
         self.start_iteration = int(state["iteration"]) + 1
         self._wall_offset = float(state["wall_s"])

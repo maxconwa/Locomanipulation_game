@@ -19,6 +19,12 @@ time and ``progress.csv`` carry on, the config's ``max_iterations`` is the numbe
 ``run.json`` records ``fine_tuned_from`` and the start in ``resumed``.
 
 ``--max-seconds``: wall time of this invocation's training loop; when reached the run saves a checkpoint and exits 0.
+The clock is checked after each iteration finishes, so a run can overrun it by up to one iteration (an update window
+included). The first update's compile and CUDA-graph capture (about 8 minutes at full size) counts against it, and is
+paid again on every resume (after the ``resume_warmup`` iterations of collection).
+
+A fine-tune must use the source run's clips (the same resolved files in the same order): the reset sampler's saved
+per-bin statistics belong to them, so other clips are refused.
 """
 
 from __future__ import annotations
@@ -54,7 +60,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--motion-dir", type=Path, default=None, help=f"default {DEFAULT_MOTION_DIR.relative_to(REPO)}")
     p.add_argument("--run-name", default=None, help="default: the config file's name")
     p.add_argument("--num-envs", type=int, default=None)
-    p.add_argument("--max-iterations", type=int, default=None)
+    p.add_argument("--max-iterations", type=int, default=None,
+                   help="new run and --resume: the iteration to stop at (exclusive); --fine-tune-from: the number of "
+                        "iterations to add to the source's count. Default: the config's (or run.json's) max_iterations")
     p.add_argument("--max-seconds", type=float, default=None)
     p.add_argument("--seed", type=int, default=None, help="default: drawn and recorded in run.json")
     p.add_argument("--fine-tune-from", type=Path, default=None, help="a stage-1 run directory to start from")
@@ -127,6 +135,16 @@ def plan(args: argparse.Namespace) -> dict:
     if args.fine_tune_from is not None:
         source = args.fine_tune_from.resolve()
         out["start"] = _checkpoint(source) + 1
+        if not (source / "run.json").exists():
+            raise UsageError(f"{source} has no run.json")
+        theirs = [str(from_repo_path(f).resolve()) for f in json.loads((source / "run.json").read_text())["motion_files"]]
+        ours = [str(Path(f).resolve()) for f in files]
+        if ours != theirs:
+            first = next((i for i, (a, b) in enumerate(zip(ours, theirs)) if a != b), min(len(ours), len(theirs)))
+            raise UsageError(
+                f"--motion-dir {motion_dir} gives {len(ours)} clips, {source} was trained on {len(theirs)}; they first "
+                f"differ at position {first}. A fine-tune needs the source run's clips (its reset sampler's state)"
+            )
         cfg.max_iterations += out["start"]  # the config's count is the fine-tune's own; the run's carries on
         out.update(mode="fine_tune", source=source)
     return out

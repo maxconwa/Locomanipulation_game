@@ -237,14 +237,14 @@ def test_smoke_training_writes_a_run_refuses_its_directory_and_fine_tunes(tmp_pa
     # fine-tune: 5 iterations of a new run from a's checkpoint with the estop position term on
     tuned_cfg = tmp_path / "tuned.yaml"
     tuned_cfg.write_text(SMALL_CONFIG.replace("estop: {velocity: -5.0}", "estop: {velocity: -5.0, position: -20.0}")
-                         .replace("log_interval: 1", "log_interval: 1\n  max_iterations: 5"))
+                         .replace("log_interval: 1", "log_interval: 1\n  max_iterations: 7"))
     _train(tmp_path, "--config", tuned_cfg, "--motion-dir", tmp_path / "motions", "--num-envs", TRAIN_ENVS,
-           "--run-name", "b", "--fine-tune-from", run)
+           "--run-name", "b", "--fine-tune-from", run, "--max-iterations", 5)
     tuned = tmp_path / "runs" / "b"
     meta = json.loads((tuned / "run.json").read_text())
     assert meta["fine_tuned_from"] == f"{run} at iteration 29"
     assert meta["resumed"][0]["iteration"] == 30
-    assert meta["rewards"]["estop"]["position"] == -20.0 and meta["config"]["runner"]["max_iterations"] == 5
+    assert meta["rewards"]["estop"]["position"] == -20.0 and meta["config"]["runner"]["max_iterations"] == 7  # --max-iterations 5 overrides it
     assert meta["runner"]["max_iterations"] == 35
     assert _iterations(tuned) == list(range(35))  # a's curves, then the fine-tune's
     assert json.loads((tuned / "checkpoint.json").read_text())["iteration"] == 34
@@ -260,8 +260,11 @@ def test_resume_after_a_wall_time_stop_continues_the_iteration_count(tmp_path):
                   "--run-name", "r", "--max-iterations", 100000, "--max-seconds", 40)
     run = tmp_path / "runs" / "r"
     stopped = json.loads((run / "checkpoint.json").read_text())["iteration"]
-    assert 1 <= stopped < 99999  # stopped by the clock (the first iterations compile: slow), proc.stdout_text[-2000:]
-    assert _iterations(run)[-1] == stopped
+    out = proc.stdout_text[-2000:]
+    # stopped by the clock, far short of --max-iterations (the stand-in run does tens of iterations per second at
+    # most), with a checkpoint at the last logged iteration
+    assert 1 <= stopped < 10000, f"stopped at {stopped}:\n{out}"
+    assert (run / "checkpoint.pt").exists() and _iterations(run)[-1] == stopped, out
     proc = _train(tmp_path, "--resume", run, "--max-iterations", stopped + 11)
     assert str(run) in proc.stdout_text
     its = _iterations(run)
@@ -274,3 +277,30 @@ def test_resume_after_a_wall_time_stop_continues_the_iteration_count(tmp_path):
     # any other option with --resume is refused: the run's settings are its run.json's
     proc = _train(tmp_path, "--resume", run, "--num-envs", 8, ok=False)
     assert "--num-envs" in proc.stdout_text
+
+
+def test_a_fine_tune_on_other_clips_is_refused(tmp_path, monkeypatch):
+    """plan() (no app) refuses a fine-tune whose clips are not the source run's, naming the counts and position."""
+    from pretraining.scripts import train
+
+    monkeypatch.setenv("PRETRAINING_RUNS_DIR", str(tmp_path / "runs"))
+    files, config = _train_setup(tmp_path)
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "run.json").write_text(json.dumps({"motion_files": [str(f) for f in files[:2]]}))
+    (source / "checkpoint.json").write_text(json.dumps({"iteration": 9, "wall_s": 1.0}))
+    (source / "checkpoint.pt").write_bytes(b"")
+    argv = ["--config", str(config), "--run-name", "ft", "--fine-tune-from", str(source)]
+    with pytest.raises(train.UsageError, match="gives 3 clips, .* trained on 2; they first differ at position 2"):
+        train.plan(train.build_parser().parse_args([*argv, "--motion-dir", str(tmp_path / "motions")]))
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "standin_000.npz").symlink_to(files[0])
+    (other / "standin_009.npz").symlink_to(files[2])
+    with pytest.raises(train.UsageError, match="differ at position 1"):
+        train.plan(train.build_parser().parse_args([*argv, "--motion-dir", str(other)]))
+    # the source's own clips: accepted; --max-iterations counts the fine-tune's iterations
+    (source / "run.json").write_text(json.dumps({"motion_files": [str(f) for f in files]}))
+    ok = train.plan(train.build_parser().parse_args([*argv, "--motion-dir", str(tmp_path / "motions"),
+                                                     "--max-iterations", "4"]))
+    assert ok["mode"] == "fine_tune" and ok["start"] == 10 and ok["cfg"].max_iterations == 14
