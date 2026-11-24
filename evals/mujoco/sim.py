@@ -29,6 +29,7 @@ MJCF's own ranges act as the physical stops.
 from __future__ import annotations
 
 import math
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -191,6 +192,12 @@ class GyroLowpass:
         return self._x[0].copy()
 
 
+# The robot's motor drivers report the velocity of these joints through a 2nd-order Butterworth low-pass at this cutoff
+# (~12 ms late; the ankles and arms unfiltered): the training env's JOINT_VEL_LOWPASS_HZ / _JOINTS
+# (locomanip_marl_env_cfg.py), which an export records as joint_vel_lowpass. stress_mujoco's hw condition applies it.
+ROBOT_JOINT_VEL_LOWPASS = {"cutoff_hz": 21.0, "joints": [".*_hip_(yaw|pitch|roll)_joint", ".*_knee_joint", "torso_joint"]}
+
+
 class MarlMujoco:
     """One H1-2 in MuJoCo driven by an export's actors (callables obs[None] -> action[None]) and its settings."""
 
@@ -313,6 +320,8 @@ class MarlMujoco:
         self.rng = np.random.default_rng(0)
         self.gyro_lowpass = GyroLowpass(imu["gyro_lowpass_hz"]) if imu.get("gyro_lowpass_hz") else None
         self._gyro = None
+        # the reported joint velocities' low-pass the run trained with (export joint_vel_lowpass; absent: none)
+        self.set_dq_lowpass(settings.get("joint_vel_lowpass"))
         # LocoManip-Marl-Direct-v0 (ArmTargetsCommandCfg.pelvis_fixed_goals, independent_of_legs): an arm goal rides
         # on the pelvis, and the velocity command runs through it. The caller sets it.
         self.pelvis_goals = False
@@ -369,6 +378,10 @@ class MarlMujoco:
         if self.gyro_lowpass is not None:
             self.gyro_lowpass.reset()
             self._gyro = self.gyro_lowpass(self._raw_gyro(), m.opt.timestep)
+        if self.dq_lowpass is not None:
+            self.dq_lowpass.reset()
+            self._dq_filtered = None
+            self._sample_dq()
 
     # -- kinematics in the pelvis frame, sensors
     def root(self):
@@ -400,9 +413,29 @@ class MarlMujoco:
         """The joint angles the policy and the torque bound see (a subclass adds encoder offsets)."""
         return self.d.qpos[self.qadr].copy()
 
+    def set_dq_lowpass(self, spec: dict | None):
+        """Low-pass the reported velocity of spec["joints"] (name patterns) at spec["cutoff_hz"] (GyroLowpass, sampled
+        every physics substep, as /lowstate's motor drivers do); None: report them unfiltered."""
+        self.dq_lowpass, self.dq_lowpass_idx, self._dq_filtered = None, [], None
+        if spec and float(spec.get("cutoff_hz") or 0.0) > 0.0:
+            pats = spec.get("joints") or ROBOT_JOINT_VEL_LOWPASS["joints"]
+            self.dq_lowpass_idx = [i for i, n in enumerate(ALL_NAMES) if any(re.fullmatch(p, n) for p in pats)]
+            self.dq_lowpass = GyroLowpass(float(spec["cutoff_hz"]))
+
+    def _sample_dq(self):
+        """One physics substep's sample into the velocity low-pass."""
+        if self.dq_lowpass is not None:
+            self._dq_filtered = self.dq_lowpass(self.d.qvel[self.vadr][self.dq_lowpass_idx], self.m.opt.timestep)
+
     def measured_dq(self) -> np.ndarray:
-        """The joint velocities the policy sees (a subclass adds LowState's lag)."""
-        return self.d.qvel[self.vadr].copy()
+        """The joint velocities the policy sees: the low-passed ones at the filter's output (a subclass adds
+        LowState's lag)."""
+        qd = self.d.qvel[self.vadr].copy()
+        if self.dq_lowpass is not None:
+            if self._dq_filtered is None:
+                self._sample_dq()
+            qd[self.dq_lowpass_idx] = self._dq_filtered
+        return qd
 
     def pd_torque(self, target):
         q, qd = self.d.qpos[self.qadr], self.d.qvel[self.vadr]
@@ -623,6 +656,7 @@ class MarlMujoco:
             mujoco.mj_step(self.m, self.d)  # pinned: the weld holds the pelvis (setting its qpos back too twisted the torso)
             if self.gyro_lowpass is not None:
                 self._gyro = self.gyro_lowpass(self._raw_gyro(), self.m.opt.timestep)
+            self._sample_dq()
         self.last_tau = self.pd_torque(self.applied)
 
     def _update_odometry(self):

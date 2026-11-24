@@ -7,6 +7,9 @@ observations, all from the export's settings) and adds the perturbations (CONDIT
                  isaac: the training plant's (none, armature 0.01)
   strength       the motors' torque x s (kp, kd and the effort limit together); gain: kp and kd x g
   dq_lag         the observed hip pitch and knee velocity (LowState dq) this many ms late
+  dq_lowpass_hz  the observed hip yaw, pitch, roll, knee and torso velocity through the motor drivers' 2nd-order
+                 low-pass at this cutoff (sim.ROBOT_JOINT_VEL_LOWPASS; the robot's, 2026-11-24 bags); 0: the export's
+                 own (joint_vel_lowpass, what its run trained with), if any
   gyro_k         the head's 20-21 Hz pitch resonance added to the gyro before its low-pass, at gyro_k x the measured
                  amplitude
   delay_ms       the joint targets this late; torso_kg: added to the torso; enc: encoder offsets on the legs (rad)
@@ -60,10 +63,11 @@ sys.path.insert(0, str(REPO))
 from evals.mujoco.common import load_deploy_cfg  # noqa: E402
 from evals.mujoco.policy import Recurrent  # noqa: E402, F401  (bag_replay uses H.Recurrent)
 from evals.mujoco.sim import (  # noqa: E402
-    ALL_NAMES, MarlMujoco, imu_bias_ranges, mjcf_path, qrot)
+    ALL_NAMES, ROBOT_JOINT_VEL_LOWPASS, MarlMujoco, imu_bias_ranges, mjcf_path, qrot)
 
-# the conditions; hw: the measured hardware effects together
-_HW = {"strength": 0.85, "dq_lag": 12.0, "gyro_k": 1.0, "delay_ms": 20.0, "enc": 0.02}
+# the conditions; hw: the measured hardware effects together. Its velocity lag is the drivers' 21 Hz low-pass on the
+# hips, knees and torso since 2026-11-24 (was dq_lag 12 ms on the hip pitches and knees only)
+_HW = {"strength": 0.85, "dq_lowpass_hz": 21.0, "gyro_k": 1.0, "delay_ms": 20.0, "enc": 0.02}
 CONDITIONS = {
     "nominal": {},
     "strength085": {"strength": 0.85},
@@ -81,7 +85,7 @@ CONDITIONS = {
     "enc002": {"enc": 0.02},
     "hw": dict(_HW),
     "hw_no_gyro": {k: v for k, v in _HW.items() if k != "gyro_k"},
-    "hw_no_dqlag": {k: v for k, v in _HW.items() if k != "dq_lag"},
+    "hw_no_dqlag": {k: v for k, v in _HW.items() if k != "dq_lowpass_hz"},
     "hw_no_strength": {k: v for k, v in _HW.items() if k != "strength"},
     "hw_no_delay": {k: v for k, v in _HW.items() if k != "delay_ms"},
     "hw_no_enc": {k: v for k, v in _HW.items() if k != "enc"},
@@ -107,7 +111,7 @@ for _start in ("settled", "bag"):
                                                                imu_pitch=_end)
 # delay_ms: the robot's /lowstate to command 1.1 ms (p99 2.1) plus the safety relay's up to 2 ms (2026-11-23 bags; the
 # motors' own latency unmeasured): 4 ms nominal, 20 in the hardware bundle (_HW). 10 until 2026-11-23
-NOMINAL = {"strength": 1.0, "gain": 1.0, "dq_lag": 0.0, "gyro_k": 0.0, "delay_ms": 4.0, "torso_kg": 0.0, "enc": 0.0,
+NOMINAL = {"strength": 1.0, "gain": 1.0, "dq_lag": 0.0, "dq_lowpass_hz": 0.0, "gyro_k": 0.0, "delay_ms": 4.0, "torso_kg": 0.0, "enc": 0.0,
            "hang_s": 0.0, "lstm_reset_s": 0.0, "lstm_reset_which": "both", "prepose": "", "rope": 0.4,
            "release": False, "imu_pitch": None, "vib_k": 0.0}
 HANG_LIFT, LOWER_S = 0.08, 1.0
@@ -161,6 +165,8 @@ class StressMujoco(MarlMujoco):
         self.enc[:12] = rng.uniform(-f["enc"], f["enc"], 12)
         self.delay = int(round(f["delay_ms"] / 1000 / m.opt.timestep))
         self.lag = int(round(f["dq_lag"] / 1000 / m.opt.timestep))
+        if f["dq_lowpass_hz"] > 0.0:  # the robot's drivers' velocity low-pass, over the export's own
+            self.set_dq_lowpass(dict(ROBOT_JOINT_VEL_LOWPASS, cutoff_hz=f["dq_lowpass_hz"]))
         self.res_freq = 20.0 + rng.uniform()
         self.res_phase = 2 * math.pi * rng.uniform()
         self.torso_body = torso
@@ -240,8 +246,9 @@ class StressMujoco(MarlMujoco):
         return self.d.qpos[self.qadr] + self.enc
 
     def measured_dq(self) -> np.ndarray:
-        qd = self.d.qvel[self.vadr].copy()
-        qd[LAG_IDX] = self.qd_hist[0][LAG_IDX]  # lag substeps old once the deque is full
+        qd = super().measured_dq()
+        if self.lag:
+            qd[LAG_IDX] = self.qd_hist[0][LAG_IDX]  # lag substeps old once the deque is full
         return qd
 
     def pd_torque(self, target):
@@ -265,6 +272,7 @@ class StressMujoco(MarlMujoco):
                 d.qvel[0:6] = 0.0
             qd = d.qvel[self.vadr].copy()
             self.qd_hist.append(qd)
+            self._sample_dq()
             self.sub += 1
             # the legs' motion, rad/s rms over 0.1 s: what drives the structure-borne shake
             self.leg_rms += m.opt.timestep / 0.1 * (math.sqrt(np.mean(qd[:12] ** 2)) - self.leg_rms)

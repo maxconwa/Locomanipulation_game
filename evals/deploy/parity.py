@@ -162,7 +162,11 @@ def main(env_cfg, agent_cfg: dict):
     def env_state(i: int = 0) -> RobotState:
         d = robot.data
         gyro = deploy_gyro.value if deploy_gyro.value is not None else imu.data.ang_vel_b[i].double().cpu().numpy()
-        return RobotState(q=d.joint_pos[i, ids].double().cpu().numpy(), dq=d.joint_vel[i, ids].double().cpu().numpy(),
+        # the velocities as /lowstate reports them: the drivers' low-pass where the env applies it (the robot does it)
+        dq = d.joint_vel[i].clone()
+        if getattr(base, "joint_vel_lowpass", None) is not None:
+            dq[base.joint_vel_lowpass_ids] = base.joint_vel_lowpass.output[i].to(dq.dtype)
+        return RobotState(q=d.joint_pos[i, ids].double().cpu().numpy(), dq=dq[ids].double().cpu().numpy(),
                           quat=reported_quat(imu.data.quat_w[i]),
                           gyro=gyro, acc=imu.data.lin_acc_b[i].double().cpu().numpy())
 

@@ -36,6 +36,7 @@ from isaaclab.managers import (
 from isaaclab.utils.math import quat_apply_inverse, subtract_frame_transforms
 
 from .golem_safety import GolemEstopMonitor
+from .imu_filter import GyroLowpass
 from .joint_noise import per_joint
 from .lowstate_imu import LowstateImu
 from .locomanip_marl_env_cfg import ARM_COMMAND, LocoManipMarlEnvCfg
@@ -76,6 +77,15 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self.curriculum_manager = CurriculumManager(self.cfg.curriculum, self)
         print("[INFO] Curriculum Manager: ", self.curriculum_manager)
         self._robot = self.scene["robot"]
+        # the joint velocities as /lowstate reports them: the drivers' low-pass on cfg.joint_vel_lowpass_joints, one
+        # sample per physics substep with the IMU's (mdp.joint_vel_rel_reported reads it; None: unfiltered)
+        self.joint_vel_lowpass, self.joint_vel_lowpass_ids = None, []
+        if self.cfg.joint_vel_lowpass_hz > 0.0:
+            self.joint_vel_lowpass_ids = self._robot.find_joints(self.cfg.joint_vel_lowpass_joints)[0]
+            self.joint_vel_lowpass = GyroLowpass(self.cfg.joint_vel_lowpass_hz, self.physics_dt, self.num_envs,
+                                                 self.device, axes=len(self.joint_vel_lowpass_ids))
+            print(f"[INFO] reported joint velocities low-passed at {self.cfg.joint_vel_lowpass_hz:g} Hz: "
+                  + ", ".join(self._robot.joint_names[i] for i in self.joint_vel_lowpass_ids))
         # the warm start: exponential means over the ending episodes of their falls and their minutes (falls per
         # minute is their ratio, from 1: a start far above any threshold that the means forget within ~10k episodes),
         # the sport-mode gate's consecutive passing checks and the last check's metrics
@@ -269,6 +279,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._refresh_sensors_after_reset(env_ids)
         self._fresh[env_ids] = True
         self.lowstate_imu.reset(env_ids)
+        if self.joint_vel_lowpass is not None:
+            self.joint_vel_lowpass.reset(env_ids)
         if getattr(self, "encoder_offset", None) is not None:
             ids = torch.as_tensor(env_ids, device=self.device)
             span = self._encoder_offset_range
@@ -343,6 +355,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
         """One /lowstate IMU sample of the current physics state (lowstate_imu.LowstateImu.sample)."""
         data = self.scene["imu"].data
         self.lowstate_imu.sample(data.quat_w, data.ang_vel_b)
+        if self.joint_vel_lowpass is not None:  # the drivers' velocity low-pass, sampled with the IMU
+            self.joint_vel_lowpass(self._robot.data.joint_vel[:, self.joint_vel_lowpass_ids])
 
     def support_share(self) -> torch.Tensor:
         """Per env, the share of the robot's weight a pre-pose gantry carries now (mdp.prepose_reset; 0 without it)."""

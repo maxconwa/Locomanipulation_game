@@ -106,6 +106,7 @@ def evaluation_cfgs(env_cfg, agent_cfg: dict, checkpoint: str, run_dir: str):
     run_imu(env_cfg, run_dir)
     run_engage_blend(env_cfg, run_dir)
     run_leg_lowpass(env_cfg, run_dir)
+    run_joint_vel_lowpass(env_cfg, run_dir)
     env_cfg.state_checkpoint_path = state_checkpoint_for(checkpoint)
     agent_cfg["trainer"]["close_environment_at_exit"] = False
     agent_cfg["agent"]["experiment"]["write_interval"] = 0
@@ -176,6 +177,20 @@ def run_leg_lowpass(env_cfg, run_dir: str) -> None:
     if hz != legs.target_lowpass_hz:
         print(f"[INFO] legs' target low-pass as the run trained: {hz:g} Hz")
     legs.target_lowpass_hz = hz
+
+
+def run_joint_vel_lowpass(env_cfg, run_dir: str) -> None:
+    """Give env_cfg the reported joint velocities' low-pass the run trained with (<run>/params/env.yaml
+    joint_vel_lowpass_hz and _joints; a run from before 2026-11-24 has none and observed them unfiltered)."""
+    saved = read_run_env(run_dir)
+    if saved is None or not hasattr(env_cfg, "joint_vel_lowpass_hz"):
+        return
+    hz = float(saved.get("joint_vel_lowpass_hz") or 0.0)
+    if hz != env_cfg.joint_vel_lowpass_hz:
+        print(f"[INFO] reported joint velocities' low-pass as the run trained: {hz:g} Hz")
+    env_cfg.joint_vel_lowpass_hz = hz
+    if saved.get("joint_vel_lowpass_joints"):
+        env_cfg.joint_vel_lowpass_joints = list(saved["joint_vel_lowpass_joints"])
 
 
 def env_override_keys(overrides: list[str]) -> list[str]:

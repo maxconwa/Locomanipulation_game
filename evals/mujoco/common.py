@@ -129,6 +129,11 @@ def read_deploy_settings(run_dir: Path) -> dict:
     # the legs' engage blend (mdp.BoundedJointPositionAction; lmg_deploy's engage_blend_s), when the run had one
     if (actions.get("joint_pos") or {}).get("engage_blend_s"):
         pose["engage_blend_s"] = float(actions["joint_pos"]["engage_blend_s"])
+    # the drivers' low-pass on the reported joint velocities the run trained with (LocoManipMarlEnvCfg
+    # joint_vel_lowpass_hz): the robot does it itself, so lmg_deploy reads nothing of it; the MuJoCo evals apply it
+    if env.get("joint_vel_lowpass_hz"):
+        pose["joint_vel_lowpass"] = {"cutoff_hz": float(env["joint_vel_lowpass_hz"]),
+                                     "joints": list(env.get("joint_vel_lowpass_joints") or [])}
     # the legs' target low-pass (mdp.BoundedJointPositionAction target_lowpass_hz), when the run had one
     if (actions.get("joint_pos") or {}).get("target_lowpass_hz"):
         pose["leg_action_lowpass_hz"] = float(actions["joint_pos"]["target_lowpass_hz"])

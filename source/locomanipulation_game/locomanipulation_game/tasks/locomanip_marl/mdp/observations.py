@@ -58,6 +58,18 @@ def joint_pos_rel_measured(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) ->
     return rel if offset is None else rel + offset[:, asset_cfg.joint_ids]
 
 
+def joint_vel_rel_reported(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """joint_vel_rel as /lowstate reports it: the joints the env low-passes (LocoManipMarlEnv.joint_vel_lowpass, the
+    motor drivers' filter) at the filter's output, the rest as they are."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    dq = asset.data.joint_vel
+    lowpass = getattr(env, "joint_vel_lowpass", None)
+    if lowpass is not None:
+        dq = dq.clone()
+        dq[:, env.joint_vel_lowpass_ids] = lowpass.output.to(dq.dtype)
+    return dq[:, asset_cfg.joint_ids] - asset.data.default_joint_vel[:, asset_cfg.joint_ids]
+
+
 def body_pose_in_root_xyzw(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
     """Each of asset_cfg's bodies in the root frame, concatenated."""
     asset: Articulation = env.scene[asset_cfg.name]

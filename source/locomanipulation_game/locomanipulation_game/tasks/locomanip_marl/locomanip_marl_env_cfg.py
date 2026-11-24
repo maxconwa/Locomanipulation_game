@@ -122,6 +122,13 @@ ROT_STDS = (0.5, 0.4, 0.3, 0.22, 0.16, 0.12, 0.08)               # rad
 # The torso IMU as /lowstate reports it (scene.imu at imu_link; lowstate_imu.py, LocoManipMarlEnvCfg.lowstate_imu).
 # Its gyro is low-passed at this cutoff, as GOLEM's deploy low-passes its IMU's gyro (export.yaml imu.gyro_lowpass_hz)
 GYRO_LOWPASS_HZ = 8.0
+# The joint velocities /lowstate reports for these joints come through the motor drivers' 2nd-order Butterworth
+# low-pass at about this cutoff (~12 ms late), the ankles' and arms' unfiltered: measured against the derivative of the
+# reported angle 0.98/-9 deg at 2 Hz, 0.92/-40 at 10, 0.75/-84 at 20, 0.22/-153 at 40 (2026-11-24 bags; the same
+# under sport mode). The actors observe them so (imu_filter.GyroLowpass per physics substep, mdp.joint_vel_rel_reported).
+# Since 2026-11-24: Coop300k_s42 @ 150k used hip-roll velocity as damping, which this lag turned into a 20 Hz ring
+JOINT_VEL_LOWPASS_HZ = 21.0
+JOINT_VEL_LOWPASS_JOINTS = [".*_hip_(yaw|pitch|roll)_joint", ".*_knee_joint", "torso_joint"]
 # The velocity-tracking kernel curriculum (ModalVelocityCommand._judge_kernels): stage 0 is unitree_rl_gym's std 0.5,
 # under which standing still against a 0.4 m/s command keeps 53% of the linear reward; narrowed as the errors fall.
 LIN_VEL_STDS = (0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1)  # m/s
@@ -262,7 +269,7 @@ class MarlObservationsCfg:
         # the joint encoders as /lowstate reports them (joint_noise.py): the angles with each reset's encoder offsets
         # and a little noise, the speeds with noise that grows with the speed
         joint_pos = _joints(mdp.joint_pos_rel_measured, Unoise(n_min=-JOINT_POS_NOISE, n_max=JOINT_POS_NOISE))
-        joint_vel = _joints(mdp.joint_vel_rel, joint_vel_noise(ALL_JOINTS_NAMES))
+        joint_vel = _joints(mdp.joint_vel_rel_reported, joint_vel_noise(ALL_JOINTS_NAMES))
         gait_phase = ObsTerm(func=mdp.gait_phase_sin, params={"command_name": "base_velocity"})
         # with the sin, each leg's phase without ambiguity (the legs' sins alone are negatives of each other)
         gait_phase_cos = ObsTerm(func=mdp.gait_phase_cos, params={"command_name": "base_velocity"})
@@ -620,6 +627,11 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     golem_estop_penalty: float = -1.0
     gyro_lowpass_hz: float = GYRO_LOWPASS_HZ
     """Hz: the policy's gyro low-pass (imu_filter.GyroLowpass, as lmg_deploy filters its IMU's gyro)."""
+    joint_vel_lowpass_hz: float = JOINT_VEL_LOWPASS_HZ
+    """Hz: the motor drivers' low-pass on the reported velocity of joint_vel_lowpass_joints (JOINT_VEL_LOWPASS_HZ;
+    mdp.joint_vel_rel_reported); 0: none."""
+    joint_vel_lowpass_joints: list[str] = JOINT_VEL_LOWPASS_JOINTS
+    """Joint name patterns whose reported velocity is low-passed."""
     lowstate_imu: LowstateImuCfg = LowstateImuCfg()
     """The torso IMU's per-reset bias, noise, lag and vibration draws (lowstate_imu.py)."""
 
