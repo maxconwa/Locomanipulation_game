@@ -95,7 +95,8 @@ class ActionsCfg:
         joint_names=list(JOINT_NAMES),
         scale=dict(ACTION_SCALE),
         use_default_offset=True,
-        # SAFETY: position targets stay inside the range golem_safety clips them to.
+        # SAFETY: targets are clipped to TARGET_LIMITS (the range golem_safety clips them to) before the encoder-bias
+        # shift, so the applied ones can sit up to the bias (<= 0.01 rad) past them, as mjlab's.
         clip=dict(TARGET_LIMITS),
         preserve_order=True,
     )

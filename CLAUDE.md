@@ -59,8 +59,9 @@ from `ALMI_RL`.
 - **`pretraining/`**: a separate package (`pip install -e pretraining`), stage-1 motion-tracking pretraining of
   a legs and an upper-body agent on retargeted AMASS clips with SuperMimic's world-model method, ported from
   `h12_train` (branch `supermimic`); gym id `LocoManip-Pretrain-Track-v0`. No clips or policies in git (licence).
-- Train it: `python -m pretraining.scripts.train --config pretraining/configs/base.yaml --run-name <name>`
-  (runs in `data/pretraining/runs/`); also `scripts/crosscheck.py`, `scripts/play.py`. Everything is in
+- Train it: `python -m pretraining.scripts.train --config pretraining/configs/base.yaml --run-name <name> --num-envs 2048`
+  (base.yaml's 5,120 envs do not fit a 16 GB GPU; runs in `data/pretraining/runs/`); also
+  `python -m pretraining.scripts.crosscheck`, `python -m pretraining.scripts.play`. Everything is in
   `pretraining/README.md`.
 - **`LocoManip-Marl-Pulse-v0`** (`marl_pulse_env_cfg.py`, `mdp/pulse_actions.py`): Marl-Direct with each agent
   acting in the latent of its frozen stage-1 decoder (PULSE, 50 Hz, pretraining's gains and default pose); fit

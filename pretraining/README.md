@@ -108,7 +108,8 @@ timeout -s KILL 25200 $PY -m pretraining.scripts.train --config pretraining/conf
 timeout -s KILL 7200 $PY -m pretraining.scripts.train --config pretraining/configs/golem_aware.yaml \
     --run-name isaac_s1_golem_aware --fine-tune-from data/pretraining/runs/isaac_s1 --num-envs 2048 --max-seconds 5200
 
-# continue a run that stopped (only --max-iterations, --max-seconds and --device are accepted beside it)
+# continue a run that stopped (only --max-iterations, --max-seconds and --device are accepted beside it);
+# without --max-seconds it runs on to max_iterations (320,000 in base.yaml, 13 h or more), whatever its budget was
 timeout -s KILL 25200 $PY -m pretraining.scripts.train --resume data/pretraining/runs/isaac_s1 [--max-iterations N] [--max-seconds S]
 
 # cross-check: a run's actors (either simulator's) on 40 clips -> crosscheck.csv, clips.txt, summary.txt
@@ -264,8 +265,9 @@ saturate. What this shows: the port runs the MuJoCo policies without falls and w
 kinematic replay reads near-zero error (sim test). What it does not show: only 4 clips have a MuJoCo number to
 compare with, so the drift gap between the simulators is measured on those 4 clips only.
 
-**Early training against `amass_s1`.** At an equal number of updates (120: iteration 600 at 2,048 envs), the Isaac
-measurement run's curve matches `amass_s1`'s: `Loss/state` 0.039 against 0.041, body position error 0.334 m against
+**Early training against `amass_s1`.** At an equal number of updates (117: the Isaac measurement run's iteration 590
+at 2,048 envs, its last row, against `amass_s1`'s iteration 240), the Isaac measurement run's curve matches
+`amass_s1`'s: `Loss/state` 0.039 against 0.041, body position error 0.334 m against
 0.370 m, mean episode length 60 against 50 (as logged in `progress.csv`).
 
 **The four policies.** Errors and falls from the cross-check in Isaac on the same 40 clips; `Safety/*` shares are
@@ -302,9 +304,12 @@ with a higher `Loss/state` (0.0047 against 0.0027-0.0031) and a larger global pe
 0.279 m) than `amass_s1` at any of the three points, a body error between `amass_s1`'s at equal updates and at its
 end, and the same episode length to within 2%. The GOLEM-aware fine-tune cut the legs' e-stop share in both
 simulators (Isaac 5.2% to 0.08%) and raised the global pelvis error in both. What this does not show: the training
-numbers come from two different simulators, so they do not say which policy tracks better. The same-simulator
-evidence is the cross-check above, where both Isaac-trained policies have a lower body and pelvis error (0.170-0.178
-m against 0.236-0.306 m) and a higher joint error (0.079-0.087 rad against 0.064-0.068 rad) than the MuJoCo-trained
+numbers come from two different simulators, so they do not say which policy tracks better. The cross-check above
+runs all four in one simulator, but that simulator is Isaac, the Isaac-trained policies' own training simulator
+(the MuJoCo-trained ones run there out of distribution), so it favours them; a symmetric check of the Isaac actors
+in MuJoCo was not run, and it does not show that the Isaac policies track better. In it both Isaac-trained policies
+have a lower body and pelvis error (0.170-0.178 m against 0.236-0.306 m) and a higher joint error (0.079-0.087 rad
+against 0.064-0.068 rad) than the MuJoCo-trained
 ones, none falls, and their arm saturation and torque-demand shares are lower; that is 40 clips, nominal physics,
 and one seed per run.
 

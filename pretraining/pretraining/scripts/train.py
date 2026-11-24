@@ -66,7 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-seconds", type=float, default=None)
     p.add_argument("--seed", type=int, default=None, help="default: drawn and recorded in run.json")
     p.add_argument("--fine-tune-from", type=Path, default=None, help="a stage-1 run directory to start from")
-    p.add_argument("--resume", type=Path, default=None, help="a run directory to continue")
+    p.add_argument("--resume", type=Path, default=None, help="a run directory to continue. Without --max-seconds it runs on to "
+                        "--max-iterations or run.json's max_iterations, whatever wall-time budget the run had")
     return p
 
 
@@ -173,18 +174,20 @@ def train(p: dict, max_seconds: float | None, device: str) -> Path:
     if p["mode"] == "resume":
         runner.load_checkpoint(run_dir / "checkpoint.pt")
     elif p["mode"] == "fine_tune":
+        runner.load_checkpoint(p["source"] / "checkpoint.pt")
+    # this invocation's wall time: the runner counts the run's, summed over its segments; set before run.json is
+    # written, so that it records the budget used
+    runner.cfg.max_seconds = max_seconds + runner._wall_offset if max_seconds else 0.0
+    if p["mode"] == "fine_tune":
         source = p["source"]
-        runner.load_checkpoint(source / "checkpoint.pt")
         run_dir.mkdir(parents=True)
         if (source / "progress.csv").exists():
             shutil.copy2(source / "progress.csv", run_dir / "progress.csv")  # the curves carry on
         run_json = {
-            "stage": runner.stage, "runner": dataclasses.asdict(cfg), **runner._run_meta(), "config": p["config"],
+            "stage": runner.stage, "runner": dataclasses.asdict(runner.cfg), **runner._run_meta(), "config": p["config"],
             "fine_tuned_from": f"{to_repo_path(source)} at iteration {p['start'] - 1}",
         }
         atomic_write_text(run_dir / "run.json", json.dumps(run_json, indent=2, default=str))
-    # this invocation's wall time: the runner counts the run's, summed over its segments
-    runner.cfg.max_seconds = max_seconds + runner._wall_offset if max_seconds else 0.0
     print(f"[train] run directory: {run_dir}", flush=True)
     meta = {**runner._run_meta(), "config": p["config"]} if p["mode"] == "new" else None
     return runner.run(meta, resume=p["mode"] != "new")

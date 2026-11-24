@@ -1,5 +1,6 @@
 # Ported from SuperMimic (HybridRobotics, commit 7e94b07, Apache-2.0), src/supermimic/utils/logger.py. Changes: wandb
-# optional (logs only to an active run).
+# optional (logs only to an active run); the console's elapsed time and ETA can be given by the caller and are printed
+# as hours and minutes (time.strftime wrapped them at 24 h).
 from __future__ import annotations
 
 import statistics
@@ -9,6 +10,12 @@ from collections import deque
 import torch
 
 from pretraining.supermimic.utils.wandb_artifacts import optional_wandb
+
+
+def format_duration(seconds: float) -> str:
+    """``seconds`` as ``<h>h<mm>m``, hours unbounded (no wrap at 24 h)."""
+    seconds = max(float(seconds), 0.0)
+    return f"{seconds // 3600:.0f}h{seconds % 3600 // 60:02.0f}m"
 
 
 class Logger:
@@ -29,6 +36,8 @@ class Logger:
 
         self.tot_timesteps = 0
         self.tot_time = 0.0
+        self._elapsed_s: float | None = None
+        self._eta_s: float | None = None
 
         # Create buffers
         self.ep_extras = []
@@ -125,11 +134,14 @@ class Logger:
         done_it = it + 1
         remaining_it = total_it - done_it
         eta = self.tot_time / done_it * remaining_it if done_it > 0 else 0.0
+        if self._eta_s is not None:
+            eta = self._eta_s
+        elapsed = self.tot_time if self._elapsed_s is None else self._elapsed_s
         log_string += (
             f"""{"-" * width}\n"""
             f"""{"Iteration time:":>{pad}} {iteration_time:.2f}s\n"""
-            f"""{"Time elapsed:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
-            f"""{"ETA:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(eta))}\n"""
+            f"""{"Time elapsed:":>{pad}} {format_duration(elapsed)}\n"""
+            f"""{"ETA:":>{pad}} {format_duration(eta)}\n"""
         )
 
         return log_string
@@ -145,7 +157,12 @@ class Logger:
         num_collected_steps: int,
         width: int = 80,
         pad: int = 40,
+        elapsed_s: float | None = None,
+        eta_s: float | None = None,
     ) -> None:
+        """``elapsed_s`` / ``eta_s``, when given, replace the console's own estimates (the sum of logged
+        iteration times, and that average times the log calls left)."""
+        self._elapsed_s, self._eta_s = elapsed_s, eta_s
         iteration_time = collect_time + wm_learn_time + policy_learn_time
         self.tot_timesteps += num_collected_steps
         self.tot_time += iteration_time

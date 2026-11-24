@@ -123,6 +123,19 @@ class TwoAgentRunnerCfg(BaseRunnerCfg):
     """Iterations a resumed run collects into its empty replay buffer before updating."""
 
 
+def eta_seconds(
+    it: int, start_iteration: int, max_iterations: int, segment_s: float, wall_s: float, max_seconds: float
+) -> float:
+    """Seconds left after iteration ``it``: this segment's mean time per iteration (counted from ``start_iteration``,
+    so right after a resume) times the iterations left to ``max_iterations``; with a wall-time budget
+    (``max_seconds`` > 0, the run's summed ``wall_s``) the smaller of that and the budget left."""
+    done = it + 1 - start_iteration
+    eta = segment_s / done * max(max_iterations - it - 1, 0) if done > 0 else 0.0
+    if max_seconds > 0:
+        eta = min(eta, max(max_seconds - wall_s, 0.0))
+    return eta
+
+
 def safety_flags(
     limits: JointLimits,
     q: torch.Tensor,
@@ -429,7 +442,8 @@ class TwoAgentRunner(BaseRunner[TwoAgentRunnerCfg]):
         log_dir = self.run_dir or Path(self.cfg.runs_dir) / (self.cfg.run_name or self.stage)
         if resume:
             run_json = json.loads((log_dir / "run.json").read_text())
-            run_json.setdefault("resumed", []).append({"iteration": self.start_iteration, "wall_s": self._wall_offset})
+            run_json.setdefault("resumed", []).append({"iteration": self.start_iteration, "wall_s": self._wall_offset,
+                                                      "max_seconds": self.cfg.max_seconds})
             progress = ProgressCsv(log_dir / "progress.csv", keep_through_iteration=self.start_iteration - 1)
         else:
             if log_dir.exists():
@@ -461,12 +475,12 @@ class TwoAgentRunner(BaseRunner[TwoAgentRunnerCfg]):
         should_train = Ratio(self.env.num_envs / wm.num_batches / wm.batch_size / wm.horizon * self.cfg.replay_ratio)
         first_update = self.start_iteration + (self.cfg.resume_warmup if resume else 0)
         run_start = time.time() - self._wall_offset
+        segment_start = time.time()
         last_checkpoint = time.time()
         t0 = time.time()
         wm_time = policy_time = 0.0
         collected = updates = 0
         loss_dict: dict[str, torch.Tensor] = {}
-        log_count = 0
         it = self.start_iteration
         for it in range(self.start_iteration, self.cfg.max_iterations):
             collected += self.step()
@@ -504,13 +518,16 @@ class TwoAgentRunner(BaseRunner[TwoAgentRunnerCfg]):
                     **{k: v for k, v in extras.items() if k.startswith(("Episode_Termination", "Metrics/motion/error"))},
                 }
                 self.logger.log(
-                    it=log_count,
+                    it=it // self.cfg.log_interval,
                     total_it=self.cfg.max_iterations // self.cfg.log_interval,
                     collect_time=row["collect_s"],
                     wm_learn_time=wm_time,
                     policy_learn_time=policy_time,
                     loss_dict=loss_dict,
                     num_collected_steps=collected,
+                    elapsed_s=wall,
+                    eta_s=eta_seconds(it, self.start_iteration, self.cfg.max_iterations, time.time() - segment_start,
+                                      wall, self.cfg.max_seconds),
                 )
                 progress.append(row)
                 print(
@@ -521,7 +538,6 @@ class TwoAgentRunner(BaseRunner[TwoAgentRunnerCfg]):
                     ),
                     flush=True,
                 )
-                log_count += 1
                 t0 = time.time()
                 wm_time = policy_time = 0.0
                 collected = updates = 0

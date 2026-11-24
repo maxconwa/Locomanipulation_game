@@ -239,13 +239,15 @@ def test_smoke_training_writes_a_run_refuses_its_directory_and_fine_tunes(tmp_pa
     tuned_cfg.write_text(SMALL_CONFIG.replace("estop: {velocity: -5.0}", "estop: {velocity: -5.0, position: -20.0}")
                          .replace("log_interval: 1", "log_interval: 1\n  max_iterations: 7"))
     _train(tmp_path, "--config", tuned_cfg, "--motion-dir", tmp_path / "motions", "--num-envs", TRAIN_ENVS,
-           "--run-name", "b", "--fine-tune-from", run, "--max-iterations", 5)
+           "--run-name", "b", "--fine-tune-from", run, "--max-iterations", 5, "--max-seconds", 100000)
     tuned = tmp_path / "runs" / "b"
     meta = json.loads((tuned / "run.json").read_text())
     assert meta["fine_tuned_from"] == f"{run} at iteration 29"
     assert meta["resumed"][0]["iteration"] == 30
     assert meta["rewards"]["estop"]["position"] == -20.0 and meta["config"]["runner"]["max_iterations"] == 7  # --max-iterations 5 overrides it
     assert meta["runner"]["max_iterations"] == 35
+    # the budget used (this invocation's plus the source's wall time), not 0
+    assert meta["runner"]["max_seconds"] > 100000 and meta["resumed"][0]["max_seconds"] == meta["runner"]["max_seconds"]
     assert _iterations(tuned) == list(range(35))  # a's curves, then the fine-tune's
     assert json.loads((tuned / "checkpoint.json").read_text())["iteration"] == 34
     assert _iterations(run) == list(range(30)) and (run / "run.json").read_text() == before  # the source untouched

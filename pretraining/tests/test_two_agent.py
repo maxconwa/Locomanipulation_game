@@ -256,6 +256,20 @@ def test_progress_csv_resume_drops_rows_after_the_checkpoint(tmp_path):
     assert rows[-1]["loss"] == "40.0"
 
 
+def test_console_eta_counts_from_the_resume_respects_the_budget_and_does_not_wrap():
+    from pretraining.marl.runner import eta_seconds
+    from pretraining.supermimic.utils.logger import format_duration
+
+    # resumed at 1,000, 100 iterations in 50 s: 0.5 s each, 8,900 left
+    assert eta_seconds(1099, 1000, 10_000, 50.0, 20_050.0, 0.0) == 0.5 * 8900
+    # a budget of 23,000 s of the run's wall time, 20,050 s used: the budget ends first
+    assert eta_seconds(1099, 1000, 10_000, 50.0, 20_050.0, 23_000.0) == 2950.0
+    assert eta_seconds(1099, 1000, 10_000, 50.0, 24_000.0, 23_000.0) == 0.0
+    assert eta_seconds(1099, 1000, 1100, 50.0, 0.0, 0.0) == 0.0
+    assert format_duration(13 * 3600 + 5 * 60 + 59) == "13h05m"
+    assert format_duration(30 * 3600) == "30h00m"
+
+
 def test_reward_cfg_round_trips_through_run_json():
     from pretraining.marl.config import EstopPenaltyCfg, ImitationRewardCfg, Kernel
     from pretraining.marl.runs import config_from_dict
