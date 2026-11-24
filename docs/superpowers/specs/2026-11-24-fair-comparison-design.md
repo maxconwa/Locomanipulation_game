@@ -16,7 +16,7 @@ PD), not main's, and the frozen decoders fell on it 23% of the time in 10 s with
 3. **Three arms:** (A) pure RL + MAPPO, (B) PULSE + MAPPO, (C) PULSE + world-model gradients.
 4. **Rewards: each method its own training rewards; one scorecard for all.** PULSE keeps the gait, stance and
    torso-posture terms at zero; the baseline keeps main's full set.
-5. **Development runs default to 40k steps** (about 3 h; the first PULSE run's legs had plateaued by 30k).
+5. **Runs are 40k steps** (about 3 h; the first PULSE run's legs had plateaued by 30k).
 
 ## The shared POMDP
 
@@ -70,20 +70,22 @@ learner (A, B: skrl MAPPO; C: gradients through the world model).
 
 | Run | Estimate |
 |---|---|
-| Stage 1 base on main's plant | 8-13 h (the 50 Hz one took 6.4 h for 15.8k updates; twice the iterations per second of motion) |
-| Stage 1 fine-tune (randomisation, GOLEM limits) | 2-3 h |
+| Stage 1 base on main's plant | 3 h wall cap (Max: "shorten stage 1 base as much as you can"; the 50 Hz run's body error was 0.063 m at half its updates against 0.057 m at the end) |
+| Stage 1 fine-tune (randomisation, GOLEM limits) | 1.5 h wall cap |
 | Prior fit | 0.5 h |
 | A, B, C development runs, 40k steps each | about 3 h each; C's speed is unknown until measured |
-| A, B, C final runs, 200k steps each | about 13 h each (A's past runs; B and C to be measured) |
+
+Gate on the short stage 1: the cross-check (40 clips) must show no more than a few falls; if it does not, the
+base run is resumed for another 3 h and that is reported. No 200k-step final runs (Max, 2026-11-24): the
+comparison is the three 40k-step runs.
 
 Before the stage-1 long run: a clip-replay check that the new decoders' wrist poses match main's wrist-goal frames
 (the first PULSE run showed 120-140 degree wrist orientation errors, cause not established).
 
 ## Success
 
-A scorecard table for A, B and C at 200k steps on the same conditions (velocity error, wrist position and
-orientation error, falls, e-stop trips), with the 40k-step development runs showing each arm trains before its
-long run is started.
+A scorecard table for A, B and C at 40k steps on the same conditions (velocity error, wrist position and
+orientation error, falls, e-stop trips), from the same eval code.
 
 ## Not in scope
 
