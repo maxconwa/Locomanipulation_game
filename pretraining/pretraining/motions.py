@@ -15,16 +15,51 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from pretraining.constants import DECIMATION, JOINT_NAMES, SIM_DT
+from pretraining.constants import JOINT_NAMES
 from pretraining.kinematics import ForwardKinematics
 
-FPS = 1.0 / (SIM_DT * DECIMATION)  # one motion frame per policy step: 50 Hz
+# Hz: the clip files' rate, the pretraining plant's policy rate; plants at an integer multiple get resampled clips
+SOURCE_FPS = 50.0
 _FIELDS = ("joint_pos", "joint_vel", "root_pos_w", "root_quat_w", "root_lin_vel_w", "root_ang_vel_w")
+
+
+def resample_clip(clip: dict[str, np.ndarray], factor: int) -> dict[str, np.ndarray]:
+    """``clip`` at ``factor`` times its rate: ``(n-1)*factor + 1`` frames, every ``factor``-th the source frame
+    exactly; positions, joint angles and velocities interpolated linearly, ``root_quat_w`` by slerp on the short arc
+    (unit norm whatever sign the source frames' quaternions have). Fields other than ``_FIELDS`` are kept, ``fps``
+    times ``factor``."""
+    out = dict(clip)
+    out["fps"] = np.asarray(clip["fps"]) * factor
+    n = clip["joint_pos"].shape[0]
+    if n < 2 or factor == 1:  # nothing between frames to fill
+        return out
+    t = np.arange((n - 1) * factor + 1) / factor
+    i0 = np.minimum(np.floor(t).astype(np.int64), n - 2)
+    a = (t - i0)[:, None]
+    for name in _FIELDS:
+        src = clip[name].astype(np.float64)
+        x0, x1 = src[i0], src[i0 + 1]
+        if name == "root_quat_w":
+            x1 = np.where(np.sum(x0 * x1, -1, keepdims=True) < 0, -x1, x1)  # q and -q are one rotation
+            cos = np.clip(np.sum(x0 * x1, -1, keepdims=True), -1.0, 1.0)
+            angle = np.arccos(cos)
+            sin = np.sin(angle)
+            small = sin < 1e-6  # nearly equal: slerp's weights tend to linear ones
+            w0 = np.where(small, 1 - a, np.sin((1 - a) * angle) / np.where(small, 1.0, sin))
+            w1 = np.where(small, a, np.sin(a * angle) / np.where(small, 1.0, sin))
+            value = w0 * x0 + w1 * x1
+            value /= np.linalg.norm(value, axis=-1, keepdims=True)
+        else:
+            value = (1 - a) * x0 + a * x1
+        value = value.astype(clip[name].dtype)
+        value[::factor] = clip[name]  # the source frames bit-exact, not re-rounded through the interpolation
+        out[name] = value
+    return out
 
 
 def check_motion_dir(path: str | Path) -> list[Path]:
     """The ``.npz`` clips of ``path``, sorted; ValueError naming the path or file if the directory is missing or
-    empty, or a clip is not at 50 Hz or its ``joint_names`` are not ``JOINT_NAMES``."""
+    empty, or a clip is not at 50 Hz (``SOURCE_FPS``; the loader resamples) or its ``joint_names`` are not ``JOINT_NAMES``."""
     path = Path(path).expanduser()
     if not path.is_dir():
         raise ValueError(f"motion directory {path} does not exist")
@@ -40,24 +75,30 @@ def _check_clip(f: Path) -> None:
     with np.load(f) as clip:
         fps = float(np.asarray(clip["fps"]).reshape(-1)[0])
         names = [str(n) for n in clip["joint_names"]]
-    if abs(fps - FPS) > 1e-6 * FPS:
-        raise ValueError(f"motion {f}: {fps:g} Hz, not the env's {FPS:g} Hz")
+    if abs(fps - SOURCE_FPS) > 1e-6 * SOURCE_FPS:
+        raise ValueError(f"motion {f}: {fps:g} Hz, not the clips' {SOURCE_FPS:g} Hz")
     if names != list(JOINT_NAMES):
         raise ValueError(f"motion {f}: joint_names {names} are not the robot's JOINT_NAMES {list(JOINT_NAMES)}")
 
 
 class MotionLoader:
     """Clips of ``motion_dir`` (or the given files), concatenated per frame on ``device``, with the world poses and
-    velocities of ``fk``'s bodies. ``motion_starts`` / ``motion_ends`` delimit the clips (end exclusive)."""
+    velocities of ``fk``'s bodies. ``motion_starts`` / ``motion_ends`` delimit the clips (end exclusive). The 50 Hz
+    clips are resampled to ``fps`` (one frame per policy step), which must be an integer multiple of ``SOURCE_FPS``."""
 
-    def __init__(self, motion_dir: str | Path | list[Path], fk: ForwardKinematics, device: str = "cpu") -> None:
+    def __init__(self, motion_dir: str | Path | list[Path], fk: ForwardKinematics, device: str = "cpu",
+                 fps: float = SOURCE_FPS) -> None:
+        ratio = fps / SOURCE_FPS
+        factor = round(ratio)
+        if factor < 1 or abs(ratio - factor) > 1e-9:
+            raise ValueError(f"motion rate {fps:g} Hz is not an integer multiple of the clips' {SOURCE_FPS:g} Hz")
         if isinstance(motion_dir, list):
             files = [Path(f) for f in motion_dir]
             for f in files:
                 _check_clip(f)
         else:
             files = check_motion_dir(motion_dir)
-        clips = [dict(np.load(f)) for f in files]
+        clips = [resample_clip(dict(np.load(f)), factor) for f in files]
         lengths = [clip["joint_pos"].shape[0] for clip in clips]
 
         def field(name: str) -> torch.Tensor:  # assembled on the CPU, moved to the device once
@@ -65,7 +106,7 @@ class MotionLoader:
             return torch.from_numpy(arr).to(device=device)
 
         self.files = files
-        self.fps = FPS
+        self.fps = float(fps)
         self.fk = fk
         self.joint_pos, self.joint_vel, self.root_pos_w, self.root_quat_w, self.root_lin_vel_w, self.root_ang_vel_w = (
             field(name) for name in _FIELDS)

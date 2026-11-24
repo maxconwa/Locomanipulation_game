@@ -4,7 +4,7 @@ import torch
 
 from pretraining.constants import JOINT_NAMES, TRACKED_BODIES
 from pretraining.kinematics import URDF, ForwardKinematics, UrdfTree
-from pretraining.motions import MotionLoader, check_motion_dir
+from pretraining.motions import MotionLoader, check_motion_dir, resample_clip
 from standins import write_clips
 
 
@@ -88,3 +88,56 @@ def test_loader_holds_nothing_frames_by_bodies(tmp_path, fk):
     for name, value in vars(motion).items():
         if isinstance(value, torch.Tensor):
             assert value.dim() < 2 or value.shape[:2] != (120, len(TRACKED_BODIES)), name
+
+
+def _clip(quats: np.ndarray) -> dict[str, np.ndarray]:
+    """A clip of len(quats) frames: ramps in every vector field, the given root quaternions."""
+    n = len(quats)
+    ramp = np.arange(n, dtype=np.float32)[:, None]
+    return {
+        "fps": np.array([50.0]), "joint_names": np.array(JOINT_NAMES),
+        "joint_pos": ramp * np.linspace(0.1, 1.0, 27, dtype=np.float32), "joint_vel": ramp * np.ones(27, np.float32),
+        "root_pos_w": ramp * np.array([1.0, 2.0, 0.0], np.float32), "root_quat_w": quats.astype(np.float32),
+        "root_lin_vel_w": ramp * np.ones(3, np.float32), "root_ang_vel_w": -ramp * np.ones(3, np.float32),
+    }
+
+
+def test_resample_doubles_frames_and_keeps_originals(tmp_path):
+    [path] = write_clips(tmp_path, n=1, frames=30)
+    clip = dict(np.load(path))
+    out = resample_clip(clip, 2)
+    assert float(out["fps"][0]) == 100.0
+    assert out["joint_names"].tolist() == clip["joint_names"].tolist()
+    for name in ("joint_pos", "joint_vel", "root_pos_w", "root_quat_w", "root_lin_vel_w", "root_ang_vel_w"):
+        assert out[name].shape == (59, *clip[name].shape[1:]) and out[name].dtype == clip[name].dtype
+        np.testing.assert_array_equal(out[name][::2], clip[name])
+    # odd frames of linear fields are the midpoints
+    np.testing.assert_allclose(out["joint_pos"][1::2], (clip["joint_pos"][:-1] + clip["joint_pos"][1:]) / 2,
+                               atol=1e-6)
+
+
+def test_resample_takes_the_short_arc_and_keeps_edges():
+    q0 = np.array([np.cos(0.2), 0.0, np.sin(0.2), 0.0])
+    neighbour = np.array([np.cos(0.35), 0.0, np.sin(0.35) * 0.8, np.sin(0.35) * 0.6])
+    out = resample_clip(_clip(np.stack([q0, -neighbour])), 2)  # q and -q: the long arc would swing past 300 deg
+    assert out["root_quat_w"].shape == (3, 4)
+    mid = out["root_quat_w"][1].astype(np.float64)
+    assert abs(np.linalg.norm(mid) - 1.0) < 1e-6
+    short = (q0 + neighbour) / np.linalg.norm(q0 + neighbour)  # slerp at t = 1/2 on the short arc
+    assert min(np.abs(mid - short).max(), np.abs(mid + short).max()) < 1e-6
+    np.testing.assert_allclose(out["root_pos_w"][1], [0.5, 1.0, 0.0], atol=1e-7)
+    one = resample_clip(_clip(q0[None]), 2)
+    assert one["root_quat_w"].shape == (1, 4) and float(one["fps"][0]) == 100.0
+
+
+def test_loader_resamples_to_an_integer_multiple(tmp_path, fk):
+    write_clips(tmp_path, n=2, frames=40)
+    motion = MotionLoader(tmp_path, fk, "cpu", fps=100.0)
+    assert motion.fps == 100.0 and motion.time_step_total == 2 * 79
+    assert motion.motion_ends.tolist() == [79, 158]
+
+
+def test_loader_refuses_non_integer_ratio(tmp_path, fk):
+    write_clips(tmp_path, n=1, frames=10)
+    with pytest.raises(ValueError, match=r"75.*50|50.*75"):
+        MotionLoader(tmp_path, fk, "cpu", fps=75.0)
