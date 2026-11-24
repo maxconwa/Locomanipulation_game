@@ -63,7 +63,8 @@ class MotionCommand(CommandTerm):
         motion_file = self.cfg.motion_file
         if isinstance(motion_file, (list, tuple)):
             motion_file = [Path(f) for f in motion_file]
-        self.motion = MotionLoader(motion_file, fk, device=self.device)
+        # one clip frame per policy step (the 50 Hz clips resampled on a faster plant)
+        self.motion = MotionLoader(motion_file, fk, device=self.device, fps=round(1.0 / env.step_dt, 6))
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
         self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)

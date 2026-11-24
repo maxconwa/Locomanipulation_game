@@ -10,6 +10,7 @@ contact's, as the feet's geom priority does in h12_train). The encoder bias live
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 import torch
@@ -38,6 +39,17 @@ def sample_encoder_bias(
     if env_ids is None:
         env_ids = torch.arange(env.num_envs, device=env.device)
     bias[env_ids] = sample_uniform(bias_range[0], bias_range[1], (len(env_ids), bias.shape[1]), device=env.device)
+
+
+def sample_encoder_offsets(env: ManagerBasedEnv, env_ids: torch.Tensor | None, half_widths: dict[str, float]) -> None:
+    """Draw ``env.encoder_bias`` for ``env_ids`` as main's encoder offsets (``joint_noise.ENCODER_OFFSET_RAD``): each
+    joint uniform in +- the half-width of the first pattern it matches in full, 0 for joints no pattern names."""
+    bias = encoder_bias(env)
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    span = torch.tensor([next((w for p, w in half_widths.items() if re.fullmatch(p, j)), 0.0) for j in JOINT_NAMES],
+                        device=env.device)
+    bias[env_ids] = (2.0 * torch.rand(len(env_ids), len(span), device=env.device) - 1.0) * span
 
 
 def _shape_slices(asset: Articulation, body_ids: list[int]) -> list[int]:

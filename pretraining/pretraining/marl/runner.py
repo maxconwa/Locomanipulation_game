@@ -37,6 +37,7 @@ import torch.nn as nn
 from tensordict import TensorDict
 
 from pretraining.constants import JOINT_NAMES
+from pretraining.plants import get_plant
 from pretraining.marl.actors import build_imitation_actor
 from pretraining.marl.config import ACTION_DIMS, AGENTS, EE_DIM, JOINT_SLICES, ImitationRewardCfg
 from pretraining.marl.learner import TwoAgentLearner
@@ -204,7 +205,9 @@ class TwoAgentRunner(BaseRunner[TwoAgentRunnerCfg]):
         self._pending_norm_updates: list[tuple] = []
         self._sim_history: torch.Tensor | None = None
         # The policy joints, in the full state's (JOINT_NAMES) order.
-        self.joint_limits = JointLimits.for_joints(JOINT_NAMES, self.device)
+        # The PD of the env's plant (TrackMainEnvCfg.plant; the pretrain plant's for envs that name none).
+        plant = get_plant(getattr(self.env.unwrapped.cfg, "plant", "pretrain"))
+        self.joint_limits = JointLimits.for_joints(JOINT_NAMES, self.device, plant)
         self._safety: dict[str, torch.Tensor] = {}
         self._safety_steps = torch.zeros((), device=self.device)
         self.start_iteration = 0

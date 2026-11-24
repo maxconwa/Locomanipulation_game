@@ -5,6 +5,9 @@
   python -m pretraining.scripts.train --config pretraining/configs/golem_aware.yaml --run-name amass_s1_golem_aware \\
       --fine-tune-from <run dir>
   python -m pretraining.scripts.train --resume <run dir> [--max-iterations N] [--max-seconds S]
+  python -m pretraining.scripts.train --config pretraining/configs/main_plant.yaml --plant main --run-name <name>
+  python -m pretraining.scripts.train --config pretraining/configs/main_plant_finetune.yaml --plant main --fine-tune \\
+      --run-name <name> --fine-tune-from <main-plant run dir>
 
 A config file has ``num_envs``, ``runner:`` (``TwoAgentRunnerCfg``'s fields) and ``rewards:``
 (``ImitationRewardCfg``'s); an unknown key is an error. A new run goes to ``<runs dir>/<run name>``
@@ -17,6 +20,11 @@ run directory from another run's checkpoint (world model, actors, critics, optim
 with this config's rewards and settings, as h12_train made amass_s1_golem_aware: the source's iteration count, wall
 time and ``progress.csv`` carry on, the config's ``max_iterations`` is the number of iterations to add, and
 ``run.json`` records ``fine_tuned_from`` and the start in ``resumed``.
+
+``--plant`` picks the plant a new run trains on (``plants``): ``pretrain`` (the default; ``TASK``) or ``main``
+(``TASK_MAIN``, or ``TASK_MAIN_FINE_TUNE``, main's domain randomization, with ``--fine-tune``). ``run.json`` records
+``plant`` and ``task``; ``--resume`` reads both from it (a run.json without them is a pretrain-plant run), and
+``--fine-tune-from`` takes the source run's plant and refuses another.
 
 ``--max-seconds``: wall time of this invocation's training loop; when reached the run saves a checkpoint and exits 0.
 The clock is checked after each iteration finishes, so a run can overrun it by up to one iteration (an update window
@@ -45,6 +53,8 @@ REPO = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG = REPO / "pretraining" / "configs" / "base.yaml"
 DEFAULT_MOTION_DIR = REPO / "data" / "motions" / "h12_amass"
 TASK = "LocoManip-Pretrain-Track-v0"
+TASK_MAIN = "LocoManip-Pretrain-Track-Main-v0"
+TASK_MAIN_FINE_TUNE = "LocoManip-Pretrain-Track-Main-FineTune-v0"
 CONFIG_KEYS = {"num_envs", "runner", "rewards"}
 RESUME_OPTIONS = ("max_iterations", "max_seconds", "resume", "device")
 
@@ -68,7 +78,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fine-tune-from", type=Path, default=None, help="a stage-1 run directory to start from")
     p.add_argument("--resume", type=Path, default=None, help="a run directory to continue. Without --max-seconds it runs on to "
                         "--max-iterations or run.json's max_iterations, whatever wall-time budget the run had")
+    p.add_argument("--plant", choices=("pretrain", "main"), default=None,
+                   help="a new run's plant (default pretrain; a fine-tune: its source's)")
+    p.add_argument("--fine-tune", action="store_true", default=None,
+                   help="with --plant main: the env with main's domain randomization (TASK_MAIN_FINE_TUNE)")
     return p
+
+
+def _plant_of(meta: dict) -> tuple[str, str]:
+    """(plant, task) a run.json records; one written before they were recorded is a pretrain-plant run."""
+    return meta.get("plant", "pretrain"), meta.get("task", TASK)
+
+
+def run_json_entries(p: dict) -> dict:
+    """The entries ``train`` adds to a new or fine-tuned run's run.json."""
+    return {"plant": p["plant"], "task": p["task"]}
 
 
 def _checkpoint(run_dir: Path) -> int:
@@ -97,11 +121,12 @@ def plan(args: argparse.Namespace) -> dict:
         start = _checkpoint(run_dir) + 1
         meta = json.loads((run_dir / "run.json").read_text())
         cfg = config_from_dict(TwoAgentRunnerCfg, meta["runner"])
+        plant, task = _plant_of(meta)
         cfg.runs_dir, cfg.run_name = str(run_dir.parent), run_dir.name
         if args.max_iterations is not None:
             cfg.max_iterations = args.max_iterations
         return {
-            "mode": "resume", "run_dir": run_dir, "cfg": cfg, "start": start,
+            "mode": "resume", "run_dir": run_dir, "cfg": cfg, "start": start, "plant": plant, "task": task,
             "rewards": config_from_dict(ImitationRewardCfg, meta["rewards"]),
             "num_envs": int(meta["num_envs"]), "files": [str(from_repo_path(f)) for f in meta["motion_files"]],
         }
@@ -129,6 +154,7 @@ def plan(args: argparse.Namespace) -> dict:
     files = sorted(str(f) for f in motion_dir.glob("*.npz"))
     if not files:
         raise UsageError(f"no .npz clips in {motion_dir}")
+    plant = args.plant
     out = {
         "mode": "new", "run_dir": run_dir, "cfg": cfg, "rewards": rewards, "start": 0, "config": config,
         "num_envs": args.num_envs or int(config.get("num_envs", 4096)), "files": files,
@@ -138,7 +164,12 @@ def plan(args: argparse.Namespace) -> dict:
         out["start"] = _checkpoint(source) + 1
         if not (source / "run.json").exists():
             raise UsageError(f"{source} has no run.json")
-        theirs = [str(from_repo_path(f).resolve()) for f in json.loads((source / "run.json").read_text())["motion_files"]]
+        source_meta = json.loads((source / "run.json").read_text())
+        source_plant = _plant_of(source_meta)[0]
+        if plant is not None and plant != source_plant:
+            raise UsageError(f"--plant {plant}, but {source} was trained on the {source_plant} plant")
+        plant = source_plant
+        theirs = [str(from_repo_path(f).resolve()) for f in source_meta["motion_files"]]
         ours = [str(Path(f).resolve()) for f in files]
         if ours != theirs:
             first = next((i for i, (a, b) in enumerate(zip(ours, theirs)) if a != b), min(len(ours), len(theirs)))
@@ -148,6 +179,10 @@ def plan(args: argparse.Namespace) -> dict:
             )
         cfg.max_iterations += out["start"]  # the config's count is the fine-tune's own; the run's carries on
         out.update(mode="fine_tune", source=source)
+    plant = plant or "pretrain"
+    if args.fine_tune and plant != "main":
+        raise UsageError("--fine-tune picks main's fine-tune env: it needs the main plant (--plant main)")
+    out.update(plant=plant, task=(TASK_MAIN_FINE_TUNE if args.fine_tune else TASK_MAIN) if plant == "main" else TASK)
     return out
 
 
@@ -163,13 +198,16 @@ def train(p: dict, max_seconds: float | None, device: str) -> Path:
 
     os.environ.setdefault("WANDB_MODE", "offline")
     cfg, run_dir = p["cfg"], p["run_dir"]
-    env_cfg = load_cfg_from_registry(TASK, "env_cfg_entry_point")
+    env_cfg = load_cfg_from_registry(p["task"], "env_cfg_entry_point")
     env_cfg.scene.num_envs = p["num_envs"]
     env_cfg.sim.device = device
     env_cfg.seed = cfg.seed + p["start"]  # a resumed segment seeds with seed + its first iteration
     env_cfg.commands.motion.motion_file = p["files"]
     env_cfg.commands.motion.sampling_mode = "external" if cfg.sampling_mode == "return" else cfg.sampling_mode
-    env = EnvAdapter(gym.make(TASK, cfg=env_cfg).unwrapped)
+    env_plant = getattr(env_cfg, "plant", "pretrain")
+    if env_plant != p["plant"]:
+        raise RuntimeError(f"{p['task']} is on the {env_plant} plant, the run's is {p['plant']}")
+    env = EnvAdapter(gym.make(p["task"], cfg=env_cfg).unwrapped)
     runner = ImitationRunner(env, cfg, rewards=p["rewards"], run_dir=run_dir, motion_files=p["files"], device=device)
     if p["mode"] == "resume":
         runner.load_checkpoint(run_dir / "checkpoint.pt")
@@ -185,11 +223,11 @@ def train(p: dict, max_seconds: float | None, device: str) -> Path:
             shutil.copy2(source / "progress.csv", run_dir / "progress.csv")  # the curves carry on
         run_json = {
             "stage": runner.stage, "runner": dataclasses.asdict(runner.cfg), **runner._run_meta(), "config": p["config"],
-            "fine_tuned_from": f"{to_repo_path(source)} at iteration {p['start'] - 1}",
+            "fine_tuned_from": f"{to_repo_path(source)} at iteration {p['start'] - 1}", **run_json_entries(p),
         }
         atomic_write_text(run_dir / "run.json", json.dumps(run_json, indent=2, default=str))
     print(f"[train] run directory: {run_dir}", flush=True)
-    meta = {**runner._run_meta(), "config": p["config"]} if p["mode"] == "new" else None
+    meta = {**runner._run_meta(), "config": p["config"], **run_json_entries(p)} if p["mode"] == "new" else None
     return runner.run(meta, resume=p["mode"] != "new")
 
 

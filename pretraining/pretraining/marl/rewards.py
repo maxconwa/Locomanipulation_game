@@ -74,9 +74,13 @@ class JointLimits:
     q_high: torch.Tensor
 
     @staticmethod
-    def for_joints(names: Sequence[str], device) -> JointLimits:
-        """Return the limits of joints ``names`` from ``pretraining.constants``."""
+    def for_joints(names: Sequence[str], device, plant=None) -> JointLimits:
+        """Return the limits of joints ``names``: the gains and effort limits of ``plant`` (a ``plants.Plant``;
+        None: ``pretraining.constants``', the pretrain plant's), golem_safety's estop limits whatever the plant."""
         from pretraining.constants import EFFORT, ESTOP_LIMITS, KD, KP
+
+        if plant is not None:
+            KP, KD, EFFORT = plant.kp, plant.kd, plant.effort  # noqa: N806
 
         def t(values):
             """Return ``values`` as a float tensor on ``device``."""
