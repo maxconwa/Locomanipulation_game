@@ -277,8 +277,9 @@ def test_pulse_cfg(sim_app):
     for name, act in robot.actuators.items():
         if name == "grippers":
             continue
-        # the wrists implicit (explicit PD at their kd is unstable at 2 ms), the rest explicit
-        assert isinstance(act, ImplicitActuatorCfg if name == "wrists" else IdealPDActuatorCfg), name
+        # the forearm joints implicit (explicit PD at their kd rings or diverges at 2 ms), the rest explicit
+        implicit = name in ("shoulder_yaw", "elbows", "wrists")
+        assert isinstance(act, ImplicitActuatorCfg if implicit else IdealPDActuatorCfg), name
         for j in act.joint_names_expr:
             assert (act.stiffness[j], act.damping[j], act.effort_limit_sim[j], act.armature[j]) == (
                 constants.KP[j], constants.KD[j], constants.EFFORT[j], constants.ARMATURE[j])
@@ -363,7 +364,7 @@ PULSE_ENV_SCRIPT = textwrap.dedent("""
         assert torch.allclose(robot.data.default_joint_stiffness[:, ids], kp)
         # actuator_scales drew per-env gains on every explicit PD group
         pd = [act for act in robot.actuators.values() if isinstance(act, IdealPDActuator)]
-        assert sum(act.num_joints for act in pd) == 21  # all but the six implicit wrists
+        assert sum(act.num_joints for act in pd) == 17  # all but the ten implicit forearm joints
         nominal = env._actuator_nominal
         assert any(not torch.allclose(act.stiffness, nominal[n][0]) for n, act in robot.actuators.items() if n in nominal)
         # the delay histories are the latent terms' joints

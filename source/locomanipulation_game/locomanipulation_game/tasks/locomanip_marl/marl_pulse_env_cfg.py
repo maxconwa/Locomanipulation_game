@@ -80,17 +80,21 @@ def _pd(pattern: str) -> IdealPDActuatorCfg:
         damping={j: pretrain.KD[j] for j in joints}, armature={j: pretrain.ARMATURE[j] for j in joints}, friction=0.0)
 
 
-# The wrists: implicit PD, as stage 1 ran them. Explicit damping at the physics step is stable only while
-# kd dt / I < 2 (it rings above 1); with pretraining's wrist kd 12 and armature 0.0036, at dt 0.002 and pretraining's
-# default pose (I: the MuJoCo mass matrix's diagonal of CL_Assets' h1_2_magpie.xml plus the armature), kd dt / I is
-# 4.39 on the wrist rolls, 1.42 on the yaws, 1.24 on the pitches (6.06 / 1.96 / 1.71 at actuator_scales' gain x1.2 and
-# strength x1.15): the rolls would chatter at their effort limit. Every other joint stays explicit: the worst is the
-# ankle roll, 0.50 (0.68 at the ankles' gain x1.2 x1.15), then the ankle pitch, 0.33; the rest 0.2 or less.
-# What this costs on the wrists: actuator_scales (mdp.randomize_actuator_scales, IdealPDActuator only) draws no gains
+# The forearm joints (shoulder yaws, elbows, wrists): implicit PD, as stage 1 ran them. Explicit damping at the physics
+# step is stable only while every eigenvalue of dt M^-1 Kd stays under 2, and rings above 1 (M the joint-space mass
+# matrix, Kd the explicit joints' kd). With pretraining's kd (12 on the shoulder yaws, elbows and wrists) and armature,
+# at dt 0.002 and pretraining's default pose (M: CL_Assets' h1_2_magpie.xml in MuJoCo, armature replaced), the
+# diagonal kd dt / I alone is 4.39 on the wrist rolls, 1.42 / 1.24 on the wrist yaws / pitches; with the wrists
+# implicit, the coupled shoulder-yaw / elbow mode is still at 1.28 (1.76 under actuator_scales' gain x1.2 x strength
+# x1.15), and in the sim (zero latent, prior) the shoulder yaws rang up to ~1.5-2 rad/s within 2 s, with or without the
+# randomisation, and tripped GOLEM's torque check on ~half the steps (all implicit: 0.6 rad/s, no trips). With the
+# shoulder yaws and elbows implicit too the largest explicit eigenvalue is 0.50 (the ankle rolls; 0.69 under the
+# draws); the elbows alone left explicit would be 0.69 (0.96).
+# What this costs on these joints: actuator_scales (mdp.randomize_actuator_scales, IdealPDActuator only) draws no gains
 # or strength for them, and GOLEM's torque check (golem_safety.GolemEstopMonitor._motor_torque) estimates their torque
-# as the nominal default_joint_stiffness x error - damping x speed, not the explicit PD's clipped computed torque, as it
-# does for every joint (the action delay and encoder offsets still act: they go through the joint targets).
-PULSE_IMPLICIT_GROUPS = ("wrists",)
+# from the nominal gains, as it does for every joint (the action delay and encoder offsets still act: they go through
+# the joint targets).
+PULSE_IMPLICIT_GROUPS = ("shoulder_yaw", "elbows", "wrists")
 
 
 def _implicit(pattern: str) -> ImplicitActuatorCfg:
