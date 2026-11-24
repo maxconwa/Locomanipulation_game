@@ -56,6 +56,12 @@ from `ALMI_RL`.
   separate python with mujoco. Results go to `logs/evals/<run>/`.
 - Older recipes (the paper's reach evaluation, the whole-body baseline, the
   learned pelvis estimator) are at the `pre-cleanup` tag.
+- **`pretraining/`**: a separate package (`pip install -e pretraining`), stage-1 motion-tracking pretraining of
+  a legs and an upper-body agent on retargeted AMASS clips with SuperMimic's world-model method, ported from
+  `h12_train` (branch `supermimic`); gym id `LocoManip-Pretrain-Track-v0`. No clips or policies in git (licence).
+- Train it: `python -m pretraining.scripts.train --config pretraining/configs/base.yaml --run-name <name>`
+  (runs in `data/pretraining/runs/`); also `scripts/crosscheck.py`, `scripts/play.py`. Everything is in
+  `pretraining/README.md`.
 - When adding a new task name, keep `LocoManip-` in it: `scripts/list_envs.py:54`
   only lists ids containing that substring, so a task registered under a
   different name silently won't show up.

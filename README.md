@@ -13,6 +13,11 @@ height inside their bands (no posture or alive terms); a quarter of the commands
 state; episodes have drawn lengths (uniform, 90-300 s); the arm goals start once training's own sport-mode tracking
 metrics pass. These are the defaults: `train.py` with no overrides trains the recipe.
 
+`pretraining/` is a separate package: stage-1 motion-tracking pretraining in Isaac Lab, ported from `h12_train`
+(branch `supermimic`). It trains a legs agent and an upper-body agent to follow retargeted AMASS clips with
+SuperMimic's world-model method, on `h12_train`'s gains, action scales and policy contract rather than this recipe's.
+The clips and policies are not in the repository. See [pretraining/README.md](pretraining/README.md).
+
 ## Layout
 
 - `source/locomanipulation_game/locomanipulation_game/`
