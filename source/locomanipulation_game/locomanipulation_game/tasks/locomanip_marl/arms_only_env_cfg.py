@@ -255,13 +255,16 @@ class ArmsOnlyEnvCfg(LocoManipMarlEnvCfg):
 
     def sync_derived(self):
         super().sync_derived()
-        if not isinstance(self.actions.arm_pos, mdp.IKPostureArmActionCfg):
+        # no arm_pos: LocoManip-Marl-Pulse-v0's latent actions (marl_pulse_env_cfg.py), which take the rest
+        arm_pos = getattr(self.actions, "arm_pos", None)
+        if arm_pos is not None and not isinstance(arm_pos, mdp.IKPostureArmActionCfg):
             return  # the base class's __post_init__, before this one's
         for name, noise in ARMS_OBS_NOISE.items():
             term = getattr(self.observations.arms, name)
             term.noise.n_min, term.noise.n_max = -noise * self.arms_obs_noise_scale, noise * self.arms_obs_noise_scale
         self.observations.arms.joint_vel.noise = joint_vel_noise(ALL_JOINTS_NAMES, self.arms_obs_noise_scale)
-        self.actions.arm_pos.residual_integrate = self.arms_integrate
+        if arm_pos is not None:
+            arm_pos.residual_integrate = self.arms_integrate
         initial_std, min_std = ((ARMS_INTEGRATE_INITIAL_STD, ARMS_INTEGRATE_MIN_STD) if self.arms_integrate
                                 else (ARMS_INITIAL_STD, ARMS_MIN_STD))
         self.policy_initial_std = {"arms": initial_std}

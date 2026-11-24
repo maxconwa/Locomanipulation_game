@@ -62,6 +62,10 @@ from `ALMI_RL`.
 - Train it: `python -m pretraining.scripts.train --config pretraining/configs/base.yaml --run-name <name>`
   (runs in `data/pretraining/runs/`); also `scripts/crosscheck.py`, `scripts/play.py`. Everything is in
   `pretraining/README.md`.
+- **`LocoManip-Marl-Pulse-v0`** (`marl_pulse_env_cfg.py`, `mdp/pulse_actions.py`): Marl-Direct with each agent
+  acting in the latent of its frozen stage-1 decoder (PULSE, 50 Hz, pretraining's gains and default pose); fit
+  its prior first with `python -m pretraining.scripts.fit_prior <stage-1 run>` (`pretraining/README.md`). Exports,
+  evals and the deploy gate do not handle latent policies.
 - When adding a new task name, keep `LocoManip-` in it: `scripts/list_envs.py:54`
   only lists ids containing that substring, so a task registered under a
   different name silently won't show up.

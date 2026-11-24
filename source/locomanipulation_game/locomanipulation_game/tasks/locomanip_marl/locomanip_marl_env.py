@@ -151,8 +151,9 @@ class LocoManipMarlEnv(DirectMARLEnv):
         prepose = getattr(self.cfg.events, "prepose", None)
         self._prepose = self.event_manager.get_term_cfg("prepose").func if prepose is not None else None
 
-        # -- the legs' target rate drives the torso IMU's vibration
-        self._legs_term = self.action_manager.get_term("joint_pos")
+        # -- the legs' target rate drives the torso IMU's vibration (the legs' first action term: joint_pos, or
+        # LocoManip-Marl-Pulse-v0's legs_latent)
+        self._legs_term = self.action_manager.get_term(self.cfg.agent_action_terms["legs"][0])
         self._prev_leg_target = self._legs_term._applied.clone()
         print(f"[INFO] Torso IMU (/lowstate): {self.cfg.lowstate_imu}; gyro low-pass {self.cfg.gyro_lowpass_hz:g} Hz")
 
@@ -294,10 +295,12 @@ class LocoManipMarlEnv(DirectMARLEnv):
         log.update(self.command_manager.reset(env_ids))
         if self._prepose is not None:
             log.update(self._hand_over(torch.as_tensor(env_ids, device=self.device)))
-        # the legs' engage blend starts from the target held before the first step (the pre-pose's hold at its resets)
-        held = (self._target_history[self._delay_terms.index(self._legs_term)][env_ids, 0] if self._target_history
-                else self._legs_term._applied[env_ids])
-        self._legs_term.start_blend(env_ids, held)
+        # the legs' engage blend starts from the target held before the first step (the pre-pose's hold at its resets);
+        # a legs term without one (LocoManip-Marl-Pulse-v0's latent) has nothing to start
+        if hasattr(self._legs_term, "start_blend"):
+            held = (self._target_history[self._delay_terms.index(self._legs_term)][env_ids, 0] if self._target_history
+                    else self._legs_term._applied[env_ids])
+            self._legs_term.start_blend(env_ids, held)
         log.update(self.event_manager.reset(env_ids))
         log.update(self.termination_manager.reset(env_ids))
         # skrl logs only one-element tensors; the managers also return floats

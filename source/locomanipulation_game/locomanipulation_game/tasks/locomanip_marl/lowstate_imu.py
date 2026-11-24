@@ -84,6 +84,7 @@ class LowstateImu:
         self.gyro_bias, self.vib_phase = zeros(3), zeros(3)
         self.vib_gain, self.vib_hz, self.time = zeros(), zeros(), zeros()
         self.target_rate = zeros()  # the env sets it at every policy step (rms leg target change, rad)
+        self.gyro_raw = zeros(3)  # the last sample before the low-pass (sample)
         self.gyro_lowpass = GyroLowpass(gyro_lowpass_hz, physics_dt, num_envs, device)
         self._axes = torch.tensor(cfg.vibration_axes, device=device)
         self.reset(None)
@@ -117,6 +118,8 @@ class LowstateImu:
         wave = torch.sin(2.0 * math.pi * self.vib_hz.unsqueeze(1) * self.time.unsqueeze(1) + self.vib_phase)
         vibration = math.sqrt(2.0) * std.unsqueeze(1) * self._axes * wave
         gyro = ang_vel_b + self.gyro_bias + cfg.gyro_noise * torch.randn_like(ang_vel_b) + vibration
+        # the sample before the low-pass: LocoManip-Marl-Pulse-v0's decoders read it, as h12_train's deploy does
+        self.gyro_raw = gyro
         self.gyro_lowpass(gyro)
         self.time += self.dt
 

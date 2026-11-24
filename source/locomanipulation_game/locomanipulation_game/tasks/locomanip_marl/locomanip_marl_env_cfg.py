@@ -673,9 +673,11 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
         self.sync_physics_rate()
         self.rewards.arms.goal_reached.weight = self.goal_bonus / (self.decimation * self.sim.dt)
         # every joint target inside GOLEM's position e-stop range (written to the cfg so params/env.yaml records it)
+        # (every action term that takes joint_limits: joint_pos and arm_pos; LocoManip-Marl-Pulse-v0's latent terms)
         envelope = {name: list(bounds) for name, bounds in position_envelope(self.golem_estop).items()}
-        self.actions.joint_pos.joint_limits = envelope
-        self.actions.arm_pos.joint_limits = envelope
+        for term in vars(self.actions).values():
+            if term is not None and hasattr(term, "joint_limits"):
+                term.joint_limits = envelope
 
     def sync_physics_rate(self):
         """The sensor periods and render interval for sim.dt and decimation."""
