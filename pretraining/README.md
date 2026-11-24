@@ -158,14 +158,18 @@ frames drawn uniformly) and written beside them as `prior.pt` and `prior.json` (
 latent variance and the share of it explained, over the last 500 steps). The env cfg's `pulse_stage1_run` (default
 `data/pretraining/runs/isaac_s1_golem_aware`, relative to the repository root) names the stage-1 run, `pulse_prior`
 (default `prior.pt`, relative to that run's directory; `null` or empty: no prior, `z = tanh(u)`) the prior; both are
-hydra overrides (`env.pulse_stage1_run=...`, `env.pulse_prior=null`). The skrl agent is main's yaml at discount 0.99.
+hydra overrides (`env.pulse_stage1_run=...`, `env.pulse_prior=null`; without a prior a zero latent is not a standing
+policy, so that is for debugging only). The wrists run stage 1's implicit PD (explicit PD with their kd 12 is unstable
+at 2 ms), every other joint main's explicit PD. The arm targets are clipped to main's ArmsOnly envelope (0.1 rad inside
+GOLEM's edges), tighter than stage 1's on the wrist pitch: +-0.3615 rad against +-0.4615. The skrl agent is main's
+yaml at its 50 Hz values, discount 0.99 and gae_lambda 0.95.
 
 ```bash
 PY=/home/max/miniconda3/envs/env_isaaclab/bin/python
 
-# fit the prior (h12_train's settings: 4,096 envs, 6,000 steps) -> data/pretraining/runs/isaac_s1_golem_aware/prior.{pt,json}
+# fit the prior (stage 1's 2,048 envs, h12_train's 6,000 steps) -> data/pretraining/runs/isaac_s1_golem_aware/prior.{pt,json}
 timeout -s KILL 5400 $PY -m pretraining.scripts.fit_prior data/pretraining/runs/isaac_s1_golem_aware \
-    [--out <file>] [--num-envs 4096] [--iterations 6000] [--hidden-dims 512 256] [--hide-last-action]
+    [--out <file>] [--num-envs 2048] [--iterations 6000] [--hidden-dims 512 256] [--hide-last-action]
 
 # smoke run: 300 updates (14,400 steps) at 4,096 envs -> logs/skrl/locomanip_marl/<time>_PulseSmoke
 timeout -s KILL 10800 $PY scripts/skrl/train.py --headless --task LocoManip-Marl-Pulse-v0 --num_envs 4096 \

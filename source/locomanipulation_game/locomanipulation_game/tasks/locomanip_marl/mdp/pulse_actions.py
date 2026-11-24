@@ -65,8 +65,9 @@ class _PulseShared:
             raise ValueError(f"the decoders' IMU is on {IMU_BODY}; the env's lowstate IMU is on torso_link's imu_link")
         if self.prior and not os.path.isfile(self.prior):
             raise FileNotFoundError(
-                f"no latent prior {self.prior}: fit it (python -m pretraining.scripts.fit_prior {cfg.stage1_run}) or "
-                "run without one (env.pulse_prior=null)")
+                f"no latent prior {self.prior}: fit it (python -m pretraining.scripts.fit_prior {cfg.stage1_run}). "
+                "Without one a zero latent is not a standing policy (the decoders' outputs grow through the last "
+                "action within a few steps): env.pulse_prior=null is for debugging only")
         actors = load_actors(cfg.stage1_run, env.device)
         priors = load_latent_prior(self.prior, env.device) if self.prior else None
         limits = {n: tuple(b) for n, b in (cfg.joint_limits or {}).items()}

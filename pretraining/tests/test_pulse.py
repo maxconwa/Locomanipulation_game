@@ -169,21 +169,22 @@ def test_fit_prior_arguments_and_report():
     from pretraining.scripts.fit_prior import build_parser, explained
 
     args = build_parser().parse_args(["data/pretraining/runs/x"])
-    assert args.out is None and args.num_envs == 4096 and args.iterations == 6000 and args.hidden_dims == [512, 256]
+    assert args.out is None and args.num_envs == 2048 and args.iterations == 6000 and args.hidden_dims == [512, 256]
     assert not args.hide_last_action
     r = explained([1.0] * 100 + [0.1] * 500, [2.0] * 600)
     assert r["mse"] == pytest.approx(0.1) and r["latent_variance"] == pytest.approx(2.0)
     assert r["explained"] == pytest.approx(0.95)
 
 
-def test_pulse_agent_cfg_is_the_mappo_yaml_at_discount_0_99():
+def test_pulse_agent_cfg_is_the_mappo_yaml_at_its_50_hz_values():
     spec = importlib.util.spec_from_file_location("_agents", TASKS / "agents" / "__init__.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)  # by path: the package's __init__ needs Isaac
     cfg = module.skrl_mappo_pulse_cfg()
     base = yaml.safe_load((TASKS / "agents" / "skrl_mappo_cfg.yaml").read_text())
-    assert cfg["agent"].pop("discount_factor") == 0.99
+    assert cfg["agent"].pop("discount_factor") == 0.99 and cfg["agent"].pop("gae_lambda") == 0.95
     base["agent"].pop("discount_factor")
+    base["agent"].pop("gae_lambda")
     assert cfg == base
 
 
@@ -216,7 +217,7 @@ def test_existing_tasks_cfgs_keep_their_action_limits_and_arms_settings(sim_app)
 
 @pytest.mark.sim
 def test_pulse_cfg(sim_app):
-    from isaaclab.actuators import IdealPDActuatorCfg
+    from isaaclab.actuators import IdealPDActuatorCfg, ImplicitActuatorCfg
 
     from locomanipulation_game.tasks.locomanip_marl.golem_safety import position_envelope
     from locomanipulation_game.tasks.locomanip_marl.locomanip_marl_env_cfg import ACTION_DELAY_RANGE
@@ -265,6 +266,8 @@ def test_pulse_cfg(sim_app):
     assert cfg.events.prepose is not None and cfg.events.actuator_scales is not None
     assert cfg.action_delay_range == ACTION_DELAY_RANGE and cfg.encoder_offset_rad and cfg.gyro_lowpass_hz > 0
     assert cfg.warm_start_deadline_steps == 1
+    assert cfg.lowstate_imu.vibration_per_target_rate == pytest.approx(4.0 * 5 / 10)  # per 20 ms step, not 10 ms
+    assert cfg.commands.arm_targets.standing_height == constants.DEFAULT_ROOT_HEIGHT
     # the robot: explicit PD at pretraining's values, its default pose, its joint ranges at start-up
     robot = cfg.scene.robot
     assert not robot.spawn.articulation_props.fix_root_link
@@ -274,10 +277,11 @@ def test_pulse_cfg(sim_app):
     for name, act in robot.actuators.items():
         if name == "grippers":
             continue
-        assert isinstance(act, IdealPDActuatorCfg), name
+        # the wrists implicit (explicit PD at their kd is unstable at 2 ms), the rest explicit
+        assert isinstance(act, ImplicitActuatorCfg if name == "wrists" else IdealPDActuatorCfg), name
         for j in act.joint_names_expr:
-            assert (act.stiffness[j], act.damping[j], act.effort_limit[j], act.effort_limit_sim[j], act.armature[j]) == (
-                constants.KP[j], constants.KD[j], constants.EFFORT[j], constants.EFFORT[j], constants.ARMATURE[j])
+            assert (act.stiffness[j], act.damping[j], act.effort_limit_sim[j], act.armature[j]) == (
+                constants.KP[j], constants.KD[j], constants.EFFORT[j], constants.ARMATURE[j])
             seen.append(j)
     assert sorted(seen) == sorted(JOINT_NAMES)
     assert cfg.events.joint_ranges.mode == "startup"
@@ -359,7 +363,7 @@ PULSE_ENV_SCRIPT = textwrap.dedent("""
         assert torch.allclose(robot.data.default_joint_stiffness[:, ids], kp)
         # actuator_scales drew per-env gains on every explicit PD group
         pd = [act for act in robot.actuators.values() if isinstance(act, IdealPDActuator)]
-        assert sum(act.num_joints for act in pd) == 27
+        assert sum(act.num_joints for act in pd) == 21  # all but the six implicit wrists
         nominal = env._actuator_nominal
         assert any(not torch.allclose(act.stiffness, nominal[n][0]) for n, act in robot.actuators.items() if n in nominal)
         # the delay histories are the latent terms' joints

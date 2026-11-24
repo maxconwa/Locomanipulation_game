@@ -32,7 +32,7 @@ import copy
 import math
 import re
 
-from isaaclab.actuators import IdealPDActuatorCfg
+from isaaclab.actuators import IdealPDActuatorCfg, ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
@@ -44,6 +44,8 @@ from pretraining.tasks.events import joint_ranges
 from locomanipulation_game.assets.h1_2 import H1_2_MAGPIE_CFG, REPO_ROOT
 
 from .golem_safety import GOLEM_LIMITS
+from .locomanip_marl_env_cfg import DECIMATION as MAIN_DECIMATION
+from .lowstate_imu import LowstateImuCfg
 from .marl_direct_env_cfg import MarlDirectEnvCfg
 from .mdp.pulse_actions import PulseLatentActionCfg, resolve
 
@@ -78,6 +80,29 @@ def _pd(pattern: str) -> IdealPDActuatorCfg:
         damping={j: pretrain.KD[j] for j in joints}, armature={j: pretrain.ARMATURE[j] for j in joints}, friction=0.0)
 
 
+# The wrists: implicit PD, as stage 1 ran them. Explicit damping at the physics step is stable only while
+# kd dt / I < 2 (it rings above 1); with pretraining's wrist kd 12 and armature 0.0036, at dt 0.002 and pretraining's
+# default pose (I: the MuJoCo mass matrix's diagonal of CL_Assets' h1_2_magpie.xml plus the armature), kd dt / I is
+# 4.39 on the wrist rolls, 1.42 on the yaws, 1.24 on the pitches (6.06 / 1.96 / 1.71 at actuator_scales' gain x1.2 and
+# strength x1.15): the rolls would chatter at their effort limit. Every other joint stays explicit: the worst is the
+# ankle roll, 0.50 (0.68 at the ankles' gain x1.2 x1.15), then the ankle pitch, 0.33; the rest 0.2 or less.
+# What this costs on the wrists: actuator_scales (mdp.randomize_actuator_scales, IdealPDActuator only) draws no gains
+# or strength for them, and GOLEM's torque check (golem_safety.GolemEstopMonitor._motor_torque) estimates their torque
+# as the nominal default_joint_stiffness x error - damping x speed, not the explicit PD's clipped computed torque, as it
+# does for every joint (the action delay and encoder offsets still act: they go through the joint targets).
+PULSE_IMPLICIT_GROUPS = ("wrists",)
+
+
+def _implicit(pattern: str) -> ImplicitActuatorCfg:
+    """One of pretraining's joint groups as stage 1's implicit PD (pretraining.robot), its values per joint."""
+    joints = [j for j in pretrain.JOINT_NAMES if re.fullmatch(pattern, j)]
+    return ImplicitActuatorCfg(
+        joint_names_expr=joints, stiffness={j: pretrain.KP[j] for j in joints},
+        damping={j: pretrain.KD[j] for j in joints}, effort_limit_sim={j: pretrain.EFFORT[j] for j in joints},
+        velocity_limit_sim={j: _VELOCITY_LIMITS[j] for j in joints},
+        armature={j: pretrain.ARMATURE[j] for j in joints}, friction=0.0)
+
+
 H1_2_PULSE_CFG = ArticulationCfg(
     spawn=copy.deepcopy(H1_2_MAGPIE_CFG.spawn),
     init_state=ArticulationCfg.InitialStateCfg(
@@ -86,7 +111,8 @@ H1_2_PULSE_CFG = ArticulationCfg(
         joint_vel={".*": 0.0},
     ),
     soft_joint_pos_limit_factor=H1_2_MAGPIE_CFG.soft_joint_pos_limit_factor,
-    actuators={**{name: _pd(p) for name, p in pretrain.ACTUATOR_GROUPS.items()},
+    actuators={**{name: (_implicit(p) if name in PULSE_IMPLICIT_GROUPS else _pd(p))
+                  for name, p in pretrain.ACTUATOR_GROUPS.items()},
                "grippers": copy.deepcopy(H1_2_MAGPIE_CFG.actuators["grippers"])},
 )
 """Main's H1-2 (USD, self-collision, grippers) with pretraining's actuators, default pose and pelvis height."""
@@ -116,6 +142,11 @@ class MarlPulseEnvCfg(MarlDirectEnvCfg):
         prior = resolve(self.pulse_prior, stage1)
         for term in (self.actions.legs_latent, self.actions.arms_latent):
             term.stage1_run, term.prior = stage1, prior
+        # the IMU's vibration is per rad of leg target change per policy step, fitted at 100 Hz (decimation 5): the
+        # same leg motion changes the targets decimation / 5 times as much per step here (from the field's default,
+        # so a decimation override follows)
+        self.lowstate_imu.vibration_per_target_rate = (
+            LowstateImuCfg().vibration_per_target_rate * MAIN_DECIMATION / self.decimation)
         # after ArmsOnly's, which sets the arms' alone
         self.policy_initial_std = {agent: PULSE_INITIAL_STD for agent in self.possible_agents}
         self.policy_log_std_bounds = {agent: PULSE_LOG_STD_BOUNDS for agent in self.possible_agents}
@@ -128,6 +159,10 @@ class MarlPulseEnvCfg(MarlDirectEnvCfg):
         robot.spawn = copy.deepcopy(robot.spawn)
         robot.spawn.articulation_props.fix_root_link = False  # MarlDirect's free pelvis
         self.scene.robot = robot
+        # the arm goals' standing frame: the pelvis height of the stance the target tables are built at, which
+        # ArmTargetsCommand builds them from (the default root state: pretraining's 0.993 m, not main's 0.9798 m
+        # ArmsOnly set it to; with that, every goal sat 1.3 cm off its table pose in the pelvis frame)
+        self.commands.arm_targets.standing_height = robot.init_state.pos[2]
         self.events.joint_ranges = EventTerm(func=joint_ranges, mode="startup", params={
             "asset_cfg": SceneEntityCfg("robot"), "ranges": dict(pretrain.JOINT_RANGES)})
         # -- the latent actions

@@ -1,7 +1,7 @@
 """Fit PULSE's latent prior on a stage-1 run: proprio history -> the stage-1 latent.
 
   python -m pretraining.scripts.fit_prior data/pretraining/runs/isaac_s1_golem_aware \\
-      [--out <file>] [--num-envs 4096] [--iterations 6000] [--hidden-dims 512 256] [--hide-last-action]
+      [--out <file>] [--num-envs 2048] [--iterations 6000] [--hidden-dims 512 256] [--hide-last-action]
 
 Ported from h12_train (this repository's own code, branch supermimic, commit b175f1c), ``scripts/fit_prior.py``.
 Changes: Isaac Lab's ``LocoManip-Pretrain-Track-v0`` env in place of mjlab's (on the run's own clips, from its
@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("stage1", type=Path, help="the stage-1 run directory (actors.pt, run.json)")
     p.add_argument("--out", type=Path, default=None, help="default: <stage1>/prior.pt")
-    p.add_argument("--num-envs", type=int, default=4096)
+    p.add_argument("--num-envs", type=int, default=2048)  # stage 1's, on its 13,578 clips
     p.add_argument("--iterations", type=int, default=6000)
     p.add_argument("--hidden-dims", type=int, nargs="+", default=[512, 256])
     p.add_argument("--lr", type=float, default=1.0e-3)
