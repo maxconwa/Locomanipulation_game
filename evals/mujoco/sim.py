@@ -67,6 +67,20 @@ def _arm_kinematics():
     return module
 
 
+def _joint_noise():
+    """The task's joint_noise.py (the encoders' noise, plain torch here), loaded by path as _arm_kinematics."""
+    import importlib.util
+    path = (C.REPO / "source" / "locomanipulation_game" / "locomanipulation_game" / "tasks" / "locomanip_marl"
+            / "joint_noise.py")
+    spec = importlib.util.spec_from_file_location("joint_noise", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+JN = _joint_noise()
+
+
 def mjcf_path(assets: Path = C.DEFAULT_ASSETS) -> Path:
     return assets / "mujoco_assets" / "h1_2_magpie.xml"
 
@@ -180,7 +194,11 @@ class GyroLowpass:
 class MarlMujoco:
     """One H1-2 in MuJoCo driven by an export's actors (callables obs[None] -> action[None]) and its settings."""
 
-    NOISE = {"lin_acc": 0.5, "ang_vel": 0.2, "grav": 0.05, "jpos": 0.01, "jvel": 1.5, "wrist": 0.005}
+    # uniform +-: the training's observation noise; the joint speeds' is the encoders' (joint_noise.py: Gaussian, its std
+    # growing with the speed; jvel scales it, 0 off). Until 2026-11-23 jpos 0.01 and jvel uniform 1.5, the training's
+    # then: MuJoCo's targets jittered ~0.017 rad per step standing on it, the robot's 0.001-0.002
+    NOISE = {"lin_acc": 0.5, "ang_vel": 0.2, "grav": 0.05, "jpos": JN.JOINT_POS_NOISE, "jvel": 1.0, "wrist": 0.005}
+    JVEL_FLOOR = np.array(JN.per_joint(ALL_NAMES, JN.JOINT_VEL_NOISE_FLOOR, JN.JOINT_VEL_NOISE_FLOOR_DEFAULT))
 
     def __init__(self, actors: dict, settings: dict, physics: str = "robocasa", assets: Path = C.DEFAULT_ASSETS,
                  model: mujoco.MjModel | None = None, pinned: bool = False, arms_hold_zero: bool = False):
@@ -302,7 +320,8 @@ class MarlMujoco:
         self.imu_bias_deg = ({k: 0.5 * (lo + hi) for k, (lo, hi) in imu_bias_ranges(imu).items()} if self.lowstate
                              else {"roll": 0.0, "pitch": 0.0, "yaw": 0.0})
         if self.lowstate:
-            self.NOISE = {**self.NOISE, "ang_vel": 0.03, "grav": 0.0017}
+            # the gyro's per-sample noise and the quaternion's per-step noise rotation (0.05 deg) of the IMU model
+            self.NOISE = {**self.NOISE, "ang_vel": 0.03, "grav": 0.00087}
 
     # -- state
     def reset(self, rng: np.random.Generator):
@@ -630,6 +649,12 @@ class MarlMujoco:
         return out + [np.cos(2 * math.pi * phase)] if self.gait_cos else out
 
     # -- observations
+    def noisy_dq(self, scale: float) -> np.ndarray:
+        """The measured joint speeds with the encoders' noise (joint_noise.py) times scale."""
+        dq = self.measured_dq()
+        std = JN.joint_vel_noise_std(dq, self.JVEL_FLOOR) * scale
+        return dq + std * self.rng.standard_normal(np.shape(dq))
+
     def observations(self) -> dict[str, np.ndarray]:
         acc, gyro, grav = self.imu()
         n, r = self.NOISE, self.rng
@@ -644,7 +669,7 @@ class MarlMujoco:
         terms = {"base_lin_acc": u(acc, n["lin_acc"]), "base_ang_vel": u(gyro, n["ang_vel"]),
                  "projected_gravity": u(grav, n["grav"]), "velocity_commands": self.observed_cmd(),
                  "arm_goal": np.array([1.0 if self.arm_mode else 0.0]), "ee_targets": believed,
-                 "joint_pos": u(self.measured_q() - self.default, n["jpos"]), "joint_vel": u(self.measured_dq(), n["jvel"]),
+                 "joint_pos": u(self.measured_q() - self.default, n["jpos"]), "joint_vel": self.noisy_dq(n["jvel"]),
                  "gait_phase": gait[0]}
         if len(gait) > 1:
             terms["gait_phase_cos"] = gait[1]

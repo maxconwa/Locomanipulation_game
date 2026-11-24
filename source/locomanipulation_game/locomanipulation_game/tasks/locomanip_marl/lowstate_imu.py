@@ -47,8 +47,9 @@ class LowstateImuCfg:
     quat_bias_deg: dict[str, tuple[float, float]] = {"roll": (-1.0, 1.0), "pitch": (-1.0, 1.0), "yaw": (-1.0, 1.0)}
     """What the quaternion reads with the torso level, after the deploy's calibration: its error, zero-centred. The
     references for the offset disagree by about 1 deg (pitch -2.3 by the torso's accelerometer, -3.3 by the head's)."""
-    quat_noise_deg: float = 0.1
-    """Std of a fresh roll and pitch noise rotation each policy step (measured 0.02-0.07)."""
+    quat_noise_deg: float = 0.05
+    """Std of a fresh roll and pitch noise rotation each policy step (measured 0.02-0.07 on 11-20; on 11-23 0.001 standing
+    still, 0.025-0.046 walking; 0.1 until 2026-11-23)."""
     quat_lag_s: tuple[float, float] = (0.0, 0.02)
     """The firmware filter's lag under motion (unmeasured)."""
     gyro_bias: tuple[float, float, float] = (0.005, 0.005, 0.02)

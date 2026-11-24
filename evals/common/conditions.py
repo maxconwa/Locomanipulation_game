@@ -15,10 +15,11 @@ import subprocess
 
 from .outputs import REPO
 
-# the actuator overrides for nominal motors (Isaac hydra syntax)
+# the actuator overrides for nominal motors (Isaac hydra syntax): their gains and strength, and no encoder offsets
 NOMINAL_MOTORS = ["env.events.actuator_scales.params.gain_range=[1.0,1.0]",
                   "env.events.actuator_scales.params.strength_range=[1.0,1.0]",
-                  "env.events.actuator_scales.params.joint_gain_ranges=null"]
+                  "env.events.actuator_scales.params.joint_gain_ranges=null",
+                  "env.encoder_offset_rad=null"]
 
 DEFAULTS = {
     ("isaac", "legs"): dict(num_envs=84, segments_per_env=6, seed=7, wrist_goals=0, motors="nominal",

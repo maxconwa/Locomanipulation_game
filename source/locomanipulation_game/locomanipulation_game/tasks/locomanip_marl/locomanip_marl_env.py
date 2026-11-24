@@ -4,7 +4,8 @@ DirectMARLEnv owns the step loop, the scene and the event manager; this class bu
 them onto the per-agent dicts:
 
     actions:      one ActionManager, the agents' terms concatenated in possible_agents order (cfg.agent_action_terms);
-                  with cfg.action_delay_range each env's joint targets reach the robot that many physics substeps late
+                  with cfg.action_delay_range each env's joint targets reach the robot that many physics substeps late,
+                  with cfg.encoder_offset_rad less each env's encoder offsets (joint_noise.py)
     observations: agent -> its observation group; the env state is the `critic` group
     rewards:      agent -> its own RewardManager, floored at 0, plus termination_penalty on terminating steps and
                   golem_estop_penalty on the step a GOLEM e-stop trip starts
@@ -35,6 +36,7 @@ from isaaclab.managers import (
 from isaaclab.utils.math import quat_apply_inverse, subtract_frame_transforms
 
 from .golem_safety import GolemEstopMonitor
+from .joint_noise import per_joint
 from .lowstate_imu import LowstateImu
 from .locomanip_marl_env_cfg import ARM_COMMAND, LocoManipMarlEnvCfg
 
@@ -134,6 +136,17 @@ class LocoManipMarlEnv(DirectMARLEnv):
             ]
             print(f"[INFO] Action delay: {low}-{high} physics substeps per env, drawn at each reset")
 
+        # -- the joint encoders' offsets (cfg.encoder_offset_rad, joint_noise.py), per env and robot joint, drawn at each
+        # reset: the actors read angle + offset (mdp.joint_pos_rel_measured), the motors put the joints at target - offset
+        self.encoder_offset: torch.Tensor | None = None
+        self._step_targets: list[torch.Tensor] = []
+        if self.cfg.encoder_offset_rad:
+            self._encoder_offset_range = torch.tensor(
+                per_joint(self._robot.joint_names, self.cfg.encoder_offset_rad, 0.0), device=self.device)
+            self.encoder_offset = torch.zeros(self.num_envs, len(self._robot.joint_names), device=self.device)
+            named = {n: r for n, r in zip(self._robot.joint_names, self._encoder_offset_range.tolist()) if r > 0.0}
+            print(f"[INFO] Encoder offsets, uniform +- rad per reset: {named}")
+
         # -- the pre-pose resets' gantry (mdp.prepose_reset, the events' prepose term; None without it)
         prepose = getattr(self.cfg.events, "prepose", None)
         self._prepose = self.event_manager.get_term_cfg("prepose").func if prepose is not None else None
@@ -161,6 +174,9 @@ class LocoManipMarlEnv(DirectMARLEnv):
         for term, history in zip(self._delay_terms, self._target_history):
             history[:] = history.roll(1, dims=1)
             history[:, 0] = term.processed_actions
+        if self.encoder_offset is not None and not self._target_history:
+            # the step's own targets, which _apply_action offsets at every substep
+            self._step_targets = [term.processed_actions.clone() for term in self._delay_terms]
         self._substep = 0
 
     def _apply_action(self) -> None:
@@ -177,13 +193,21 @@ class LocoManipMarlEnv(DirectMARLEnv):
             back = torch.div(back + self.cfg.decimation - 1, self.cfg.decimation, rounding_mode="floor")
             rows = torch.arange(self.num_envs, device=self.device)
             for term, history in zip(self._delay_terms, self._target_history):
-                term._processed_actions = history[rows, back]
+                term._processed_actions = self._at_motor(term, history[rows, back])
+        else:
+            for term, target in zip(self._delay_terms, self._step_targets):
+                term._processed_actions = self._at_motor(term, target)
         if self._prepose is not None and self._substep == 0:
             # the rope's force, set once per policy step and held over its substeps (set every substep it cost ~6 ms
             # each, ~30 ms per step, about a fifth of the step; the rope's ~1 Hz dynamics don't need 500 Hz)
             self._prepose.apply_support(self.episode_length_buf * self.step_dt)
         self._substep += 1
         self.action_manager.apply_action()
+
+    def _at_motor(self, term, target: torch.Tensor) -> torch.Tensor:
+        """The joint angles a term's targets put the joints at: the motor holds its measured angle (angle + its
+        encoder offset) at the target, so the joint settles at target - offset."""
+        return target if self.encoder_offset is None else target - self.encoder_offset[:, term._joint_ids]
 
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         self.termination_manager.compute()
@@ -245,6 +269,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._refresh_sensors_after_reset(env_ids)
         self._fresh[env_ids] = True
         self.lowstate_imu.reset(env_ids)
+        if getattr(self, "encoder_offset", None) is not None:
+            ids = torch.as_tensor(env_ids, device=self.device)
+            span = self._encoder_offset_range
+            self.encoder_offset[ids] = (2.0 * torch.rand(len(ids), len(span), device=self.device) - 1.0) * span
         self.golem_monitor.reset(env_ids)
         self._golem_tripped_prev[env_ids] = False
         for prev in self._golem_tripped_by_prev.values():

@@ -18,8 +18,8 @@ over 500 Hz physics with an explicit PD (the torque computed every physics step 
 0-20 ms of action delay. Joint targets are clipped inside GOLEM's position e-stop range and bounded by PD torque;
 GOLEM's e-stops are checked and charged (golem_safety.py). Domain randomization: motor gains and strength, friction and
 torso mass (all drawn at each reset), the torso IMU's bias, lag and noise as /lowstate reports it (lowstate_imu.py),
-observation noise; a third of the resets from the robot's pre-pose range (mdp/prepose.py). Flat ground, no pushes. Episodes
-have drawn lengths (uniform, 90-300 s).
+the joint encoders' offsets and noise (joint_noise.py); a third of the resets from the robot's pre-pose range
+(mdp/prepose.py). Flat ground, no pushes. Episodes have drawn lengths (uniform, 90-300 s).
 """
 
 import math
@@ -58,6 +58,7 @@ from locomanipulation_game.assets.h1_2 import (
 
 from . import mdp
 from .golem_safety import GOLEM_TARGET_CLIP, GolemEstopCfg, position_envelope
+from .joint_noise import ENCODER_OFFSET_RAD, JOINT_POS_NOISE, joint_vel_noise
 from .lowstate_imu import LowstateImuCfg
 from .scene_cfg import SELF_CONTACT_LINK_NAMES, SELF_CONTACT_SENSOR_NAMES, TerrainSceneCfg
 
@@ -221,11 +222,11 @@ class MarlActionsCfg:
     )
 
 
-def _joints(func, noise: float) -> ObsTerm:
+def _joints(func, noise=None) -> ObsTerm:
     return ObsTerm(
         func=func,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=ALL_JOINTS_NAMES, preserve_order=True)},
-        noise=Unoise(n_min=-noise, n_max=noise),
+        noise=noise,
     )
 
 
@@ -245,8 +246,10 @@ class MarlObservationsCfg:
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
         arm_goal = ObsTerm(func=mdp.arm_goal_active, params={"command_name": ARM_COMMAND})
         ee_targets = ObsTerm(func=mdp.arm_targets_in_root_xyzw, params={"command_name": ARM_COMMAND})
-        joint_pos = _joints(mdp.joint_pos_rel, 0.01)
-        joint_vel = _joints(mdp.joint_vel_rel, 1.5)
+        # the joint encoders as /lowstate reports them (joint_noise.py): the angles with each reset's encoder offsets
+        # and a little noise, the speeds with noise that grows with the speed
+        joint_pos = _joints(mdp.joint_pos_rel_measured, Unoise(n_min=-JOINT_POS_NOISE, n_max=JOINT_POS_NOISE))
+        joint_vel = _joints(mdp.joint_vel_rel, joint_vel_noise(ALL_JOINTS_NAMES))
         gait_phase = ObsTerm(func=mdp.gait_phase_sin, params={"command_name": "base_velocity"})
         # with the sin, each leg's phase without ambiguity (the legs' sins alone are negatives of each other)
         gait_phase_cos = ObsTerm(func=mdp.gait_phase_cos, params={"command_name": "base_velocity"})
@@ -278,8 +281,8 @@ class MarlObservationsCfg:
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
         arm_goal = ObsTerm(func=mdp.arm_goal_active, params={"command_name": ARM_COMMAND})
         true_ee_targets = ObsTerm(func=mdp.true_arm_targets_in_root_xyzw, params={"command_name": ARM_COMMAND})
-        joint_pos = _joints(mdp.joint_pos_rel, 0.0)
-        joint_vel = _joints(mdp.joint_vel_rel, 0.0)
+        joint_pos = _joints(mdp.joint_pos_rel)
+        joint_vel = _joints(mdp.joint_vel_rel)
         gait_phase = ObsTerm(func=mdp.gait_phase_sin, params={"command_name": "base_velocity"})
         gait_phase_cos = ObsTerm(func=mdp.gait_phase_cos, params={"command_name": "base_velocity"})
         legs_actions = ObsTerm(func=mdp.applied_action, params={"action_name": LEGS_ACTION})
@@ -332,12 +335,15 @@ class LegsRewardsCfg:
                                params={"command_name": "base_velocity", "component": "lin_xy"})
     track_ang_vel_z = RewTerm(func=mdp.track_velocity_cycle_exp, weight=1.5,
                               params={"command_name": "base_velocity", "component": "ang_z"})
-    # --- torso: sport mode's is steady (roll/pitch sd 0.83/0.75 deg while stepping). orientation -3 (ALMI-Open's
-    # -0.25 charged a 3.4 deg sway about 0.001 per second; at -10 the first sport-mode run fell in 40% of its episodes
-    # at 24k steps' worth of time, against 11% before)
+    # --- torso: sport mode's is steady (roll/pitch sd 0.83/0.75 deg while stepping). orientation -30 since 2026-11-23
+    # (was -3: ALMI-Open's -0.25 charged a 3.4 deg sway about 0.001 per second; at -10 the first sport-mode run fell in
+    # 40% of its episodes at 24k steps' worth of time, against 11% before). At -3 a 5.8 deg lean cost 0.03 per second and
+    # LegsFastEnv60k_s42 stood wherever the plant left it: on the robot (2026-11-23 bags) back 3.4 and 5.8 deg after two
+    # engages, tipping back to 10 deg as the walking stopped; in the MuJoCo engage grid -3 to -8 deg (RoboCasa) and
+    # +3 to +4 (Isaac's MJCF). At -30 a 5 deg lean costs 0.23 per second, 8 deg 0.58
     lin_vel_z = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
     ang_vel_xy = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.2)
-    orientation = RewTerm(func=mdp.flat_orientation_l2, weight=-3.0)
+    orientation = RewTerm(func=mdp.flat_orientation_l2, weight=-30.0)
     # --- gait
     # each swing foot at the 6 cm sine reference: at most 0.57 per second at weight 1 (two feet, 45% of the stride
     # each, the lift-share weighting's mean 0.64), 0.15 of that for dragged feet. At 4.0 (2.3/s) the tracking's 2.1/s
@@ -647,6 +653,9 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     soft_joint_pos_limit_factors: dict[str, float] = {".*_knee_joint": 0.95, ".*_ankle_pitch_joint": 0.95}
     action_delay_range: tuple[int, int] | None = ACTION_DELAY_RANGE
     """Physics substeps each env's joint targets reach the robot late, drawn at each reset; None: on time."""
+    encoder_offset_rad: dict[str, float] | None = ENCODER_OFFSET_RAD
+    """rad: each named joint's encoder offset, uniform +- per reset (joint name pattern -> range; joint_noise.py): the
+    actors' joint_pos reads angle + offset and the joint settles at target - offset. None: none."""
     gait_period: float = 0.7
     """s per full stride of the gait clock (mdp.leg_phase), sport mode's at every speed; the gait-cycle means of the
     tracking terms, sport_gait and the velocity command's metrics span one."""

@@ -96,9 +96,10 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
-from locomanipulation_game.assets.h1_2 import CL_ASSETS_DIR
+from locomanipulation_game.assets.h1_2 import ALL_JOINTS_NAMES, CL_ASSETS_DIR
 
 from . import mdp
+from .joint_noise import JOINT_POS_NOISE, joint_vel_noise
 from .locomanip_marl_env_cfg import FINE_POS_STDS, ROT_STDS, ArmsRewardsCfg, LocoManipMarlEnvCfg, MarlRewardsCfg
 
 ARMS_OUTPUT_INIT_SCALE = 0.01
@@ -160,9 +161,10 @@ ARMS_PRECISION_ACTION_RATE = -0.05
 # arms_integrate (ArmsOnlyEnvCfg): the arms' exploration
 ARMS_INTEGRATE_INITIAL_STD = 0.1
 ARMS_INTEGRATE_MIN_STD = 0.03
-# the arms' observation noise at arms_obs_noise_scale 1 (the walking task's). The measured wrist poses carry none
-# (user 2026-11-19; the walking task's 0.005, as every run up to ArmsObs200k_s42)
-ARMS_OBS_NOISE = {"wrist_errors": 0.005, "joint_pos": 0.01, "joint_vel": 1.5}
+# the arms' uniform observation noise at arms_obs_noise_scale 1 (the walking task's); their joint speeds' noise is the
+# encoders' (joint_noise.py, times the same scale). The measured wrist poses carry none (user 2026-11-19; the walking
+# task's 0.005, as every run up to ArmsObs200k_s42). Until 2026-11-23 joint_pos 0.01 and joint_vel uniform 1.5
+ARMS_OBS_NOISE = {"wrist_errors": 0.005, "joint_pos": JOINT_POS_NOISE}
 
 
 @configclass
@@ -258,6 +260,7 @@ class ArmsOnlyEnvCfg(LocoManipMarlEnvCfg):
         for name, noise in ARMS_OBS_NOISE.items():
             term = getattr(self.observations.arms, name)
             term.noise.n_min, term.noise.n_max = -noise * self.arms_obs_noise_scale, noise * self.arms_obs_noise_scale
+        self.observations.arms.joint_vel.noise = joint_vel_noise(ALL_JOINTS_NAMES, self.arms_obs_noise_scale)
         self.actions.arm_pos.residual_integrate = self.arms_integrate
         initial_std, min_std = ((ARMS_INTEGRATE_INITIAL_STD, ARMS_INTEGRATE_MIN_STD) if self.arms_integrate
                                 else (ARMS_INITIAL_STD, ARMS_MIN_STD))

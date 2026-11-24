@@ -49,6 +49,15 @@ def pelvis_height_above_ground(env: ManagerBasedRLEnv) -> torch.Tensor:
     return (env.scene["robot"].data.root_pos_w[:, 2] - ground_height(env)).unsqueeze(1)
 
 
+def joint_pos_rel_measured(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """joint_pos_rel as the encoders report it: plus each env's encoder offset (LocoManipMarlEnv.encoder_offset, the
+    robot's joint order; none on an env that draws none)."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    rel = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    offset = getattr(env, "encoder_offset", None)
+    return rel if offset is None else rel + offset[:, asset_cfg.joint_ids]
+
+
 def body_pose_in_root_xyzw(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
     """Each of asset_cfg's bodies in the root frame, concatenated."""
     asset: Articulation = env.scene[asset_cfg.name]

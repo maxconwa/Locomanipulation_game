@@ -105,7 +105,9 @@ for _start in ("settled", "bag"):
     for _end in ("lo", "hi"):
         CONDITIONS[f"pp_{_start}_release_pitch_{_end}"] = dict(_HW, prepose=_start, release=True, vib_k=4.0,
                                                                imu_pitch=_end)
-NOMINAL = {"strength": 1.0, "gain": 1.0, "dq_lag": 0.0, "gyro_k": 0.0, "delay_ms": 10.0, "torso_kg": 0.0, "enc": 0.0,
+# delay_ms: the robot's /lowstate to command 1.1 ms (p99 2.1) plus the safety relay's up to 2 ms (2026-11-23 bags; the
+# motors' own latency unmeasured): 4 ms nominal, 20 in the hardware bundle (_HW). 10 until 2026-11-23
+NOMINAL = {"strength": 1.0, "gain": 1.0, "dq_lag": 0.0, "gyro_k": 0.0, "delay_ms": 4.0, "torso_kg": 0.0, "enc": 0.0,
            "hang_s": 0.0, "lstm_reset_s": 0.0, "lstm_reset_which": "both", "prepose": "", "rope": 0.4,
            "release": False, "imu_pitch": None, "vib_k": 0.0}
 HANG_LIFT, LOWER_S = 0.08, 1.0
@@ -128,12 +130,18 @@ BAG_ENGAGE_Q = {"bag": REPO / "evals" / "deploy" / "data" / "bag_engage_q.npy",
 PREPOSE_JOINT_RANGES = {"ankle_pitch": (-0.3, 0.15), "ankle_roll": (-0.1, 0.1), "knee": (-0.1, 0.2), "hip": (-0.1, 0.1),
                         "torso": (-0.05, 0.05), "shoulder": (-0.15, 0.15), "elbow": (-0.15, 0.15), "wrist": (-0.15, 0.15)}
 # the torso IMU's gyro vibration: rad/s rms per rad/s rms of leg joint speed at vib_k 1 (on the robot 0.4-0.8 rad/s
-# while the legs thrashed at a few rad/s); and the lowstate model's noise and lag (lowstate_imu.LowstateImuCfg)
+# while the legs thrashed at a few rad/s); and the lowstate model's noise and lag (lowstate_imu.LowstateImuCfg). The
+# noise is the robot's of 2026-11-23 (the quaternion's per-step noise 0.001 deg standing, 0.025-0.046 walking; the
+# gyro's 0.009-0.011 rad/s standing): until then 0.1 deg and 0.02 rad/s
 TORSO_GYRO_PER_DQ = 0.2
 TORSO_GYRO_AXES = np.array([0.6, 1.0, 0.4])
-LOWSTATE_QUAT_NOISE_DEG, LOWSTATE_LAG_MS, LOWSTATE_GYRO_NOISE = 0.1, 10.0, 0.02
+LOWSTATE_QUAT_NOISE_DEG, LOWSTATE_LAG_MS, LOWSTATE_GYRO_NOISE = 0.05, 10.0, 0.01
 # the pp table's pass marks
 PP_MAX_MEAN_JUMP, PP_MAX_TORQUE_SHARE, PP_MAX_KNEE_OFFSET, PP_MAX_AT_LIMIT = 0.03, 0.85, 0.15, 0.05
+# the stance's pitch from 2 s on (deg, the pelvis against gravity): the 2026-11-23 bags of LegsFastEnv60k_s42 stood
+# at -0.5 deg after one engage and leaned back to -3.4 and -5.8 after two others (the ankles pulling, the weight
+# behind them), and those two tipped back to -10 deg when they stopped walking
+PP_MAX_STANCE_PITCH_DEG = 2.0
 
 
 class StressMujoco(MarlMujoco):
@@ -283,6 +291,12 @@ class StressMujoco(MarlMujoco):
         zb = qrot(q, np.array([0.0, 0.0, 1.0]))
         return math.acos(max(-1.0, min(1.0, zb[2])))
 
+    def pitch(self):
+        """The pelvis's pitch against gravity (rad), positive nose down (lmg_deploy's imu_calibration.tilt_deg)."""
+        p, q = self.root()
+        g = qrot(q * np.array([1.0, -1.0, -1.0, -1.0]), np.array([0.0, 0.0, -1.0]))
+        return math.atan2(g[0], -g[2])
+
 
 def command(t: float, profile: str) -> np.ndarray:
     if profile == "small60":
@@ -390,7 +404,7 @@ def run_prepose_job(job, video: str | None = None):
                         "jump_policy": np.abs(sim.policy_target - prev_policy) if engaged else np.zeros(12),
                         "tau_share": float(np.max(np.abs(sim.last_tau[:12]) / sim.effort[:12])),
                         "knee_off": float(np.abs(q[KNEE_IDX] - sim.default[KNEE_IDX]).mean()),
-                        "target": sim.applied[:12].copy(), "tilt": tilt, "z": float(d.qpos[2]),
+                        "target": sim.applied[:12].copy(), "tilt": tilt, "pitch": sim.pitch(), "z": float(d.qpos[2]),
                         "wrist_err": float(np.linalg.norm(sim.wrist_poses_b()[:, :3] - sim.believed[:, :3], axis=1).mean())})
             if engaged and fell_t is None and (tilt > FALL_TILT or d.qpos[2] < FALL_HEIGHT):
                 fell_t = t - PP_ENGAGE_S
@@ -441,7 +455,9 @@ def run_prepose_job(job, video: str | None = None):
             "pre_knee_off": float(np.mean([r["knee_off"] for r in rec if not r["engaged"] and r["t"] > -0.5])),
             "wrist_err_mm": [1000 * x if x is not None else None for x in (w0, err(0.25), err(0.5), err(1.0))],
             "arm_max_jump": float(np.max([r["jump_arms"].max() for r in eng])),
-            "max_tilt_deg": float(math.degrees(max(r["tilt"] for r in eng)))}
+            "max_tilt_deg": float(math.degrees(max(r["tilt"] for r in eng))),
+            # the stance's mean pitch from 2 s on (deg, + nose down)
+            "stance_pitch_deg": float(math.degrees(np.mean([r["pitch"] for r in after]))) if after and fell_t is None else None}
 
 
 def run_job(job):
@@ -583,12 +599,17 @@ def main():
                     "knee_off": med("knee_off"), "knee_off_worst": worst("knee_off"), "at_limit": worst("at_limit"),
                     "pre_knee_off": med("pre_knee_off"), "arm_max_jump": worst("arm_max_jump"),
                     "max_tilt_deg": worst("max_tilt_deg"),
+                    "stance_pitch_deg": med("stance_pitch_deg"),
+                    "stance_pitch_range": ([float(np.min(sp)), float(np.max(sp))] if (sp := [r["stance_pitch_deg"] for r in rs
+                                           if r["stance_pitch_deg"] is not None]) else None),
                     "wrist_err_mm": np.median([r["wrist_err_mm"] for r in rs], axis=0).tolist()}
             cell["pass"] = bool(cell["fell_pct"] == 0 and cell["first_mean_jump_worst"] <= PP_MAX_MEAN_JUMP
                                 and (cell["second_mean_jump_worst"] or 0.0) <= PP_MAX_MEAN_JUMP
                                 and cell["first_torque_share"] <= PP_MAX_TORQUE_SHARE
                                 and (cell["knee_off_worst"] or 0.0) <= PP_MAX_KNEE_OFFSET
-                                and (cell["at_limit"] or 0.0) < PP_MAX_AT_LIMIT)
+                                and (cell["at_limit"] or 0.0) < PP_MAX_AT_LIMIT
+                                and cell["stance_pitch_range"] is not None
+                                and max(map(abs, cell["stance_pitch_range"])) <= PP_MAX_STANCE_PITCH_DEG)
             pp_cells[f"{c}/{pl}"] = cell
     for c in [c for c in names if not CONDITIONS[c].get("prepose")]:
         for pl in args.plants.split(","):
@@ -636,13 +657,15 @@ def main():
                f" fall, mean leg target jump <= {PP_MAX_MEAN_JUMP} rad (worst seed) in 0-0.5 s and in 0.5-1 s, leg torque"
                f" <= {PP_MAX_TORQUE_SHARE}"
                f" of the limit, knees within {PP_MAX_KNEE_OFFSET} rad of default, targets at a limit"
-               f" < {PP_MAX_AT_LIMIT:.0%} of steps.", "",
+               f" < {PP_MAX_AT_LIMIT:.0%} of steps, the stance's pelvis pitch from 2 s on within"
+               f" +-{PP_MAX_STANCE_PITCH_DEG} deg (every seed; + nose down).", "",
                "The policy's own jump: its leg targets before lmg_deploy's engage blend (export.yaml engage_blend_s; the"
                " same as the sent ones without it), reported only.", "",
                "| cell | pass | fell % | 0.5 s mean jump med / worst | 0.5-1 s worst | 0.5 s max jump | policy's own"
                " 0.5 s mean jump med / worst / max | 0.5 s torque/limit | knee off"
-               " med / worst | at limit | knee off pre-pose | wrist err mm at 0/0.25/0.5/1 s | arm max jump | max tilt deg |",
-               "|" + "---|" * 14]
+               " med / worst | at limit | knee off pre-pose | wrist err mm at 0/0.25/0.5/1 s | arm max jump | max tilt deg |"
+               " stance pitch deg med (min / max) |",
+               "|" + "---|" * 15]
         for key, r in pp_cells.items():
             md.append(f"| {key} | {'yes' if r['pass'] else 'NO'} | {r['fell_pct']:.0f} | {fmt(r['first_mean_jump'], '{:.3f}')} /"
                       f" {fmt(r['first_mean_jump_worst'], '{:.3f}')} | {fmt(r.get('second_mean_jump_worst'), '{:.3f}')} |"
@@ -650,7 +673,8 @@ def main():
                       f" {fmt(r.get('policy_mean_jump_worst'), '{:.3f}')} / {fmt(r.get('policy_max_jump'))} |"
                       f" {fmt(r['first_torque_share'])} | {fmt(r['knee_off'])} / {fmt(r['knee_off_worst'])} |"
                       f" {fmt(r['at_limit'], '{:.1%}')} | {fmt(r['pre_knee_off'])} | {fmt(r['wrist_err_mm'], '{:.0f}')} |"
-                      f" {fmt(r['arm_max_jump'])} | {fmt(r['max_tilt_deg'], '{:.1f}')} |")
+                      f" {fmt(r['arm_max_jump'])} | {fmt(r['max_tilt_deg'], '{:.1f}')} |"
+                      f" {fmt(r.get('stance_pitch_deg'), '{:+.1f}')} ({fmt(r.get('stance_pitch_range'), '{:+.1f}')}) |")
     (out / "summary.md").write_text("\n".join(md) + "\n")
     print("\n".join(md), flush=True)
     print(f"[stress-mj] wrote {out}", flush=True)

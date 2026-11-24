@@ -110,6 +110,7 @@ def main(env_cfg, agent_cfg: dict):
     for group in ("legs", "arms"):
         getattr(env_cfg.observations, group).enable_corruption = False
     env_cfg.action_delay_range = None  # the targets the env applies are the step's own
+    env_cfg.encoder_offset_rad = None  # the deploy reads the joints as they are
     env = SkrlVecEnvWrapper(gym.make(args.task, cfg=env_cfg))
     base = env.unwrapped
     robot, imu = base.scene["robot"], base.scene["imu"]
