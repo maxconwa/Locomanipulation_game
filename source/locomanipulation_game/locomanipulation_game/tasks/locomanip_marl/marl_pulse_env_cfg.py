@@ -10,8 +10,9 @@ its reasons: docs/superpowers/specs/2026-11-24-pulse-cooperative-design.md. Agai
   delay stays 0-20 ms); target = pretraining's default pose + its ACTION_SCALE x the decoder's output, clipped to its
   TARGET_LIMITS within GOLEM's position envelope; the legs' decoder sets the 12 leg joints, the upper body's the torso
   and the 14 arm joints (the arms agent owns the torso); no IK, no residual; the grippers as main holds them;
-- the robot: main's explicit PD (IdealPDActuatorCfg, so the gain and strength draws, the action delay and GOLEM's
-  torque check act on it) with pretraining's gains, effort limits and armature (pretraining.constants), its default
+- the robot: main's explicit PD (IdealPDActuatorCfg, so the gain and strength draws act on it) on 17 joints, implicit
+  PD on the shoulder yaws, elbows and wrists (no gain or strength draws there; the action delay, the encoder offsets
+  and GOLEM's torque check act on all 27), with pretraining's gains, effort limits and armature (pretraining.constants), its default
   pose and pelvis height as the articulation's (init_state), its joint ranges (h12_train's MJCF's, a start-up event
   as stage 1's; main's USD has the shoulder rolls at +-0.19). Stage 1 ran implicit PD at 5 ms: the plant differs a
   little, inside what the gain draws cover;
