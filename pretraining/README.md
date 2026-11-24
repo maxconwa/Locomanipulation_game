@@ -243,6 +243,11 @@ the learner. Isaac itself holds about 5 GB.
 |---|---|---|---|---|
 | `amass_s1` | 0 | 0.236 m | 0.234 m | 0.064 rad |
 | `amass_s1_golem_aware` | 0 | 0.306 m | 0.303 m | 0.068 rad |
+| `isaac_s1` | 0 | 0.178 m | 0.176 m | 0.079 rad |
+| `isaac_s1_golem_aware` | 0 | 0.170 m | 0.163 m | 0.087 rad |
+
+The two Isaac-trained rows were added after their runs finished, on the same clip list (`--clips-file`); they have no
+MuJoCo number, so the 4-clip table below covers the MuJoCo-trained policies only.
 
 On the 4 clips scored in both simulators (means of the 4):
 
@@ -270,8 +275,51 @@ the mean over the 40 clips of the share of steps with the flag.
 |---|---|---|---|---|---|---|---|---|---|---|
 | `amass_s1` | MuJoCo | 320,000 | 26.4 h | 5,120 | 0.236 m | 0.064 rad | 0 | 0.02% / 2.2% | 2.7% | 2.4% |
 | `amass_s1_golem_aware` | MuJoCo | 340,000 (320,000 + 20,000) | 28.1 h (26.4 + 1.7) | 5,120 | 0.306 m | 0.068 rad | 0 | 0.13% / 2.3% | 0.19% | 2.5% |
-| `isaac_s1` | Isaac | run in progress | run in progress | 2,048 | run in progress | run in progress | run in progress | run in progress | run in progress | run in progress |
-| `isaac_s1_golem_aware` | Isaac | run in progress | run in progress | 2,048 | run in progress | run in progress | run in progress | run in progress | run in progress | run in progress |
+| `isaac_s1` | Isaac | 79,165 | 6.4 h | 2,048 | 0.178 m | 0.079 rad | 0 | 0.03% / 0.50% | 1.9% | 0.70% |
+| `isaac_s1_golem_aware` | Isaac | 96,131 (79,165 + 16,966) | 7.8 h (6.4 + 1.4) | 2,048 | 0.170 m | 0.087 rad | 0 | 0.09% / 1.5% | 0.01% | 2.0% |
+
+Iterations and wall time are the last row of each run's `progress.csv` (`wall_s`: 23,000 s and 28,200 s for the
+Isaac runs; the fine-tune's file carries the base run's rows). Updates, summed from `updates`: `amass_s1` 159,992,
+`amass_s1_golem_aware` +10,221, `isaac_s1` 15,832, `isaac_s1_golem_aware` +3,384 (19,216 in all).
+
+**Isaac against MuJoCo.** Training-rollout metrics from `progress.csv`, each the mean over the 50 logged rows (500
+iterations) ending at the point. Body error is `Metrics/motion/error_body_pos` (pelvis-relative), pelvis error is
+`error_anchor_pos` (global). `Episode_Termination/*` is logged on a different scale by the two runs (the Isaac values
+sum to about 1, the MuJoCo ones to about 20), so the table gives each reason's share of their sum. `legs q over
+e-stop` is not logged by `amass_s1`.
+
+| point | run | iteration | updates | `Loss/state` | body error | pelvis error | episode length | time-out / motion end / pelvis-position share | legs / arms force saturated | legs q over e-stop | arms torque demand over 1.0 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| equal updates | `amass_s1` | 31,670 | 15,832 | 0.0031 | 0.071 m | 0.266 m | 499.3 | 12.9% / 86.9% / 0.12% | 0.11% / 1.29% | n/a | 1.37% |
+| equal wall time (23,000 s) | `amass_s1` | 77,450 | 38,722 | 0.0028 | 0.054 m | 0.279 m | 497.9 | 19.0% / 80.7% / 0.39% | 0.17% / 0.96% | n/a | 1.15% |
+| end of base run | `isaac_s1` | 79,165 | 15,832 | 0.0047 | 0.058 m | 0.394 m | 497.4 | 26.6% / 72.8% / 0.57% | 0.31% / 1.36% | 5.2% | 1.29% |
+| end of base run | `amass_s1` | 319,990 | 159,992 | 0.0027 | 0.057 m | 0.246 m | 498.5 | 19.8% / 79.9% / 0.31% | 0.14% / 1.01% | n/a | 1.09% |
+| end of fine-tune | `isaac_s1_golem_aware` | 96,131 | 19,216 | 0.0050 | 0.063 m | 0.461 m | 487.5 | 27.6% / 71.7% / 0.69% | 0.41% / 1.71% | 0.08% | 1.71% |
+| end of fine-tune | `amass_s1_golem_aware` | 339,990 | 170,213 | 0.0028 | 0.058 m | 0.335 m | 493.2 | 20.1% / 79.4% / 0.32% | 0.20% / 1.05% | 0.03% | 1.09% |
+
+Pelvis-orientation terminations are 0.11% or less of the sum everywhere. In training rollouts the Isaac runs end
+with a higher `Loss/state` (0.0047 against 0.0027-0.0031) and a larger global pelvis error (0.394 m against 0.246 to
+0.279 m) than `amass_s1` at any of the three points, a body error between `amass_s1`'s at equal updates and at its
+end, and the same episode length to within 2%. The GOLEM-aware fine-tune cut the legs' e-stop share in both
+simulators (Isaac 5.2% to 0.08%) and raised the global pelvis error in both. What this does not show: the training
+numbers come from two different simulators, so they do not say which policy tracks better. The same-simulator
+evidence is the cross-check above, where both Isaac-trained policies have a lower body and pelvis error (0.170-0.178
+m against 0.236-0.306 m) and a higher joint error (0.079-0.087 rad against 0.064-0.068 rad) than the MuJoCo-trained
+ones, none falls, and their arm saturation and torque-demand shares are lower; that is 40 clips, nominal physics,
+and one seed per run.
+
+**Why Isaac did 2.5 times fewer updates per hour.** From the summed per-interval timings in `progress.csv`
+(`interval_s`, `collect_s`, `wm_s`, `policy_s`, `updates`):
+
+| run | envs | updates per hour | updates per iteration | env steps/s (mean) | per update: collect / world model / policy |
+|---|---|---|---|---|---|
+| `amass_s1` | 5,120 | 6,081 | 0.50 | 17,299 | 0.053 / 0.278 / 0.261 s |
+| `isaac_s1` | 2,048 | 2,484 | 0.20 | 7,088 | 0.372 / 0.587 / 0.491 s |
+
+Three things add up: fewer envs, so 2.5 times fewer updates per iteration (the replay ratio ties updates to collected
+steps); slower updates, 1.08 s of world-model plus policy update against 0.54 s; and
+slower simulation, 7,088 env steps/s against 17,299 (collection takes 0.074 s per iteration for
+2,048 envs against 0.027 s for 5,120). Why the updates are about twice as slow is not yet measured.
 
 ## What was not done
 
