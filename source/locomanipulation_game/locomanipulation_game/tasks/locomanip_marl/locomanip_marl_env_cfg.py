@@ -143,8 +143,10 @@ PREPOSE_JOINT_RANGES = {
 # and LegsFastEnv60k_s42 moved their mean targets 0.045-0.058 rad per joint per step in the first 0.5 s. The sampled
 # targets' exploration noise (legs std ~0.5, scales 0.125-0.25) alone moves them ~0.14 rad per joint per step, a sum of
 # squares ~0.26 over the 12 joints: at std ENGAGE_SMOOTH_STD it keeps ~60% of the kernel, which is then nearly linear
-# in the mean's squared change, ~18x action_rate's charge on it during the window
-ENGAGE_BLEND_S = 0.5
+# in the mean's squared change, ~18x action_rate's charge on it during the window. Both off by default since 2026-11-24
+# (ENGAGE_BLEND_S 0, engage_smooth 0): with them on, LegsSmoothOnly60k_s42 and LegsBlendOnly60k_s42 failed the engage
+# grid, while LegsFastEnv60k_s42, trained without either, engaged well on the robot (2026-11-23)
+ENGAGE_BLEND_S = 0.0
 ENGAGE_WINDOW_S = 1.0
 ENGAGE_SMOOTH_STD = 0.7
 # the motors' gain and strength draws (mdp.randomize_actuator_scales)
@@ -400,8 +402,9 @@ class LegsRewardsCfg:
     # x4 since 2026-11-20 (was -0.025): the real loop amplified the targets' step-to-step changes ~2.5x over MuJoCo
     # (LegsEnergyDefault200k_s43's engage, 0.18 rad per step), so the trained ones must be that much tamer
     action_rate = RewTerm(func=mdp.action_term_rate_l2, weight=-0.1, params={"action_name": LEGS_ACTION})
-    # the engage from the pre-pose (ENGAGE_SMOOTH_STD): at most 40 over its first second, ~24 of it under the noise
-    engage_smooth = RewTerm(func=mdp.engage_target_smooth_exp, weight=40.0, params={
+    # the engage from the pre-pose (ENGAGE_SMOOTH_STD): at most 40 over its first second at weight 40, ~24 of it under
+    # the noise; off by default (ENGAGE_BLEND_S)
+    engage_smooth = RewTerm(func=mdp.engage_target_smooth_exp, weight=0.0, params={
         "action_name": LEGS_ACTION, "window_s": ENGAGE_WINDOW_S, "std": ENGAGE_SMOOTH_STD})
     ankle_torque = RewTerm(func=mdp.joint_torques_l2, weight=-5.0e-5,
                            params={"asset_cfg": SceneEntityCfg("robot", joint_names=ANKLE_JOINT_NAMES)})

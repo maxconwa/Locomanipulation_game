@@ -8,7 +8,7 @@ arm-goal flag (always 0 here; the critic's state drops it too), and on top of it
   scored apart. Against sport mode's bags (lateral in the levelled pelvis frame): feet lateral (0.28, 0.45), stepping
   p1 0.267, p99 0.441, standing 0.297-0.338; knees lateral, KNEE_DISTANCE_RANGE (0.286, 0.376), stepping p1 0.284,
   p99 0.394; feet fore-aft while standing is commanded |dx| <= 0.05, the bags' standing p99 0.047;
-- a standing band on the feet's load split, 1 up to 60/40;
+- a standing band on the feet's load split, 1 up to 52/48, weight 3;
 - the mechanical-power penalty on (energy, -1e-3 per W). The pelvis-height band stays on: off (LegsEnergy200k_s42's
   recipe, the defaults 11-19 to 11-20) the policy tracked as well but stood in a deep crouch, knees 1.5-1.6 rad, and
   LegsEnergyDefault200k_s43 failed its real engage from it (2026-11-20).
@@ -48,10 +48,11 @@ class LegsOnlyLegsRewardsCfg(LegsRewardsCfg):
     feet_stagger_standing = RewTerm(func=mdp.body_pair_offset_band, weight=1.0, params={
         "asset_cfg": _FEET, "axis": 0, "min_dist": 0.0, "max_dist": STANDING_STAGGER_MAX,
         "command_name": "base_velocity"})
-    # standing, the load split evenly: at most 1 per second, as feet_stagger_standing
-    feet_load_balance_standing = RewTerm(func=mdp.feet_load_balance_band, weight=1.0, params={
+    # standing, the load split evenly: at most 3 per second, full up to 52/48, 0.67 at 54/46, 0.37 at 57/43 (x3 and 0.1 ->
+    # 0.02 since 2026-11-24: LegsRealNoise100k_s42 stood 57/43 on the right foot in MuJoCo, FastEnv60k 51/49)
+    feet_load_balance_standing = RewTerm(func=mdp.feet_load_balance_band, weight=3.0, params={
         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=FOOT_LINK_NAMES, preserve_order=True),
-        "max_imbalance": 0.1, "command_name": "base_velocity"})
+        "max_imbalance": 0.02, "command_name": "base_velocity"})
 
 
 def set_legs_task(cfg):
