@@ -72,6 +72,9 @@ from lmg_deploy.networks import load_network  # noqa: E402
 
 args.checkpoint, RUN_DIR, args.task, _ = replay_run(args.checkpoint, args.task, hydra_args)
 torch.set_grad_enabled(False)
+# full fp32 on the GPU: TF32 (cuDNN's LSTM default) moves the arms' actions by up to ~0.03 against the deploy's CPU net
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
 
 
 @hydra_task_config(args.task, "skrl_mappo_cfg_entry_point")
@@ -79,8 +82,10 @@ def main(env_cfg, agent_cfg: dict):
     cfg = load_deploy_cfg(args.export, args.config)
     names = cfg["joint_names"]
     urdf = args.urdf or str(CL_ASSETS_DIR / "ros_assets" / "h1_2_magpie.urdf")
+    # the IMU frame too, as marl_deploy_node: arm_ik.gravity_offset reads the pelvis-frame gravity through it
+    imu_frame = (cfg.get("imu") or {}).get("frame", "imu_link")
     kin = ArmKinematics(urdf, names, cfg["arms"]["ee_frames"], [names[ARM_START:ARM_START + 7], names[ARM_START + 7:]],
-                        extra_frames=[cfg["slam_frame"]])
+                        extra_frames=list(dict.fromkeys([cfg["slam_frame"], imu_frame])))
     legs_net = load_network(os.path.join(args.export, cfg["legs"]["policy"]), cfg["legs"]["num_obs"], cfg["legs"]["num_actions"])
     arms_net = load_network(os.path.join(args.export, cfg["arms"]["policy"]), cfg["arms"]["num_obs"], cfg["arms"]["num_actions"])
     # a calibrated export: the robot's quaternion carries an offset lmg_deploy's calibration takes back out
@@ -176,9 +181,21 @@ def main(env_cfg, agent_cfg: dict):
         ctrl.legs_last = legs_term.applied_actions[i].double().cpu().numpy().copy()
         ctrl.arms_last = arms_term.applied_actions[i].double().cpu().numpy().copy()
         ctrl.residual = arms_term._residual[i].double().cpu().numpy().copy()
+        if getattr(ctrl, "arm_ik", None):  # IKPostureArmAction's state: its trajectory, integral, latch and posture base
+            ctrl.ik_q = arms_term._ik_q[i].double().cpu().numpy().copy()
+            ctrl.traj_v = arms_term._traj_v[i].double().cpu().numpy().copy()
+            ctrl.integral = arms_term._integral[i].double().cpu().numpy().copy()
+            ctrl.frozen, ctrl.settled_steps = bool(arms_term._frozen[i]), int(arms_term._settled_steps[i])
+            seed = arms_term._rest[i].clone()
+            if arms_term.cfg.posture_from_command:
+                for a, cols in enumerate(arms_term._arm_cols):
+                    seed[cols] = arm.seed_q[i, a]
+            ctrl.seed_q = seed.double().cpu().numpy()
         if hasattr(ctrl, "blend_from"):  # lmg_deploy's engage blend, started where the env's started
             ctrl.blend_from = (legs_term._blend_from[i].double().cpu().numpy().copy()
                                if ctrl.engage_blend_steps else None)
+        if hasattr(ctrl, "legs_lowpass"):  # lmg_deploy's leg target low-pass, its state the env's
+            ctrl.legs_lowpass = legs_term._lowpass[i].double().cpu().numpy().copy()
 
     def compare(prefix, terms, deploy, trained):
         k = 0
@@ -195,6 +212,8 @@ def main(env_cfg, agent_cfg: dict):
     states = base.state()
     # the engage blend's length, steps: the export's (lmg_deploy without the blend: none) against the env's
     worst["engage_blend_steps"] = float(abs(getattr(ctrl, "engage_blend_steps", 0) - legs_term._blend_steps))
+    # the leg target low-pass's alpha: the export's (lmg_deploy without the filter: none, 1) against the env's
+    worst["legs_lowpass_alpha"] = float(abs(getattr(ctrl, "legs_lowpass_alpha", 1.0) - legs_term._lowpass_alpha))
     worst["rest_pose"] = float(np.abs(ctrl.rest_pose - arm.rest_pose_b.double().cpu().numpy()).max())
     for _ in range(args.steps):
         state = env_state()
@@ -218,13 +237,16 @@ def main(env_cfg, agent_cfg: dict):
             target[legs] = ctrl.legs_targets(a_legs, state)
         else:
             target[legs] = ctrl._torque_bound(ctrl._bound(a_legs * ctrl.legs_scale + ctrl.default[legs], legs), state, legs)
-        ik = state.q[ARM_START:].copy()
-        for a in range(ctrl.num_arms):
-            cols = kin.arm_cols[a] - ARM_START
-            ik[cols] += kin.ik_step(a, ctrl.believed[a, :3], ctrl.believed[a, 3:], ctrl.ik_damping, ctrl.max_ik_step)
-        residual = ctrl.residual + ctrl.filter_alpha * (a_arms - ctrl.residual)
         arms = slice(ARM_START, len(names))
-        target[arms] = ctrl._torque_bound(ctrl._bound(ik + residual * ctrl.arms_scale, arms), state, arms)
+        if getattr(ctrl, "arm_ik", None):  # the controller's own IKPostureArmAction mapping
+            target[arms] = ctrl._posture_arms(state, a_arms)
+        else:
+            ik = state.q[ARM_START:].copy()
+            for a in range(ctrl.num_arms):
+                cols = kin.arm_cols[a] - ARM_START
+                ik[cols] += kin.ik_step(a, ctrl.believed[a, :3], ctrl.believed[a, 3:], ctrl.ik_damping, ctrl.max_ik_step)
+            residual = ctrl.residual + ctrl.filter_alpha * (a_arms - ctrl.residual)
+            target[arms] = ctrl._torque_bound(ctrl._bound(ik + residual * ctrl.arms_scale, arms), state, arms)
 
         obs, _, terminated, truncated, _ = base.step(actions)
         states = base.state()
