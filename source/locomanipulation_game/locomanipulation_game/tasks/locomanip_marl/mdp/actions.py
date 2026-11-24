@@ -11,6 +11,11 @@ The legs' engage blend (engage_blend_s, lmg_deploy's): over the first engage_ble
 linearly from the target held before it (start_blend; the env passes the delay history's newest, the pre-pose's hold at
 its resets) to the policy's, then is bounded; the legs observe the blended target. policy_target and
 prev_policy_target are the policy's own targets before the blend (engage_target_smooth_exp).
+
+The legs' target low-pass (target_lowpass_hz, lmg_deploy's leg_action_lowpass_hz): after the blend, a one-pole low-pass
+per policy step, y += alpha (target - y) with alpha = 1 - exp(-2 pi f dt), then the bounds, so they hold every step. Its
+state y is the filtered target before the bounds; start_blend sets it to the held target, so the engage starts where
+the motors are. The legs observe the filtered, bounded target.
 """
 
 from __future__ import annotations
@@ -108,6 +113,11 @@ class BoundedJointPositionAction(_BoundedTargets):
         self._blend_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)  # policy steps since it
         self._policy_target = self._applied.clone()
         self._prev_policy_target = self._applied.clone()
+        hz = 0.0 if self._held else cfg.target_lowpass_hz
+        self._lowpass_alpha = 1.0 - math.exp(-2.0 * math.pi * hz * env.step_dt) if hz > 0.0 else 1.0
+        self._lowpass = self._applied.clone()  # rad, the filtered target before the bounds
+        if hz > 0.0:
+            print(f"[INFO] BoundedJointPositionAction: targets low-passed at {hz:g} Hz (alpha {self._lowpass_alpha:.4f})")
         self._describe("the default pose held (scale 0): " if self._held else
                        f"engage blend over {self._blend_steps} steps: " if self._blend_steps else "")
 
@@ -137,6 +147,7 @@ class BoundedJointPositionAction(_BoundedTargets):
         self._blend_step[env_ids] = 0
         self._policy_target[env_ids] = held
         self._prev_policy_target[env_ids] = held
+        self._lowpass[env_ids] = held
 
     def process_actions(self, actions: torch.Tensor):
         self._raw_actions[:] = actions
@@ -147,6 +158,9 @@ class BoundedJointPositionAction(_BoundedTargets):
             w = ((self._blend_step + 1).float() / self._blend_steps).clamp(max=1.0).unsqueeze(1)
             target = self._blend_from + w * (target - self._blend_from)
             self._blend_step += 1
+        if self._lowpass_alpha < 1.0:
+            self._lowpass = self._lowpass + self._lowpass_alpha * (target - self._lowpass)
+            target = self._lowpass
         bounded = self._apply_bounds(target)
         self._beyond = torch.zeros_like(target) if self._held else (target - bounded).abs() / abs(self._scale)
 
@@ -159,6 +173,7 @@ class BoundedJointPositionAction(_BoundedTargets):
         self._blend_step[ids] = 0
         self._policy_target[ids] = self._applied[ids]
         self._prev_policy_target[ids] = self._applied[ids]
+        self._lowpass[ids] = self._applied[ids]
 
 
 @configclass
@@ -174,6 +189,9 @@ class BoundedJointPositionActionCfg(JointPositionActionCfg):
     engage_blend_s: float = 0.0
     """s over which an episode's first targets blend from the held target to the policy's (the module docstring);
     0: none. lmg_deploy blends the same at the engage (export.yaml engage_blend_s)."""
+    target_lowpass_hz: float = 0.0
+    """Hz, the cutoff of the one-pole low-pass on the targets, per policy step, before the bounds (the module
+    docstring); 0: none. lmg_deploy filters the same (export.yaml leg_action_lowpass_hz)."""
 
 
 class IKResidualArmAction(_BoundedTargets):

@@ -113,9 +113,14 @@ class ModalVelocityCommand(UniformVelocityCommand):
 
     A resampled moving command is replaced, with probability pure_turn_prob, by a turn in place (|yaw rate| in
     pure_turn_speed, either sign) and with probability pure_lateral_prob by a sideways walk (|vy| in
-    pure_lateral_speed): uniform sampling almost never draws either. In training the command
-    changes at every navigation event (ArmTargetsCommand's nav_time_range); its own resampling_time_range only runs out
-    inside arm goals, where it is zero anyway.
+    pure_lateral_speed): uniform sampling almost never draws either; with probability nav2_walk_prob by a command in
+    Nav2's box (nav2_limits: each axis uniform within +-its limit, then at the limit with probability 1/2, as the
+    planner's saturated commands). In training the command changes at every navigation event (ArmTargetsCommand's
+    nav_time_range); its own resampling_time_range only runs out inside arm goals, where it is zero anyway.
+
+    **Stops.** A resample that follows a walk (the raw command's norm over vx, vy, wz above stop_after_walk_speed) is,
+    with probability stop_after_walk_prob, a stand (zero command) held for stop_time_range s: the stop after a walk,
+    which the standing terms then cover.
 
     **Filter.** `command`, what the observations, the tracking rewards, the gait clock and the metrics read, is the
     sampled command vel_command_b through a first-order low-pass with time constant command_filter_tau (sport mode's
@@ -177,6 +182,7 @@ class ModalVelocityCommand(UniformVelocityCommand):
         self._env_ids = torch.arange(self.num_envs, device=self.device)
         self._rings = {key: [torch.zeros(cfg.sport_metric_samples, 2, device=self.device), 0, 0]
                        for key in ("all", "lin", "ang")}
+        self.stops_after_walk = 0  # stands drawn after a walk (stop_after_walk_prob), since the start
 
     @property
     def command(self) -> torch.Tensor:
@@ -238,13 +244,14 @@ class ModalVelocityCommand(UniformVelocityCommand):
         return self._env.command_manager.get_term(self.cfg.arm_command_name).legs_arm_mode
 
     def _resample_command(self, env_ids: Sequence[int]):
-        self._end_segments(torch.as_tensor(env_ids, device=self.device))
+        all_ids = torch.as_tensor(env_ids, device=self.device)
+        self._end_segments(all_ids)
         self._since_cmd[env_ids] = 0.0
+        walked = self.vel_command_b[all_ids].norm(dim=1) > self.cfg.stop_after_walk_speed  # the command ending now
         super()._resample_command(env_ids)
-        ids = torch.as_tensor(env_ids, device=self.device)
-        ids = ids[~self.is_standing_env[ids]]
+        ids = all_ids[~self.is_standing_env[all_ids]]
         u = torch.rand(len(ids), device=self.device)
-        p_turn, p_lateral = self.cfg.pure_turn_prob, self.cfg.pure_lateral_prob
+        p_turn, p_lateral, p_nav2 = self.cfg.pure_turn_prob, self.cfg.pure_lateral_prob, self.cfg.nav2_walk_prob
         turn = ids[u < p_turn]
         lateral = ids[(u >= p_turn) & (u < p_turn + p_lateral)]
         for sub, axis, speed in ((turn, 2, self.cfg.pure_turn_speed), (lateral, 1, self.cfg.pure_lateral_speed)):
@@ -253,6 +260,18 @@ class ModalVelocityCommand(UniformVelocityCommand):
             sign = torch.where(torch.rand(len(sub), device=self.device) < 0.5, -1.0, 1.0)
             self.vel_command_b[sub] = 0.0
             self.vel_command_b[sub, axis] = sign * torch.empty(len(sub), device=self.device).uniform_(*speed)
+        nav2 = ids[(u >= p_turn + p_lateral) & (u < p_turn + p_lateral + p_nav2)]
+        if len(nav2) > 0:
+            limit = torch.tensor(self.cfg.nav2_limits, device=self.device)
+            cmd = (2.0 * torch.rand(len(nav2), 3, device=self.device) - 1.0) * limit
+            saturate = torch.rand(len(nav2), 3, device=self.device) < 0.5
+            self.vel_command_b[nav2] = torch.where(saturate, torch.sign(cmd) * limit, cmd)
+        stop = all_ids[walked & (torch.rand(len(all_ids), device=self.device) < self.cfg.stop_after_walk_prob)]
+        if len(stop) > 0:
+            self.is_standing_env[stop] = True
+            self.vel_command_b[stop] = 0.0
+            self.time_left[stop] = torch.empty(len(stop), device=self.device).uniform_(*self.cfg.stop_time_range)
+            self.stops_after_walk += len(stop)
 
     def _update_command(self):
         super()._update_command()
@@ -358,12 +377,14 @@ class ModalVelocityCommand(UniformVelocityCommand):
         _add_weighted_mean(extras, "nav_cos_vel_xy", self._walk_cos[ids], self._walk_steps[ids])
         _add_weighted_mean(extras, "stand_knee", self._stand_knee[ids], self._stand_steps[ids])
         _add_weighted_mean(extras, "walk_knee", self._move_knee[ids], self._move_steps[ids])
+        extras["stops_after_walk"] = float(self.stops_after_walk)  # since the start (stop_after_walk_prob)
         for buffer in (self._nav_steps, self._nav_err_xy, self._nav_err_yaw, self._walk_steps, self._walk_cos,
                        self._stand_steps, self._stand_knee, self._move_steps, self._move_knee, self._since_cmd,
                        self._count):
             buffer[ids] = 0.0
         self._vel_samples[ended] = 0.0
         self._cmd_samples[ended] = 0.0
+        self.vel_command_b[ended] = 0.0  # a new episode's first command follows no walk (no stop drawn)
         extras.update(super().reset(env_ids))
         self.vel_command_filtered[ended] = 0.0
         return extras
@@ -377,6 +398,16 @@ class ModalVelocityCommandCfg(UniformVelocityCommandCfg):
     pure_turn_speed: tuple[float, float] = (0.2, 0.97)       # rad/s
     pure_lateral_prob: float = 0.0
     pure_lateral_speed: tuple[float, float] = (0.15, 0.54)   # m/s
+    nav2_walk_prob: float = 0.0
+    """Share of the moving commands drawn in Nav2's box (nav2_limits), each axis at its limit half the time."""
+    nav2_limits: tuple[float, float, float] = (0.3, 0.2, 0.5)
+    """vx, vy (m/s), wz (rad/s): the limits GOLEM's Nav2 sends the H1-2 (its bags, 2026-11-24)."""
+    stop_after_walk_prob: float = 0.0
+    """Probability that a resample following a walk is a stand held for stop_time_range (the class doc)."""
+    stop_after_walk_speed: float = 0.2
+    """The norm over (vx, vy, wz) of the ending command above which it was a walk."""
+    stop_time_range: tuple[float, float] = (10.0, 20.0)
+    """s a stop after a walk is held."""
     min_cos_speed: float = 0.1
     """The commanded |v_xy| (m/s) from which a step counts for nav_cos_vel_xy and a segment is judged for the linear
     kernel, and the commanded |w_z| (rad/s) from which a segment is judged for the yaw kernel."""

@@ -105,6 +105,7 @@ def evaluation_cfgs(env_cfg, agent_cfg: dict, checkpoint: str, run_dir: str):
     env_cfg.training = False
     run_imu(env_cfg, run_dir)
     run_engage_blend(env_cfg, run_dir)
+    run_leg_lowpass(env_cfg, run_dir)
     env_cfg.state_checkpoint_path = state_checkpoint_for(checkpoint)
     agent_cfg["trainer"]["close_environment_at_exit"] = False
     agent_cfg["agent"]["experiment"]["write_interval"] = 0
@@ -162,6 +163,19 @@ def run_engage_blend(env_cfg, run_dir: str) -> None:
     if blend != legs.engage_blend_s:
         print(f"[INFO] legs' engage blend as the run trained: {blend:g} s")
     legs.engage_blend_s = blend
+
+
+def run_leg_lowpass(env_cfg, run_dir: str) -> None:
+    """Give env_cfg the legs' target low-pass the run trained with (<run>/params/env.yaml actions.joint_pos
+    target_lowpass_hz; a run from before 2026-11-24 has none and trained without one)."""
+    legs = getattr(getattr(env_cfg, "actions", None), "joint_pos", None)
+    saved = read_run_env(run_dir)
+    if legs is None or saved is None:
+        return
+    hz = float(((saved.get("actions") or {}).get("joint_pos") or {}).get("target_lowpass_hz") or 0.0)
+    if hz != legs.target_lowpass_hz:
+        print(f"[INFO] legs' target low-pass as the run trained: {hz:g} Hz")
+    legs.target_lowpass_hz = hz
 
 
 def env_override_keys(overrides: list[str]) -> list[str]:

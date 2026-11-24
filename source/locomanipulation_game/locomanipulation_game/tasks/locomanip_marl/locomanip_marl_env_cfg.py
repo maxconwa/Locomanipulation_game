@@ -149,6 +149,11 @@ PREPOSE_JOINT_RANGES = {
 ENGAGE_BLEND_S = 0.0
 ENGAGE_WINDOW_S = 1.0
 ENGAGE_SMOOTH_STD = 0.7
+# The legs' targets through a one-pole low-pass at this cutoff (Hz) before their bounds (mdp.BoundedJointPositionAction;
+# lmg_deploy's leg_action_lowpass_hz): 0.99 of the 1.4 Hz stride passes (8 deg lag), 0.40 at 20 Hz (35 deg). Since
+# 2026-11-24: Coop300k_s42 @ 150k dithered its leg targets on the robot (hip roll 0.10-0.12 rad per step, 36-38% of the
+# steps reversing, FastEnv60k 0.04 and 22%), which locked into a 20 Hz hip-roll loop the sim plants don't have
+LEGS_TARGET_LOWPASS_HZ = 8.0
 # the motors' gain and strength draws (mdp.randomize_actuator_scales)
 # The real ankles give about 0.2 rad under 13-17 Nm at kp 80 through their parallel linkage (2026-11-20's pre-pose):
 # softer than the MJCF's, so their gains are drawn wider and lower than the rest's
@@ -169,9 +174,14 @@ class MarlCommandsCfg:
                                                   ang_vel_z=(-0.97, 0.97)),
         arm_command_name=ARM_COMMAND,
         # uniform sampling almost never draws a turn in place or a pure sideways walk (of the moving commands, 20% turn
-        # in place, 20% walk sideways, 60% uniform over the full ranges)
+        # in place, 20% walk sideways, 20% in Nav2's box, 40% uniform over the full ranges)
         pure_turn_prob=0.2,
         pure_lateral_prob=0.2,
+        # 20% of the moving commands in Nav2's box, and 30% of the resamples after a walk a 10-20 s stop (since
+        # 2026-11-24: after its walks on the robot Coop300k_s42 @ 150k rocked heel to toe and stood 57-76% on the
+        # right knee)
+        nav2_walk_prob=0.2,
+        stop_after_walk_prob=0.3,
         lin_vel_stds=LIN_VEL_STDS,
         ang_vel_stds=ANG_VEL_STDS,
     )
@@ -207,6 +217,7 @@ class MarlActionsCfg:
         target_margin=-GOLEM_TARGET_CLIP,
         torque_headroom=TORQUE_HEADROOM,
         engage_blend_s=ENGAGE_BLEND_S,
+        target_lowpass_hz=LEGS_TARGET_LOWPASS_HZ,
     )
     arm_pos = mdp.IKResidualArmActionCfg(
         asset_name="robot",
@@ -345,6 +356,11 @@ class LegsRewardsCfg:
     # +3 to +4 (Isaac's MJCF). At -30 a 5 deg lean costs 0.23 per second, 8 deg 0.58
     lin_vel_z = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
     ang_vel_xy = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.2)
+    # standing (the stand/walk gate), the torso's pitch and roll rate once more, on top of ang_vel_xy: at -5 a 0.9 Hz
+    # rock of +-2 deg (rate rms ~0.14 rad/s) costs 0.1 per second, ang_vel_xy 0.004. Since 2026-11-24: after a walk
+    # Coop300k_s42 @ 150k rocked heel to toe at ~0.9 Hz on the robot and in MuJoCo (ankle-pitch targets +-0.9 rad)
+    ang_vel_xy_standing = RewTerm(func=mdp.ang_vel_xy_standing_l2, weight=-5.0,
+                                  params={"command_name": "base_velocity"})
     orientation = RewTerm(func=mdp.flat_orientation_l2, weight=-30.0)
     # --- gait
     # each swing foot at the 6 cm sine reference: at most 0.57 per second at weight 1 (two feet, 45% of the stride
@@ -402,6 +418,10 @@ class LegsRewardsCfg:
     # x4 since 2026-11-20 (was -0.025): the real loop amplified the targets' step-to-step changes ~2.5x over MuJoCo
     # (LegsEnergyDefault200k_s43's engage, 0.18 rad per step), so the trained ones must be that much tamer
     action_rate = RewTerm(func=mdp.action_term_rate_l2, weight=-0.1, params={"action_name": LEGS_ACTION})
+    # the raw actions' second difference, |a_t - 2 a_t-1 + a_t-2|^2 (0 for the first two steps of an episode): a
+    # reversal. Against action_rate's charge it costs 20 Hz content ~180x more than the 1.4 Hz stride's. Since
+    # 2026-11-24 (LEGS_TARGET_LOWPASS_HZ): Coop300k_s42 reversed its targets on 36-38% of the robot's steps
+    action_accel = RewTerm(func=mdp.action_term_accel_l2, weight=-0.1, params={"action_name": LEGS_ACTION})
     # the engage from the pre-pose (ENGAGE_SMOOTH_STD): at most 40 over its first second at weight 40, ~24 of it under
     # the noise; off by default (ENGAGE_BLEND_S)
     engage_smooth = RewTerm(func=mdp.engage_target_smooth_exp, weight=0.0, params={

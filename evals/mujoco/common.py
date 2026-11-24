@@ -129,6 +129,9 @@ def read_deploy_settings(run_dir: Path) -> dict:
     # the legs' engage blend (mdp.BoundedJointPositionAction; lmg_deploy's engage_blend_s), when the run had one
     if (actions.get("joint_pos") or {}).get("engage_blend_s"):
         pose["engage_blend_s"] = float(actions["joint_pos"]["engage_blend_s"])
+    # the legs' target low-pass (mdp.BoundedJointPositionAction target_lowpass_hz), when the run had one
+    if (actions.get("joint_pos") or {}).get("target_lowpass_hz"):
+        pose["leg_action_lowpass_hz"] = float(actions["joint_pos"]["target_lowpass_hz"])
     # the run's own, where the deploy template has one value for every run
     for key in ("residual_cutoff_hz", "ik_damping"):
         if (actions.get("arm_pos") or {}).get(key) is not None:

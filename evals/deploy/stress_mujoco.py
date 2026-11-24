@@ -378,6 +378,7 @@ def run_prepose_job(job, video: str | None = None):
                 # the engage blend (export.yaml engage_blend_s) starts from the last command sent, the pre-pose's
                 sim.blend_from = sim.applied[sim.leg_idx].copy()
                 sim.policy_target = sim.blend_from.copy()
+                sim.lowpass = sim.blend_from.copy()  # and the leg target low-pass (leg_action_lowpass_hz)
                 sim.applied[:] = q
                 sim.residual[:] = 0.0
                 sim.ik_q = q[sim.arm_idx].copy()

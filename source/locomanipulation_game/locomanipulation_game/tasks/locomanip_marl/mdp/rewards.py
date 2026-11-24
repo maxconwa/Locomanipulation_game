@@ -36,6 +36,51 @@ def action_term_rate_l2(env: ManagerBasedRLEnv, action_name: str) -> torch.Tenso
     return torch.sum(torch.square(a - prev), dim=1)
 
 
+def _action_term_slice(env: ManagerBasedRLEnv, action_name: str) -> slice:
+    """The slice of the action vector that action_name's term takes."""
+    manager = env.action_manager
+    start = 0
+    for name, dim in zip(manager.active_terms, manager.action_term_dim):
+        if name == action_name:
+            return slice(start, start + dim)
+        start += dim
+    raise KeyError(f"no action term {action_name!r}")
+
+
+class action_term_accel_l2(ManagerTermBase):
+    """The second difference of one action term's raw actions, |a_t - 2 a_t-1 + a_t-2|^2 summed: a reversal of the
+    action costs, a steady change does not. Zero for the first two steps of an episode (their history is the reset's).
+    The same slice as action_term_rate_l2."""
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self._slice = _action_term_slice(env, cfg.params["action_name"])
+        dim = self._slice.stop - self._slice.start
+        self._prev = torch.zeros(env.num_envs, dim, device=env.device)
+        self._prev2 = torch.zeros(env.num_envs, dim, device=env.device)
+        self._seen = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)  # steps since the reset, up to 2
+
+    def reset(self, env_ids=None):
+        self._seen[slice(None) if env_ids is None else env_ids] = 0
+
+    def __call__(self, env: ManagerBasedRLEnv, action_name: str) -> torch.Tensor:
+        a = env.action_manager.action[:, self._slice]
+        accel = torch.sum(torch.square(a - 2.0 * self._prev + self._prev2), dim=1)
+        accel = torch.where(self._seen >= 2, accel, torch.zeros_like(accel))
+        self._prev2[:] = self._prev
+        self._prev[:] = a
+        self._seen[:] = (self._seen + 1).clamp(max=2)
+        return accel
+
+
+def ang_vel_xy_standing_l2(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """The pelvis's roll and pitch rate squared (base frame, rad^2/s^2) while standing is commanded (the stand/walk
+    gate), 0 otherwise."""
+    w = env.scene["robot"].data.root_ang_vel_b[:, :2]
+    standing = standing_command(env, env.command_manager.get_command(command_name))
+    return torch.sum(torch.square(w), dim=1) * standing.float()
+
+
 def engage_target_smooth_exp(env, action_name: str, window_s: float, std: float) -> torch.Tensor:
     """In the first window_s of an episode from the pre-pose (mdp.prepose_reset), exp(-sum_j dq_j^2 / std^2) for the
     change dq of the policy's own targets (rad, before the engage blend) since the last step, the first step's from the
