@@ -166,7 +166,9 @@ def main() -> None:
         os._exit(1)
     sys.stdout.flush()
     sys.stderr.flush()
-    app.close()
+    # not app.close(): after a fit it did not return (the sim test's subprocess, results written, was killed at its
+    # 900 s limit). The prior and its report are on disk, so leave without closing the app.
+    os._exit(0)
 
 
 if __name__ == "__main__":

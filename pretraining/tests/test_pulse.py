@@ -413,9 +413,16 @@ PULSE_ENV_SCRIPT = textwrap.dedent("""
         assert shared.decoders.last_action[2].abs().sum() == 0
         assert shared.decoders.last_action[[0, 1, 3]].abs().sum() > 0
         print("PULSE ENV OK")
-    finally:
-        env.close()
-        app.close()
+    except BaseException:
+        # app.close() ends the process without flushing: print the failure first, and exit non-zero
+        import os, traceback
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
+    env.close()
+    sys.stdout.flush()
+    app.close()
 """)
 
 FIT_PRIOR_SCRIPT = "import runpy, sys; sys.argv = ['fit_prior', *sys.argv[1:]]; runpy.run_module(" \
