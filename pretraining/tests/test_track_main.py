@@ -176,7 +176,7 @@ def test_main_fine_tune_from_a_main_base_run_keeps_its_world_model(tmp_path):
     layout = json.loads((base / "run.json").read_text())["sim_context"]
     assert [(e["name"], e["dim"]) for e in layout] == [("foot_friction", 1), ("base_com", 3), ("encoder_bias", 27)]
 
-    # resume_warmup (2) iterations of collection only: what it saves is what it loaded
+    # resume_warmup (2) iterations of collection only: the networks it saves are the ones it loaded
     proc = _train(tmp_path, *common, "--fine-tune", "--run-name", "ft0", "--fine-tune-from", base,
                   "--max-iterations", 2)
     assert "foot_friction, base_com held at the source run's mean" in proc.stdout_text
@@ -188,6 +188,8 @@ def test_main_fine_tune_from_a_main_base_run_keeps_its_world_model(tmp_path):
         flat_ours, flat_theirs = _flatten(ours), _flatten(theirs)
         assert flat_ours.keys() == flat_theirs.keys(), name
         for k in flat_ours:
+            if "normalizer" in k:  # running statistics: collection updates them, warm-up included
+                continue
             torch.testing.assert_close(flat_ours[k], flat_theirs[k], msg=f"{name}: {k}")
 
     _train(tmp_path, *common, "--fine-tune", "--run-name", "ft1", "--fine-tune-from", base, "--max-iterations", 6)

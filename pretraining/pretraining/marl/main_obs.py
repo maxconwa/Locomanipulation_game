@@ -37,6 +37,7 @@ from __future__ import annotations
 import importlib.util
 import math
 import re
+import sys
 from pathlib import Path
 
 import torch
@@ -53,6 +54,7 @@ def _load(name: str):
     """One of main's torch-only modules by path: the package's __init__ imports Isaac Lab."""
     spec = importlib.util.spec_from_file_location(f"_main_{name}", _TASK_DIR / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclasses (joint_noise's configclass, with Isaac Lab up) look it up there
     spec.loader.exec_module(module)
     return module
 
