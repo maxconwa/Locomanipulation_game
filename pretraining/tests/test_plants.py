@@ -75,3 +75,44 @@ def test_main_plant_damping_eigenvalues_below_one():
                               "--kd-scale", scale], capture_output=True, text=True, timeout=600)
         summary = [line for line in run.stdout.splitlines() if line.startswith(("plant", "  ", "max"))]
         assert run.returncode == 0, (scale, summary or run.stderr[-2000:])
+        top = [float(line.split()[1]) for line in summary if line.startswith("max ")]
+        # the hip-yaw/torso mode, as measured 2026-11 (armature 0.01 added to M's diagonal)
+        assert top == [pytest.approx({"1.0": 0.376, "1.2": 0.452}[scale], abs=0.01)], (scale, summary)
+
+
+_ARMATURE_PROBE = """
+import os, sys
+from isaaclab.app import AppLauncher
+sys.argv = sys.argv[:1]
+AppLauncher(headless=True)
+import isaaclab.sim as sim_utils, torch
+from isaaclab.assets import Articulation
+from pretraining.plants import MAIN
+from pretraining.robot import robot_cfg
+sim = sim_utils.SimulationContext(sim_utils.SimulationCfg(dt=MAIN.sim_dt, device="cpu", gravity=(0.0, 0.0, 0.0)))
+robot = Articulation(robot_cfg(MAIN).replace(prim_path="/World/ArmatureProbe"))
+sim.reset()
+diags = []
+for armature in (0.01, 1.0):
+    robot.write_joint_armature_to_sim(armature)
+    robot.write_joint_state_to_sim(robot.data.default_joint_pos, torch.zeros_like(robot.data.default_joint_pos))
+    sim.forward()
+    arm = robot.root_physx_view.get_dof_armatures()[0]
+    mass = robot.root_physx_view.get_generalized_mass_matrices()[0]
+    n = robot.num_joints
+    diags.append((float(arm.min()), float(arm.max()), mass.diagonal()[-n:]))
+(a0, b0, d0), (a1, b1, d1) = diags
+print(f"ARMATURE {a0} {b0} {a1} {b1} MAXDIFF {float((d1 - d0).abs().max())}", flush=True)
+os._exit(0)
+"""
+
+
+@pytest.mark.sim
+def test_physx_mass_matrix_excludes_armature():
+    # pd_stability adds the armature to PhysX's mass matrix: it must not already be in it
+    run = subprocess.run([sys.executable, "-c", _ARMATURE_PROBE], capture_output=True, text=True, timeout=600)
+    line = [line for line in run.stdout.splitlines() if line.startswith("ARMATURE")]
+    assert run.returncode == 0 and line, run.stderr[-2000:]
+    a0, b0, a1, b1, diff = (float(x) for x in line[0].split()[1:] if x != "MAXDIFF")
+    assert (a0, b0) == pytest.approx((0.01, 0.01)) and (a1, b1) == pytest.approx((1.0, 1.0))  # it was applied
+    assert diff < 1e-3, line[0]  # a 0.99 armature change leaves M's joint diagonal as it was
