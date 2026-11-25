@@ -491,3 +491,26 @@ def test_train_commands_plan_and_resume(tmp_path, monkeypatch):
     with pytest.raises(UsageError, match="cannot be given with --resume"):
         plan(_args(resume=run_dir, num_envs=8))
     assert isinstance(_args(), argparse.Namespace)
+
+
+def test_imagined_targets_are_clamped_to_the_sources_limits(tmp_path):
+    """Imagination applies, rolls and rewards the target the env would: clamped to the decoders' limits."""
+    run = make_stage1_run(tmp_path / "stage1", fine_tuned=True)
+
+    class _Delayed(StandinSource):
+        has_delay, decimation = True, 5
+
+    source = _Delayed()
+    runner = CommandRunner(source, run, small_cfg(max_iterations=1), run_dir=tmp_path / "out")
+    dyn = runner.dynamics
+    action = torch.cat([torch.full((1, 27), 1e3), torch.full((1, 27), -1e3)]).requires_grad_(True)
+    limit = torch.stack([source.target_high, source.target_low])
+    ctx = torch.zeros(2, runner.sim_context.output_dim)
+    ctx[:, dyn.delay[1]] = 1.0  # a delay of 10 substeps: past both previous targets
+    prev = limit.unsqueeze(1).expand(2, 2, 27).clone()
+    torch.testing.assert_close(dyn.proc(action), limit)
+    torch.testing.assert_close(dyn.effective_target(action, ctx, prev), limit)
+    torch.testing.assert_close(dyn.roll_targets(action, prev)[:, 0], limit)
+    # the reward's target, as update_encoders builds it, keeps the graph
+    (dyn.proc(action) - runner.rep.encoder_bias(ctx)).sum().backward()
+    assert action.grad is not None
