@@ -90,6 +90,11 @@ if args_cli.checkpoint is None and args_cli.latent_run is None:
     parser.error("--checkpoint, --run or --latent_run is required")
 if args_cli.latent_run and (args_cli.ik_only or args_cli.steerability):
     parser.error("--latent_run: no IK to score alone (--ik_only), no steerability benchmark for latent policies")
+if args_cli.latent_run and args_cli.stochastic:
+    from evals.isaac.latent import resolve_latent_run  # noqa: E402  (torch only, no Isaac)
+
+    if resolve_latent_run(args_cli.latent_run).kind == "commands":
+        parser.error("--stochastic: a train_commands --latent_run runs its encoders' mean only; drop --stochastic")
 args_cli.headless = True
 simulation_app = AppLauncher(args_cli).app
 
