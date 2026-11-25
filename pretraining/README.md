@@ -184,6 +184,42 @@ timeout -s INT -k 600 43200 $PY scripts/skrl/train.py --headless --task LocoMani
 Not done for a latent policy: export, the evals and the deploy gate (they assume joint-space actions; the decoder has
 to be in their loop first).
 
+## Stage 2 through the world model
+
+Arm C of the comparison (`docs/superpowers/specs/2026-11-24-fair-comparison-design.md`, piece 4): h12_train's
+`train_commands` on main's task. A command encoder per agent (`marl/command_actor.py`: an LSTM of 64 with main's cell
+cap, then an MLP, as main's actor) reads main's actor observation and its command (the legs the velocity command, the
+arms both wrist goals) and outputs the 32-wide latent of the frozen stage-1 decoder. `marl/command_runner.py`
+collects data in `LocoManip-Marl-Pulse-v0` built on the stage-1 run without a prior (`marl/marl_source.py`; the env's
+`u = atanh(z)`), keeps training the stage-1 world model on it, and trains the encoders by back-propagating, through
+64-step imagined rollouts from buffered states, main's velocity and wrist tracking terms on the predicted state plus
+stage 1's e-stop penalties (`marl/main_rewards.py`), with main's actor observation synthesised from it
+(`marl/main_obs.py`) and main's command law (`marl/command_law.py`). A quarter of the imagined command segments
+follow a clip, and on them the latent is pulled toward the stage-1 encoder's (weight 0.1). The stage-1 run must be on
+main's plant; another is refused. What the training reward leaves out of main's is printed at the start.
+
+```bash
+PY=/home/max/miniconda3/envs/env_isaaclab/bin/python
+
+# smoke: 20 iterations (480 steps per env), to read peak_gpu_gb and the seconds per iteration off the log
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True timeout -s KILL 2400 $PY -m pretraining.scripts.train_commands \
+    --stage1 data/pretraining/runs/<main-plant stage-1 run> --run-name commands_smoke --max-steps 480
+
+# the run: 40,032 steps per env (1,668 iterations of 24) or a wall-time cap, whichever comes first
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True timeout -s KILL 14400 $PY -m pretraining.scripts.train_commands \
+    --stage1 data/pretraining/runs/<main-plant stage-1 run> --run-name <name> --max-seconds 12600
+
+# continue it (only the caps are taken from the command line)
+$PY -m pretraining.scripts.train_commands --resume data/pretraining/runs/<name> [--max-steps N] [--max-seconds S]
+```
+
+`configs/commands.yaml` holds the settings and the memory estimate behind them (4,096 envs; world model 10 x 1,024 x
+16; policy 128 x 64); `--num-envs`, `--rollout`, `--buffer-size`, `--replay-ratio`, `--wm-batch-size`,
+`--wm-horizon`, `--policy-batch-size`, `--policy-horizon` and `--max-clips` override it. The run directory holds
+`run.json` (stage-1 run, plant, task, settings, seed, env count), `progress.csv` (one row per iteration, with
+`peak_gpu_gb`, the world-model loss, each agent's imagined return and latent-BC term, the sim's velocity and wrist
+errors), `commands.pt` (both encoders and the stage-1 run they decode through), `world_model.pt` and `checkpoint.pt`.
+
 ## Known differences from `h12_train`
 
 Each is deliberate; what was measured or decided is stated.

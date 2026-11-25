@@ -7,6 +7,8 @@ stand-in clips. The ``sim`` case runs it against the real LocoManip-Marl-Pulse-v
 
 from __future__ import annotations
 
+import argparse
+import dataclasses
 import json
 from pathlib import Path
 
@@ -299,3 +301,57 @@ def test_command_runner_two_iterations(sim_app, tmp_path):
         assert torch.isfinite(runner.buffer._storage["state"]).all()
     finally:
         env.close()
+
+
+# -- train_commands ------------------------------------------------------------------------------------------------
+
+
+def _args(**kw):
+    from pretraining.scripts.train_commands import build_parser
+
+    argv = []
+    for k, v in kw.items():
+        argv += [f"--{k.replace('_', '-')}", str(v)]
+    return build_parser().parse_args(argv)
+
+
+def test_train_commands_plan_and_resume(tmp_path, monkeypatch):
+    from pretraining.scripts.train_commands import UsageError, plan
+
+    monkeypatch.setenv("PRETRAINING_RUNS_DIR", str(tmp_path / "runs"))
+    stage1 = make_stage1_run(tmp_path / "stage1")
+    p = plan(_args(stage1=stage1, run_name="c1", num_envs=64, seed=7, max_seconds=60))
+    assert p["mode"] == "new" and p["run_dir"] == (tmp_path / "runs" / "c1").resolve()
+    assert p["num_envs"] == 64 and p["cfg"].seed == 7 and p["plant"] == "main"
+    assert p["task"] == "LocoManip-Marl-Pulse-v0" and p["cfg"].max_steps == 40032
+    assert p["cfg"].wm.horizon == 16 and p["cfg"].policy.horizon == 64
+    assert p["cfg"].clip_command_prob == 0.25 and p["cfg"].prior_weight == 0.1
+    p = plan(_args(stage1=stage1, run_name="c2", wm_batch_size=256, policy_batch_size=32, policy_horizon=32,
+                   max_steps=4800))
+    assert (p["cfg"].wm.batch_size, p["cfg"].policy.batch_size, p["cfg"].policy.horizon) == (256, 32, 32)
+    assert p["cfg"].max_steps == 4800 and p["num_envs"] == 4096
+    # an existing directory is refused
+    (tmp_path / "runs" / "c1").mkdir(parents=True)
+    with pytest.raises(UsageError, match="exists"):
+        plan(_args(stage1=stage1, run_name="c1"))
+    with pytest.raises(UsageError, match="--stage1"):
+        plan(_args(run_name="c3"))
+    # resume reads run.json
+    run_dir = tmp_path / "runs" / "c1"
+    cfg = dataclasses.asdict(small_cfg(max_steps=500))
+    (run_dir / "run.json").write_text(json.dumps({"stage": "commands", "stage1": str(stage1), "plant": "main",
+                                                  "task": "LocoManip-Marl-Pulse-v0", "num_envs": 32, "seed": 3,
+                                                  "cfg": cfg}))
+    with pytest.raises(UsageError, match="checkpoint"):
+        plan(_args(resume=run_dir))
+    (run_dir / "checkpoint.pt").write_bytes(b"")
+    (run_dir / "checkpoint.json").write_text(json.dumps({"iteration": 4, "steps_per_env": 25, "wall_s": 9.0}))
+    p = plan(_args(resume=run_dir, max_seconds=30))
+    assert p["mode"] == "resume" and p["run_dir"] == run_dir.resolve() and p["num_envs"] == 32
+    assert p["stage1"] == stage1 and p["cfg"].rollout == 5 and p["cfg"].max_steps == 500
+    assert p["cfg"].wm.horizon == 3 and p["max_seconds"] == 30
+    p = plan(_args(resume=run_dir, max_steps=900))
+    assert p["cfg"].max_steps == 900
+    with pytest.raises(UsageError, match="cannot be given with --resume"):
+        plan(_args(resume=run_dir, num_envs=8))
+    assert isinstance(_args(), argparse.Namespace)

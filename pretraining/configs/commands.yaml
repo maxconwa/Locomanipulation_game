@@ -1,0 +1,51 @@
+# Stage 2 through the world model (arm C): command encoders into a main-plant stage-1 run's frozen decoders, trained
+# by gradients through its world model, data from LocoManip-Marl-Pulse-v0 (marl/command_runner.py CommandRunnerCfg).
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m pretraining.scripts.train_commands \
+#     --stage1 data/pretraining/runs/<main-plant stage-1 run> --run-name <name>
+#
+# GPU memory (16 GB), estimated, to be checked by a short smoke (the log line prints peak_gpu_gb per iteration):
+#   the Pulse env at 4096 envs                                  ~9.4 GB (main's task at 4096 envs)
+#   policy update, batch 128 x horizon 64                       ~2.7 GB (stage 1: 10.9 GB at 512 x 64, ~21 MB a row;
+#                                                                         the decoders and dynamics are the same)
+#   world-model update, 10 x 1024 x 16 (stage 1's main plant)   ~1 GB
+#   replay buffer, 4096 envs x 100 steps x ~490 floats          ~0.8 GB
+#   clips for clip segments (max_clips 2000 of 13,578, 100 Hz)  ~0.6 GB
+#   weights and optimiser state (dynamics 2048^3, decoders)     ~0.3 GB
+#   total                                                       ~15 GB: if the smoke runs out, --num-envs 2048 (the
+#                                                               env about halves) before shrinking the policy batch
+num_envs: 4096
+rollout: 24  # sim steps per env per iteration: 40,032 = 1,668 iterations
+replay_ratio: 8.0  # 24 x 4096 x 8 / (10 x 1024 x 16) -> 5 updates per iteration
+buffer_size: 100
+wm:
+  lr: 0.0002
+  num_batches: 10
+  batch_size: 1024
+  horizon: 16  # 0.16 s at 100 Hz, stage 1's on main's plant
+policy:
+  lr: 0.0002
+  num_batches: 1
+  batch_size: 128
+  horizon: 64  # 0.64 s, stage 1's on main's plant
+  gamma: 0.995
+  survival_masking: true
+  beta2: 0.95
+  grad_clip_value: 0.1
+  lam: 0.975
+lstm: 64  # main's actor's LSTM
+command_hidden_dims: [512, 256]
+critic_hidden_dims: [256, 128]
+clip_command_prob: 0.25
+prior_weight: 0.1
+mean_hold_s: 6.0
+max_clips: 2000
+termination_softness: 0.05
+fall_height: 0.5
+max_roll: 0.8
+max_pitch: 1.0
+max_steps: 40032
+max_iterations: 1000000
+log_interval: 1
+save_interval: 100
+checkpoint_interval_s: 1800.0
+keep_checkpoints: 5

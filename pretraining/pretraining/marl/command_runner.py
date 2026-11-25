@@ -116,6 +116,9 @@ class CommandRunnerCfg:
     clip_command_prob: float = 0.25
     prior_weight: float = 0.1
     mean_hold_s: float = 6.0
+    max_clips: int = 2000
+    """Clips (of the stage-1 run's, drawn with ``seed``) held for clip segments; 0: all. All of a 13,578-clip set at
+    100 Hz with its tables would take about 4 GB of the GPU, for a quarter of the segments' regulariser."""
     termination_softness: float = 0.05
     fall_height: float = 0.5
     """m: a predicted pelvis below this counts as a fall (main's pelvis-contact term, which the world model cannot
@@ -335,6 +338,9 @@ class CommandRunner:
         from pretraining.motions import MotionLoader
 
         files = [from_repo_path(f) for f in self.stage1_meta.get("motion_files", [])]
+        if 0 < self.cfg.max_clips < len(files):
+            pick = torch.randperm(len(files), generator=torch.Generator().manual_seed(self.cfg.seed))
+            files = [files[i] for i in sorted(pick[: self.cfg.max_clips].tolist())]
         missing = [f for f in files if not f.exists()]
         if not files or missing:
             raise FileNotFoundError(
