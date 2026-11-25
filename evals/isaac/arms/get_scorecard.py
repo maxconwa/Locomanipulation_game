@@ -42,6 +42,8 @@ parser.add_argument("--run", default=None)
 parser.add_argument("--steps", default="all")
 parser.add_argument("--legs_checkpoint", default=None, help="Run this legs policy meanwhile, the pelvis free (`same`).")
 parser.add_argument("--latent_run", default=None, help="A latent policy's run (or skrl checkpoint): both its agents.")
+parser.add_argument("--settings_run", default=None, help="With a train_commands --latent_run (required): the Pulse"
+                    " skrl run whose overrides, IMU model and curriculum state it runs with.")
 parser.add_argument("--task", default=None, help="Default: LocoManip-ArmsOnly-v0 (with --legs_checkpoint: Marl-Direct,"
                     " or the run's own task when it trained both agents).")
 parser.add_argument("--num_envs", type=int, default=D["num_envs"])
@@ -109,7 +111,7 @@ from evals.common import scorecard  # noqa: E402
 from evals.isaac import env as E  # noqa: E402
 from evals.isaac.latent import LatentPolicy  # noqa: E402
 
-latent = LatentPolicy.from_run(args_cli.latent_run) if args_cli.latent_run else None
+latent = LatentPolicy.from_run(args_cli.latent_run, args_cli.settings_run) if args_cli.latent_run else None
 coupled = latent is not None or args_cli.legs_checkpoint is not None
 legs_ckpt = None
 if latent is not None:
@@ -182,7 +184,7 @@ def main(env_cfg, agent_cfg: dict):
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = args_cli.device
     env_cfg.seed = args_cli.seed
-    evaluation_cfgs(env_cfg, agent_cfg, checkpoint, run_dir)
+    evaluation_cfgs(env_cfg, agent_cfg, *(latent.cfg_run if latent is not None else (checkpoint, run_dir)))
     if coupled and latent is None:
         env_cfg.state_checkpoint_path = E.merged_state(
             env_cfg.state_checkpoint_path, state_checkpoint_for(legs_ckpt), "legs", os.path.dirname(OUT))
@@ -243,7 +245,8 @@ def main(env_cfg, agent_cfg: dict):
         reach_tol=[float(arm.cfg.reach_pos_tol), float(arm.cfg.reach_rot_tol)],
         policy_std_mean=None if (args_cli.ik_only or std is None) else float(std.mean()),
         policy_std=None if std is None else std.cpu().tolist(), reference=ref_base + ".json" if ref else None,
-        **({"latent": latent.kind} if latent is not None else {}),  # absent for a joint-space run: its json as before
+        # absent for a joint-space run: its json as before
+        **({"latent": latent.kind, "settings_run": latent.settings_run} if latent is not None else {}),
         **C.stamp("isaac", "arms", num_envs=base.num_envs, goals=args_cli.goals, seed=args_cli.seed, motors="run",
                   actions="zero" if args_cli.ik_only else "sampled" if args_cli.stochastic else "mean",
                   legs="policy" if coupled else "pinned", offtable=args_cli.offtable, extra_overrides=hydra_args))

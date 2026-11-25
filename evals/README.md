@@ -31,14 +31,16 @@ python -m evals.mujoco.arms.get_scorecard --run <run>
 run of `LocoManip-Marl-Pulse-v0` (B) or a `pretraining.scripts.train_commands` run (C), both agents together, in place
 of `--checkpoint`; a joint-space run that trained both agents (`LocoManip-Marl-Torso-v0`, A) is scored in its own task
 with the other body `same`. The three then run the same program on the same conditions (C in the Pulse env with the
-prior off and its own stage 1):
+prior off and its own stage 1, and with the env overrides, IMU model and curriculum state of a Pulse skrl run,
+`--settings_run`, which a C run must be given: it records none of its own):
 
 ```bash
 python -m evals.isaac.legs.get_scorecard --checkpoint <A run>/checkpoints/agent_<N>.pt --arms_checkpoint same
 python -m evals.isaac.arms.get_scorecard --checkpoint <A run>/checkpoints/agent_<N>.pt --legs_checkpoint same
-python -m evals.isaac.legs.get_scorecard --latent_run <B run>[/checkpoints/agent_<N>.pt]   # or <C run>
-python -m evals.isaac.arms.get_scorecard --latent_run <B or C run>
-python -m evals.isaac.get_video --latent_run <B or C run>
+python -m evals.isaac.legs.get_scorecard --latent_run <B run>[/checkpoints/agent_<N>.pt]
+python -m evals.isaac.legs.get_scorecard --latent_run <C run> --settings_run <B run>
+python -m evals.isaac.arms.get_scorecard --latent_run <B run>   # C: --settings_run <B run>, as above
+python -m evals.isaac.get_video --latent_run <B or C run> [--settings_run <B run>]
 python -m evals.mujoco.legs.get_scorecard --latent_run <B run>              # C: --settings_run <a Pulse skrl run>
 python -m evals.mujoco.arms.get_scorecard --latent_run <C run> --settings_run <B run>
 python -m evals.mujoco.get_video --latent_run <B run>

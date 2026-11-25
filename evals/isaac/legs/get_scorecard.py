@@ -42,12 +42,15 @@ parser.add_argument("--run", default=None, help="Score this run's checkpoints (-
 parser.add_argument("--steps", default="all", help="With --run: all, last, or a comma list of env steps.")
 parser.add_argument("--arms_checkpoint", default=None, help="Run this arms policy meanwhile (`same`: this checkpoint's).")
 parser.add_argument("--latent_run", default=None, help="A latent policy's run (or skrl checkpoint): both its agents.")
-parser.add_argument("--task", default=None, help="Default: the run's task (LocoManip-Marl-Direct-v0 with --arms_checkpoint,"
-                    " unless the run trained both agents).")
+parser.add_argument("--settings_run", default=None, help="With a train_commands --latent_run (required): the Pulse"
+                    " skrl run whose overrides, IMU model and curriculum state it runs with.")
+parser.add_argument("--task", default=None, help="Default: the run's task (LocoManip-Marl-Direct-v0 with"
+                    " --arms_checkpoint, unless the run trained both agents).")
 parser.add_argument("--num_envs", type=int, default=C.DEFAULTS[("isaac", "legs")]["num_envs"])
 parser.add_argument("--segments_per_env", type=int, default=C.DEFAULTS[("isaac", "legs")]["segments_per_env"])
 parser.add_argument("--seed", type=int, default=C.DEFAULTS[("isaac", "legs")]["seed"])
-parser.add_argument("--wrist_goals", type=int, default=0, help="Standing arm goals after the program (arms policy only).")
+parser.add_argument("--wrist_goals", type=int, default=0,
+                    help="Standing arm goals after the program (arms policy only).")
 parser.add_argument("--run_motors", action="store_true", help="Keep the run's motor randomization (default: nominal).")
 parser.add_argument("--stochastic", action="store_true", help="Sample the actions (default: the mean, as deployed).")
 parser.add_argument("--save_raw", action="store_true", help="Also save the policy-rate series (npz).")
@@ -98,7 +101,7 @@ from evals.common import scorecard  # noqa: E402
 from evals.isaac import env as E  # noqa: E402
 from evals.isaac.latent import LatentPolicy  # noqa: E402
 
-latent = LatentPolicy.from_run(args_cli.latent_run) if args_cli.latent_run else None
+latent = LatentPolicy.from_run(args_cli.latent_run, args_cli.settings_run) if args_cli.latent_run else None
 coupled = latent is not None or args_cli.arms_checkpoint is not None
 arms_ckpt = None
 extra = ([] if args_cli.run_motors else list(C.NOMINAL_MOTORS)) + hydra_args
@@ -188,7 +191,7 @@ def main(env_cfg, agent_cfg: dict):
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = args_cli.device
     env_cfg.seed = args_cli.seed
-    evaluation_cfgs(env_cfg, agent_cfg, checkpoint, run_dir)
+    evaluation_cfgs(env_cfg, agent_cfg, *(latent.cfg_run if latent is not None else (checkpoint, run_dir)))
     if coupled and latent is None:
         env_cfg.state_checkpoint_path = E.merged_state(
             env_cfg.state_checkpoint_path, state_checkpoint_for(arms_ckpt), "arms", os.path.dirname(OUT))
@@ -283,10 +286,12 @@ def main(env_cfg, agent_cfg: dict):
     res.update(
         backend="isaac", body="legs", run=runs.name(run_dir),
         step=latent.run.step if latent is not None else runs.step_of(checkpoint), checkpoint=checkpoint,
-        task=args_cli.task, trainer=latent.trainer if latent is not None else runs.trainer(run_dir), overrides=replayed + extra, stochastic=args_cli.stochastic,
+        task=args_cli.task, trainer=latent.trainer if latent is not None else runs.trainer(run_dir),
+        overrides=replayed + extra, stochastic=args_cli.stochastic,
         full=list(full), wrist=wrist,
         other_policy=(f"arms policy {arms_ckpt}" if coupled else None),
-        **({"latent": latent.kind} if latent is not None else {}),  # absent for a joint-space run: its json as before
+        # absent for a joint-space run: its json as before
+        **({"latent": latent.kind, "settings_run": latent.settings_run} if latent is not None else {}),
         **C.stamp("isaac", "legs", num_envs=N, segments_per_env=args_cli.segments_per_env, seed=args_cli.seed,
                   wrist_goals=args_cli.wrist_goals, motors="run" if args_cli.run_motors else "nominal",
                   actions="sampled" if args_cli.stochastic else "mean",

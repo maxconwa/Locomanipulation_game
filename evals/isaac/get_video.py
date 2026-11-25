@@ -33,6 +33,8 @@ parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.R
 parser.add_argument("--legs")
 parser.add_argument("--arms", help="An arms checkpoint, or `same` (the legs checkpoint's own arms).")
 parser.add_argument("--latent_run", help="A latent policy's run (or skrl checkpoint): both its agents.")
+parser.add_argument("--settings_run", help="With a train_commands --latent_run (required): the Pulse skrl run whose"
+                    " overrides, IMU model and curriculum state it runs with.")
 parser.add_argument("--every", type=int, default=2)
 parser.add_argument("--out")
 from isaaclab.app import AppLauncher  # noqa: E402
@@ -61,7 +63,7 @@ from locomanipulation_game.tasks.locomanip_marl.run_files import (  # noqa: E402
 from evals.isaac import env as E  # noqa: E402
 from evals.isaac.latent import LatentPolicy  # noqa: E402
 
-latent = LatentPolicy.from_run(args_cli.latent_run) if args_cli.latent_run else None
+latent = LatentPolicy.from_run(args_cli.latent_run, args_cli.settings_run) if args_cli.latent_run else None
 LEGS = latent is not None or args_cli.legs is not None
 ARMS = latent is not None or args_cli.arms is not None
 extra = list(C.NOMINAL_MOTORS) + hydra_args
@@ -106,7 +108,7 @@ def main(env_cfg, agent_cfg: dict):
     env_cfg.scene.num_envs = 1
     env_cfg.sim.device = args_cli.device
     env_cfg.seed = 0
-    evaluation_cfgs(env_cfg, agent_cfg, checkpoint, run_dir)
+    evaluation_cfgs(env_cfg, agent_cfg, *(latent.cfg_run if latent is not None else (checkpoint, run_dir)))
     if LEGS and ARMS and latent is None:
         env_cfg.state_checkpoint_path = E.merged_state(env_cfg.state_checkpoint_path, state_checkpoint_for(arms_ckpt),
                                                        "arms", os.path.dirname(OUT))

@@ -200,6 +200,33 @@ def test_the_torso_action_drives_the_torso_joint():
     assert plain.applied[12] == 0.0
 
 
+def test_cached_decoders_are_redone_when_their_source_changes():
+    """prepare() reuses an export only for the same stage-1 run, prior and checkpoint, the actors and the prior
+    unchanged (plant.json's sha256s, as export_decoders writes them)."""
+    import hashlib
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        stage1, dec = tmp / "stage1", tmp / "dec"
+        stage1.mkdir()
+        dec.mkdir()
+        (stage1 / "actors.pt").write_bytes(b"a")
+        (stage1 / "prior.pt").write_bytes(b"p")
+        sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()  # noqa: E731
+        assert LM.stale(dec, stage1, "none", "ck") == "no export yet"
+        (dec / "plant.json").write_text(json.dumps({
+            "stage1": str(stage1.resolve()), "prior": str(stage1 / "prior.pt"), "checkpoint": "ck",
+            "actors_sha256": sha(stage1 / "actors.pt"), "prior_sha256": sha(stage1 / "prior.pt")}))
+        assert LM.stale(dec, stage1, str(stage1 / "prior.pt"), "ck") is None
+        assert "checkpoint" in LM.stale(dec, stage1, str(stage1 / "prior.pt"), "ck2")
+        assert "prior" in LM.stale(dec, stage1, "none", "ck")
+        assert "stage1" in LM.stale(dec, tmp / "other", str(stage1 / "prior.pt"), "ck")
+        (stage1 / "prior.pt").write_bytes(b"refit")
+        assert "prior_sha256" in LM.stale(dec, stage1, str(stage1 / "prior.pt"), "ck")
+        (stage1 / "prior.pt").write_bytes(b"p")
+        (stage1 / "actors.pt").write_bytes(b"retrained")
+        assert "actors_sha256" in LM.stale(dec, stage1, str(stage1 / "prior.pt"), "ck")
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in [(k, v) for k, v in dict(globals()).items() if k.startswith("test_") and callable(v)]:

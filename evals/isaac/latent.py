@@ -163,14 +163,34 @@ class LatentPolicy:
     """A latent policy's two agents (module docstring). from_run, then bind(env, agent_cfg) once the env is up;
     act(obs) -> {agent: action}; reset(done) zeroes the reset envs' recurrent state."""
 
-    def __init__(self, run: LatentRun):
-        self.run = run
+    def __init__(self, run: LatentRun, settings: LatentRun | None = None):
+        self.run, self.settings = run, settings
+        if run.kind == "commands" and settings is None:
+            raise SystemExit("[evals] a train_commands run records no env overrides, IMU model or curriculum state:"
+                             " give --settings_run <a LocoManip-Marl-Pulse-v0 skrl run> so C runs on B's conditions")
+        if settings is not None and settings.kind != "skrl":
+            raise SystemExit(f"[evals] --settings_run {settings.run_dir}: not an skrl run of {PULSE}")
         self.base = self.runner = self.actors = self.hc = None
         self.stochastic = False
 
     @classmethod
-    def from_run(cls, run_dir: str | Path) -> "LatentPolicy":
-        return cls(resolve_latent_run(run_dir))
+    def from_run(cls, run_dir: str | Path, settings_run: str | Path | None = None) -> "LatentPolicy":
+        """settings_run: for C (required there), the Pulse skrl run whose env overrides, IMU model, engage blend and
+        curriculum state C is scored with; ignored for B (its own run's)."""
+        run = resolve_latent_run(run_dir)
+        settings = resolve_latent_run(settings_run) if (settings_run and run.kind == "commands") else None
+        return cls(run, settings)
+
+    @property
+    def cfg_run(self) -> tuple[str, str]:
+        """(checkpoint, run dir) evaluation_cfgs reads the IMU model, engage blend and curriculum state from: B's own,
+        C's settings run's."""
+        src = self.run if self.kind == "skrl" else self.settings
+        return str(src.checkpoint), str(src.run_dir)
+
+    @property
+    def settings_run(self) -> str | None:
+        return None if self.settings is None else str(self.settings.run_dir)
 
     @property
     def kind(self) -> str:
@@ -186,9 +206,10 @@ class LatentPolicy:
         if self.kind == "skrl":
             from locomanipulation_game.tasks.locomanip_marl.run_files import replay_run
             return replay_run(str(self.run.checkpoint), PULSE, extra)
-        overrides = hydra_overrides(self.run)
-        sys.argv = [sys.argv[0]] + overrides + extra
-        return str(self.run.checkpoint), str(self.run.run_dir), PULSE, overrides
+        from locomanipulation_game.tasks.locomanip_marl.run_files import replay_run
+        # the settings run's overrides, then C's own decoders (its stage 1, no prior), then the caller's
+        _, _, _, replayed = replay_run(str(self.settings.checkpoint), PULSE, hydra_overrides(self.run) + extra)
+        return str(self.run.checkpoint), str(self.run.run_dir), PULSE, replayed + hydra_overrides(self.run)
 
     def bind(self, env, agent_cfg: dict, stochastic: bool = False) -> None:
         """Load the agents into the built env (SkrlVecEnvWrapper)."""

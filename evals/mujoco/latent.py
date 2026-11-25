@@ -196,6 +196,29 @@ def _run_env(run_dir: Path) -> dict:
     return _yaml_load_any((Path(run_dir) / "params" / "env.yaml").read_text())
 
 
+def _sha256(path) -> str | None:
+    import hashlib
+    path = Path(path) if path else None
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path is not None and path.is_file() else None
+
+
+def stale(decoders: Path, stage1: Path, prior: str, checkpoint: str) -> str | None:
+    """Why the decoders in `decoders` are not the ones asked for (None: they are): no plant.json, another stage-1
+    run, prior or checkpoint, or the stage-1 actors or the prior changed since (their sha256)."""
+    path = Path(decoders) / "plant.json"
+    if not path.is_file():
+        return "no export yet"
+    info = json.loads(path.read_text())
+    want_prior = None if prior == "none" else str(prior)
+    checks = {"stage1": (info.get("stage1"), str(Path(stage1).resolve())),
+              "prior": (info.get("prior"), want_prior),
+              "checkpoint": (info.get("checkpoint"), str(checkpoint)),
+              "actors_sha256": (info.get("actors_sha256"), _sha256(Path(stage1) / "actors.pt")),
+              "prior_sha256": (info.get("prior_sha256"), _sha256(want_prior))}
+    diff = [f"{k}: {have!r} -> {want!r}" for k, (have, want) in checks.items() if have != want]
+    return "; ".join(diff) or None
+
+
 def prepare(latent_run: str, settings_run: str | None = None) -> dict:
     """What a MuJoCo eval needs for `--latent_run`: {kind, run_dir, step, checkpoint, settings, encoders (folder),
     decoders (folder)}. The deploy settings (gains, IMU model, rates, target clip, command filter) are an export_marl
@@ -233,10 +256,14 @@ def prepare(latent_run: str, settings_run: str | None = None) -> dict:
         export = export_for(s.checkpoint, outputs.eval_dir(runs.name(s.run_dir), "mujoco", "exports"))
         stage1, prior = r.stage1, "none"
         decoders, commands = root / "decoders_commands", r.run_dir
-    if commands is not None or not (decoders / "plant.json").is_file():
+    why = "the command encoders are re-exported each time" if commands is not None else \
+        stale(decoders, stage1, prior, str(r.checkpoint))
+    if why:
+        print(f"[evals] exporting the decoders ({why})", flush=True)
         python = os.environ.get("LMG_ISAAC_PYTHON", ISAAC_PYTHON)
         cmd = [python, "-m", "pretraining.scripts.export_decoders", str(stage1), "--out", str(decoders),
-               "--prior", prior] + (["--commands", str(commands)] if commands is not None else [])
+               "--prior", prior, "--checkpoint", str(r.checkpoint)] + \
+            (["--commands", str(commands)] if commands is not None else [])
         print(f"[evals] exporting the decoders: {' '.join(cmd)}", flush=True)
         subprocess.run(cmd, check=True, cwd=str(REPO), env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
                        stdout=sys.stdout, stderr=sys.stderr)

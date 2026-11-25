@@ -71,6 +71,17 @@ def to_torchscript(module: nn.Module, example: tuple) -> torch.jit.ScriptModule:
             return torch.jit.trace(module, example, check_trace=False)
 
 
+def file_sha256(path) -> str | None:
+    """The file's sha256 (None: no file); plant.json records the actors' and the prior's, so a cached export is
+    redone when either changes (evals/mujoco/latent.py)."""
+    import hashlib
+
+    path = Path(path) if path else None
+    if path is None or not path.is_file():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def check_out(out: Path) -> Path:
     out = out.resolve()
     if not any(out.is_relative_to(REPO / d) for d in UNTRACKED):
@@ -78,7 +89,8 @@ def check_out(out: Path) -> Path:
     return out
 
 
-def export(stage1: Path, out: Path, prior: Path | str | None = "auto", commands: Path | None = None) -> dict:
+def export(stage1: Path, out: Path, prior: Path | str | None = "auto", commands: Path | None = None,
+           checkpoint: str | None = None) -> dict:
     """Write the files (module docstring) and return plant.json's content. prior: "auto" the run's prior.pt if it
     has one, None no prior, else that file."""
     from pretraining.constants import JOINT_NAMES
@@ -113,6 +125,8 @@ def export(stage1: Path, out: Path, prior: Path | str | None = "auto", commands:
         "target_limits": [list(plant.target_limits[j]) for j in JOINT_NAMES],
         "agent_joints": {"legs": [0, 12], "arms": [12, 27]},
         "stage1": str(stage1), "prior": str(prior) if prior is not None else None,
+        "actors_sha256": file_sha256(stage1 / "actors.pt"), "prior_sha256": file_sha256(prior),
+        "checkpoint": checkpoint,  # the policy the export was made for (recorded; the decoders do not depend on it)
     }
     if commands is not None:
         from pretraining.marl.command_runner import load_commands
@@ -138,9 +152,10 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--prior", default=None, help="A fit_prior.py file (default: the run's prior.pt); none: no prior.")
     p.add_argument("--commands", default=None, help="A train_commands run whose encoders to export too.")
+    p.add_argument("--checkpoint", default=None, help="Recorded in plant.json: the policy this export is for.")
     a = p.parse_args(argv)
     prior = "auto" if a.prior is None else None if a.prior == "none" else Path(a.prior)
-    export(Path(a.stage1), Path(a.out), prior, Path(a.commands) if a.commands else None)
+    export(Path(a.stage1), Path(a.out), prior, Path(a.commands) if a.commands else None, a.checkpoint)
     return 0
 
 

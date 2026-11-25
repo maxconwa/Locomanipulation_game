@@ -71,7 +71,16 @@ def test_latent_run_names_a_commands_run_on_its_stage1_without_prior(tmp_path):
     assert r.stage1 == (REPO / "data/pretraining/runs/main_s1_finetune").resolve()
     assert r.step == 40  # steps_per_env x the run's env count
     assert L.hydra_overrides(r) == [f"env.pulse_stage1_run={r.stage1}", "env.pulse_prior=null"]
-    assert L.LatentPolicy(r).trainer == "commands"
+    with pytest.raises(SystemExit, match="--settings_run"):  # C has no conditions of its own: B's run's
+        L.LatentPolicy(r)
+    b_run = _skrl_run(tmp_path / "b", PULSE)
+    p = L.LatentPolicy.from_run(run, b_run)
+    assert p.trainer == "commands" and p.settings_run == str(b_run.resolve())
+    assert p.cfg_run == (str(b_run.resolve() / "checkpoints" / "agent_2000.pt"), str(b_run.resolve()))
+    with pytest.raises(SystemExit, match="not an skrl run"):
+        L.LatentPolicy(r, r)
+    b = L.LatentPolicy.from_run(b_run, run)  # B: its own conditions, a settings run ignored
+    assert b.settings_run is None and b.cfg_run[1] == str(b_run.resolve())
 
 
 def test_latent_run_refuses_a_commands_run_without_stage1_or_of_another_task(tmp_path):
@@ -162,7 +171,8 @@ def test_a_commands_policy_acts_atanh_z_and_resets_only_the_done_envs():
     cmds = L.command_inputs(base)
     obs = {"legs": torch.randn(n, 5), "arms": torch.randn(n, 7)}
     torch.manual_seed(0)
-    policy = L.LatentPolicy(L.LatentRun("commands", Path("."), Path("c.pt"), PULSE, None))
+    policy = L.LatentPolicy(L.LatentRun("commands", Path("."), Path("c.pt"), PULSE, None),
+                            L.LatentRun("skrl", Path("."), Path("agent_1.pt"), PULSE, 1))
     policy.base = base
     policy.actors = {a: _FakeActor(obs[a].shape[1], cmds[a].shape[1]).eval() for a in L.AGENTS}
     policy.hc = {a: L.initial_hc(policy.actors[a], n, "cpu") for a in L.AGENTS}
@@ -239,10 +249,13 @@ def test_scorecard_runs_a_c_policy_from_a_standin_run(tmp_path):
     run.mkdir()
     assert "STANDIN OK" in _run(COMMANDS_STANDIN_SCRIPT, stage1, run)
     out = tmp_path / "scorecard"
-    _run(SCORECARD_SCRIPT, "--latent_run", run, "--num_envs", 2, "--segments_per_env", 1, "--out", out)
+    settings = _skrl_run(tmp_path / "b", PULSE, steps=(1,))  # B's conditions: no overrides, env.yaml or state here
+    _run(SCORECARD_SCRIPT, "--latent_run", run, "--settings_run", settings, "--num_envs", 2, "--segments_per_env", 1,
+         "--out", out)
     res = json.loads(Path(str(out) + ".json").read_text())
     assert SKRL_LEGS_KEYS <= set(res)
     assert res["latent"] == "commands" and res["task"] == PULSE and res["trainer"] == "commands"
+    assert res["settings_run"] == str(settings.resolve())
     assert res["conditions"]["arms"] == "policy" and res["step"] == 2
     assert res["conditions"]["num_envs"] == 2
 
@@ -279,6 +292,9 @@ def test_exported_decoders_and_prior_equal_the_eager_ones(tmp_path, monkeypatch)
     out = tmp_path / "logs" / "decoders"
     info = X.export(run, out)
     assert info["plant"] == "main" and info["prior"] == str(run / "prior.pt")
+    import hashlib
+    assert info["actors_sha256"] == hashlib.sha256((run / "actors.pt").read_bytes()).hexdigest()
+    assert info["prior_sha256"] == hashlib.sha256((run / "prior.pt").read_bytes()).hexdigest()
     assert info["default_joint_pos"] == [MAIN.default_joint_pos[j] for j in info["joint_names"]]
     torch.manual_seed(1)
     frame, z = torch.randn(100, PROPRIO_DIM), torch.tanh(torch.randn(100, 32))
