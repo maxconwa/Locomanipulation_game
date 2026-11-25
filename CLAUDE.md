@@ -63,10 +63,13 @@ from `ALMI_RL`.
   (base.yaml's 5,120 envs do not fit a 16 GB GPU; runs in `data/pretraining/runs/`); also
   `python -m pretraining.scripts.crosscheck`, `python -m pretraining.scripts.play`. Everything is in
   `pretraining/README.md`.
-- **`LocoManip-Marl-Pulse-v0`** (`marl_pulse_env_cfg.py`, `mdp/pulse_actions.py`): Marl-Direct with each agent
-  acting in the latent of its frozen stage-1 decoder (PULSE, 50 Hz, pretraining's gains and default pose); fit
-  its prior first with `python -m pretraining.scripts.fit_prior <stage-1 run>` (`pretraining/README.md`). Exports,
-  evals and the deploy gate do not handle latent policies.
+- **`LocoManip-Marl-Torso-v0`** (`marl_torso_env_cfg.py`): Marl-Direct with the arms agent also driving the torso.
+  **`LocoManip-Marl-Pulse-v0`** (`marl_pulse_env_cfg.py`, `mdp/pulse_actions.py`): the same task with each agent
+  acting in the latent of its frozen stage-1 decoder (PULSE), on main's plant (100 Hz), so the stage-1 run must be a
+  main-plant one; fit its prior first with `python -m pretraining.scripts.fit_prior <stage-1 run>`
+  (`pretraining/README.md`). `python -m pretraining.scripts.train_commands` trains the same latent policy through the
+  world model. The scorecards and `get_video` take latent policies (`--latent_run`, `evals/README.md`); exports and
+  the deploy gate do not.
 - When adding a new task name, keep `LocoManip-` in it: `scripts/list_envs.py:54`
   only lists ids containing that substring, so a task registered under a
   different name silently won't show up.

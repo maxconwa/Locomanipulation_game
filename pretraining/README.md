@@ -171,40 +171,36 @@ timeout -s KILL 1800 $PY -m pretraining.scripts.play --run data/runs/amass_s1 --
 ## PULSE on the cooperative task
 
 `LocoManip-Marl-Pulse-v0` (main's `locomanip_marl/marl_pulse_env_cfg.py`, `mdp/pulse_actions.py`; design in
-`docs/superpowers/specs/2026-11-24-pulse-cooperative-design.md`) is `LocoManip-Marl-Direct-v0` with each agent acting
-in the 32-wide latent of its frozen stage-1 actor: the env decodes `z = tanh(u + prior(proprio))` with the stage-1
-decoder (`marl/pulse.py`) into joint targets, default + `ACTION_SCALE` x output, at 50 Hz on main's explicit PD with
-this package's gains, armature, default pose and joint ranges, under main's full randomisation, with the gait, stance
-and torso posture rewards at weight 0. The latent prior (`marl/actors.py::LatentPrior`, ported from h12_train) is
-fitted first on the stage-1 actors tracking the clips (`scripts/fit_prior.py`: their run's clips from its `run.json`,
-frames drawn uniformly) and written beside them as `prior.pt` and `prior.json` (per agent the mean squared error, the
-latent variance and the share of it explained, over the last 500 steps). The env cfg's `pulse_stage1_run` (default
-`data/pretraining/runs/isaac_s1_golem_aware`, relative to the repository root) names the stage-1 run, `pulse_prior`
-(default `prior.pt`, relative to that run's directory; `null` or empty: no prior, `z = tanh(u)`) the prior; both are
-hydra overrides (`env.pulse_stage1_run=...`, `env.pulse_prior=null`; without a prior a zero latent is not a standing
-policy, so that is for debugging only). The wrists run stage 1's implicit PD (explicit PD with their kd 12 is unstable
-at 2 ms), every other joint main's explicit PD. The arm targets are clipped to main's ArmsOnly envelope (0.1 rad inside
-GOLEM's edges), tighter than stage 1's on the wrist pitch: +-0.3615 rad against +-0.4615. The skrl agent is main's
-yaml at its 50 Hz values, discount 0.99 and gae_lambda 0.95.
+`docs/superpowers/specs/2026-11-24-fair-comparison-design.md`, piece 3; the first version, at 50 Hz on this package's
+plant, in `2026-11-24-pulse-cooperative-design.md`) is `LocoManip-Marl-Torso-v0` (Marl-Direct with the arms agent
+driving the torso) with each agent acting in the 32-wide latent of its frozen stage-1 actor: the env decodes
+`z = tanh(u + prior(proprio))` with the stage-1 decoder (`marl/pulse.py`) into joint targets, main's default pose +
+the plant's action scale x output, clipped to the plant's target limits within GOLEM's position envelope. The plant is
+main's throughout (100 Hz, explicit PD at main's gains, armature, default pose and joint ranges, main's full
+randomisation), so the stage-1 run must have been trained on it (`run.json`'s `"plant": "main"`; another is refused).
+The gait, stance and torso posture rewards are at weight 0. The latent prior (`marl/actors.py::LatentPrior`, ported
+from h12_train) is fitted first on the stage-1 actors tracking the clips (`scripts/fit_prior.py`: their run's clips
+from its `run.json`, frames drawn uniformly) and written beside them as `prior.pt` and `prior.json` (per agent the
+mean squared error, the latent variance and the share of it explained, over the last 500 steps). The env cfg's
+`pulse_stage1_run` (default `data/pretraining/runs/main_s1_finetune`, relative to the repository root) names the
+stage-1 run, `pulse_prior` (default `prior.pt`, relative to that run's directory; `null` or empty: no prior,
+`z = tanh(u)`) the prior; both are hydra overrides (`env.pulse_stage1_run=...`, `env.pulse_prior=null`). The skrl
+agent is main's yaml as it is (`agents.skrl_mappo_pulse_cfg`).
 
 ```bash
 PY=/home/max/miniconda3/envs/env_isaaclab/bin/python
 
-# fit the prior (stage 1's 2,048 envs, h12_train's 6,000 steps) -> data/pretraining/runs/isaac_s1_golem_aware/prior.{pt,json}
-timeout -s KILL 5400 $PY -m pretraining.scripts.fit_prior data/pretraining/runs/isaac_s1_golem_aware \
+# fit the prior -> <stage-1 run>/prior.{pt,json}
+timeout -s KILL 5400 $PY -m pretraining.scripts.fit_prior data/pretraining/runs/main_s1_finetune \
     [--out <file>] [--num-envs 2048] [--iterations 6000] [--hidden-dims 512 256] [--hide-last-action]
 
-# smoke run: 300 updates (14,400 steps) at 4,096 envs -> logs/skrl/locomanip_marl/<time>_PulseSmoke
-timeout -s KILL 10800 $PY scripts/skrl/train.py --headless --task LocoManip-Marl-Pulse-v0 --num_envs 4096 \
-    --max_iterations 300 --name PulseSmoke
-
-# the long run: 200k steps (4,167 updates of 48) or 12 hours, whichever comes first (checkpoints every 9,600 steps)
-timeout -s INT -k 600 43200 $PY scripts/skrl/train.py --headless --task LocoManip-Marl-Pulse-v0 --num_envs 4096 \
-    --max_iterations 4167 --name Pulse200k
+# 40k steps at 4,096 envs -> logs/skrl/locomanip_marl/<time>_<name>; the pure-RL arm is the same command with
+# --task LocoManip-Marl-Torso-v0
+$PY scripts/skrl/train.py --headless --task LocoManip-Marl-Pulse-v0 --num_envs 4096 --max_iterations <N> --name <name>
 ```
 
-Not done for a latent policy: export, the evals and the deploy gate (they assume joint-space actions; the decoder has
-to be in their loop first).
+Scoring a latent policy (this env's skrl runs and `train_commands` runs): `evals/README.md`, "Latent policies". Not
+done for one: export and the deploy gate.
 
 ## Stage 2 through the world model
 
@@ -389,9 +385,7 @@ slower simulation, 7,088 env steps/s against 17,299 (collection takes 0.074 s pe
 
 ## What was not done
 
-- h12_train's stage 2 (`CommandRunner`: velocity and hand-goal commands on the world model). Its PULSE mechanics
-  (the frozen decoders, the latent prior) drive `LocoManip-Marl-Pulse-v0` instead (above), trained by main's MAPPO.
-- Any change to `main`'s existing `locomanip_marl` tasks, its trainer, or `evals/`.
+- Export and the deploy gate for a latent policy.
 - The full-length run. The long run had a wall-time budget of 8 hours, split into the base run (23,000 s) and the
   GOLEM-aware fine-tune (5,200 s); `amass_s1` took 26.4 hours in MuJoCo (94,945 s), at 2.5 times the updates per
   iteration.
