@@ -70,7 +70,7 @@ def read_target_limits(run_dir: Path) -> dict[str, tuple[float, float]] | None:
         return None
     actions = _yaml_load_any(path.read_text()).get("actions", {})
     limits = {}
-    for term in ("joint_pos", "arm_pos"):
+    for term in ("joint_pos", "arm_pos", "torso_pos"):  # torso_pos: LocoManip-Marl-Torso-v0's
         for name, bounds in ((actions.get(term) or {}).get("joint_limits") or {}).items():
             limits[name] = (float(bounds[0]), float(bounds[1]))
     return limits or None
@@ -135,6 +135,9 @@ def read_deploy_settings(run_dir: Path) -> dict:
             pose[key] = float(actions["arm_pos"][key])
     if env.get("clip_actions") is not None:
         pose["clip_actions"] = float(env["clip_actions"])
+    # LocoManip-Marl-Torso-v0's torso term (the arms' first action), written only when the run had one
+    if (actions.get("torso_pos") or {}).get("scale") is not None:
+        pose["torso_action_scale"] = float(actions["torso_pos"]["scale"])
     # mdp.IKPostureArmAction's IK (LocoManip-ArmsOnly-v0): its settings, and its action twice as wide
     arm_pos = actions.get("arm_pos") or {}
     if "rot_weight" in arm_pos:

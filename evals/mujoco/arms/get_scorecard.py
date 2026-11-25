@@ -3,13 +3,16 @@ scorecard (evals/common/arms_scorecard.py), against the IK alone on the same goa
 
     python -m evals.mujoco.arms.get_scorecard --checkpoint <run>/checkpoints/agent_<N>.pt [--legs_checkpoint <ckpt>|same]
     python -m evals.mujoco.arms.get_scorecard --run <run> [--steps all|last|<N>,...]   (the IK-only reference first)
+    python -m evals.mujoco.arms.get_scorecard --latent_run <run> [--settings_run <Pulse skrl run>]   (latent: both)
         [--num_envs 32] [--goals 8] [--plant isaac|robocasa] [--ik_only] [--workers 12] [--force]
 
 Without a legs policy the pelvis is pinned (a weld; the legs at their default pose); with one, the pelvis is free,
 the legs policy balances, the goals ride on the pelvis (LocoManip-Marl-Direct-v0), and the goals are scored twice:
 standing, then while the legs walk (a velocity command from the export's ranges x 0.6, new each goal). Goals: the
 export's own goal table (evals/mujoco/runner.py). --ik_only: no arms actor (residual 0, the IK alone): the reference,
-written as scorecard_ik_only. CPU only.
+written as scorecard_ik_only. CPU only. --latent_run: a policy in the stage-1 decoders' latent (evals/mujoco/latent.py),
+its arms and legs together, as --legs_checkpoint same (no IK, so no IK-only reference); a train_commands run takes its
+deploy settings from a LocoManip-Marl-Pulse-v0 skrl run's export (--settings_run).
 
 Writes logs/evals/<run>/mujoco/arms/scorecard_<N>[_robocasa][_with_<legs run>_<M>].{json,md}.
 """
@@ -38,8 +41,12 @@ def job(spec):
 
     from evals.mujoco import runner as R
     torch.set_num_threads(1)
-    e, settings, arms_export, legs_export, plant, goals, seed, walk_cmds = spec
-    sim = R.make_sim(settings, legs_export, arms_export, plant, pinned=legs_export is None)
+    e, settings, arms_export, legs_export, plant, goals, seed, walk_cmds, latent = spec
+    if latent is not None:
+        from evals.mujoco.latent import make_latent_sim
+        sim = make_latent_sim(latent, settings, plant)
+    else:
+        sim = R.make_sim(settings, legs_export, arms_export, plant, pinned=legs_export is None)
     rng = np.random.default_rng(seed + e)
     sim.reset(rng)
     R.reset_actors(sim)
@@ -84,25 +91,38 @@ def out_base(checkpoint, a) -> str:
     return str(outputs.base(runs.name(run_dir), "mujoco", "arms", "scorecard", runs.step_of(checkpoint), suffix))
 
 
-def score_one(a, checkpoint: str):
+def score_one(a, checkpoint: str | None):
     from evals.mujoco.policy import combined_settings, export_for
-    run_dir = runs.run_dir_of(checkpoint)
-    base = a.out or out_base(checkpoint, a)
+    latent = None
+    if a.latent_run:
+        from evals.mujoco.latent import prepare
+        latent = prepare(a.latent_run, a.settings_run)
+        run_dir, checkpoint = latent["run_dir"], latent["checkpoint"]
+        base = a.out or str(outputs.base(runs.name(run_dir), "mujoco", "arms", "scorecard", latent["step"],
+                                         "" if a.plant == "isaac" else f"_{a.plant}"))
+    else:
+        run_dir = runs.run_dir_of(checkpoint)
+        base = a.out or out_base(checkpoint, a)
     if outputs.cached(base) and not a.force:
         print(f"[evals] cached: {base}.json")
         return 0
-    arms_export = export_for(checkpoint, outputs.eval_dir(runs.name(run_dir), "mujoco", "exports"))
-    legs_export = None
-    if a.legs_checkpoint:
-        lc = checkpoint if a.legs_checkpoint == "same" else os.path.abspath(a.legs_checkpoint)
-        legs_export = export_for(lc, outputs.eval_dir(runs.name(runs.run_dir_of(lc)), "mujoco", "exports"))
-    settings = combined_settings(legs_export, arms_export)
+    if latent is not None:
+        arms_export = legs_export = latent["encoders"]
+        settings = latent["settings"]
+    else:
+        arms_export = export_for(checkpoint, outputs.eval_dir(runs.name(run_dir), "mujoco", "exports"))
+        legs_export = None
+        if a.legs_checkpoint:
+            lc = checkpoint if a.legs_checkpoint == "same" else os.path.abspath(a.legs_checkpoint)
+            legs_export = export_for(lc, outputs.eval_dir(runs.name(runs.run_dir_of(lc)), "mujoco", "exports"))
+        settings = combined_settings(legs_export, arms_export)
     r = settings.get("command_ranges") or {}
     rng = np.random.default_rng(a.seed)
     walk = np.stack([rng.uniform(*r.get(k, [-0.5, 0.5]), (a.num_envs, a.goals))
                      for k in ("lin_vel_x", "lin_vel_y", "ang_vel_z")], -1) * 0.6
+    lat = (latent["kind"], latent["encoders"], latent["decoders"]) if latent is not None else None
     specs = [(e, settings, None if a.ik_only else str(arms_export), str(legs_export) if legs_export else None, a.plant,
-              a.goals, a.seed, walk[e]) for e in range(a.num_envs)]
+              a.goals, a.seed, walk[e], lat) for e in range(a.num_envs)]
     print(f"[evals] mujoco arms scorecard: {a.num_envs} robots x {a.goals} goals, plant {a.plant},"
           f" {'IK alone' if a.ik_only else 'arms policy'}, legs {'policy ' + str(legs_export) if legs_export else 'pinned'}",
           flush=True)
@@ -116,9 +136,14 @@ def score_one(a, checkpoint: str):
     res = phase(0)
     if legs_export is not None:
         res["walk"] = phase(1)
-    ref_base = out_base(checkpoint, argparse.Namespace(**{**vars(a), "ik_only": True}))
-    ref = json.load(open(ref_base + ".json")) if (not a.ik_only and outputs.cached(ref_base)) else None
-    res.update(backend="mujoco", body="arms", run=runs.name(run_dir), step=runs.step_of(checkpoint),
+    if latent is not None:
+        ref_base, ref = None, None
+        res.update(latent=latent["kind"], decoders=latent["decoders"], settings_export=latent["settings_export"])
+    else:
+        ref_base = out_base(checkpoint, argparse.Namespace(**{**vars(a), "ik_only": True}))
+        ref = json.load(open(ref_base + ".json")) if (not a.ik_only and outputs.cached(ref_base)) else None
+    res.update(backend="mujoco", body="arms", run=runs.name(run_dir),
+               step=latent["step"] if latent is not None else runs.step_of(checkpoint),
                checkpoint=checkpoint, export=str(arms_export), plant=a.plant, ik_only=a.ik_only, stochastic=False,
                offtable=False, other_policy=(f"legs policy {legs_export}" if legs_export else None), overrides=[],
                reference=ref_base + ".json" if ref else None,
@@ -141,6 +166,8 @@ def main():
     p.add_argument("--seed", type=int, default=D["seed"])
     p.add_argument("--plant", default=D["plant"], choices=["isaac", "robocasa"])
     p.add_argument("--ik_only", action="store_true")
+    p.add_argument("--latent_run", help="A latent policy's run (or skrl checkpoint): both its agents.")
+    p.add_argument("--settings_run", help="With a train_commands --latent_run: the Pulse skrl run for the settings.")
     p.add_argument("--workers", type=int, default=min(12, os.cpu_count() or 1))
     p.add_argument("--force", action="store_true")
     p.add_argument("--out")
@@ -155,9 +182,13 @@ def main():
         for _, ckpt in ckpts:
             code |= score_one(a, str(ckpt))
         return code
+    if a.latent_run:
+        if a.ik_only:
+            p.error("--latent_run: no IK to score alone")
+        return score_one(a, None)
     if a.checkpoint:
         return score_one(a, os.path.abspath(a.checkpoint))
-    p.error("--checkpoint or --run")
+    p.error("--checkpoint, --run or --latent_run")
 
 
 if __name__ == "__main__":

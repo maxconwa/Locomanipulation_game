@@ -39,9 +39,18 @@ python -m evals.isaac.arms.get_scorecard --checkpoint <A run>/checkpoints/agent_
 python -m evals.isaac.legs.get_scorecard --latent_run <B run>[/checkpoints/agent_<N>.pt]   # or <C run>
 python -m evals.isaac.arms.get_scorecard --latent_run <B or C run>
 python -m evals.isaac.get_video --latent_run <B or C run>
+python -m evals.mujoco.legs.get_scorecard --latent_run <B run>              # C: --settings_run <a Pulse skrl run>
+python -m evals.mujoco.arms.get_scorecard --latent_run <C run> --settings_run <B run>
+python -m evals.mujoco.get_video --latent_run <B run>
 ```
 
-A latent arms scorecard has no IK-only reference (no IK). Its json carries `"latent": "skrl"|"commands"`.
+A latent arms scorecard has no IK-only reference (no IK). Its json carries `"latent": "skrl"|"commands"`. MuJoCo
+decodes with the stage-1 run's decoders in TorchScript (`python -m pretraining.scripts.export_decoders <stage-1 run>
+--out <dir> [--commands <C run>]`, which the MuJoCo evals run themselves in the isaac python, `$LMG_ISAAC_PYTHON`,
+into `logs/evals/<run>/mujoco/exports/`); B's encoders are its export_marl export, C's its command encoders, and C's
+deploy settings (gains, IMU model, rates, target clip) a Pulse skrl run's export (`--settings_run`: a train_commands
+run records no env.yaml). `python -m evals.mujoco.test_latent` tests the MuJoCo side; its frame check needs
+`pretraining/tests/fixtures/pulse_frame.json`, which a sim test records.
 
 Each writes `scorecard_<N>.json` (the eval's results, its rows, the eval conditions and code commit) and
 `scorecard_<N>.md` (one table per section: value, reference, target, met). A scored checkpoint is cached: `--force`

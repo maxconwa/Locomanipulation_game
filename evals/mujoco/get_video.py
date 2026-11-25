@@ -2,6 +2,7 @@
 
     python -m evals.mujoco.get_video --legs <ckpt or export dir> [--arms <ckpt or export dir>]
     python -m evals.mujoco.get_video --arms <ckpt or export dir>                  (the pelvis pinned)
+    python -m evals.mujoco.get_video --latent_run <run> [--settings_run <Pulse skrl run>]  (latent: legs and arms)
         [--plant isaac|robocasa] [--seed 0] [--every 2] [--out <mp4>]
 
 Legs active: hung on the hoist with the feet off the ground, lowered onto its feet, the rope released (training's
@@ -62,9 +63,12 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--every", type=int, default=2, help="Render every n-th policy step (50 fps at 100 Hz).")
     ap.add_argument("--out")
+    ap.add_argument("--latent_run", help="A latent policy's run (or skrl checkpoint): both its agents"
+                    " (evals/mujoco/latent.py).")
+    ap.add_argument("--settings_run", help="With a train_commands --latent_run: the Pulse skrl run for the settings.")
     a = ap.parse_args()
-    if not (a.legs or a.arms):
-        ap.error("--legs and/or --arms")
+    if not (a.legs or a.arms or a.latent_run):
+        ap.error("--legs and/or --arms, or --latent_run")
 
     import cv2
     import imageio
@@ -75,11 +79,22 @@ def main():
     from evals.mujoco.policy import combined_settings
     from evals.mujoco.sim import qmul, qrot
 
-    legs_export, legs_ckpt = resolve(a.legs) if a.legs else (None, None)
-    arms_export, arms_ckpt = resolve(a.arms) if a.arms else (None, None)
-    settings = combined_settings(legs_export, arms_export)
-    legs, arms = legs_export is not None, arms_export is not None
-    sim = R.make_sim(settings, legs_export, arms_export, a.plant, pinned=not legs, hold_zero=legs and not arms)
+    if a.latent_run:
+        from evals.mujoco.latent import make_latent_sim, prepare
+        latent = prepare(a.latent_run, a.settings_run)
+        settings, legs, arms = latent["settings"], True, True
+        sim = make_latent_sim((latent["kind"], latent["encoders"], latent["decoders"]), settings, a.plant)
+        legs_ckpt = arms_ckpt = None
+        if not a.out:
+            tag = ("video" if latent["step"] is None else f"video_{latent['step']}") + \
+                ("" if a.plant == "isaac" else f"_{a.plant}")
+            a.out = str(outputs.eval_dir(runs.name(latent["run_dir"]), "mujoco", "legs") / f"{tag}.mp4")
+    else:
+        legs_export, legs_ckpt = resolve(a.legs) if a.legs else (None, None)
+        arms_export, arms_ckpt = resolve(a.arms) if a.arms else (None, None)
+        settings = combined_settings(legs_export, arms_export)
+        legs, arms = legs_export is not None, arms_export is not None
+        sim = R.make_sim(settings, legs_export, arms_export, a.plant, pinned=not legs, hold_zero=legs and not arms)
     model, d = sim.m, sim.d
     model.vis.global_.offwidth, model.vis.global_.offheight = TILE_W, TILE_H
     rng = np.random.default_rng(a.seed)

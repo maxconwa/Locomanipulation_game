@@ -261,6 +261,11 @@ class MarlMujoco:
         tau = float(settings.get("command_filter_tau") or 0.0)
         self.cmd_alpha = 1.0 - math.exp(-self.policy_dt / tau) if tau > 0 else None
         self.gait_period, self.zero_cmd_eps = float(settings["gait_period"]), float(settings["zero_cmd_eps"])
+        # LocoManip-Marl-Torso-v0 (export.yaml torso_action_scale): the arms' first action drives the torso joint,
+        # target = default + scale x action (BoundedJointPositionAction, as the legs'), its applied action an arms
+        # observation
+        self.torso_scale = settings.get("torso_action_scale")
+        self.torso_action = 0.0
         self.gait_cos = bool(settings.get("gait_phase_cos", False))
         # each actor's observation terms by name (read_deploy_settings); None: the walking task's layout
         self.legs_terms, self.arms_terms = settings.get("legs_obs_terms"), settings.get("arms_obs_terms")
@@ -348,6 +353,7 @@ class MarlMujoco:
             m.eq_data[self._pin_eq, 6:10] = qconj(self._pin[3:7])
         mujoco.mj_forward(m, d)
         self.applied = d.qpos[self.qadr].copy()
+        self.torso_action = 0.0
         self.residual = np.zeros(self.n_arm_actions)
         self.blend_from = self.applied[self.leg_idx].copy()  # the target held before the first step: here the pose
         self.ik_q = d.qpos[self.qadr][self.arm_idx].copy()  # arm_ik.trajectory: the target's own last value
@@ -411,6 +417,22 @@ class MarlMujoco:
 
     # -- actions
     def process_actions(self, a_legs: np.ndarray, a_arms: np.ndarray):
+        if self.torso_scale is None:
+            return self._process_joint_actions(a_legs, a_arms)
+        a_arms = np.asarray(a_arms, float)
+        self._process_joint_actions(a_legs, a_arms[1:])
+        if not self.arms_hold_zero:
+            self._apply_torso(a_arms[0])
+
+    def _apply_torso(self, a: float):
+        """The torso's target from its action, bounded as the legs' (the URDF and target_limits, then the torque)."""
+        a = float(np.clip(a, -self.clip_actions, self.clip_actions))
+        t = np.clip(self.default[12] + self.torso_scale * a, self.lower[12], self.upper[12])
+        lo, hi = self._torque_bounds(np.array([12]))
+        self.applied[12] = float(np.clip(t, lo[0], hi[0]))
+        self.torso_action = (self.applied[12] - self.default[12]) / self.torso_scale
+
+    def _process_joint_actions(self, a_legs: np.ndarray, a_arms: np.ndarray):
         clip = self.clip_actions
         a_legs, a_arms = np.clip(a_legs, -clip, clip), np.clip(a_arms, -clip, clip)
         idx = self.leg_idx
@@ -673,18 +695,24 @@ class MarlMujoco:
                  "gait_phase": gait[0]}
         if len(gait) > 1:
             terms["gait_phase_cos"] = gait[1]
-        # a leg scale of 0 holds the default pose (LocoManip-ArmsOnly-v0's legs): its action reads 0, as in the env
-        held = self.leg_scale == 0.0
-        legs_action = (self.applied[self.leg_idx] - self.default[self.leg_idx]) / np.where(held, 1.0, self.leg_scale)
-        legs = {**terms, "actions": np.where(held, 0.0, legs_action)}
-        arms = {**terms, "actions": self.residual, "wrist_poses": u(wrist_pose, n["wrist"]),
-                "wrist_errors": u(errs, n["wrist"])}
+        legs_action, arms_action = self.applied_actions()
+        legs = {**terms, "actions": legs_action}
+        arms = {**terms, "actions": arms_action, "wrist_poses": u(wrist_pose, n["wrist"]),
+                "wrist_errors": u(errs, n["wrist"]), "torso_action": np.array([self.torso_action])}
         # the walking task's layout: the shared terms, then each agent's own
         default = list(terms)
         legs_terms = self.legs_terms or default + ["actions"]
         arms_terms = self.arms_terms or default + ["actions", "wrist_poses", "wrist_errors"]
         return {"legs": np.concatenate([legs[k] for k in legs_terms]),
                 "arms": np.concatenate([arms[k] for k in arms_terms])}
+
+    def applied_actions(self) -> tuple[np.ndarray, np.ndarray]:
+        """Each agent's applied action as its observation term reads it (the legs' from their targets, the arms' the
+        residual)."""
+        # a leg scale of 0 holds the default pose (LocoManip-ArmsOnly-v0's legs): its action reads 0, as in the env
+        held = self.leg_scale == 0.0
+        legs_action = (self.applied[self.leg_idx] - self.default[self.leg_idx]) / np.where(held, 1.0, self.leg_scale)
+        return np.where(held, 0.0, legs_action), self.residual
 
     def step(self, obs: dict):
         """One policy step from obs: act, simulate, then the next observations."""

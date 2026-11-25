@@ -245,3 +245,142 @@ def test_scorecard_runs_a_c_policy_from_a_standin_run(tmp_path):
     assert res["latent"] == "commands" and res["task"] == PULSE and res["trainer"] == "commands"
     assert res["conditions"]["arms"] == "policy" and res["step"] == 2
     assert res["conditions"]["num_envs"] == 2
+
+
+# ---- export_decoders (Task 13) ------------------------------------------------------------------------------------
+
+def test_exported_decoders_and_prior_equal_the_eager_ones(tmp_path, monkeypatch):
+    """export_decoders on a stand-in stage-1 run of main's plant: each TorchScript decoder equals the eager decoder
+    (PulseDecoders' step before the tanh and the target: normalised frame, [z, hist]) on 100 random inputs to 1e-5,
+    the prior likewise; plant.json is the plant's."""
+    from test_pulse import _actors
+
+    from pretraining.marl.actors import LatentPrior
+    from pretraining.marl.runner import PROPRIO_DIM
+    from pretraining.plants import MAIN
+    from pretraining.scripts import export_decoders as X
+
+    monkeypatch.setattr(X, "REPO", tmp_path)
+    run = tmp_path / "data" / "stage1"
+    run.mkdir(parents=True)
+    import dataclasses
+
+    from test_pulse import HIDDEN
+
+    from pretraining.marl.runner import TwoAgentRunnerCfg
+    from pretraining.marl.runs import config_from_dict
+    runner = dataclasses.asdict(config_from_dict(TwoAgentRunnerCfg, {"actor_hidden_dims": list(HIDDEN)}))
+    (run / "run.json").write_text(json.dumps({"stage": "imitation", "plant": "main", "runner": runner}, default=str))
+    actors = _actors()
+    torch.save({a: m.state_dict() for a, m in actors.items()}, run / "actors.pt")
+    priors = {a: LatentPrior(PROPRIO_DIM, 1, (16,), 32) for a in L.AGENTS}
+    torch.save({a: p.state_dict() for a, p in priors.items()}, run / "prior.pt")
+    (run / "prior.json").write_text(json.dumps({"plant": "main"}))
+    out = tmp_path / "logs" / "decoders"
+    info = X.export(run, out)
+    assert info["plant"] == "main" and info["prior"] == str(run / "prior.pt")
+    assert info["default_joint_pos"] == [MAIN.default_joint_pos[j] for j in info["joint_names"]]
+    torch.manual_seed(1)
+    frame, z = torch.randn(100, PROPRIO_DIM), torch.tanh(torch.randn(100, 32))
+    for agent, name in (("legs", "legs_decoder.pt"), ("arms", "upper_decoder.pt")):
+        actor = actors[agent].eval()
+        with torch.no_grad():
+            eager = actor.decoder(torch.cat([z, actor.obs_normalizer(frame.unsqueeze(1)).flatten(1)], -1))
+            scripted = torch.jit.load(str(out / name))(z, frame)
+        assert torch.allclose(scripted, eager, atol=1e-5)
+    with torch.no_grad():
+        prior = torch.jit.load(str(out / "prior.pt"))(frame)
+        for i, agent in enumerate(L.AGENTS):
+            hist = actors[agent].obs_normalizer(frame.unsqueeze(1)).flatten(1)
+            assert torch.allclose(prior[i], priors[agent].eval()(hist), atol=1e-5)
+    assert X.export(run, tmp_path / "logs" / "noprior", prior=None)["prior"] is None
+
+    # a train_commands run's encoders: scripted equal to eager, the state carried as (n, 2, lstm)
+    from pretraining.marl.command_actor import RecurrentCommandActor
+    from pretraining.marl.command_runner import COMMAND_DIMS
+    obs = {"legs": 20, "arms": 30}
+    enc = {a: RecurrentCommandActor(obs[a], COMMAND_DIMS[a], 32, 64, (16,)).eval() for a in L.AGENTS}
+    cruns = tmp_path / "data" / "commands"
+    cruns.mkdir()
+    torch.save({"encoders": {a: m.state_dict() for a, m in enc.items()}, "obs_dims": obs,
+                "command_dims": dict(COMMAND_DIMS), "latent_dim": 32, "lstm": 64, "command_hidden_dims": [16],
+                "stage1": "data/stage1", "steps_per_env": 3}, cruns / "commands.pt")
+    info = X.export(run, tmp_path / "logs" / "c", prior=None, commands=cruns)
+    assert info["commands"]["obs_dims"] == obs and info["commands"]["lstm"] == 64
+    x, c = torch.randn(100, 30), torch.randn(100, COMMAND_DIMS["arms"])
+    hc = torch.randn(100, 2, 64)
+    with torch.no_grad():
+        z_eager, hc_eager = enc["arms"](x, c, hc)
+        z_scripted, hc_scripted = torch.jit.load(str(tmp_path / "logs" / "c" / "arms_commands.pt"))(x, c, hc)
+    assert torch.allclose(z_scripted, z_eager, atol=1e-5) and torch.allclose(hc_scripted, hc_eager, atol=1e-5)
+
+
+def test_export_decoders_writes_only_under_data_or_logs(tmp_path):
+    from pretraining.scripts import export_decoders as X
+
+    with pytest.raises(SystemExit, match="AMASS-derived"):
+        X.check_out(tmp_path / "decoders")
+    assert X.check_out(X.REPO / "logs" / "evals" / "x" / "decoders") == (X.REPO / "logs/evals/x/decoders").resolve()
+
+
+# ---- sim: the Isaac proprio frame, recorded for the MuJoCo frame's test (evals/mujoco/test_latent.py) ---------------
+
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "pulse_frame.json"
+FRAME_FIXTURE_SCRIPT = textwrap.dedent("""
+    import json, sys
+    from isaaclab.app import AppLauncher
+
+    app = AppLauncher(headless=True).app
+    import gymnasium as gym
+    import torch
+    from isaaclab.utils.math import quat_apply_inverse
+    from isaaclab_tasks.utils import load_cfg_from_registry
+
+    import locomanipulation_game.tasks  # noqa: F401
+    from locomanipulation_game.tasks.locomanip_marl.mdp import pulse_actions
+    from pretraining.constants import JOINT_NAMES
+
+    cfg = load_cfg_from_registry("LocoManip-Marl-Pulse-v0", "env_cfg_entry_point")
+    cfg.scene.num_envs = 1
+    cfg.pulse_stage1_run, cfg.pulse_prior = sys.argv[1], ""
+    # no sensor noise, bias, lag or vibration and no encoder offsets: the frame is the state's own
+    imu = cfg.lowstate_imu
+    imu.quat_bias_deg = {k: (0.0, 0.0) for k in ("roll", "pitch", "yaw")}
+    imu.quat_noise_deg, imu.quat_lag_s, imu.gyro_bias, imu.gyro_noise = 0.0, (0.0, 0.0), (0.0, 0.0, 0.0), 0.0
+    imu.vibration_per_target_rate = 0.0
+    cfg.encoder_offset_rad = None
+    pulse_actions.JOINT_POS_NOISE = 0.0
+    pulse_actions.joint_vel_noise_std = lambda dq, floor: torch.zeros_like(dq)
+    env = gym.make("LocoManip-Marl-Pulse-v0", cfg=cfg)
+    base = env.unwrapped
+    base.reset()
+    zero = {a: torch.zeros(1, 32, device=base.device) for a in ("legs", "arms")}
+    with torch.inference_mode():
+        for _ in range(3):  # a few steps from the reset pose: the robot near its default pose, moving a little
+            base.step(zero)
+        shared = base._pulse_shared
+        frame = shared.decoders.proprio(shared.sensors())[0]
+        d, ids = shared.robot.data, shared.joint_ids
+        out = {"root_quat_wxyz": d.root_quat_w[0].tolist(), "root_ang_vel_w": d.root_ang_vel_w[0].tolist(),
+               "root_lin_vel_w": d.root_lin_vel_w[0].tolist(), "joint_names": list(JOINT_NAMES),
+               "joint_pos": d.joint_pos[0, ids].tolist(), "joint_vel": d.joint_vel[0, ids].tolist(),
+               "default_joint_pos": shared.default.tolist(), "frame": frame.tolist()}
+    json.dump(out, open(sys.argv[2], "w"), indent=1)
+    print("FRAME OK", flush=True)
+    import os
+    os._exit(0)
+""")
+
+
+@pytest.mark.sim
+def test_record_the_isaac_proprio_frame_fixture(tmp_path):
+    """The Pulse env's 87-wide decoder frame (pulse_actions._PulseShared.sensors and the last action) a few steps
+    after a reset, noise, biases and lag off, with the state it came from: pretraining/tests/fixtures/pulse_frame.json
+    (numbers only), which evals/mujoco/test_latent.py rebuilds in MuJoCo."""
+    from test_pulse import _run, _stage1_run
+
+    stage1 = _stage1_run(tmp_path)
+    FIXTURE.parent.mkdir(exist_ok=True)
+    assert "FRAME OK" in _run(FRAME_FIXTURE_SCRIPT, stage1, FIXTURE)
+    rec = json.loads(FIXTURE.read_text())
+    assert len(rec["frame"]) == 87 and len(rec["joint_pos"]) == 27

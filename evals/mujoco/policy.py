@@ -20,7 +20,7 @@ import torch
 from . import common as C
 
 ARMS_KEYS = ("arms", "arm_goals", "arm_ik", "arm_residual_scales", "arm_seed_table", "arms_obs_terms", "ik_damping",
-             "max_ik_step", "residual_cutoff_hz", "rest_pose")
+             "max_ik_step", "residual_cutoff_hz", "rest_pose", "torso_action_scale")
 SHARED_KEYS = ("control_dt", "imu", "gait_period", "gait_phase_cos", "default_joint_pos", "command_filter_tau",
                "zero_cmd_eps", "clip_actions")
 LEG_JOINTS, ARM_JOINTS = range(12), range(13, 27)

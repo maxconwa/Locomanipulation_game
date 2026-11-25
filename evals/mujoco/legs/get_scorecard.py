@@ -4,6 +4,7 @@ legs_scorecard.py) on the exported policy in MuJoCo (evals/mujoco/sim.py, the de
     python -m evals.mujoco.legs.get_scorecard --checkpoint <run>/checkpoints/agent_<N>.pt [--arms_checkpoint <ckpt>|same]
     python -m evals.mujoco.legs.get_scorecard --run <run> [--steps all|last|<N>,...]
     python -m evals.mujoco.legs.get_scorecard --export <export dir> --out <base>      (an export without its run)
+    python -m evals.mujoco.legs.get_scorecard --latent_run <run> [--settings_run <Pulse skrl run>]   (latent: both)
         [--num_envs 84] [--plant isaac|robocasa] [--workers 12] [--force]
 
 A checkpoint is exported once (scripts/skrl/export_marl.py) into logs/evals/<run>/mujoco/exports/. Without an arms
@@ -12,6 +13,10 @@ on the pelvis as in LocoManip-Marl-Direct-v0) and the scorecard adds the "Couple
 on the settings both bodies live by (evals/mujoco/policy.py). Plant: isaac (the training plant's joint dynamics, the
 default) or robocasa (GOLEM's sim's). No GOLEM e-stop model. CPU only: any python with mujoco, torch, numpy, scipy,
 pyyaml.
+
+--latent_run: a policy in the stage-1 decoders' latent (evals/mujoco/latent.py; the Isaac scorecards' --latent_run),
+its legs and arms together, as --arms_checkpoint same; a train_commands run takes its deploy settings from a
+LocoManip-Marl-Pulse-v0 skrl run's export (--settings_run).
 
 Writes logs/evals/<run>/mujoco/legs/scorecard_<N>[_robocasa][_with_<arms run>_<M>].{json,md}.
 """
@@ -42,13 +47,17 @@ def job(spec):
 
     from evals.mujoco import runner as R
     torch.set_num_threads(1)
-    e, cmds, settings, legs_export, arms_export, plant, seed = spec
-    sim = R.make_sim(settings, legs_export, arms_export, plant, hold_zero=arms_export is None)
+    e, cmds, settings, legs_export, arms_export, plant, seed, latent = spec
+    if latent is not None:
+        from evals.mujoco.latent import make_latent_sim
+        sim = make_latent_sim(latent, settings, plant)
+    else:
+        sim = R.make_sim(settings, legs_export, arms_export, plant, hold_zero=arms_export is None)
     rng = np.random.default_rng(seed + e)
     sim.reset(rng)
     R.reset_actors(sim)
     torso = mujoco.mj_name2id(sim.m, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
-    coupled = arms_export is not None
+    coupled = arms_export is not None or latent is not None
     if coupled:
         sim.pelvis_goals, tables, goal_rng = True, R.goal_table(settings), np.random.default_rng(seed + 10_000 + e)
         every = int(round(GOAL_EVERY_S / sim.policy_dt))
@@ -104,7 +113,14 @@ def out_base(checkpoint, a) -> str:
 
 def score_one(a, checkpoint: str | None):
     from evals.mujoco.policy import combined_settings, export_for
-    if checkpoint:
+    latent = None
+    if a.latent_run:
+        from evals.mujoco.latent import prepare
+        latent = prepare(a.latent_run, a.settings_run)
+        run_dir, checkpoint, legs_export = latent["run_dir"], latent["checkpoint"], Path(latent["encoders"])
+        base = a.out or str(outputs.base(runs.name(run_dir), "mujoco", "legs", "scorecard", latent["step"],
+                                         "" if a.plant == "isaac" else f"_{a.plant}"))
+    elif checkpoint:
         run_dir = runs.run_dir_of(checkpoint)
         legs_export = export_for(checkpoint, outputs.eval_dir(runs.name(run_dir), "mujoco", "exports"))
         base = a.out or out_base(checkpoint, a)
@@ -114,13 +130,15 @@ def score_one(a, checkpoint: str | None):
         print(f"[evals] cached: {base}.json")
         return 0
     arms_export, arms_ckpt = None, None
-    if a.arms_checkpoint:
+    if latent is not None:
+        pass
+    elif a.arms_checkpoint:
         arms_ckpt = checkpoint if a.arms_checkpoint == "same" else os.path.abspath(a.arms_checkpoint)
         arms_run = runs.run_dir_of(arms_ckpt)
         arms_export = export_for(arms_ckpt, outputs.eval_dir(runs.name(arms_run), "mujoco", "exports"))
     elif a.arms_export:
         arms_export = Path(a.arms_export)
-    settings = combined_settings(legs_export, arms_export)
+    settings = latent["settings"] if latent is not None else combined_settings(legs_export, arms_export)
     dt = float(settings["control_dt"])
     r = settings.get("command_ranges") or {}
     full = tuple(float(max(abs(v[0]), abs(v[1]))) for v in (r.get("lin_vel_x", [-0.55, 0.55]),
@@ -128,10 +146,13 @@ def score_one(a, checkpoint: str | None):
                                                             r.get("ang_vel_z", [-0.97, 0.97])))
     rng = np.random.default_rng(a.seed)
     cmds, kinds = L.program(a.num_envs, a.segments_per_env, dt, rng, full)
-    specs = [(e, cmds[e], settings, str(legs_export), str(arms_export) if arms_export else None, a.plant, a.seed)
+    lat = (latent["kind"], latent["encoders"], latent["decoders"]) if latent is not None else None
+    specs = [(e, cmds[e], settings, str(legs_export), str(arms_export) if arms_export else None, a.plant, a.seed, lat)
              for e in range(a.num_envs)]
+    coupled = arms_export is not None or latent is not None
     print(f"[evals] mujoco legs scorecard: {a.num_envs} robots x {cmds.shape[1] * dt:.0f} s, plant {a.plant},"
-          f" {a.workers} workers; arms {'policy ' + str(arms_export) if arms_export else 'held at 0 rad'}", flush=True)
+          f" {a.workers} workers; arms {'policy ' + str(arms_export or legs_export) if coupled else 'held at 0 rad'}",
+          flush=True)
     with Pool(a.workers) as pool:
         results = sorted(pool.map(job, specs), key=lambda x: x[0])
     N, T = cmds.shape[:2]
@@ -139,10 +160,14 @@ def score_one(a, checkpoint: str | None):
     fell_at = np.array([res[2] for res in results])
     out = L.compute(cmds, kinds, {k: rec[k] for k in ("vel", "q", "rp", "foot_z", "contact")}, fell_at, dt,
                     results[0][4], None)
-    if arms_export is not None:
+    if coupled:
         out["coupled_rows"] = coupled_rows(rec["arm_pos"], rec["arm_rot"], rec["arm_mode"], fell_at)
+    if latent is not None:
+        out.update(latent=latent["kind"], decoders=latent["decoders"], settings_export=latent["settings_export"])
+        arms_export = legs_export
     out.update(backend="mujoco", body="legs", run=runs.name(run_dir) if run_dir else str(legs_export),
-               step=runs.step_of(checkpoint) if checkpoint else None, checkpoint=checkpoint, export=str(legs_export),
+               step=(latent["step"] if latent is not None else runs.step_of(checkpoint) if checkpoint else None),
+               checkpoint=checkpoint, export=str(legs_export),
                plant=a.plant, full=list(full), overrides=[], other_policy=(f"arms policy {arms_export}" if arms_export else None),
                **C.stamp("mujoco", "legs", num_envs=N, segments_per_env=a.segments_per_env, seed=a.seed, plant=a.plant,
                          actions="mean", arms="policy" if arms_export else "zero"))
@@ -160,6 +185,8 @@ def main():
     p.add_argument("--export", help="Score an export folder (with --out).")
     p.add_argument("--arms_checkpoint", help="Run this arms policy meanwhile (`same`: this checkpoint's).")
     p.add_argument("--arms_export", help="... or this export's arms.")
+    p.add_argument("--latent_run", help="A latent policy's run (or skrl checkpoint): both its agents.")
+    p.add_argument("--settings_run", help="With a train_commands --latent_run: the Pulse skrl run for the settings.")
     p.add_argument("--num_envs", type=int, default=D["num_envs"])
     p.add_argument("--segments_per_env", type=int, default=D["segments_per_env"])
     p.add_argument("--seed", type=int, default=D["seed"])
@@ -174,11 +201,11 @@ def main():
         for _, ckpt in dispatch.select(runs.resolve(a.run), a.steps):
             code |= score_one(a, str(ckpt))
         return code
-    if a.checkpoint:
-        return score_one(a, os.path.abspath(a.checkpoint))
+    if a.checkpoint or a.latent_run:
+        return score_one(a, os.path.abspath(a.checkpoint) if a.checkpoint else None)
     if a.export and a.out:
         return score_one(a, None)
-    p.error("--checkpoint, --run, or --export with --out")
+    p.error("--checkpoint, --run, --latent_run, or --export with --out")
 
 
 if __name__ == "__main__":
