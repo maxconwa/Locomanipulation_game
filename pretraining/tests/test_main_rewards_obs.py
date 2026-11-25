@@ -141,6 +141,11 @@ def _commands(n=4, seed=1):
     return {"velocity": 0.3 * torch.randn(n, 3, generator=gen), "arm": arm}
 
 
+def _inst(state):
+    """A one-sample cycle mean: the state's own (vx, vy, wz)."""
+    return cycle_push(cycle_init(state.joint_pos.shape[0], 35), state)[1]
+
+
 # -- rewards -------------------------------------------------------------------------------------------------------
 
 
@@ -164,6 +169,8 @@ def test_reward_cfg_reads_main_terms():
     standin.rewards.arms.left_ee_quat.weight = 1.0
     t = {(t.agent, t.name): t for t in MainRewardCfg.from_env_cfg(standin, arm_stage=1).terms}["arms", "left_ee_quat"]
     assert t.std == 0.4 and t.kind == "ee_quat"
+    with pytest.raises(ValueError, match="cycle_mean"):
+        main_rewards(None, SimpleNamespace(joint_pos=torch.zeros(1, 27)), _commands(1), cfg, cycle_mean=None)
     standin.commands.arm_targets.pelvis_fixed_goals = False
     with pytest.raises(ValueError, match="pelvis-fixed"):
         MainRewardCfg.from_env_cfg(standin)
@@ -181,7 +188,7 @@ def test_wrist_terms_are_on_main_wrist_frame_without_grasp_offset(fk):
     from pretraining.math import quat_apply_inverse
     assert torch.allclose(pos, quat_apply_inverse(state.root_quat[:, None].expand(-1, 2, 4), rel), atol=1e-6)
     on_wrist = {"velocity": torch.zeros(4, 3), "arm": torch.cat([pos, quat], -1)}
-    out = main_rewards(state, state, on_wrist, cfg)
+    out = main_rewards(state, state, on_wrist, cfg, cycle_mean=_inst(state))
     for side in ("left", "right"):
         assert torch.allclose(out[f"arms/{side}_ee_pos_k2"], torch.ones(4), atol=1e-4)
         assert torch.allclose(out[f"arms/{side}_ee_quat_k50"], torch.ones(4), atol=1e-4)
@@ -189,7 +196,8 @@ def test_wrist_terms_are_on_main_wrist_frame_without_grasp_offset(fk):
     # a goal at stage 1's tool frame sits |GRASP_OFFSET| = 0.232 m off main's wrist frame: the capped term saturates
     offset = torch.tensor(GRASP_OFFSET)
     tool = pos + quat_apply(quat, offset.expand(4, 2, 3))
-    out = main_rewards(state, state, {"velocity": torch.zeros(4, 3), "arm": torch.cat([tool, quat], -1)}, cfg)
+    out = main_rewards(state, state, {"velocity": torch.zeros(4, 3), "arm": torch.cat([tool, quat], -1)}, cfg,
+                       cycle_mean=_inst(state))
     assert torch.allclose(out["arms/left_ee_pos_linear"], torch.full((4,), 0.02))
     assert torch.allclose(out["arms/left_ee_pos"], torch.full((4,), math.exp(-offset.norm().item() ** 2 / 0.25**2)),
                           atol=1e-4)
@@ -199,7 +207,7 @@ def test_velocity_terms_on_the_gait_cycle_mean(fk):
     cfg = MainRewardCfg.from_env_cfg(pulse_cfg_standin())
     state, _ = _state(fk)
     cmd = {"velocity": torch.cat([state.lin_vel_b[:, :2], state.ang_vel_b[:, 2:]], -1), "arm": _commands()["arm"]}
-    out = main_rewards(state, state, cmd, cfg)
+    out = main_rewards(state, state, cmd, cfg, cycle_mean=_inst(state))
     assert torch.allclose(out["legs/track_lin_vel_xy"], torch.ones(4))
     assert torch.allclose(out["arms/legs_track_ang_vel_z"], torch.ones(4))
     # the window: a cycle of 35 steps at 50 Hz; the mean over the samples so far
@@ -224,7 +232,7 @@ def test_estop_penalty_on_a_joint_past_its_limit(fk):
     q = leaves[4].clone()
     q[:, 3] = ESTOP_LIMITS[JOINT_NAMES[3]].q_high + 0.01  # a knee past its e-stop range: the legs' penalty
     past = WMState.from_root(fk, leaves[0], leaves[1], leaves[2], leaves[3], q, torch.zeros(4, 27))
-    out = main_rewards(state, past, _commands(), cfg)
+    out = main_rewards(state, past, _commands(), cfg, cycle_mean=_inst(past))
     assert (out["legs/estop"] < 0).all() and torch.allclose(out["arms/estop"], torch.zeros(4))
 
 
@@ -233,7 +241,7 @@ def test_main_rewards_are_differentiable(fk):
     state, _ = _state(fk, seed=3)
     nxt, leaves = _state(fk, seed=4, requires_grad=True)
     target = (nxt.joint_pos + 0.05).detach()
-    out = main_rewards(state, nxt, _commands(), cfg, target=target)
+    out = main_rewards(state, nxt, _commands(), cfg, cycle_mean=_inst(nxt), target=target)
     (out["legs"] + out["arms"]).sum().backward()
     grads = [x.grad for x in leaves]
     assert all(g is not None and torch.isfinite(g).all() for g in grads)
@@ -335,7 +343,8 @@ def _env_state(env) -> WMState:
     ids = robot.find_joints(list(JOINT_NAMES), preserve_order=True)[0]
     bodies = robot.find_bodies(list(TRACKED_BODIES), preserve_order=True)[0]
     fields = (d.root_pos_w, d.root_quat_w, d.root_lin_vel_b, d.root_ang_vel_b, d.joint_pos[:, ids],
-              d.joint_vel[:, ids], d.body_pos_w[:, bodies], d.body_quat_w[:, bodies], d.body_lin_vel_w[:, bodies], d.body_ang_vel_w[:, bodies])
+              d.joint_vel[:, ids], d.body_pos_w[:, bodies], d.body_quat_w[:, bodies], d.body_lin_vel_w[:, bodies],
+              d.body_ang_vel_w[:, bodies])
     return WMState(*(x.clone() for x in fields))  # the sim's buffers change in place
 
 
@@ -401,3 +410,15 @@ def test_main_rewards_match_env_terms(sim_app):
                 f"{t.agent}/{t.name}: {(value - out[f'{t.agent}/{t.name}']).abs().max().item()}")
     finally:
         env.close()
+
+
+def test_main_obs_refuses_an_action_term_it_does_not_model():
+    """LocoManip-Marl-Torso-v0's arms act in joint space with a torso_action term: not a latent."""
+    standin = pulse_cfg_standin()
+    standin.observations.arms.torso_action = _term("applied_action", action_name="torso_pos")
+    with pytest.raises(ValueError, match="arms/torso_action.*torso_pos.*LocoManip-Marl-Torso-v0"):
+        MainActorObs(standin, "cpu")
+    standin = pulse_cfg_standin()
+    standin.observations.arms.actions = _term("applied_action", action_name="arm_pos")
+    with pytest.raises(ValueError, match="arm_pos"):
+        MainActorObs(standin, "cpu")

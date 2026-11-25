@@ -112,6 +112,11 @@ class MainActorObs:
                 if kind not in self._BUILDERS:
                     raise ValueError(f"{agent}/{name}: main's observation {kind} is not modelled")
                 self._check_params(agent, name, kind, term.params)
+                if kind == "applied_action" and term.params.get("action_name") != f"{agent}_latent":
+                    raise ValueError(
+                        f"{agent}/{name}: action term {term.params.get('action_name')!r} is not modelled (only the "
+                        f"latent {agent}_latent of LocoManip-Marl-Pulse-v0; e.g. LocoManip-Marl-Torso-v0's joint-space "
+                        f"actions and torso_action are not)")
                 terms.append((name, kind, term))
             self.groups[agent] = terms
             self.corrupt[agent] = bool(getattr(group, "enable_corruption", True)) if corrupt is None else corrupt
@@ -246,7 +251,7 @@ class MainActorObs:
                     phase = 2.0 * math.pi * self._phase(commands["velocity"], t)
                     x = phase.sin() if kind == "gait_phase_sin" else phase.cos()
                 elif kind == "applied_action":
-                    x = last_latent.get(term.params.get("action_name"), last_latent[agent])
+                    x = last_latent[agent]
                 elif kind == "body_pose_in_root_xyzw":
                     x = torch.cat([wrist_pos, _xyzw(_unique(wrist_quat))], -1).reshape(n, -1)
                 else:  # arm_target_error_in_root: isaaclab compute_pose_error, axis-angle

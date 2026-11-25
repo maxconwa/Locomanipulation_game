@@ -21,6 +21,9 @@ Stage 2 through the world model trains a command encoder on imagined rollouts of
   draw. The seen velocity command is main's low-pass of the drawn one (``command_filter_tau``,
   ``commands.py:171-172, 257-263``), carried across segments as main's is.
 
+A reached arm goal does not end its segment here (main's goal-reached event, its bonus and any hold after it are not
+modelled): ending or scoring a segment on a reached goal is left to the caller.
+
 Quaternions are w-first, qw >= 0, as ``ArmTargetsCommand.believed_b``.
 """
 

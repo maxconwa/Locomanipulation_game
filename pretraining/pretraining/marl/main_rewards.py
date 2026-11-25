@@ -21,9 +21,14 @@ each agent's own joints:
 
 Every term is ``weight * dt * kernel`` (the reward manager's, ``_prepare_reward_function`` multiplies by dt), summed
 per agent with the agent's share of the other's terms as Marl-Direct's cfg weighs them (``arms_*`` on the legs,
-``legs_*`` on the arms, marl_direct_env_cfg.py:62-74). Main's other terms (effort, smoothness, contacts, limits,
-self-collision, hold_still, ...) are left out; ``MainRewardCfg.left_out`` lists those with a nonzero weight. Main
-floors each agent's per-step sum at 0 (locomanip_marl_env.py:243); the partial sum here is not floored.
+``legs_*`` on the arms, marl_direct_env_cfg.py:62-74).
+
+**What this sum is.** It is arm C's training reward: a tracking-only surrogate of main's, not main's reward. It is
+deliberately not floored at 0 (main clamps each agent's per-step sum at 0, locomanip_marl_env.py:243, which would zero
+the gradient exactly where the arms miss), and it uses stage 1's soft, differentiable e-stop penalty in place of
+main's trip cost and ``golem_*`` terms. Main's hold_still, effort, smoothness, contact, limit and self-collision terms
+are not modelled (``MainRewardCfg.left_out`` lists those with a nonzero weight). The comparison between arms is scored
+by the shared scorecard, not by this sum.
 """
 
 from __future__ import annotations
@@ -202,14 +207,15 @@ class MainRewardCfg:
 
 
 def main_rewards(state: WMState, next_state: WMState, commands: dict[str, torch.Tensor], cfg: MainRewardCfg, *,
-                 cycle_mean: torch.Tensor | None = None, target: torch.Tensor | None = None,
+                 cycle_mean: torch.Tensor, target: torch.Tensor | None = None,
                  just_reached: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
     """Score one predicted step ``state -> next_state`` under ``commands`` (``velocity`` (n, 3) as the policies see
     it, ``arm`` (n, 2, 7) pelvis-frame goals, w-first).
 
-    ``cycle_mean`` (n, 3) is the gait-cycle mean of ``(vx, vy, wz)`` including ``next_state`` (``cycle_push``; None:
-    ``next_state``'s own); ``target`` (n, 27) the step's clamped joint targets less the encoder bias, for the e-stop
-    torque demand (None: no torque term); ``just_reached`` (n,) main's goal-reached event (None: 0).
+    ``cycle_mean`` (n, 3) is the gait-cycle mean of ``(vx, vy, wz)`` including ``next_state`` (``cycle_push``;
+    required: main scores the cycle mean, rewards.py:140-141, never the instantaneous twist);
+    ``target`` (n, 27) the step's clamped joint targets less the encoder bias, for the e-stop torque demand
+    (None: no torque term); ``just_reached`` (n,) main's goal-reached event (None: 0).
 
     Returns ``legs`` and ``arms`` (n,): each agent's ``dt * (sum of weight x kernel + e-stop penalty)``; and per term
     ``<agent>/<term>`` the unweighted kernel (main's term value: its reward-manager value over weight x dt), and
@@ -218,7 +224,7 @@ def main_rewards(state: WMState, next_state: WMState, commands: dict[str, torch.
     n = next_state.joint_pos.shape[0]
     device, dtype = next_state.joint_pos.device, next_state.joint_pos.dtype
     if cycle_mean is None:
-        cycle_mean = torch.cat([next_state.lin_vel_b[..., :2], next_state.ang_vel_b[..., 2:3]], -1)
+        raise ValueError("main_rewards needs cycle_mean (cycle_push): main scores the gait-cycle mean velocity")
     velocity = commands["velocity"]
     pos_err, rot_err = wrist_errors(next_state, commands["arm"])
     out: dict[str, torch.Tensor] = {}
