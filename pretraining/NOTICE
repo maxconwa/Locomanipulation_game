@@ -11,7 +11,10 @@ commit they come from.
   h12_sensor_actor_group); pretraining/marl/{actors,config,learner,representation,rewards,runner,runs,wm_env}.py
   (src/h12_train/marl/ at the same paths, stage 1 only; the stage-1 goal and tool-frame helpers of
   src/h12_train/marl/goals.py in pretraining/marl/{rewards,wm_env}.py) and the stage-1 cases of
-  pretraining/tests/test_two_agent.py (tests/{test_two_agent,test_runs}.py).
+  pretraining/tests/test_two_agent.py (tests/{test_two_agent,test_runs}.py). Stage 2:
+  pretraining/marl/command_actor.py (src/h12_train/marl/actors.py CommandActor, made recurrent) and
+  pretraining/marl/command_runner.py (src/h12_train/marl/runner.py CommandRunner, with
+  src/h12_train/marl/{wm_env,goals}.py's CommandWorldModelEnv and CommandProcess, on main's Pulse env).
 - SuperMimic (HybridRobotics, commit 7e94b07): Apache License 2.0. Ported from it:
   pretraining/supermimic/goal_window.py (goal-window constants and helpers of src/supermimic/representations.py,
   quat_to_rot6d of src/supermimic/utils/helpers.py); the full-state and goal terms of
