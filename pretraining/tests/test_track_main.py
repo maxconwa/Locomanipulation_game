@@ -243,7 +243,12 @@ def test_main_fine_tune_from_a_main_base_run_keeps_its_world_model(tmp_path):
     ours_wm, base_wm = (torch.load(d / "world_model.pt", map_location="cpu", weights_only=False) for d in (ft0, base))
     ctx_b, ctx_f = base_wm["sim_context"], ours_wm["sim_context"]
     torch.testing.assert_close(ctx_f["mean"][:31], ctx_b["mean"])
-    torch.testing.assert_close(ctx_f["mean"][31:], torch.tensor([5.0] + [1.0] * 54 + [1.0]))  # fixed constants
+    new_mean = ctx_f["mean"][31:]  # fixed constants: delay 5, gains 1 (the four ankle joints 0.85), strength 1, mass 1
+    torch.testing.assert_close(new_mean[[0, -1]], torch.tensor([5.0, 1.0]))
+    torch.testing.assert_close(new_mean[28:55], torch.ones(27))
+    gain_mean = new_mean[1:28]
+    assert int(torch.isclose(gain_mean, torch.tensor(0.85)).sum()) == 4
+    assert int(torch.isclose(gain_mean, torch.tensor(1.0)).sum()) == 23
     torch.testing.assert_close(ctx_f["scale"][31:32], torch.tensor([5.0]))
     torch.testing.assert_close(ctx_f["scale"][-1:], torch.tensor([3.0]))
     flat_ours, flat_theirs = _flatten(ours_wm), _flatten(base_wm)
