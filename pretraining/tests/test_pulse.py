@@ -24,11 +24,12 @@ import pytest
 import torch
 import yaml
 
-from pretraining.constants import ACTION_SCALE, DEFAULT_JOINT_POS, JOINT_NAMES, TARGET_LIMITS
+from pretraining.constants import JOINT_NAMES
 from pretraining.marl.actors import LatentPrior, build_imitation_actor, load_latent_prior
 from pretraining.marl.config import ACTION_DIMS, AGENTS, JOINT_SLICES
-from pretraining.marl.pulse import SENSOR_DIM, PulseDecoders
+from pretraining.marl.pulse import SENSOR_DIM, PulseDecoders, stage1_plant
 from pretraining.marl.runner import IMITATION_GOAL_DIMS, PROPRIO_DIM
+from pretraining.plants import MAIN, PRETRAIN
 
 REPO = Path(__file__).resolve().parents[2]
 TASKS = REPO / "source" / "locomanipulation_game" / "locomanipulation_game" / "tasks" / "locomanip_marl"
@@ -47,13 +48,14 @@ def _actors(seed: int = 0) -> dict:
     return actors
 
 
-def _expected(actors, latents, frame, priors=None):
-    """The decoding written out (h12_train's CommandActor.latent / decode), on one (N, 87) frame."""
+def _expected(actors, latents, frame, priors=None, plant=MAIN):
+    """The decoding written out (h12_train's CommandActor.latent / decode), on one (N, 87) frame, at the plant's
+    default pose, action scale and target limits."""
     out, raw = {}, {}
-    default = torch.tensor([DEFAULT_JOINT_POS[j] for j in JOINT_NAMES])
-    scale = torch.tensor([ACTION_SCALE[j] for j in JOINT_NAMES])
-    low = torch.tensor([TARGET_LIMITS[j][0] for j in JOINT_NAMES])
-    high = torch.tensor([TARGET_LIMITS[j][1] for j in JOINT_NAMES])
+    default = torch.tensor([plant.default_joint_pos[j] for j in JOINT_NAMES])
+    scale = torch.tensor([plant.action_scale[j] for j in JOINT_NAMES])
+    low = torch.tensor([plant.target_limits[j][0] for j in JOINT_NAMES])
+    high = torch.tensor([plant.target_limits[j][1] for j in JOINT_NAMES])
     with torch.no_grad():
         for a in AGENTS:
             hist = actors[a].obs_normalizer(frame.unsqueeze(1)).flatten(1)
@@ -71,7 +73,7 @@ def _latents(seed: int) -> dict:
 
 def test_decoders_read_one_frame_and_move_the_last_action_on_after_both():
     actors = _actors()
-    dec = PulseDecoders(actors, N, "cpu")
+    dec = PulseDecoders(actors, N, "cpu", MAIN)
     sensors = torch.randn(N, SENSOR_DIM)
     targets = dec.step(_latents(1), sensors)
     frame0 = torch.cat([sensors, torch.zeros(N, 27)], -1)  # zero last action at the start
@@ -92,7 +94,7 @@ def test_decoders_read_one_frame_and_move_the_last_action_on_after_both():
 def test_agent_order_does_not_matter():
     actors = _actors()
     sensors = torch.randn(N, SENSOR_DIM)
-    forward, backward = PulseDecoders(actors, N, "cpu"), PulseDecoders(actors, N, "cpu")
+    forward, backward = PulseDecoders(actors, N, "cpu", MAIN), PulseDecoders(actors, N, "cpu", MAIN)
     lat = _latents(3)
     a = forward.step({"legs": lat["legs"], "arms": lat["arms"]}, sensors)
     b = backward.step({"arms": lat["arms"], "legs": lat["legs"]}, sensors)
@@ -102,7 +104,7 @@ def test_agent_order_does_not_matter():
 
 
 def test_reset_zeroes_only_the_reset_envs_last_action():
-    dec = PulseDecoders(_actors(), N, "cpu")
+    dec = PulseDecoders(_actors(), N, "cpu", MAIN)
     dec.step(_latents(4), torch.randn(N, SENSOR_DIM))
     before = dec.last_action.clone()
     dec.reset(torch.tensor([1, 4]))
@@ -116,24 +118,24 @@ def test_reset_zeroes_only_the_reset_envs_last_action():
 def test_targets_stay_within_target_limits_and_the_given_limits():
     actors = _actors()
     tight = {"left_knee_joint": (0.5, 0.7), "torso_joint": (-0.01, 0.01), "left_hip_yaw_joint": (-10.0, 10.0)}
-    dec = PulseDecoders(actors, N, "cpu", limits=tight)
+    dec = PulseDecoders(actors, N, "cpu", MAIN, limits=tight)
     for seed in range(5):
         targets = dec.step({a: 50.0 * v for a, v in _latents(seed).items()}, 10.0 * torch.randn(N, SENSOR_DIM))
         full = torch.cat([targets[a] for a in AGENTS], -1)
         for i, j in enumerate(JOINT_NAMES):
-            lo, hi = TARGET_LIMITS[j]
+            lo, hi = MAIN.target_limits[j]
             if j in tight:
                 lo, hi = max(lo, tight[j][0]), min(hi, tight[j][1])
             assert (full[:, i] >= lo - 1e-6).all() and (full[:, i] <= hi + 1e-6).all(), j
     with pytest.raises(ValueError, match="empty"):
-        PulseDecoders(actors, N, "cpu", limits={"left_knee_joint": (3.0, 4.0)})
+        PulseDecoders(actors, N, "cpu", MAIN, limits={"left_knee_joint": (3.0, 4.0)})
 
 
 def test_the_prior_adds_to_the_latent_before_the_tanh():
     actors = _actors()
     priors = {a: LatentPrior(PROPRIO_DIM, 1, (16,), 32) for a in AGENTS}
     sensors = torch.randn(N, SENSOR_DIM)
-    dec = PulseDecoders(actors, N, "cpu", priors=priors)
+    dec = PulseDecoders(actors, N, "cpu", MAIN, priors=priors)
     targets = dec.step(_latents(5), sensors)
     want, _ = _expected(actors, _latents(5), torch.cat([sensors, torch.zeros(N, 27)], -1), priors)
     for a in AGENTS:
@@ -144,9 +146,9 @@ def test_decoders_refuse_a_longer_history_or_a_missing_agent():
     actors = _actors()
     longer = dict(actors, arms=build_imitation_actor(PROPRIO_DIM, 15, IMITATION_GOAL_DIMS["arms"], 32, HIDDEN, 2))
     with pytest.raises(ValueError, match="2 frames"):
-        PulseDecoders(longer, N, "cpu")
+        PulseDecoders(longer, N, "cpu", MAIN)
     with pytest.raises(ValueError, match="per agent"):
-        PulseDecoders({"legs": actors["legs"]}, N, "cpu")
+        PulseDecoders({"legs": actors["legs"]}, N, "cpu", MAIN)
 
 
 def test_latent_prior_mask_and_load_roundtrip(tmp_path):
@@ -176,15 +178,53 @@ def test_fit_prior_arguments_and_report():
     assert r["explained"] == pytest.approx(0.95)
 
 
-def test_pulse_agent_cfg_is_the_mappo_yaml_at_its_50_hz_values():
+def test_decoders_take_the_plants_default_pose_and_scale():
+    """Each plant decodes about its own default pose at its own action scale (a run is decoded on its plant)."""
+    actors = _actors()
+    sensors, lat = torch.randn(N, SENSOR_DIM), _latents(6)
+    frame = torch.cat([sensors, torch.zeros(N, 27)], -1)
+    for plant in (MAIN, PRETRAIN):
+        targets = PulseDecoders(actors, N, "cpu", plant).step(lat, sensors)
+        want, _ = _expected(actors, lat, frame, plant=plant)
+        for a in AGENTS:
+            torch.testing.assert_close(targets[a], want[a])
+    assert MAIN.default_joint_pos != PRETRAIN.default_joint_pos  # else the case above proves nothing
+
+
+def _plant_run(tmp_path, plant: str | None) -> Path:
+    run = tmp_path / f"run_{plant}"
+    run.mkdir(exist_ok=True)
+    meta = {"stage": "imitation"} if plant is None else {"stage": "imitation", "plant": plant}
+    (run / "run.json").write_text(json.dumps(meta))
+    return run
+
+
+def test_pulse_refuses_a_run_of_another_plant(tmp_path):
+    """The env (main's plant: 0.002 s x 5, main's default pose) refuses a stage-1 run of pretraining's plant, naming
+    the run, its plant and the env's decimation; a run without the key is pretraining's plant; main's run passes."""
+    main_pose = dict(MAIN.default_joint_pos)
+    assert stage1_plant(_plant_run(tmp_path, "main"), 0.002, 5, main_pose) is MAIN
+    for plant in ("pretrain", None):
+        run = _plant_run(tmp_path, plant)
+        with pytest.raises(ValueError) as err:
+            stage1_plant(run, 0.002, 5, main_pose)
+        msg = str(err.value)
+        assert str(run) in msg and "pretrain" in msg and "decimation 5" in msg
+    # same rate, another default pose: refused too
+    moved = dict(main_pose, left_knee_joint=main_pose["left_knee_joint"] + 0.1)
+    with pytest.raises(ValueError, match="default pose"):
+        stage1_plant(_plant_run(tmp_path, "main"), 0.002, 5, moved)
+
+
+def test_pulse_agent_cfg_is_the_mappo_yaml():
+    """At main's 100 Hz again: the yaml as it is (discount and lambda main's), PULSE's std and init in the env cfg."""
     spec = importlib.util.spec_from_file_location("_agents", TASKS / "agents" / "__init__.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)  # by path: the package's __init__ needs Isaac
     cfg = module.skrl_mappo_pulse_cfg()
     base = yaml.safe_load((TASKS / "agents" / "skrl_mappo_cfg.yaml").read_text())
-    assert cfg["agent"].pop("discount_factor") == 0.99 and cfg["agent"].pop("gae_lambda") == 0.95
-    base["agent"].pop("discount_factor")
-    base["agent"].pop("gae_lambda")
+    assert cfg["agent"]["discount_factor"] == base["agent"]["discount_factor"]
+    assert cfg["agent"]["gae_lambda"] == base["agent"]["gae_lambda"]
     assert cfg == base
 
 
@@ -217,8 +257,8 @@ def test_existing_tasks_cfgs_keep_their_action_limits_and_arms_settings(sim_app)
 
 @pytest.mark.sim
 def test_pulse_cfg(sim_app):
-    from isaaclab.actuators import IdealPDActuatorCfg, ImplicitActuatorCfg
-
+    """The Pulse task's own settings (updated for main's plant: no decimation, robot, joint-range, standing-height or
+    IMU-vibration overrides any more; those are test_pulse_env_is_main_plant's)."""
     from locomanipulation_game.tasks.locomanip_marl.golem_safety import position_envelope
     from locomanipulation_game.tasks.locomanip_marl.locomanip_marl_env_cfg import ACTION_DELAY_RANGE
     from locomanipulation_game.tasks.locomanip_marl.marl_pulse_env_cfg import (
@@ -226,13 +266,11 @@ def test_pulse_cfg(sim_app):
         PULSE_ZEROED_TERMS,
         MarlPulseEnvCfg,
     )
-    from pretraining import constants
 
     cfg = MarlPulseEnvCfg()
-    assert cfg.decimation == 10 and cfg.sim.dt == 0.002 and cfg.sim.render_interval == 10
     assert cfg.agent_action_terms == {"legs": ["legs_latent"], "arms": ["arms_latent"]}
     assert [n for n, t in vars(cfg.actions).items() if t is not None] == ["legs_latent", "arms_latent"]
-    run = REPO / "data" / "pretraining" / "runs" / "isaac_s1_golem_aware"
+    run = REPO / "data" / "pretraining" / "runs" / "main_s1_finetune"
     for term in (cfg.actions.legs_latent, cfg.actions.arms_latent):
         assert term.stage1_run == str(run) and term.prior == str(run / "prior.pt")
         assert term.joint_limits == {n: list(b) for n, b in position_envelope(cfg.golem_estop).items()}
@@ -242,6 +280,12 @@ def test_pulse_cfg(sim_app):
     cfg.pulse_prior, cfg.pulse_stage1_run = "/abs/prior.pt", "data/other"
     cfg.sync_derived()
     assert cfg.actions.arms_latent.prior == "/abs/prior.pt" and cfg.actions.arms_latent.stage1_run == str(REPO / "data/other")
+    # the latent drives the torso: MarlTorso's torso term, its observations and its rate reward are absent
+    assert not cfg.arms_drive_torso
+    assert getattr(cfg.actions, "torso_pos", None) is None
+    assert getattr(cfg.observations.arms, "torso_action", None) is None
+    assert getattr(cfg.observations.critic, "torso_action", None) is None
+    assert getattr(cfg.rewards.arms, "torso_action_rate", None) is None
     # the policies
     assert cfg.clip_actions == 5.0
     assert cfg.policy_output_init_scale == {"legs": 0.01, "arms": 0.01}
@@ -261,32 +305,34 @@ def test_pulse_cfg(sim_app):
         assert getattr(cfg.rewards.legs, name).weight != 0.0, name
     for name in ("alive", "hold_still", "target_rate", "goal_reached", "legs_track_lin_vel_xy", "left_ee_pos_k20"):
         assert getattr(cfg.rewards.arms, name).weight != 0.0, name
-    assert cfg.rewards.arms.goal_reached.weight == pytest.approx(cfg.goal_bonus / 0.02)
+    assert cfg.rewards.arms.goal_reached.weight == pytest.approx(cfg.goal_bonus / 0.01)
     # main's randomisation and sensing
     assert cfg.events.prepose is not None and cfg.events.actuator_scales is not None
     assert cfg.action_delay_range == ACTION_DELAY_RANGE and cfg.encoder_offset_rad and cfg.gyro_lowpass_hz > 0
     assert cfg.warm_start_deadline_steps == 1
-    assert cfg.lowstate_imu.vibration_per_target_rate == pytest.approx(4.0 * 5 / 10)  # per 20 ms step, not 10 ms
-    assert cfg.commands.arm_targets.standing_height == constants.DEFAULT_ROOT_HEIGHT
-    # the robot: explicit PD at pretraining's values, its default pose, its joint ranges at start-up
+
+
+@pytest.mark.sim
+def test_pulse_env_is_main_plant(sim_app):
+    """Main's plant, as MarlTorso has it: decimation 5 at 2 ms, H1_2_MAGPIE_CFG's actuators and init_state, the same
+    randomisation events (pretraining's joint ranges no longer an event), the arm goals' standing height main's."""
+    from locomanipulation_game.assets.h1_2 import H1_2_MAGPIE_CFG
+    from locomanipulation_game.tasks.locomanip_marl.marl_pulse_env_cfg import MarlPulseEnvCfg
+    from locomanipulation_game.tasks.locomanip_marl.marl_torso_env_cfg import MarlTorsoEnvCfg
+
+    cfg, torso = MarlPulseEnvCfg(), MarlTorsoEnvCfg()
+    assert cfg.decimation == 5 == MAIN.decimation and cfg.sim.dt == 0.002 == MAIN.sim_dt
+    assert cfg.sim.render_interval == 5
     robot = cfg.scene.robot
     assert not robot.spawn.articulation_props.fix_root_link
-    assert robot.init_state.pos[2] == constants.DEFAULT_ROOT_HEIGHT
-    assert {j: robot.init_state.joint_pos[j] for j in JOINT_NAMES} == dict(constants.DEFAULT_JOINT_POS)
-    seen = []
-    for name, act in robot.actuators.items():
-        if name == "grippers":
-            continue
-        # the forearm joints implicit (explicit PD at their kd rings or diverges at 2 ms), the rest explicit
-        implicit = name in ("shoulder_yaw", "elbows", "wrists")
-        assert isinstance(act, ImplicitActuatorCfg if implicit else IdealPDActuatorCfg), name
-        for j in act.joint_names_expr:
-            assert (act.stiffness[j], act.damping[j], act.effort_limit_sim[j], act.armature[j]) == (
-                constants.KP[j], constants.KD[j], constants.EFFORT[j], constants.ARMATURE[j])
-            seen.append(j)
-    assert sorted(seen) == sorted(JOINT_NAMES)
-    assert cfg.events.joint_ranges.mode == "startup"
-    assert cfg.events.joint_ranges.params["ranges"] == dict(constants.JOINT_RANGES)
+    assert robot.actuators == H1_2_MAGPIE_CFG.actuators
+    assert robot.init_state == H1_2_MAGPIE_CFG.init_state
+    assert robot.init_state.pos[2] == MAIN.default_root_height
+    events = lambda c: sorted(n for n, t in vars(c.events).items() if t is not None)  # noqa: E731
+    assert events(cfg) == events(torso)
+    assert "joint_ranges" not in events(cfg)
+    assert cfg.commands.arm_targets.standing_height == torso.commands.arm_targets.standing_height
+    assert cfg.lowstate_imu.vibration_per_target_rate == torso.lowstate_imu.vibration_per_target_rate
 
 
 def _run(script: str, *args) -> str:
@@ -317,7 +363,9 @@ def _stage1_run(tmp_path) -> Path:
         "policy": {"batch_size": 32, "horizon": 4}})
     run = tmp_path / "stage1"
     run.mkdir()
-    meta = {"stage": "imitation", "runner": dataclasses.asdict(runner), "motion_files": [str(f) for f in files]}
+    # main's plant: the Pulse env refuses a run of another (stage1_plant)
+    meta = {"stage": "imitation", "runner": dataclasses.asdict(runner), "motion_files": [str(f) for f in files],
+            "plant": "main"}
     (run / "run.json").write_text(json.dumps(meta, default=str))
     torch.save({a: m.state_dict() for a, m in _actors().items()}, run / "actors.pt")
     return run
@@ -336,6 +384,7 @@ PULSE_ENV_SCRIPT = textwrap.dedent("""
     import locomanipulation_game.tasks  # noqa: F401
     from pretraining import constants
     from pretraining.marl.config import AGENTS, JOINT_SLICES
+    from pretraining.plants import MAIN
 
     TASK = "LocoManip-Marl-Pulse-v0"
     cfg = load_cfg_from_registry(TASK, "env_cfg_entry_point")
@@ -345,26 +394,25 @@ PULSE_ENV_SCRIPT = textwrap.dedent("""
     try:
         env.reset()
         assert env.cfg.action_spaces == {"legs": 32, "arms": 32}, env.cfg.action_spaces
-        assert abs(env.step_dt - 0.02) < 1e-9
+        assert abs(env.step_dt - 0.01) < 1e-9
         robot = env.scene["robot"]
         shared = env._pulse_shared
-        assert shared.decoders.priors is not None
+        assert shared.decoders.priors is not None and shared.plant is MAIN
         names = list(constants.JOINT_NAMES)
         ids = robot.find_joints(names, preserve_order=True)[0]
         terms = {a: env.action_manager.get_term(f"{a}_latent") for a in AGENTS}
         for a, term in terms.items():
             assert [robot.joint_names[i] for i in term._joint_ids] == names[JOINT_SLICES[a]], a
         assert env._legs_term is terms["legs"]
-        # pretraining's robot: default pose, joint ranges (the start-up event), nominal gains (GOLEM's torque check)
-        default = torch.tensor([constants.DEFAULT_JOINT_POS[j] for j in names], device=env.device)
+        # main's robot: its default pose (the decoders' too), nominal gains (GOLEM's torque check)
+        default = torch.tensor([MAIN.default_joint_pos[j] for j in names], device=env.device)
         assert torch.allclose(robot.data.default_joint_pos[:, ids], default)
-        ranges = torch.tensor([constants.JOINT_RANGES[j] for j in names], device=env.device)
-        assert torch.allclose(robot.data.joint_pos_limits[:, ids], ranges, atol=1e-5)
-        kp = torch.tensor([constants.KP[j] for j in names], device=env.device)
+        assert torch.allclose(shared.decoders.default, default)
+        kp = torch.tensor([MAIN.kp[j] for j in names], device=env.device)
         assert torch.allclose(robot.data.default_joint_stiffness[:, ids], kp)
-        # actuator_scales drew per-env gains on every explicit PD group
+        # actuator_scales drew per-env gains on every explicit PD group: all 27 joints explicit on main's plant
         pd = [act for act in robot.actuators.values() if isinstance(act, IdealPDActuator)]
-        assert sum(act.num_joints for act in pd) == 17  # all but the ten implicit forearm joints
+        assert sum(act.num_joints for act in pd) == 27
         nominal = env._actuator_nominal
         assert any(not torch.allclose(act.stiffness, nominal[n][0]) for n, act in robot.actuators.items() if n in nominal)
         # the delay histories are the latent terms' joints

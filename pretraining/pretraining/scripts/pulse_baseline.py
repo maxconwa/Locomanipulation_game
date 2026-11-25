@@ -7,7 +7,8 @@ the stage-1 policy would do, decoded, under the task's full randomisation, comma
 arm goals start at step 1 as in training). Nothing learns. Printed, over the run: the mean length of the episodes that
 ended (s) and how they ended, falls per minute of simulated robot time, the share of env-steps on which a GOLEM e-stop
 trip started per agent and the share of env-steps in trip per cause, and the wrists' PD torque (GOLEM's estimate,
-nominal gains) as a share of their e-stop torque and their speed. Also the env's own Episode_Reward/* means at resets.
+nominal gains) as a share of their e-stop torque and their speed. Also the env's own Episode_Reward/* means at resets,
+and the stage-1 run and its plant (main's: the env refuses a run of another).
 """
 
 from __future__ import annotations
@@ -81,7 +82,9 @@ def run(args) -> dict:
             if step % 100 == 0:
                 print(f"[pulse_baseline] step {step}: ended {len(ended_len)} ({ended_fell} fell)", flush=True)
     robot_minutes = n * args.steps * env.step_dt / 60.0
+    shared = env._pulse_shared  # the decoders' run and its plant (refused unless the env's: pulse.stage1_plant)
     out = {
+        "stage1_run": shared.stage1_run, "plant": shared.plant.name,
         "num_envs": n, "steps": args.steps, "prior": not args.no_prior, "nominal": args.nominal, "seconds_per_env": args.steps * env.step_dt,
         "episodes_ended": len(ended_len), "fell": ended_fell, "timed_out": ended_timeout,
         "mean_ended_episode_s": sum(ended_len) / len(ended_len) if ended_len else None,

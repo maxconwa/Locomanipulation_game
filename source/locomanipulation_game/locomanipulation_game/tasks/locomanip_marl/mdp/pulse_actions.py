@@ -3,15 +3,17 @@
 Each agent acts in its stage-1 actor's 32-wide latent (pretraining/, PULSE as h12_train's stage 2 used it): the legs'
 decoder sets the 12 leg joints, the upper body's the torso and the 14 arm joints (the arms agent owns the torso), in
 Unitree motor order (pretraining.constants.JOINT_NAMES), mapped to the articulation's joints by name. The decoding
-itself is pretraining.marl.pulse.PulseDecoders: z = tanh(u + prior(proprio)), target = default + ACTION_SCALE x
-decoder(z, proprio), clipped to pretraining's TARGET_LIMITS within GOLEM's position envelope (joint_limits, which
-sync_derived writes). No IK, no residual, no torque bound, no engage blend.
+itself is pretraining.marl.pulse.PulseDecoders: z = tanh(u + prior(proprio)), target = default + action_scale x
+decoder(z, proprio), clipped to the target limits within GOLEM's position envelope (joint_limits, which sync_derived
+writes); default pose, action scale and target limits are the stage-1 run's plant's (pretraining.plants; run.json's
+"plant"), and a run whose plant's policy step or default pose is not the env's is refused (pulse.stage1_plant). No IK,
+no residual, no torque bound, no engage blend.
 
 The decoders read one proprio frame per policy step, what the robot would report: gravity and the gyro of the torso
 IMU's /lowstate model (env.lowstate_imu: lagged, biased, noisy; the gyro before the actors' low-pass, as h12_train's
-deploy reads it), the measured joint angles (angle + encoder offset, main's position noise) less pretraining's default
-pose, the joint speeds with main's encoder noise, and both decoders' raw outputs of the step before. The two terms
-share it (_PulseShared, one per env): each term's process_actions only hands its latent over, and once both have,
+deploy reads it), the measured joint angles (angle + encoder offset, main's position noise) less the plant's default
+pose (the env's), the joint speeds with main's encoder noise, and both decoders' raw outputs of the step before. The
+two terms share it (_PulseShared, one per env): each term's process_actions only hands its latent over, and once both have,
 the frame is built and both decode, then the last-action buffer moves on. The order the ActionManager calls them in
 cannot matter. A term's reset zeroes its envs' last action (both terms do; it is the same buffer).
 
@@ -48,10 +50,10 @@ class _PulseShared:
     """Per env: the stage-1 decoders and priors (loaded once), the latents handed over this step, the terms."""
 
     def __init__(self, env: ManagerBasedEnv, cfg: PulseLatentActionCfg):
-        from pretraining.constants import DEFAULT_JOINT_POS, IMU_BODY, JOINT_NAMES
+        from pretraining.constants import IMU_BODY, JOINT_NAMES
         from pretraining.marl.actors import load_latent_prior
         from pretraining.marl.config import AGENTS
-        from pretraining.marl.pulse import PulseDecoders
+        from pretraining.marl.pulse import PulseDecoders, stage1_plant
         from pretraining.marl.runner import load_actors
 
         self.env, self.agents = env, AGENTS
@@ -68,17 +70,20 @@ class _PulseShared:
                 f"no latent prior {self.prior}: fit it (python -m pretraining.scripts.fit_prior {cfg.stage1_run}). "
                 "Without one a zero latent is not a standing policy (the decoders' outputs grow through the last "
                 "action within a few steps): env.pulse_prior=null is for debugging only")
+        # before loading anything: decoded on another plant than its own, a run falls (23% of zero-policy episodes)
+        env_pose = robot.data.default_joint_pos[0, self.joint_ids].tolist()
+        self.plant = stage1_plant(cfg.stage1_run, env.cfg.sim.dt, env.cfg.decimation, dict(zip(JOINT_NAMES, env_pose)))
         actors = load_actors(cfg.stage1_run, env.device)
         priors = load_latent_prior(self.prior, env.device) if self.prior else None
         limits = {n: tuple(b) for n, b in (cfg.joint_limits or {}).items()}
-        self.decoders = PulseDecoders(actors, env.num_envs, env.device, priors=priors, limits=limits)
-        self.default = torch.tensor([DEFAULT_JOINT_POS[j] for j in JOINT_NAMES], device=env.device)
+        self.decoders = PulseDecoders(actors, env.num_envs, env.device, self.plant, priors=priors, limits=limits)
+        self.default = self.decoders.default
         floor = per_joint(list(JOINT_NAMES), JOINT_VEL_NOISE_FLOOR, JOINT_VEL_NOISE_FLOOR_DEFAULT)
         self.vel_floor = torch.tensor(floor, device=env.device)
         self.terms: dict[str, PulseLatentAction] = {}
         self.pending: dict[str, torch.Tensor] = {}
-        print(f"[INFO] Pulse decoders: {cfg.stage1_run} (latent {self.decoders.latent_dim}), prior "
-              f"{self.prior or 'none'}; targets within: " + ", ".join(
+        print(f"[INFO] Pulse decoders: {cfg.stage1_run} ({self.plant.name} plant, latent "
+              f"{self.decoders.latent_dim}), prior {self.prior or 'none'}; targets within: " + ", ".join(
                   f"{n} [{lo:.3f}, {hi:.3f}]" for n, lo, hi in zip(
                       JOINT_NAMES, self.decoders.low.tolist(), self.decoders.high.tolist())))
 
@@ -189,7 +194,7 @@ class PulseLatentActionCfg(ActionTermCfg):
     prior: str | None = None
     """A fit_prior.py file (absolute), or None / "": no prior."""
     joint_limits: dict[str, tuple[float, float]] | None = None
-    """Per joint (rad), intersected with pretraining's TARGET_LIMITS (sync_derived writes GOLEM's position envelope)."""
+    """Per joint (rad), intersected with the plant's target limits (sync_derived writes GOLEM's position envelope)."""
 
 
 def resolve(path: str | None, base: str) -> str | None:
