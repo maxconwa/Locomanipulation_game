@@ -71,6 +71,8 @@ class MarlDirectEnvCfg(ArmsOnlyEnvCfg):
         for name in LEG_TRACKING_TERMS:
             term = getattr(rewards.legs, name)
             setattr(rewards.arms, f"legs_{name}", term.replace(weight=self.lambda_arms * term.weight))
+        # again, at the arms' action_rate weight as ArmsOnly's sync_derived set it after the base class's call
+        self.sync_arms_drive_torso()
 
     def __post_init__(self):
         super().__post_init__()

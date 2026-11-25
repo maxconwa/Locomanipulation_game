@@ -77,6 +77,11 @@ ARMS_ACTION = "arm_pos"
 # agent -> the action terms it drives. In possible_agents order the terms follow MarlActionsCfg's order: the env
 # concatenates the agents' actions into the ActionManager's vector.
 AGENT_ACTION_TERMS = {"legs": [LEGS_ACTION], "arms": [ARMS_ACTION]}
+# The torso joint's term when the arms agent drives it (LocoManipMarlEnvCfg.arms_drive_torso): as GOLEM's controller
+# (lmg_deploy policies/h12/export.yaml, controller.py), target = default + TORSO_ACTION_SCALE x action, the torso's
+# action first of the arms'
+TORSO_ACTION = "torso_pos"
+TORSO_ACTION_SCALE = 0.25
 
 SIM_DT = 0.002            # physics 500 Hz, as ALMI-Open
 DECIMATION = 5            # policy 100 Hz, as sport mode
@@ -666,6 +671,11 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     """The stand/walk gate: a command whose norm over (vx, vy, wz) is under this counts as standing (gait phase 0,
     both feet down); sport mode steps on any input."""
 
+    arms_drive_torso: bool = False
+    """The arms agent drives the torso joint too (TORSO_ACTION, first of its actions, as GOLEM's controller), with its
+    applied action in the arms' and the critic's observations and its rate charged to the arms at their action_rate
+    weight. Off: the torso held at its default, no torso term anywhere (sync_derived adds them only when on)."""
+
     def sync_derived(self):
         """What follows from other fields, for their values after the command line's overrides (__post_init__ runs
         before them, so train.py and the env call this again): the physics-rate settings, the goal bonus per second
@@ -674,10 +684,42 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
         self.rewards.arms.goal_reached.weight = self.goal_bonus / (self.decimation * self.sim.dt)
         # every joint target inside GOLEM's position e-stop range (written to the cfg so params/env.yaml records it)
         # (every action term that takes joint_limits: joint_pos and arm_pos; LocoManip-Marl-Pulse-v0's latent terms)
+        self.sync_arms_drive_torso()  # before the loop below, which gives the torso term GOLEM's envelope too
         envelope = {name: list(bounds) for name, bounds in position_envelope(self.golem_estop).items()}
         for term in vars(self.actions).values():
             if term is not None and hasattr(term, "joint_limits"):
                 term.joint_limits = envelope
+
+    def sync_arms_drive_torso(self):
+        """With arms_drive_torso, the torso term, its observations and its rate reward (idempotent: sync_derived runs
+        several times). The torso's rate weight follows the arms' action_rate as it stands, so a subclass that sets
+        that weight after this runs calls this again (MarlDirectEnvCfg.sync_derived)."""
+        if not self.arms_drive_torso:
+            return
+        actions = self.actions
+        if getattr(actions, TORSO_ACTION, None) is None:
+            arm = getattr(actions, ARMS_ACTION, None)
+            if arm is None:
+                raise ValueError(f"arms_drive_torso needs the {ARMS_ACTION} term (the latent tasks have none)")
+            # between the legs' term and the arms': the env splits the ActionManager's vector by term order, and
+            # GOLEM puts the torso's action first of the arms'
+            delattr(actions, ARMS_ACTION)
+            setattr(actions, TORSO_ACTION, mdp.BoundedJointPositionActionCfg(
+                asset_name="robot",
+                joint_names=["torso_joint"],
+                scale=TORSO_ACTION_SCALE,
+                use_default_offset=True,
+                target_margin=-GOLEM_TARGET_CLIP,
+                torque_headroom=TORQUE_HEADROOM,
+            ))
+            setattr(actions, ARMS_ACTION, arm)
+        # a new dict: AGENT_ACTION_TERMS is the other tasks' default
+        self.agent_action_terms = {**self.agent_action_terms, "arms": [TORSO_ACTION, ARMS_ACTION]}
+        for group in (self.observations.arms, self.observations.critic):
+            group.torso_action = ObsTerm(func=mdp.applied_action, params={"action_name": TORSO_ACTION})
+        self.rewards.arms.torso_action_rate = RewTerm(
+            func=mdp.action_term_rate_l2, weight=self.rewards.arms.action_rate.weight,
+            params={"action_name": TORSO_ACTION})
 
     def sync_physics_rate(self):
         """The sensor periods and render interval for sim.dt and decimation."""
