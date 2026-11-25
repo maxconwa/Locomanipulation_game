@@ -91,8 +91,8 @@ COMMAND_DIMS = {"legs": 3, "arms": 14}
 """Each encoder's command: the legs' velocity command (vx, vy, wz), the arms' two pelvis-frame wrist goals (xyz, xyzw
 each, as main's ``arm_targets_in_root_xyzw``)."""
 
-# The stage-1 track env's sim-context specs in their column order (SimContext.from_env) and widths; a stage-1 run's
-# world_model.pt holds the normalisation of the ones its env had.
+# The stage-1 track env's sim-context specs in their column order (SimContext.from_env) and widths, for a stage-1 run
+# whose run.json does not record its layout; its world_model.pt holds the normalisation of the ones its env had.
 _SIM_CONTEXT_SPECS = (("foot_friction", 1), ("base_com", 3), ("encoder_bias", len(JOINT_NAMES)))
 
 
@@ -152,9 +152,17 @@ class _Spec:
         self.name, self.dim = name, dim
 
 
-def _sim_context(bundle: dict, device) -> SimContext:
-    """The stage-1 world model's sim-context normalisation, its specs inferred from its width."""
+def _sim_context(bundle: dict, device, layout: list[dict] | None = None) -> SimContext:
+    """The stage-1 world model's sim-context normalisation, its specs from ``layout`` (run.json's ``sim_context``),
+    else inferred from its width."""
     width = bundle["sim_context"]["mean"].numel()
+    if layout is not None:
+        specs = [(e["name"], int(e["dim"])) for e in layout]
+        if sum(d for _, d in specs) != width:
+            raise ValueError(f"run.json's sim context is {sum(d for _, d in specs)} wide, the world model's {width}")
+        ctx = SimContext([_Spec(n, d) for n, d in specs], [(0.0, 0.0)] * width)
+        ctx.load_state_dict(bundle["sim_context"])
+        return ctx.to(device)
     for mask in range(1 << len(_SIM_CONTEXT_SPECS)):
         specs = [s for i, s in enumerate(_SIM_CONTEXT_SPECS) if mask >> i & 1]
         if sum(d for _, d in specs) == width:
@@ -164,7 +172,8 @@ def _sim_context(bundle: dict, device) -> SimContext:
     raise ValueError(f"the world model's sim context is {width} wide; no combination of {_SIM_CONTEXT_SPECS} is")
 
 
-def build_world_model(bundle: dict, plant: Plant, hidden_dims, target_low, target_high, device) -> WorldModel:
+def build_world_model(bundle: dict, plant: Plant, hidden_dims, target_low, target_high, device,
+                      sim_context_layout: list[dict] | None = None) -> WorldModel:
     """Stage 1's torso-IMU gencoord world model for ``plant``, from a ``world_model.pt`` bundle, without an env
     (``representation.build_world_model`` reads the same from the track env). Refuses a bundle whose action scale or
     offset is not the plant's (the world model of another plant's run)."""
@@ -176,7 +185,7 @@ def build_world_model(bundle: dict, plant: Plant, hidden_dims, target_low, targe
     if not (torch.allclose(saved_scale, scale, atol=1e-5) and torch.allclose(saved_offset, default, atol=1e-4)):
         raise ValueError(f"the world model's action scale or offset is not the {plant.name} plant's: it was trained "
                          "on another plant")
-    ctx = _sim_context(bundle, device)
+    ctx = _sim_context(bundle, device, sim_context_layout)
     rep = TorsoImuGenCoordRepresentation(n, default)
     rep.actor_obs_mode = "proprio"
     rep.register_buffer("_proprio_noise_bounds", rep.proprio_noise_bounds(n, device), persistent=False)
@@ -281,7 +290,8 @@ class CommandRunner:
         runner_meta = self.stage1_meta.get("runner", {})
         hidden = runner_meta.get("dynamics_hidden_dims", (2048, 2048, 2048))
         bundle = torch.load(self.stage1_run / "world_model.pt", map_location=dev, weights_only=False)
-        self.wm = build_world_model(bundle, self.plant, hidden, source.target_low, source.target_high, dev)
+        self.wm = build_world_model(bundle, self.plant, hidden, source.target_low, source.target_high, dev,
+                                    self.stage1_meta.get("sim_context"))
         self.rep, self.dynamics, self.sim_context = self.wm.representation, self.wm.dynamics, self.wm.sim_context
         self.wm_learner = WorldModelLearner(self.dynamics, self.rep, cfg.wm, device=str(dev))
         if dev.type != "cuda":  # torch.compile is for the GPU (and fails on some CPU toolchains)
@@ -379,9 +389,10 @@ class CommandRunner:
         if self._sim is None:
             self._start_sim()
         s = self._sim
-        ctx = self.source.sim_ctx(self.sim_context.output_dim)
         sums = {"vel_xy_error": 0.0, "wrist_pos_error": 0.0, "done": 0.0, "reward_legs": 0.0, "reward_arms": 0.0}
         for _ in range(self.cfg.rollout):
+            # the env's draws for the step's start state (per-reset ones change as envs reset)
+            ctx = self.source.sim_ctx(self.sim_context)
             cmd = command_vectors(s["commands"])
             z, hc_next = {}, {}
             for a in AGENTS:

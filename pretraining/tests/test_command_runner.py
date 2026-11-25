@@ -119,8 +119,8 @@ class StandinSource:
     def clock(self):
         return self.t * self.step_dt
 
-    def sim_ctx(self, dim):
-        return torch.zeros(self.num_envs, dim)
+    def sim_ctx(self, sim_context):
+        return torch.zeros(self.num_envs, sim_context.output_dim)
 
     def reset(self):
         self.t.zero_()
@@ -137,9 +137,18 @@ class StandinSource:
         return self._state(), self._obs(), self._commands(), dones
 
 
-def make_stage1_run(run: Path, plant: str = "main", clips: bool = True, seed: int = 0) -> Path:
+# a main-plant fine-tune's sim context (--fine-tune-from a base run): the base's columns, then main's new ones
+_FINE_TUNED = ([("foot_friction", 1), ("base_com", 3), ("encoder_bias", 27), ("action_delay", 1), ("actuator_gain", 27),
+                ("actuator_strength", 27), ("torso_mass", 1)],
+               [(0.3, 1.2)] + [(-0.05, 0.05)] * 3 + [(-0.02, 0.02)] * 27 + [(0.0, 10.0)] + [(0.8, 1.2)] * 27
+               + [(0.85, 1.15)] * 27 + [(-2.0, 4.0)])
+
+
+def make_stage1_run(run: Path, plant: str = "main", clips: bool = True, seed: int = 0,
+                    fine_tuned: bool = False) -> Path:
     """A stage-1 run directory: untrained small actors to the policy contract, a small world model of ``plant``,
-    stand-in clips."""
+    stand-in clips. ``fine_tuned``: its world model takes a fine-tune's 87 sim-context columns, recorded in
+    run.json."""
     from standins import write_clips
 
     torch.manual_seed(seed)
@@ -157,14 +166,19 @@ def make_stage1_run(run: Path, plant: str = "main", clips: bool = True, seed: in
     scale = torch.tensor([p.action_scale[j] for j in JOINT_NAMES])
     rep = TorsoImuGenCoordRepresentation(27, default)
     rep.dt = p.step_dt
-    dynamics = Dynamics(rep, 27, 31, scale.view(1, 27), default.view(1, 27), hidden_dims=(32, 32))
 
     class _S:
         def __init__(self, name, dim):
             self.name, self.dim = name, dim
 
-    ctx = SimContext([_S("foot_friction", 1), _S("base_com", 3), _S("encoder_bias", 27)],
-                     [(0.3, 1.2)] + [(-0.05, 0.05)] * 3 + [(-0.01, 0.01)] * 27)
+    if fine_tuned:
+        ctx = SimContext([_S(n, d) for n, d in _FINE_TUNED[0]], _FINE_TUNED[1])
+        meta["sim_context"] = ctx.layout()
+        (run / "run.json").write_text(json.dumps(meta))
+    else:
+        ctx = SimContext([_S("foot_friction", 1), _S("base_com", 3), _S("encoder_bias", 27)],
+                         [(0.3, 1.2)] + [(-0.05, 0.05)] * 3 + [(-0.01, 0.01)] * 27)
+    dynamics = Dynamics(rep, 27, ctx.output_dim, scale.view(1, 27), default.view(1, 27), hidden_dims=(32, 32))
     torch.save({"dynamics": dynamics.state_dict(), "sim_context": ctx.state_dict()}, run / "world_model.pt")
     return run
 
@@ -248,6 +262,29 @@ def test_command_runner_two_iterations_on_cpu(tmp_path):
     assert json.loads((out / "checkpoint.json").read_text())["steps_per_env"] == 15
 
 
+def test_command_runner_takes_a_fine_tuned_world_model(tmp_path):
+    """A stage-1 fine-tune's world model (87 sim-context columns, run.json's layout): built at its width with its
+    normalisation, the source asked for every column each step, and it trains."""
+    run = make_stage1_run(tmp_path / "stage1", fine_tuned=True)
+    asked = []
+
+    class _Source(StandinSource):
+        def sim_ctx(self, sim_context):
+            asked.append([s.name for s in sim_context.specs])
+            return super().sim_ctx(sim_context)
+
+    runner = CommandRunner(_Source(), run, small_cfg(max_iterations=1), run_dir=tmp_path / "out")
+    assert runner.sim_context.output_dim == 87 and runner.sim_context.find("encoder_bias") == slice(4, 31)
+    torch.testing.assert_close(runner.sim_context.scale[31:32], torch.tensor([5.0]))
+    runner.run({"stage1": str(run), "plant": "main"})
+    assert len(asked) == runner.cfg.rollout and asked[0] == [n for n, _ in _FINE_TUNED[0]]
+    meta = json.loads((run / "run.json").read_text())
+    meta["sim_context"] = meta["sim_context"][:-1]
+    (run / "run.json").write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="run.json's sim context is 86 wide, the world model's 87"):
+        CommandRunner(StandinSource(), run, small_cfg(), run_dir=tmp_path / "out2")
+
+
 def test_command_runner_stops_at_max_steps(tmp_path):
     run = make_stage1_run(tmp_path / "stage1")
     runner = CommandRunner(StandinSource(), run, small_cfg(max_steps=12, max_iterations=100, clip_command_prob=0.0),
@@ -318,6 +355,52 @@ def test_command_runner_two_iterations(sim_app, tmp_path):
             assert _changed(enc[a], runner.encoders[a]), a
             assert not _changed(dec[a], runner.stage1[a]), a
         assert torch.isfinite(runner.buffer._storage["state"]).all()
+    finally:
+        env.close()
+
+
+@pytest.mark.sim
+def test_pulse_source_supplies_a_fine_tuned_world_models_context(sim_app, tmp_path):
+    """Main's Pulse env supplies every column of a fine-tune's layout from its own draws: the delay is
+    env._delay_steps, gains and strength reproduce the actuators' kp and effort limit, the torso mass and friction lie
+    in main's ranges, the encoder offsets are env.encoder_offset, the COM 0; and the runner trains on it."""
+    import gymnasium as gym
+    from isaaclab_tasks.utils import load_cfg_from_registry
+
+    import locomanipulation_game.tasks  # noqa: F401
+    from pretraining.marl.marl_source import MarlEnvSource
+
+    run = make_stage1_run(tmp_path / "stage1", fine_tuned=True)
+    task = "LocoManip-Marl-Pulse-v0"
+    cfg = load_cfg_from_registry(task, "env_cfg_entry_point")
+    cfg.scene.num_envs = 16
+    cfg.pulse_stage1_run, cfg.pulse_prior = str(run), ""
+    env = gym.make(task, cfg=cfg)
+    try:
+        source = MarlEnvSource(env)
+        source.reset()
+        runner = CommandRunner(source, run, small_cfg(max_iterations=1), run_dir=tmp_path / "out")
+        ctx = runner.sim_context
+        raw = source.sim_ctx(ctx) * ctx.scale + ctx.mean
+        u = env.unwrapped
+        col = {s.name: ctx.find(s.name) for s in ctx.specs}
+        torch.testing.assert_close(raw[:, col["action_delay"]].squeeze(-1), u._delay_steps.float())
+        torch.testing.assert_close(raw[:, col["base_com"]], torch.zeros(16, 3, device=u.device))
+        torch.testing.assert_close(raw[:, col["encoder_bias"]], u.encoder_offset[:, source.joint_ids])
+        gain, strength = raw[:, col["actuator_gain"]], raw[:, col["actuator_strength"]]
+        robot = u.scene["robot"]
+        for name, (kp, _, limit) in u._actuator_nominal.items():
+            act = robot.actuators[name]
+            idx = [JOINT_NAMES.index(j) for j in act.joint_names if j in JOINT_NAMES]
+            if len(idx) != act.num_joints:
+                continue
+            torch.testing.assert_close(act.stiffness, kp * gain[:, idx] * strength[:, idx])
+            torch.testing.assert_close(act.effort_limit, limit * strength[:, idx])
+        mass, friction = raw[:, col["torso_mass"]], raw[:, col["foot_friction"]]
+        assert mass.min() >= -2.0 - 1e-4 and mass.max() <= 4.0 + 1e-4
+        assert friction.min() >= 0.1 - 1e-5 and friction.max() <= 1.25 + 1e-5
+        runner.run({"stage1": str(run), "plant": "main"})
+        assert torch.isfinite(runner.buffer._storage["sim_ctx"]).all()
     finally:
         env.close()
 

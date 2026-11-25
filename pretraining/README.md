@@ -137,6 +137,22 @@ timeout -s KILL 1800 $PY -m pretraining.scripts.play --run data/runs/amass_s1 --
   (start + added). The source directory is not touched.
 - A fine-tune must use the source run's clips, the same files in the same order: the reset sampler's saved per-clip
   statistics belong to them. Other clips are refused before the app starts.
+- The sim context (the world model's and critics' privileged per-env input, `supermimic/sim_context.py`; `run.json`'s
+  `sim_context` records the layout). A new run takes every quantity its env draws: the base envs foot friction,
+  torso COM and encoder bias (31 columns); `--plant main --fine-tune`'s env (`TrackMainFineTuneEnvCfg`) its foot
+  friction (the feet shapes' mean static friction from main's per-shape material draw), encoder offsets, target
+  delay `action_delay` (0-10 physics substeps, normalised as 5 +- 5), `actuator_gain` and `actuator_strength` (main's
+  `randomize_actuator_scales`: per env and joint at every reset, one gain scaling kp and kd together, so it is both
+  the stiffness and the damping scale; strength scales kp, kd and the effort limit; normalised over the event's own
+  ranges, the ankles' gains 0.5-1.2, the rest 0.8-1.2, strength 0.85-1.15) and `torso_mass` (kg added at start-up,
+  -2 to 4, normalised as 1 +- 3). A `--fine-tune-from` keeps the source's columns in its order (one its env does not
+  draw, as main's torso COM, held at the source's mean), widens a live column's normalisation where this env draws
+  wider about the same centre (main's encoder offsets, +-0.02 and +-0.04 at the ankle pitch, against the base's
+  +-0.01), and appends the env's quantities the source lacks; the loaded world model's and critics' first layers are
+  widened to match (zero weights on the appended columns, the renormalised columns' weights rescaled), so they
+  compute the source's function until trained. Friction keeps the source's normalisation (0.3-1.2; main draws
+  0.1-1.25 about another centre). One line at the start names what was appended, held and renormalised. A
+  `--resume` keeps the run's layout unchanged.
 - `PRETRAINING_CUDA_GRAPHS=0` turns off CUDA-graph capture of the updates (crosscheck and play turn it off
   themselves). A capture that fails stops the run with an error saying to set it: on torch 2.7 a failed capture
   leaves the CUDA random-number generator unusable for the rest of the process.
@@ -196,7 +212,10 @@ collects data in `LocoManip-Marl-Pulse-v0` built on the stage-1 run without a pr
 stage 1's e-stop penalties (`marl/main_rewards.py`), with main's actor observation synthesised from it
 (`marl/main_obs.py`) and main's command law (`marl/command_law.py`). A quarter of the imagined command segments
 follow a clip, and on them the latent is pulled toward the stage-1 encoder's (weight 0.1). The stage-1 run must be on
-main's plant; another is refused. What the training reward leaves out of main's is printed at the start.
+main's plant; another is refused. The world model's sim context is read from the Pulse env each step, column by
+column of the stage-1 run's layout (`MarlEnvSource.sim_ctx`): main's feet friction, encoder offsets, own target delay
+(`_delay_steps`), actuator gains and strength and torso mass; a quantity main does not draw takes its true nominal
+value (the torso COM offset 0), and a column it can neither read nor knows the nominal value of is an error. What the training reward leaves out of main's is printed at the start.
 
 ```bash
 PY=/home/max/miniconda3/envs/env_isaaclab/bin/python

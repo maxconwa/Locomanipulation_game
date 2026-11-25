@@ -18,9 +18,14 @@ handed over as ``u = atanh(clamp(z, +-tanh 5))``, 5 the env's ``clip_actions``).
   it), ``obs_dims``, ``target_low`` / ``target_high`` (the decoders' clip: the plant's within GOLEM's envelope),
   ``velocity_law`` / ``arm_law`` (``command_law``), ``kernel_stages()``, ``sim_ctx(dim)``.
 
-The world model's sim context: main's randomisation is not stage 1's (friction, COM and encoder-bias events whose
-values the world model reads), so every row gets the context's mean (zeros, normalised); the world model fits the
-mean over main's randomisation, as h12_train's stage 2 did for its RandomisationCfg.
+The world model's sim context (``sim_ctx(sim_context)``): each column of the stage-1 run's layout read from this env,
+normalised with the world model's own statistics. Main's draws are read as the stage-1 specs read the fine-tune env's
+(``supermimic.sim_context``): ``foot_friction`` the feet shapes' mean static friction (``physics_material``),
+``action_delay`` ``env._delay_steps`` (main's own delay, physics substeps as ``TargetDelay``'s), ``actuator_gain`` /
+``actuator_strength`` from the explicit actuators against ``env._actuator_nominal`` (``randomize_actuator_scales``),
+``torso_mass`` (``add_torso_mass``) and ``encoder_bias`` ``env.encoder_offset`` (main's per-reset offsets, in
+``JOINT_NAMES`` order). A quantity the env does not randomise reads its true, nominal value (``_NOMINAL``: main has no
+torso-COM event, so ``base_com`` is 0); a column it can neither read nor knows the nominal value of is an error.
 """
 
 from __future__ import annotations
@@ -32,6 +37,10 @@ from pretraining.constants import JOINT_NAMES
 from pretraining.marl.command_actor import latent_to_action
 from pretraining.marl.command_law import ArmGoalLaw, VelocityLaw
 from pretraining.marl.config import AGENTS
+
+_NOMINAL = {"base_com": 0.0, "encoder_bias": 0.0, "action_delay": 0.0, "actuator_gain": 1.0,
+            "actuator_strength": 1.0, "torso_mass": 0.0}
+"""Each sim-context quantity's raw value in an env that does not randomise it (no event, no delay, no offsets)."""
 
 ARM_COMMAND = "arm_targets"  # locomanip_marl_env_cfg.ARM_COMMAND
 VELOCITY_COMMAND = "base_velocity"
@@ -101,9 +110,43 @@ class MarlEnvSource:
         return {"lin_stage": int(vel.lin_kernel_stage), "ang_stage": int(vel.ang_kernel_stage),
                 "arm_stage": int(getattr(arm, "kernel_stage", 0))}
 
-    def sim_ctx(self, dim: int) -> torch.Tensor:
-        """The world model's normalised sim context per env: its mean (module docstring)."""
-        return torch.zeros(self.num_envs, dim, device=self.device)
+    def sim_ctx(self, sim_context) -> torch.Tensor:
+        """The world model's normalised sim context per env, ``sim_context``'s columns read from the env (module
+        docstring); ValueError for a column it cannot supply."""
+        raw = torch.cat([self._raw_sim_ctx(s.name, s.dim) for s in sim_context.specs], dim=-1)
+        return (raw - sim_context.mean) / sim_context.scale
+
+    def _raw_sim_ctx(self, name: str, dim: int) -> torch.Tensor:
+        from pretraining.supermimic import sim_context as sc
+
+        u, n = self.u, self.num_envs
+        if name == "encoder_bias":
+            offset = getattr(u, "encoder_offset", None)
+            raw = None if offset is None else offset[:, self.joint_ids]
+        elif name == "base_com":
+            if getattr(u.cfg.events, "base_com", None) is not None:
+                raise ValueError("sim context base_com: the env draws a torso COM, which stage 2 does not read")
+            raw = None
+        elif name in sc._CANDIDATES:
+            spec_cls = sc._CANDIDATES[name]
+            if not spec_cls.available(u):
+                raw = None
+            else:
+                specs = self.__dict__.setdefault("_ctx_specs", {})
+                if name not in specs:
+                    spec = spec_cls()
+                    spec.bind(u)
+                    specs[name] = spec
+                raw = specs[name].read(u)
+        else:
+            raise ValueError(f"sim context {name}: the stage-2 source cannot read it from {type(u).__name__}")
+        if raw is None:
+            if name not in _NOMINAL:
+                raise ValueError(f"sim context {name}: {type(u).__name__} does not draw it and it has no nominal value")
+            raw = torch.full((n, dim), _NOMINAL[name], device=self.device)
+        if raw.shape != (n, dim):
+            raise ValueError(f"sim context {name}: the env gives {tuple(raw.shape)}, the world model takes {(n, dim)}")
+        return raw.to(self.device, torch.float32)
 
     # -- the loop ---------------------------------------------------------------------------------------------------
 

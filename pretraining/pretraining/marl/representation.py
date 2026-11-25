@@ -106,7 +106,7 @@ def action_clip(env) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def build_world_model(
-    cfg: BaseRunnerCfg, env, device: str, sim_context_layout: list[dict] | None = None
+    cfg: BaseRunnerCfg, env, device: str, sim_context_layout: list[dict] | None = None, fine_tune: bool = False
 ) -> WorldModel:
     """Build supermimic's world model for ``env`` with the torso-IMU representation and clamped targets.
 
@@ -116,7 +116,8 @@ def build_world_model(
     obs, _ = env.reset()
     num_full_state, num_goals = unpack_obs_dims(obs)
     num_actions = env.num_actions
-    sim_context = SimContext.from_env(env.unwrapped, sim_context_layout)  # a fine-tune's / resume's: the source's
+    # a fine-tune's / resume's: the source's columns (a fine-tune's with this env's new ones appended)
+    sim_context = SimContext.from_env(env.unwrapped, sim_context_layout, fine_tune=fine_tune)
     # The policy joints, in the motion command's (JOINT_NAMES) order.
     joint_ids = env.unwrapped.command_manager.get_term("motion").joint_ids
     default_joint_pos = env.unwrapped.scene["robot"].data.default_joint_pos[0][joint_ids].to(device)

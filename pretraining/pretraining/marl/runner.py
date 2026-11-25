@@ -59,6 +59,7 @@ from pretraining.supermimic.learners.policy_learner import ActorCriticPolicyLear
 from pretraining.supermimic.learners.wm_learner import WorldModelLearner
 from pretraining.supermimic.models import build_mlp
 from pretraining.supermimic.replay_buffer import ReplayBuffer
+from pretraining.supermimic.sim_context import widen_input_weight
 from pretraining.supermimic.runners.base_runner import BaseRunner, BaseRunnerCfg, Ratio
 from pretraining.supermimic.runners.reset_sampling import ReturnSampler, ReturnSamplerCfg
 from pretraining.supermimic.utils.wandb_artifacts import optional_wandb
@@ -183,7 +184,8 @@ class TwoAgentRunner(BaseRunner[TwoAgentRunnerCfg]):
 
     def _init_common(self) -> None:
         """Do ``BaseRunner._init_common``'s set-up with the torso-IMU world model."""
-        wm = build_world_model(self.cfg, self.env, self.device, getattr(self, "sim_context_layout", None))
+        wm = build_world_model(self.cfg, self.env, self.device, getattr(self, "sim_context_layout", None),
+                               fine_tune=getattr(self, "sim_context_fine_tune", False))
         self._wm = wm
         self._representation = wm.representation
         self._dynamics = wm.dynamics
@@ -377,6 +379,7 @@ class TwoAgentRunner(BaseRunner[TwoAgentRunnerCfg]):
         The optimisers' learning rates stay device tensors (the captured updates read them).
         """
         state = torch.load(path, map_location=self.device, weights_only=False)
+        widen_sim_context(state, self._sim_context)
         self._load_world_model(state["world_model"])
         for a in AGENTS:
             self.actors[a].load_state_dict(state["actors"][a])
@@ -384,6 +387,7 @@ class TwoAgentRunner(BaseRunner[TwoAgentRunnerCfg]):
         for name, opts in self._optimizers().items():
             for opt, sd in zip(opts, state["optimizers"][name], strict=True):
                 opt.load_state_dict(sd)
+                _pad_optimizer_state(opt)
                 for group in opt.param_groups:
                     if torch.is_tensor(group["lr"]):
                         group["lr"] = group["lr"].to(self.device)
@@ -573,11 +577,14 @@ class ImitationRunner(TwoAgentRunner):
         registry_name: str | None = None,
         device: str = "cuda:0",
         sim_context_layout: list[dict] | None = None,
+        sim_context_fine_tune: bool = False,
     ):
         """Hold the reward cfg, the run directory and the motion files (recorded in ``run.json``), then build
         everything. ``env`` is the env wrapped in ``EnvAdapter``; ``sim_context_layout`` is the sim-context layout of
-        the run a fine-tune or resume starts from (``SimContext.from_env``)."""
+        the run a fine-tune or resume starts from, ``sim_context_fine_tune`` whether it is a fine-tune's
+        (``SimContext.from_env``)."""
         self.sim_context_layout = sim_context_layout
+        self.sim_context_fine_tune = sim_context_fine_tune
         self.reward_cfg = rewards or ImitationRewardCfg()
         self.run_dir = None if run_dir is None else Path(run_dir)
         self.motion_files = list(motion_files or [])
@@ -630,6 +637,35 @@ class ImitationRunner(TwoAgentRunner):
             device=self.device,
         )
         self._finish_policy(wm_env)
+
+
+def widen_sim_context(state: dict, sim_context) -> None:
+    """Fit a ``training_state`` saved with another sim context (a fine-tune's source: fewer columns, or narrower
+    normalisation) to ``sim_context``, in place: the world model's and each critic's first layer by
+    ``widen_input_weight`` (the sim context is the last block of both inputs), and the saved normalisation replaced by
+    ``sim_context``'s. The loaded function is the source's for the same raw values. A no-op for the same context."""
+    saved = state["world_model"]["sim_context"]
+    mean, scale = sim_context.mean, sim_context.scale
+    if saved["mean"].shape == mean.shape and torch.equal(saved["scale"].to(scale), scale) \
+            and torch.equal(saved["mean"].to(mean), mean):
+        return
+    args = (saved["mean"], saved["scale"], mean, scale)
+    dyn = state["world_model"]["dynamics"]
+    dyn["mlp.0.weight"] = widen_input_weight(dyn["mlp.0.weight"], *args)
+    for critic in state["critics"].values():
+        critic["0.weight"] = widen_input_weight(critic["0.weight"], *args)
+    state["world_model"]["sim_context"] = {"mean": mean.clone(), "scale": scale.clone()}
+
+
+def _pad_optimizer_state(opt: torch.optim.Optimizer) -> None:
+    """Zero-pad, at the end of each dimension, any per-parameter state (moments, momentum) smaller than its now
+    wider parameter (``widen_sim_context``'s first layers): the appended columns start without history."""
+    for p, st in opt.state.items():
+        for k, v in st.items():
+            if torch.is_tensor(v) and v.ndim == p.ndim and v.shape != p.shape:
+                pad = v.new_zeros(p.shape)
+                pad[tuple(slice(0, n) for n in v.shape)] = v
+                st[k] = pad
 
 
 def imitation_goal_dims(runner: TwoAgentRunner) -> dict[str, int]:

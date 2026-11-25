@@ -229,8 +229,9 @@ def train(p: dict, max_seconds: float | None, device: str) -> Path:
     # a fine-tune or resume keeps its source's sim-context columns (the world model's and critics' input)
     source = {"resume": run_dir, "fine_tune": p.get("source")}.get(p["mode"])
     layout = source_sim_context_layout(source) if source is not None else None
+    # (a fine-tune's: then this env's new columns appended, its first layers widened at load: SimContext.from_env)
     runner = ImitationRunner(env, cfg, rewards=p["rewards"], run_dir=run_dir, motion_files=p["files"], device=device,
-                             sim_context_layout=layout)
+                             sim_context_layout=layout, sim_context_fine_tune=p["mode"] == "fine_tune")
     if p["mode"] == "resume":
         runner.load_checkpoint(run_dir / "checkpoint.pt")
     elif p["mode"] == "fine_tune":
