@@ -31,7 +31,7 @@ import torch.nn as nn
 
 from pretraining.constants import JOINT_NAMES
 from pretraining.marl.config import AGENTS, JOINT_SLICES
-from pretraining.plants import Plant, get_plant
+from pretraining.plants import Plant, get_plant, prior_plant
 
 DEFAULT_POSE_TOL = 1e-4  # rad: the env's default pose (float32 in the sim) against the plant's
 
@@ -130,3 +130,12 @@ def stage1_plant(run_dir, sim_dt: float, decimation: int, default_pose: dict[str
         raise ValueError(f"{where}: the env's default pose differs from the plant's on "
                          + ", ".join(f"{j} ({d:+.3f} rad)" for j, d in off.items()))
     return plant
+
+
+def check_prior_plant(prior_file, plant: Plant) -> None:
+    """ValueError unless the latent prior ``prior_file`` was fitted on ``plant`` (its report's ``plant``; without it:
+    pretraining's): a prior fitted on another plant maps other proprio to the latent."""
+    fitted = prior_plant(prior_file)
+    if fitted.name != plant.name:
+        raise ValueError(f"latent prior {prior_file} was fitted on the {fitted.name} plant; the stage-1 run and the env "
+                         f"are on the {plant.name} plant: refit it (python -m pretraining.scripts.fit_prior <run>)")

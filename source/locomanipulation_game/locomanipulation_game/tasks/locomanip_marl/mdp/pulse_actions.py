@@ -13,9 +13,9 @@ The decoders read one proprio frame per policy step, what the robot would report
 IMU's /lowstate model (env.lowstate_imu: lagged, biased, noisy; the gyro before the actors' low-pass, as h12_train's
 deploy reads it), the measured joint angles (angle + encoder offset, main's position noise) less the plant's default
 pose (the env's), the joint speeds with main's encoder noise, and both decoders' raw outputs of the step before. The
-two terms share it (_PulseShared, one per env): each term's process_actions only hands its latent over, and once both have,
-the frame is built and both decode, then the last-action buffer moves on. The order the ActionManager calls them in
-cannot matter. A term's reset zeroes its envs' last action (both terms do; it is the same buffer).
+two terms share it (_PulseShared, one per env): each term's process_actions only hands its latent over, and once both
+have, the frame is built and both decode, then the last-action buffer moves on. The order the ActionManager calls them
+in cannot matter. A term's reset zeroes its envs' last action (both terms do; it is the same buffer).
 
 What the policies observe of their action (applied_actions) is the latent as the env clamped it (clip_actions). The
 env's action delay and encoder offsets act on these terms as on main's (_joint_ids, _processed_actions), and _applied
@@ -53,7 +53,7 @@ class _PulseShared:
         from pretraining.constants import IMU_BODY, JOINT_NAMES
         from pretraining.marl.actors import load_latent_prior
         from pretraining.marl.config import AGENTS
-        from pretraining.marl.pulse import PulseDecoders, stage1_plant
+        from pretraining.marl.pulse import PulseDecoders, check_prior_plant, stage1_plant
         from pretraining.marl.runner import load_actors
 
         self.env, self.agents = env, AGENTS
@@ -65,14 +65,16 @@ class _PulseShared:
             raise ValueError("the articulation's joints do not cover pretraining's JOINT_NAMES")
         if IMU_BODY != "torso_link":
             raise ValueError(f"the decoders' IMU is on {IMU_BODY}; the env's lowstate IMU is on torso_link's imu_link")
+        # before loading anything: decoded on another plant than its own, a run falls (23% of zero-policy episodes)
+        env_pose = robot.data.default_joint_pos[0, self.joint_ids].tolist()
+        self.plant = stage1_plant(cfg.stage1_run, env.cfg.sim.dt, env.cfg.decimation, dict(zip(JOINT_NAMES, env_pose)))
         if self.prior and not os.path.isfile(self.prior):
             raise FileNotFoundError(
                 f"no latent prior {self.prior}: fit it (python -m pretraining.scripts.fit_prior {cfg.stage1_run}). "
                 "Without one a zero latent is not a standing policy (the decoders' outputs grow through the last "
                 "action within a few steps): env.pulse_prior=null is for debugging only")
-        # before loading anything: decoded on another plant than its own, a run falls (23% of zero-policy episodes)
-        env_pose = robot.data.default_joint_pos[0, self.joint_ids].tolist()
-        self.plant = stage1_plant(cfg.stage1_run, env.cfg.sim.dt, env.cfg.decimation, dict(zip(JOINT_NAMES, env_pose)))
+        if self.prior:
+            check_prior_plant(self.prior, self.plant)
         actors = load_actors(cfg.stage1_run, env.device)
         priors = load_latent_prior(self.prior, env.device) if self.prior else None
         limits = {n: tuple(b) for n, b in (cfg.joint_limits or {}).items()}

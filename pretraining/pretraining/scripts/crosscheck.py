@@ -54,7 +54,8 @@ def run(args: argparse.Namespace) -> str:
     device = getattr(args, "device", None) or "cuda:0"
     actors = load_actors(args.run, device)
     history_length = next(iter(actors.values())).history_length
-    env = rollout.make_env(files, args.num_envs or len(files), device, args.seed)
+    env = rollout.make_env(files, args.num_envs or len(files), device, args.seed,
+                           task=rollout.play_task(args.run))  # the run's own plant
     try:
         rows = rollout.rollout(env, actors, history_length, args.seconds)
     finally:

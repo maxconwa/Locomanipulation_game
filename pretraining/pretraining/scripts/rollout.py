@@ -74,6 +74,13 @@ def choose_clips(
     return [motion_dir / f"{c}.npz" for c in chosen]
 
 
+def play_task(run_dir) -> str:
+    """The play env of a stage-1 run's own plant (``plants.PLAY_TASKS``; a run without ``plant``: pretraining's)."""
+    from pretraining.plants import PLAY_TASKS, run_plant
+
+    return PLAY_TASKS[run_plant(run_dir).name]
+
+
 def make_env(files: list[Path], num_envs: int, device: str, seed: int, task: str = PLAY_TASK, render_mode=None):
     """Create the play env on ``files`` only (never a whole dataset: its body tensors fill the GPU), nominal."""
     from isaaclab_tasks.utils import load_cfg_from_registry
@@ -88,7 +95,8 @@ def make_env(files: list[Path], num_envs: int, device: str, seed: int, task: str
     motion.pose_range = {}
     motion.velocity_range = {}
     motion.joint_position_range = (0.0, 0.0)
-    cfg.events.foot_friction.params["friction_range"] = (NOMINAL_FOOT_FRICTION, NOMINAL_FOOT_FRICTION)
+    if getattr(cfg.events, "foot_friction", None) is not None:
+        cfg.events.foot_friction.params["friction_range"] = (NOMINAL_FOOT_FRICTION, NOMINAL_FOOT_FRICTION)
     cfg.events.base_com = None
     cfg.events.encoder_bias = None
     return gym.make(task, cfg=cfg, render_mode=render_mode)

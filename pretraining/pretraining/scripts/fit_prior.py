@@ -4,7 +4,8 @@
       [--out <file>] [--num-envs 2048] [--iterations 6000] [--hidden-dims 512 256] [--hide-last-action]
 
 Ported from h12_train (this repository's own code, branch supermimic, commit b175f1c), ``scripts/fit_prior.py``.
-Changes: Isaac Lab's ``LocoManip-Pretrain-Track-v0`` env in place of mjlab's (on the run's own clips, from its
+Changes: Isaac Lab's tracking env of the run's own plant (``plants.NOMINAL_TASKS``, from its ``run.json``'s ``plant``;
+without the key pretraining's ``LocoManip-Pretrain-Track-v0``) in place of mjlab's (on the run's own clips, from its
 ``run.json``, frames drawn uniformly, the env's own randomisation: no ``--randomisation`` options); argparse in place
 of tyro; ``--out`` defaults to ``<stage-1 run>/prior.pt``.
 
@@ -24,7 +25,7 @@ import sys
 import traceback
 from pathlib import Path
 
-TASK = "LocoManip-Pretrain-Track-v0"
+TASK = "LocoManip-Pretrain-Track-v0"  # pretraining's plant's (plants.NOMINAL_TASKS); a run's own plant's is fit_task's
 WINDOW = 500  # steps the report averages over
 
 
@@ -48,6 +49,15 @@ def explained(mse: list[float], var: list[float]) -> dict[str, float]:
     return {"mse": m, "latent_variance": v, "explained": 1.0 - m / v if v > 0.0 else float("nan")}
 
 
+def fit_task(stage1: Path) -> tuple[str, str]:
+    """(plant name, gym id) a prior for ``stage1`` is fitted in: the nominal tracking env of the run's plant, at its
+    rate (a prior fitted on another plant than its decoders' sees other proprio; the decoders refuse such a run)."""
+    from pretraining.plants import NOMINAL_TASKS, run_plant
+
+    plant = run_plant(stage1)
+    return plant.name, NOMINAL_TASKS[plant.name]
+
+
 def fit(args: argparse.Namespace, device: str) -> dict:
     """Collect with the stage-1 actors and fit both priors; write the files and return the report. Needs the app."""
     import gymnasium as gym
@@ -69,13 +79,16 @@ def fit(args: argparse.Namespace, device: str) -> dict:
     cfg = config_from_dict(TwoAgentRunnerCfg, meta["runner"])
     cfg.sampling_mode, cfg.buffer_size = "uniform", 8
     files = [str(from_repo_path(f)) for f in meta["motion_files"]]
-    env_cfg = load_cfg_from_registry(TASK, "env_cfg_entry_point")
+    plant, task = fit_task(stage1)
+    env_cfg = load_cfg_from_registry(task, "env_cfg_entry_point")
+    if getattr(env_cfg, "plant", "pretrain") != plant:
+        raise RuntimeError(f"{task} is on the {getattr(env_cfg, 'plant', 'pretrain')} plant, {stage1}'s is {plant}")
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.sim.device = device
     env_cfg.seed = args.seed
     env_cfg.commands.motion.motion_file = files
     env_cfg.commands.motion.sampling_mode = "uniform"
-    env = EnvAdapter(gym.make(TASK, cfg=env_cfg).unwrapped)
+    env = EnvAdapter(gym.make(task, cfg=env_cfg).unwrapped)
     runner = ImitationRunner(env, cfg, rewards=None, run_dir=None, motion_files=files, device=device)
     state = torch.load(stage1 / "actors.pt", map_location=device, weights_only=False)
     for a in AGENTS:
@@ -130,6 +143,8 @@ def fit(args: argparse.Namespace, device: str) -> dict:
     atomic_save({a: priors[a].state_dict() for a in AGENTS}, out)
     report = {
         "stage1": str(stage1),
+        "plant": plant,
+        "task": task,
         "iterations": args.iterations,
         "num_envs": args.num_envs,
         "hidden_dims": list(args.hidden_dims),

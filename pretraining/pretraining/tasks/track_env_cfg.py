@@ -325,3 +325,16 @@ class TrackMainFineTuneEnvCfg(TrackMainEnvCfg):
         actor.enable_corruption = True
         actor.joint_pos.noise = Unoise(n_min=-JOINT_POS_NOISE, n_max=JOINT_POS_NOISE)
         actor.joint_vel.noise = joint_vel_noise(list(JOINT_NAMES))
+
+
+@configclass
+class TrackMainEnvCfg_PLAY(TrackMainEnvCfg):
+    """``TrackMainEnvCfg`` as ``TrackEnvCfg_PLAY``: no time-out, every reset at its clip's start, no perturbation (the
+    nominal env crosscheck.py and play.py roll a main-plant run in)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.episode_length_s = int(1e9)
+        self.commands.motion.pose_range = {}
+        self.commands.motion.velocity_range = {}
+        self.commands.motion.sampling_mode = "start"

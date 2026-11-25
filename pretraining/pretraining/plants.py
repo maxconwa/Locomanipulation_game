@@ -116,3 +116,35 @@ def get_plant(name: str) -> Plant:
     if name not in PLANTS:
         raise ValueError(f"unknown plant {name!r}; known plants: {', '.join(sorted(PLANTS))}")
     return PLANTS[name]
+
+
+# The tracking env of each plant without domain randomization (a fit or a check on a run uses its plant's), and its
+# play variant (every reset at the clip's start, no time-out); ids registered in pretraining.tasks.
+NOMINAL_TASKS: dict[str, str] = {"pretrain": "LocoManip-Pretrain-Track-v0", "main": "LocoManip-Pretrain-Track-Main-v0"}
+PLAY_TASKS: dict[str, str] = {
+    "pretrain": "LocoManip-Pretrain-Track-Play-v0", "main": "LocoManip-Pretrain-Track-Main-Play-v0"}
+
+
+def _meta_plant(path) -> Plant:
+    import json
+    from pathlib import Path
+
+    path = Path(path)
+    meta = json.loads(path.read_text()) if path.is_file() else {}
+    return get_plant(meta.get("plant", "pretrain"))
+
+
+def run_plant(run_dir) -> Plant:
+    """The plant a stage-1 run was trained on: its ``run.json``'s ``plant`` (without the key or the file: written
+    before plants were recorded, so pretraining's)."""
+    from pathlib import Path
+
+    return _meta_plant(Path(run_dir) / "run.json")
+
+
+def prior_plant(prior_file) -> Plant:
+    """The plant a latent prior was fitted on: the ``plant`` of fit_prior.py's report beside it (``<prior>.json``;
+    without the key or the file: pretraining's, as before plants were recorded)."""
+    from pathlib import Path
+
+    return _meta_plant(Path(prior_file).with_suffix(".json"))

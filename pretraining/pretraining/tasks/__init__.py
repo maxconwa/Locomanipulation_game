@@ -30,3 +30,9 @@ gym.register(
     disable_env_checker=True,
     kwargs={"env_cfg_entry_point": "pretraining.tasks.track_env_cfg:TrackMainFineTuneEnvCfg"},
 )
+gym.register(
+    id="LocoManip-Pretrain-Track-Main-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": "pretraining.tasks.track_env_cfg:TrackMainEnvCfg_PLAY"},
+)

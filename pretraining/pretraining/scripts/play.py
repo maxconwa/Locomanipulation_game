@@ -47,7 +47,8 @@ def run(args: argparse.Namespace) -> str:
     device = getattr(args, "device", None) or "cuda:0"
     actors = load_actors(args.run, device)
     history_length = next(iter(actors.values())).history_length
-    env = rollout.make_env(files, len(files), device, seed=0, render_mode="rgb_array" if args.video else None)
+    env = rollout.make_env(files, len(files), device, seed=0, task=rollout.play_task(args.run),
+                           render_mode="rgb_array" if args.video else None)
     if args.video:
         import gymnasium as gym
 

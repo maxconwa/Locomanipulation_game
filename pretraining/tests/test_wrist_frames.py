@@ -82,5 +82,6 @@ def test_wrist_frames_on_standin_clip(tmp_path):
     assert result["goal_vs_tool_frame"]["rotation_deg_max"] < 0.05
     cov = result["goal_coverage"]
     assert 0.0 <= cov["both"] <= 1.0 and cov["table_poses"] > 0
+    assert "yaw-only" in cov["coverage_note"]
     # aggregates only: the clip's name is nowhere in the output
     assert clip.stem not in text

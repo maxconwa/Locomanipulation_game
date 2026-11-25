@@ -9,7 +9,11 @@ are written at every replayed frame and the articulation's kinematics updated, n
 - ``fk_pos_err_m`` / ``fk_rot_err_deg`` (p50, p95, max over frames and both wrists): Isaac's ``*_wrist_yaw_link`` pose
   in the pelvis frame against ``pretraining.kinematics``' FK (the URDF stage 1 tracks on) on the same frames;
 - ``goal_coverage``: the share of main's arm-target table poses (``ArmTargetsCommandCfg.table_file``, per arm and
-  over both) with a clip wrist pose of the same arm within ``POS_TOL_M`` and ``ROT_TOL_DEG``;
+  over both) with a clip wrist pose of the same arm within ``POS_TOL_M`` and ``ROT_TOL_DEG``. It compares the clip
+  wrist poses in the full pelvis frame (the clip's pelvis roll, pitch and height, crouches included) against the
+  table's rows, built at the standing stance; at run time ArmTargetsCommand places goals in a yaw-only standing frame
+  and lowers them below the table's reach (commands.py:413-420). So it is not coverage of crouched or lowered goals
+  (``COVERAGE_NOTE``, also written to the json);
 - ``goal_vs_tool_frame``: the rotation (deg, max over frames) between main's goal frame (``*_wrist_yaw_link`` in the
   pelvis frame, as ArmTargetsCommand takes it) and stage 1's tool frame (``marl.rewards.ee_in_pelvis``: the same link
   plus ``GRASP_OFFSET``, a translation, so 0 is expected) and that offset.
@@ -35,6 +39,11 @@ POS_TOL_M = 0.1
 ROT_TOL_DEG = 30.0
 WRIST_BODIES = ("left_wrist_yaw_link", "right_wrist_yaw_link")  # main's LEFT_EE_BODY, RIGHT_EE_BODY
 _PRIM = "/World/WristFramesRobot"
+COVERAGE_NOTE = (
+    "clip wrist poses in the full pelvis frame (the clip's pelvis roll, pitch and height, crouches included) against "
+    "the table's rows, built at the standing stance; at run time ArmTargetsCommand places goals in a yaw-only "
+    "standing frame and lowers them below the table's reach (commands.py:413-420), so this is not coverage of "
+    "crouched or lowered goals")
 
 
 def percentiles(x: torch.Tensor) -> dict[str, float]:
@@ -186,7 +195,8 @@ def replay(args) -> dict:
         "clips": len(files), "frames": frames, "stride": args.stride, "plant": MAIN.name,
         "fk_pos_err_m": percentiles(pos_err), "fk_rot_err_deg": percentiles(rot_err),
         "goal_coverage": {**per_arm, "both": hits / total, "pos_tol_m": POS_TOL_M, "rot_tol_deg": ROT_TOL_DEG,
-                          "table": table_path.name, "table_poses": total},
+                          "table": table_path.name, "table_poses": total,
+                          "coverage_note": COVERAGE_NOTE},
         "goal_vs_tool_frame": {"rotation_deg_max": float(rot.max()), "grasp_offset_m": offset},
     }
 

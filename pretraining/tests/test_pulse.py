@@ -216,6 +216,33 @@ def test_pulse_refuses_a_run_of_another_plant(tmp_path):
         stage1_plant(_plant_run(tmp_path, "main"), 0.002, 5, moved)
 
 
+def test_fit_prior_and_the_rollouts_take_the_runs_plant(tmp_path):
+    """fit_prior fits in the nominal tracking env of the run's plant; crosscheck and play roll in its play env; a run
+    without the key is pretraining's."""
+    from pretraining.scripts.fit_prior import fit_task
+    from pretraining.scripts.rollout import play_task
+
+    assert fit_task(_plant_run(tmp_path, "main")) == ("main", "LocoManip-Pretrain-Track-Main-v0")
+    assert play_task(_plant_run(tmp_path, "main")) == "LocoManip-Pretrain-Track-Main-Play-v0"
+    for plant in ("pretrain", None):
+        assert fit_task(_plant_run(tmp_path, plant)) == ("pretrain", "LocoManip-Pretrain-Track-v0")
+        assert play_task(_plant_run(tmp_path, plant)) == "LocoManip-Pretrain-Track-Play-v0"
+
+
+def test_pulse_refuses_a_prior_of_another_plant(tmp_path):
+    from pretraining.marl.pulse import check_prior_plant
+
+    prior = tmp_path / "prior.pt"
+    (tmp_path / "prior.json").write_text(json.dumps({"plant": "main"}))
+    check_prior_plant(prior, MAIN)
+    with pytest.raises(ValueError, match="pretrain plant"):
+        check_prior_plant(prior, PRETRAIN)
+    (tmp_path / "prior.json").write_text(json.dumps({"iterations": 3}))  # written before plants were recorded
+    check_prior_plant(prior, PRETRAIN)
+    with pytest.raises(ValueError, match="fitted on the pretrain plant"):
+        check_prior_plant(prior, MAIN)
+
+
 def test_pulse_agent_cfg_is_the_mappo_yaml():
     """At main's 100 Hz again: the yaml as it is (discount and lambda main's), PULSE's std and init in the env cfg."""
     spec = importlib.util.spec_from_file_location("_agents", TASKS / "agents" / "__init__.py")
@@ -270,6 +297,7 @@ def test_pulse_cfg(sim_app):
     cfg = MarlPulseEnvCfg()
     assert cfg.agent_action_terms == {"legs": ["legs_latent"], "arms": ["arms_latent"]}
     assert [n for n, t in vars(cfg.actions).items() if t is not None] == ["legs_latent", "arms_latent"]
+    # only the resolved path: the cfg never opens the run, so this passes whether or not it exists yet
     run = REPO / "data" / "pretraining" / "runs" / "main_s1_finetune"
     for term in (cfg.actions.legs_latent, cfg.actions.arms_latent):
         assert term.stage1_run == str(run) and term.prior == str(run / "prior.pt")
@@ -487,6 +515,7 @@ def test_fit_prior_on_standins_then_the_pulse_env_decodes_with_it(tmp_path):
     assert "[fit_prior] 0:" in out
     report = json.loads((run / "prior.json").read_text())
     assert report["iterations"] == 3 and report["hidden_dims"] == [16]
+    assert report["plant"] == "main" and report["task"] == "LocoManip-Pretrain-Track-Main-v0"  # the run's plant
     for a in AGENTS:
         assert set(report[a]) == {"mse", "latent_variance", "explained"}
     priors = load_latent_prior(run / "prior.pt", "cpu")
