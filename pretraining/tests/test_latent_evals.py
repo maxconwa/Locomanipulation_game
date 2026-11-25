@@ -252,6 +252,8 @@ def test_scorecard_runs_a_c_policy_from_a_standin_run(tmp_path):
     settings = _skrl_run(tmp_path / "b", PULSE, steps=(1,))  # B's conditions: no overrides, env.yaml or state here
     _run(SCORECARD_SCRIPT, "--latent_run", run, "--settings_run", settings, "--num_envs", 2, "--segments_per_env", 1,
          "--out", out)
+    # the untrained stand-in falls within 2 s: the scorecard is still written (falls, no response fit)
+    assert Path(str(out) + ".json").is_file()
     res = json.loads(Path(str(out) + ".json").read_text())
     assert SKRL_LEGS_KEYS <= set(res)
     assert res["latent"] == "commands" and res["task"] == PULSE and res["trainer"] == "commands"

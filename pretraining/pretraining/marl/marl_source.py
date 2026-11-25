@@ -25,7 +25,6 @@ mean over main's randomisation, as h12_train's stage 2 did for its Randomisation
 
 from __future__ import annotations
 
-import os
 
 import torch
 
@@ -64,12 +63,15 @@ class MarlEnvSource:
         cmds = u.cfg.commands
         self.velocity_law = VelocityLaw.from_cfg(getattr(cmds, VELOCITY_COMMAND))
         arm = getattr(cmds, ARM_COMMAND)
-        table = arm.table_file
-        if table and os.path.isfile(table):
-            self.arm_law = ArmGoalLaw.from_table(table, arm.standing_height, **ArmGoalLaw.cmd_cfg_kwargs(arm))
-        else:
-            # without it the arms encoder would train on goals frozen at each rollout's start
-            raise FileNotFoundError(f"no arm-target table at {table!r}: the imagined arm goals are drawn from it")
+        # the tables the env's arm command loaded or built (its table_file lives in a log_dir, if any)
+        term = u.command_manager.get_term(ARM_COMMAND)
+        tables = getattr(term, "_tables", None)
+        if not tables:
+            # without them the arms encoder would train on goals frozen at each rollout's start
+            raise ValueError(f"the env's {ARM_COMMAND} term has no arm-target tables: the imagined arm goals are "
+                             "drawn from them")
+        self.arm_law = ArmGoalLaw([t.cpu() for t in tables], term.rest_pose_b.cpu(), arm.standing_height,
+                                  **ArmGoalLaw.cmd_cfg_kwargs(arm))
         n = self.num_envs
         self.last_action = torch.zeros(n, len(JOINT_NAMES), device=self.device)
         self.time_outs = torch.zeros(n, dtype=torch.bool, device=self.device)

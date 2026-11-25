@@ -114,7 +114,13 @@ def compute(cmds: np.ndarray, kinds: np.ndarray, rec: dict, fell_at: np.ndarray,
     cmds100, vels100 = [s["cmd"] for s in series], [s["vel"] for s in series]
     stride = int(round(gait_period / S.DT))
     subsets = {kind: [s["kind"] == i for s in series] for i, kind in enumerate(KINDS)}
-    res = lm.score(cmds100, vels100, masks, stride, subsets=subsets)
+    if series:
+        res = lm.score(cmds100, vels100, masks, stride, subsets=subsets)
+    else:  # nothing to fit: the falls only
+        res = {"stride_samples": stride, "note": "no episode reached 2 s before falling: no response fit or tracking",
+               "response": {ax: dict.fromkeys(("tau", "delay", "bias", "gain", "r2", "resid_rmse"))
+                            for ax in ("vx", "vy", "wz")},
+               "tracking_vs_lagged": {}, "tracking_vs_command": {}}
     commanded = [lm.commanded(c) for c in cmds100]
     small = subsets["small"]
 
