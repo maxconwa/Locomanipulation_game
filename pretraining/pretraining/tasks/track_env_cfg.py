@@ -295,9 +295,11 @@ class TrackMainEnvCfg(TrackEnvCfg):
 @configclass
 class MainFineTuneEventCfg(EventCfg):
     """Main's randomization (``MarlEventCfg``) in place of the tracking env's foot friction and encoder bias: friction
-    on every body, torso mass, the motors' gains and strength per reset, and the encoders' offsets per reset."""
+    on every body, torso mass, the motors' gains and strength per reset, and the encoders' offsets per reset. The
+    tracking env's torso centre-of-mass draw is off: main has none, and it would come on top of main's torso mass."""
 
     foot_friction = None
+    base_com = None
     encoder_bias = EventTerm(
         func=events.sample_encoder_offsets, mode="reset", params={"half_widths": dict(ENCODER_OFFSET_RAD)}
     )
