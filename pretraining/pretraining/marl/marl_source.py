@@ -68,9 +68,8 @@ class MarlEnvSource:
         if table and os.path.isfile(table):
             self.arm_law = ArmGoalLaw.from_table(table, arm.standing_height, **ArmGoalLaw.cmd_cfg_kwargs(arm))
         else:
-            # the imagined rollouts then keep the arm goal the env held at their start (no new arm segments)
-            print(f"[MarlEnvSource] no arm-target table at {table!r}: imagined arm goals are not resampled", flush=True)
-            self.arm_law = None
+            # without it the arms encoder would train on goals frozen at each rollout's start
+            raise FileNotFoundError(f"no arm-target table at {table!r}: the imagined arm goals are drawn from it")
         n = self.num_envs
         self.last_action = torch.zeros(n, len(JOINT_NAMES), device=self.device)
         self.time_outs = torch.zeros(n, dtype=torch.bool, device=self.device)

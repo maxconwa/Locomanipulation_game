@@ -138,6 +138,13 @@ class CommandRunnerCfg:
     seed: int = 0
 
 
+def _joint_noise():
+    """Main's joint_noise module (loaded by path in main_obs: the task package's __init__ imports Isaac Lab)."""
+    from pretraining.marl import main_obs
+
+    return main_obs._joint_noise
+
+
 class _Spec:
     """A sim-context spec stand-in: a name and a width (the values come from the source, not an env)."""
 
@@ -300,6 +307,9 @@ class CommandRunner:
         widths = self.obs_model.widths()
         if widths != {a: source.obs_dims[a] for a in widths}:
             raise ValueError(f"main's observation model gives {widths}, the env {source.obs_dims}")
+        jn = _joint_noise()
+        self._vel_floor = torch.tensor(jn.per_joint(list(JOINT_NAMES), jn.JOINT_VEL_NOISE_FLOOR,
+                                                    jn.JOINT_VEL_NOISE_FLOOR_DEFAULT), device=dev)
         self.gait_window = cycle_window(source.env_cfg.gait_period, self.dt)
         self._refresh_rewards()
         self.process = CommandProcess(self.dt, cfg.mean_hold_s, cfg.clip_command_prob, source.velocity_law,
@@ -430,14 +440,30 @@ class CommandRunner:
         roll = torch.atan2(-g_b[:, 1], -g_b[:, 2]).abs()
         pitch = torch.asin(g_b[:, 0].clamp(-1.0, 1.0)).abs()
         s = self.cfg.termination_softness
-        alive = ((1 - torch.sigmoid((roll - self.cfg.max_roll) / s)) * (1 - torch.sigmoid((pitch - self.cfg.max_pitch) / s))
+        alive = ((1 - torch.sigmoid((roll - self.cfg.max_roll) / s))
+                 * (1 - torch.sigmoid((pitch - self.cfg.max_pitch) / s))
                  * (1 - torch.sigmoid((self.cfg.fall_height - z[:, 0]) / s)))
         return 1.0 - alive
+
+    def decoder_sensors(self, sensors: torch.Tensor) -> torch.Tensor:
+        """The decoders' measured joints as the env gives them (pulse_actions.py:96-102): compute_wm_obs adds no
+        noise (its _proprio_noise_bounds are only read by add_proprio_noise), so add the rollout's encoder offsets
+        (MainActorObs.reset's draw from main's ranges, the same the actor observation reads), main's uniform position
+        noise and its speed-scaled velocity noise. Columns: gravity 3, gyro 3, q - default 27, dq 27."""
+        jn = _joint_noise()
+        n = len(JOINT_NAMES)
+        q, dq = sensors[:, 6 : 6 + n], sensors[:, 6 + n : 6 + 2 * n]
+        g = self.gen
+        u = torch.rand(q.shape, generator=g, device=g.device).to(q)
+        q = q + self.obs_model.encoder_offset + (2.0 * u - 1.0) * jn.JOINT_POS_NOISE
+        noise = torch.randn(dq.shape, generator=g, device=g.device).to(dq)
+        dq = dq + noise * jn.joint_vel_noise_std(dq.detach(), self._vel_floor.to(dq))
+        return torch.cat([sensors[:, :6], q, dq], dim=-1)
 
     def _decode(self, rep: torch.Tensor, aux: torch.Tensor, sim_ctx: torch.Tensor, prev_action: torch.Tensor,
                 z: dict[str, torch.Tensor]) -> torch.Tensor:
         """Both frozen decoders on one proprio frame, into the 27 raw actions (pulse.PulseDecoders.step's order)."""
-        sensors = self.rep.compute_wm_obs(rep, aux, self.rep.joint_state(rep), sim_ctx)
+        sensors = self.decoder_sensors(self.rep.compute_wm_obs(rep, aux, self.rep.joint_state(rep), sim_ctx))
         frame = torch.cat([sensors, prev_action], dim=-1).unsqueeze(1)
         out = []
         for a in AGENTS:

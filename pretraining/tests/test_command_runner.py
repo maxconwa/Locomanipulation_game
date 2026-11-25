@@ -271,6 +271,25 @@ def test_clip_segments_pull_toward_the_stage1_latent(tmp_path):
         assert logs[f"Policy/latent_bc_{a}"] == 0.0
 
 
+def test_decoders_read_main_joint_noise_and_encoder_offsets_in_imagination(tmp_path):
+    """compute_wm_obs adds no noise; the decoders' frame gets the rollout's encoder offsets (the actor observation's
+    own draw) and main's joint noise (pulse_actions.py:96-102), gravity and gyro untouched."""
+    run = make_stage1_run(tmp_path / "stage1")
+    runner = CommandRunner(StandinSource(), run, small_cfg(), run_dir=tmp_path / "out")
+    runner.obs_model.reset(4000, runner.gen)
+    clean = torch.zeros(4000, 60)
+    clean[:, 6 + 27 :] = 2.0  # dq: speed-scaled noise
+    noisy = runner.decoder_sensors(clean)
+    assert torch.equal(noisy[:, :6], clean[:, :6])
+    dq_noise = noisy[:, 33:] - clean[:, 33:]
+    q_noise = noisy[:, 6:33] - runner.obs_model.encoder_offset
+    assert q_noise.abs().max() <= 0.003 + 1e-6 and q_noise.std() > 0.001
+    assert runner.obs_model.encoder_offset.abs().max() > 0.0
+    assert dq_noise.std() > 0.5  # 0.6 x |dq| = 1.2 rad/s at 2 rad/s
+    # the clean model output itself carries none
+    assert runner.rep._proprio_noise_bounds.abs().max() > 0.0  # it exists, but only add_proprio_noise reads it
+
+
 @pytest.mark.sim
 def test_command_runner_two_iterations(sim_app, tmp_path):
     """The runner on LocoManip-Marl-Pulse-v0 (8 envs, no prior) with a stand-in stage-1 run at plant main: two
