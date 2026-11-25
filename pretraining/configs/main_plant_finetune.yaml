@@ -35,7 +35,7 @@ runner:
   policy:
     lr: 0.0002
     num_batches: 1
-    batch_size: 384  # horizon 64: x1024 and x512 (10.9 GB peak in the policy update) ran out of 16 GB
+    batch_size: 320  # horizon 64: x384 fitted with the base run's 31-column sim context, not with the fine-tune's 87
     horizon: 64  # 0.64 s, base.yaml's 32 steps at 50 Hz
     gamma: 0.995  # the same 1 / (1 - gamma) = 2 s horizon as 0.99 at 50 Hz
     survival_masking: true
