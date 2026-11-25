@@ -39,6 +39,9 @@ class WorldModelEnv(ABC):
     method; subclasses choose how to assemble the actor observation.
     """
 
+    prev_targets: torch.Tensor | None = None
+    """(B, 2, A): the targets of the two steps before the current one, as applied; None without a delay."""
+
     def __init__(
         self,
         dynamics: Dynamics,
@@ -111,6 +114,8 @@ class WorldModelEnv(ABC):
         # the reward path consumes these directly.
         self.last_actions = batch["prev_action"].detach()
         self.sim_ctx = batch["sim_ctx"]
+        # a delayed env's: the targets of the two steps before the sampled one, as applied (Dynamics.delay)
+        self.prev_targets = batch["prev_target"].unflatten(-1, (2, -1)) if "prev_target" in batch.keys() else None
         self._on_reset(batch)
         return self.get_observations()
 
@@ -125,6 +130,8 @@ class WorldModelEnv(ABC):
         self.rep_state = next_rep_state
         self.aux_state = next_aux_state
         self.joint_state = next_joint_state
+        if self.prev_targets is not None:
+            self.prev_targets = self.dynamics.roll_targets(actions, self.prev_targets)
         self.last_actions = actions
 
         self._compute_commands()
@@ -173,7 +180,8 @@ class WorldModelEnv(ABC):
         score the post-step state against the cached reference body state, the way
         the simulator scores it before advancing the clip.
         """
-        next_aux_state, next_rep_state = self.dynamics(rep_state, action, aux_state, sim_ctx)
+        delayed = () if self.prev_targets is None else (self.prev_targets,)  # a delay-unaware dynamics takes four
+        next_aux_state, next_rep_state = self.dynamics(rep_state, action, aux_state, sim_ctx, *delayed)
         next_joint_state = self.representation.joint_state(next_rep_state)
         ref_body_pos_w, ref_body_quat_w, ref_body_lin_vel_w, ref_body_ang_vel_w = self._ref_body_state
         term_prob = self._compute_term_prob(next_aux_state, ref_body_pos_w, ref_body_quat_w)

@@ -131,6 +131,48 @@ def test_finetune_sim_context_reads_the_envs_draws(sim_app, tmp_path):
         env.close()
 
 
+@pytest.mark.sim
+def test_finetune_effective_target_is_the_mean_applied_target(sim_app, tmp_path):
+    """The world model's action input in the delayed fine-tune env (Dynamics.effective_target from the term's
+    previous_targets, read before the step, and the step's delay) equals the mean over the step's substeps of the
+    target the action term applied (plus the encoder bias it subtracts), the steps after a reset included."""
+    from types import SimpleNamespace
+
+    from pretraining.supermimic.models import Dynamics
+
+    write_clips(tmp_path, n=1, frames=FRAMES)
+    n = 64
+    env = _make(FINETUNE_TASK, n, tmp_path)
+    try:
+        term = env.action_manager.get_term("joint_pos")
+        decimation = env.cfg.decimation
+        applied: list[torch.Tensor] = []
+        apply = term.apply_actions
+
+        def record():
+            apply()
+            applied.append(env.scene["robot"].data.joint_pos_target[:, term._joint_ids].clone())
+
+        term.apply_actions = record
+        env.reset()
+        for step in range(6):
+            if step == 3:
+                env.reset()  # every env starts again: its history is the pose it starts in
+            prev = term.previous_targets()
+            delay = term.delay_steps.clone().float()
+            bias = env.encoder_bias.clone()
+            applied.clear()
+            env.step(0.5 * torch.randn(n, len(JOINT_NAMES), device=env.device))
+            own = term.processed_actions.clone()
+            stub = SimpleNamespace(proc=lambda a: own, delay=(decimation, 0, 5.0, 5.0))
+            ctx = ((delay - 5.0) / 5.0).unsqueeze(-1)
+            eff = Dynamics.effective_target(stub, own, ctx, prev)
+            mean = torch.stack(applied).mean(0) + bias
+            torch.testing.assert_close(eff, mean, atol=1e-5, rtol=0, msg=f"step {step}")
+    finally:
+        env.close()
+
+
 def _setup(tmp_path, monkeypatch):
     monkeypatch.setenv("PRETRAINING_RUNS_DIR", str(tmp_path / "runs"))
     write_clips(tmp_path / "motions", n=2, frames=FRAMES)

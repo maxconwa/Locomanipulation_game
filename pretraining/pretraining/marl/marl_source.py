@@ -82,6 +82,9 @@ class MarlEnvSource:
         self.arm_law = ArmGoalLaw([t.cpu() for t in tables], term.rest_pose_b.cpu(), arm.standing_height,
                                   **ArmGoalLaw.cmd_cfg_kwargs(arm))
         n = self.num_envs
+        # main's action delay: its per-term target histories (newest first), in the robot's joint order
+        self.has_delay = bool(getattr(u, "_target_history", None))
+        self.decimation = int(u.cfg.decimation)
         self.last_action = torch.zeros(n, len(JOINT_NAMES), device=self.device)
         self.time_outs = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.rewards = {a: torch.zeros(n, device=self.device) for a in AGENTS}
@@ -109,6 +112,17 @@ class MarlEnvSource:
         arm = self.u.command_manager.get_term(ARM_COMMAND)
         return {"lin_stage": int(vel.lin_kernel_stage), "ang_stage": int(vel.ang_kernel_stage),
                 "arm_stage": int(getattr(arm, "kernel_stage", 0))}
+
+    def prev_targets(self) -> torch.Tensor:
+        """(n, 2, 27) the joint targets the next step will apply as one and two steps old, ``JOINT_NAMES`` order,
+        read before it from main's histories (``_target_history``; after a reset they hold the pose it was reset to,
+        the measured one or the pre-pose's default, which main writes at the reset)."""
+        u = self.u
+        full = torch.zeros(self.num_envs, 2, self.robot.num_joints, device=self.device)
+        for term, history in zip(u._delay_terms, u._target_history):
+            rows = history[:, :2] if history.shape[1] >= 2 else history[:, :1].expand(-1, 2, -1)
+            full[:, :, term._joint_ids] = rows
+        return full[:, :, self.joint_ids]
 
     def sim_ctx(self, sim_context) -> torch.Tensor:
         """The world model's normalised sim context per env, ``sim_context``'s columns read from the env (module

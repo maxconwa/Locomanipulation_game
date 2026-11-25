@@ -49,6 +49,18 @@ class TargetDelay(BiasedJointPositionAction):
         self._asset.set_joint_position_target(target, joint_ids=self._joint_ids)
         self._substep += 1
 
+    def previous_targets(self) -> torch.Tensor:
+        """(num_envs, 2, action_dim): the targets the next step will apply as one and two steps old (policy
+        coordinates), read before it: the history's newest two rows, or for an env reset since its last step the pose
+        it starts in, as ``process_actions`` will write it."""
+        prev = self._history[:, :2].clone()
+        if prev.shape[1] < 2:  # a delay of at most one step keeps no older row
+            prev = torch.cat([prev, prev], dim=1)
+        if self._fresh.any():
+            measured = self._asset.data.joint_pos[:, self._joint_ids] + encoder_bias(self._env)
+            prev[self._fresh] = measured[self._fresh].unsqueeze(1).expand(-1, 2, -1)
+        return prev
+
     def reset(self, env_ids=None) -> None:
         super().reset(env_ids)
         if env_ids is None:

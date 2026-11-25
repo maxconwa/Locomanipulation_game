@@ -103,7 +103,11 @@ class WorldModelLearner:
         self.dynamics.train()
         for p in self._all_params:
             p.requires_grad_(True)
-        batches = torch.stack([td.select("state", "action", "sim_ctx") for td in data])
+        data = list(data)
+        # prev_target: the targets of the two steps before each step, as applied (a delayed env's; Dynamics.delay)
+        keys = ("state", "action", "sim_ctx", "prev_target") if "prev_target" in data[0].keys() else (
+            "state", "action", "sim_ctx")
+        batches = torch.stack([td.select(*keys) for td in data])
         return self._captured_update(batches)
 
     def _update_from(self, batches: TensorDict) -> dict[str, torch.Tensor]:
@@ -121,7 +125,8 @@ class WorldModelLearner:
 
             sim_ctx = td["sim_ctx"][:, 0]
 
-            pred_rep_states, pred_aux_states = self._compiled_rollout(init_rep_state, actions, init_aux, sim_ctx)
+            prev = td["prev_target"].unflatten(-1, (2, -1)) if "prev_target" in td.keys() else None
+            pred_rep_states, pred_aux_states = self._compiled_rollout(init_rep_state, actions, init_aux, sim_ctx, prev)
 
             # 2. Vectorized Loss Calculation (always FP32, compiled for kernel fusion)
             loss_state, group_mse = self._compiled_compute_losses(
@@ -147,8 +152,10 @@ class WorldModelLearner:
         actions: torch.Tensor,
         init_aux: torch.Tensor,
         sim_ctx: torch.Tensor,
+        prev_targets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Autoregressive rollout over the window's actions.
+        """Autoregressive rollout over the window's actions; ``prev_targets`` (B, T, 2, A): each step's targets of the
+        two steps before it, as the env applied them (teacher-forced: the stored ones, right across a reset).
 
         The prediction from the last action is never scored, so the rollout stops
         one step short.
@@ -160,7 +167,8 @@ class WorldModelLearner:
         pred_rep_states: list[torch.Tensor] = []
         pred_aux_states: list[torch.Tensor] = []
         for k in range(actions.shape[1] - 1):
-            aux, rep_state = self.dynamics(rep_state, actions[:, k], aux, sim_ctx)
+            prev = () if prev_targets is None else (prev_targets[:, k],)
+            aux, rep_state = self.dynamics(rep_state, actions[:, k], aux, sim_ctx, *prev)
             pred_rep_states.append(rep_state)
             pred_aux_states.append(aux)
         return torch.stack(pred_rep_states, dim=1), torch.stack(pred_aux_states, dim=1)

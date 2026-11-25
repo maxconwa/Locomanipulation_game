@@ -58,7 +58,7 @@ from pretraining.supermimic.goal_window import NUM_GOAL_FRAMES
 from pretraining.supermimic.learners.policy_learner import ActorCriticPolicyLearnerCfg
 from pretraining.supermimic.learners.wm_learner import WorldModelLearner
 from pretraining.supermimic.models import build_mlp
-from pretraining.supermimic.replay_buffer import ReplayBuffer
+from pretraining.supermimic.replay_buffer import FieldSpec, ReplayBuffer
 from pretraining.supermimic.sim_context import widen_input_weight
 from pretraining.supermimic.runners.base_runner import BaseRunner, BaseRunnerCfg, Ratio
 from pretraining.supermimic.runners.reset_sampling import ReturnSampler, ReturnSamplerCfg
@@ -193,6 +193,12 @@ class TwoAgentRunner(BaseRunner[TwoAgentRunnerCfg]):
         self._num_goals = wm.num_goals
         self._num_actions = wm.num_actions
         self.action_manager = self.env.unwrapped.action_manager
+        # a delayed env (tasks.delay.TargetDelay): the world model takes each step's effective target, from the
+        # stored targets of the two steps before it (Dynamics.set_delay)
+        term = self.action_manager.get_term("joint_pos")
+        self._delay_term = term if hasattr(term, "previous_targets") else None
+        if self._delay_term is not None:
+            self._dynamics.set_delay(self.env.unwrapped.cfg.decimation, self._sim_context)
         self.motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
         self.motion = self.motion_cmd.motion
         self.replay_buffer = ReplayBuffer(
@@ -214,6 +220,13 @@ class TwoAgentRunner(BaseRunner[TwoAgentRunnerCfg]):
         self._safety_steps = torch.zeros((), device=self.device)
         self.start_iteration = 0
         self._wall_offset = 0.0
+
+    def _buffer_schema(self) -> dict:
+        """The base schema, plus the two steps' previous targets for a delayed env (``Dynamics.delay``)."""
+        schema = super()._buffer_schema()
+        if self._dynamics.delay is not None:
+            schema["prev_target"] = FieldSpec(2 * self._num_actions)
+        return schema
 
     def _make_tables(self) -> None:
         """Tabulate the clips' tool-frame poses."""
@@ -274,6 +287,8 @@ class TwoAgentRunner(BaseRunner[TwoAgentRunnerCfg]):
             )
             actions, actor_td = self.act(self._collection_history(sensor), self._goals(motion_times, aux_state))
             extra = {"sim_ctx": sim_ctx}
+            if self._dynamics.delay is not None:
+                extra["prev_target"] = self._delay_term.previous_targets().flatten(1)
             if self._stores_actor_obs:
                 extra["actor_obs"] = sim_actor_obs
             next_obs, rewards, dones, extras = self._step_and_store(

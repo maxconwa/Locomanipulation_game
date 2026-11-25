@@ -285,6 +285,40 @@ def test_command_runner_takes_a_fine_tuned_world_model(tmp_path):
         CommandRunner(StandinSource(), run, small_cfg(), run_dir=tmp_path / "out2")
 
 
+def test_command_runner_imagines_from_the_replays_previous_targets(tmp_path):
+    """A delayed source: the buffer stores each step's two previous targets, and the first imagined step of a
+    rollout takes the sampled start's (the replay's), the next ones the imagined targets."""
+    run = make_stage1_run(tmp_path / "stage1", fine_tuned=True)
+
+    class _Delayed(StandinSource):
+        has_delay, decimation = True, 5
+
+        def prev_targets(self):
+            return 0.1 * self._r(self.num_envs, 2 * 27).view(-1, 2, 27)
+
+    cfg = small_cfg(max_iterations=1)
+    cfg.policy.batch_size = 6  # the imagined rollouts' calls, told from the world-model updates' (8)
+    runner = CommandRunner(_Delayed(), run, cfg, run_dir=tmp_path / "out")
+    assert runner.dynamics.delay == (5, 31, 5.0, 5.0)
+    calls = []
+    forward = runner.dynamics.forward
+
+    def spy(rep, action, aux, ctx, prev=None):
+        calls.append(None if prev is None else prev.detach().clone())
+        return forward(rep, action, aux, ctx, prev)
+
+    runner.dynamics.forward = spy
+    runner.run({"stage1": str(run), "plant": "main"})
+    stored = runner.buffer._storage["prev_target"].reshape(-1, 2, 27)
+    assert all(c is not None for c in calls)
+    imagined = [c for c in calls if c.shape[0] == runner.cfg.policy.batch_size]
+    assert len(imagined) == cfg.policy.horizon
+    for row in imagined[0]:
+        assert (stored == row).all(-1).all(-1).any()
+    # then the imagined ones: the step's target becomes the newest
+    torch.testing.assert_close(imagined[1][:, 1], imagined[0][:, 0])
+
+
 def test_command_runner_stops_at_max_steps(tmp_path):
     run = make_stage1_run(tmp_path / "stage1")
     runner = CommandRunner(StandinSource(), run, small_cfg(max_steps=12, max_iterations=100, clip_command_prob=0.0),

@@ -153,6 +153,12 @@ timeout -s KILL 1800 $PY -m pretraining.scripts.play --run data/runs/amass_s1 --
   compute the source's function until trained. Friction keeps the source's normalisation (0.3-1.2; main draws
   0.1-1.25 about another centre). One line at the start names what was appended, held and renormalised. A
   `--resume` keeps the run's layout unchanged.
+- In a delayed env (the fine-tune's, main's in stage 2) the world model's action input is the step's effective
+  target: the mean over its substeps of the targets applied, the step's own, the previous step's and the one before,
+  by the env's substep rule and each env's delay from the sim context (`Dynamics.effective_target`). The replay
+  buffer stores each step's two previous targets as the env holds them (`prev_target`; after a reset the pose it
+  starts in); world-model training feeds them per step, imagination starts from the sampled step's and rolls its own
+  targets in. A delay of 0, and an env without one, give the step's own target as before; the weights are unchanged.
 - `PRETRAINING_CUDA_GRAPHS=0` turns off CUDA-graph capture of the updates (crosscheck and play turn it off
   themselves). A capture that fails stops the run with an error saying to set it: on torch 2.7 a failed capture
   leaves the CUDA random-number generator unusable for the rest of the process.

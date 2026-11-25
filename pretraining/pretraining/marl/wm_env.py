@@ -169,7 +169,7 @@ class ImitationWorldModelEnv(_TwoAgentWorldModelEnv):
 
     def _wm_step(self, rep_state, aux_state, action, last_action, sim_ctx):
         """Predict the next state, its termination probability and the three rewards."""
-        next_aux, next_rep = self.dynamics(rep_state, action, aux_state, sim_ctx)
+        next_aux, next_rep = self.dynamics(rep_state, action, aux_state, sim_ctx, self.prev_targets)
         next_joint = self.representation.joint_state(next_rep)
         ref_pos, ref_quat, ref_lin, ref_ang = self._ref_body_state
         term_prob = self._compute_term_prob(next_aux, ref_pos, ref_quat)

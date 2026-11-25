@@ -45,6 +45,15 @@ def build_mlp(
     return nn.Sequential(*layers)
 
 
+def delay_weights(d: torch.Tensor, decimation: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shares of a policy step's substeps that apply the step's target, the previous step's and the one before, for a
+    delay of ``d`` (<= 2 x decimation) physics substeps: substep k applies the target of ceil(max(d - k, 0) /
+    decimation) steps ago (``tasks.delay.TargetDelay``, main's ``LocoManipMarlEnv._apply_action``)."""
+    two = (d - decimation).clamp(0, decimation)
+    late = d.clamp(0, decimation)
+    return (decimation - late) / decimation, (late - two) / decimation, two / decimation
+
+
 class Dynamics(nn.Module):
     """Differentiable forward model: ``(rep_state, action, aux_state) -> (next_aux, next_rep)``.
 
@@ -85,15 +94,45 @@ class Dynamics(nn.Module):
         """Map raw policy output to proc joint commands: ``action * scale + offset``."""
         return action * self.action_scale + self.action_offset
 
+    delay: tuple[int, int, float, float] | None = None
+    """``(decimation, column, mean, scale)`` of the sim context's ``action_delay`` (``set_delay``); None: the action
+    input is the step's own target."""
+
+    def set_delay(self, decimation: int, sim_context) -> None:
+        """Make the action input the step's effective target (``effective_target``) when ``sim_context`` has the
+        ``action_delay`` column; not saved (the input width is the same either way)."""
+        cols = sim_context.find("action_delay")
+        self.delay = None if cols is None else (
+            int(decimation), cols.start, float(sim_context.mean[cols.start]), float(sim_context.scale[cols.start]))
+
+    def effective_target(self, action: torch.Tensor, sim_ctx: torch.Tensor,
+                         prev_targets: torch.Tensor | None = None) -> torch.Tensor:
+        """The target the step applies, averaged over its substeps: ``proc(action)`` without a delay; with one of d
+        substeps (from ``sim_ctx``) and ``prev_targets`` (..., 2, A) the targets of one and two steps before (as
+        applied, ``proc`` coordinates), ``delay_weights``' mix of the three. d = 0 gives ``proc(action)`` exactly."""
+        target = self.proc(action)
+        if self.delay is None or prev_targets is None:
+            return target
+        decimation, col, mean, scale = self.delay
+        d = torch.round(sim_ctx[..., col : col + 1] * scale + mean)
+        w0, w1, w2 = delay_weights(d, decimation)
+        mixed = w0 * target + w1 * prev_targets[..., 0, :] + w2 * prev_targets[..., 1, :]
+        return torch.where(d == 0, target, mixed)
+
+    def roll_targets(self, action: torch.Tensor, prev_targets: torch.Tensor) -> torch.Tensor:
+        """``prev_targets`` for the step after the one that took ``action``."""
+        return torch.stack([self.proc(action), prev_targets[..., 0, :]], dim=-2)
+
     def forward(
         self,
         rep_state: torch.Tensor,
         action: torch.Tensor,
         aux_state: torch.Tensor,
         sim_ctx: torch.Tensor,
+        prev_targets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         state_norm = self.state_normalizer(rep_state)
-        action_norm = self.action_normalizer(self.proc(action))
+        action_norm = self.action_normalizer(self.effective_target(action, sim_ctx, prev_targets))
         prediction = self.mlp(torch.cat([state_norm, action_norm, sim_ctx], dim=-1))
         return self._apply_prediction(aux_state, rep_state, prediction, self.dt)
 

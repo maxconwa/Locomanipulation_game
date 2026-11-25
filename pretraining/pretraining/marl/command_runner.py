@@ -293,6 +293,10 @@ class CommandRunner:
         self.wm = build_world_model(bundle, self.plant, hidden, source.target_low, source.target_high, dev,
                                     self.stage1_meta.get("sim_context"))
         self.rep, self.dynamics, self.sim_context = self.wm.representation, self.wm.dynamics, self.wm.sim_context
+        # a delayed env (main's action delay) and a context with the delay: the world model takes each step's
+        # effective target, from the targets of the two steps before it (Dynamics.set_delay)
+        if getattr(source, "has_delay", False):
+            self.dynamics.set_delay(getattr(source, "decimation", self.plant.decimation), self.sim_context)
         self.wm_learner = WorldModelLearner(self.dynamics, self.rep, cfg.wm, device=str(dev))
         if dev.type != "cuda":  # torch.compile is for the GPU (and fails on some CPU toolchains)
             self.wm_learner._compiled_rollout = self.wm_learner._rollout
@@ -336,6 +340,8 @@ class CommandRunner:
             "velocity": FieldSpec(3), "velocity_target": FieldSpec(3), "arm": FieldSpec(14), "clock": FieldSpec(),
             "terminated": FieldSpec(dtype=torch.bool), "truncated": FieldSpec(dtype=torch.bool),
         }
+        if self.dynamics.delay is not None:
+            schema["prev_target"] = FieldSpec(2 * n)
         self.buffer = ReplayBuffer(schema, cfg.buffer_size, self.num_envs, device=str(dev))
         per_update = cfg.wm.num_batches * cfg.wm.batch_size * cfg.wm.horizon
         self.updates_per_iteration = max(1, round(cfg.rollout * self.num_envs * cfg.replay_ratio / per_update))
@@ -393,6 +399,7 @@ class CommandRunner:
         for _ in range(self.cfg.rollout):
             # the env's draws for the step's start state (per-reset ones change as envs reset)
             ctx = self.source.sim_ctx(self.sim_context)
+            delayed = {} if self.dynamics.delay is None else {"prev_target": self.source.prev_targets().flatten(1)}
             cmd = command_vectors(s["commands"])
             z, hc_next = {}, {}
             for a in AGENTS:
@@ -406,7 +413,7 @@ class CommandRunner:
                 "latent_legs": s["latent"]["legs"], "latent_arms": s["latent"]["arms"],
                 "velocity": s["commands"]["velocity"], "velocity_target": s["commands"]["velocity_target"],
                 "arm": s["commands"]["arm"].flatten(1), "clock": s["clock"],
-                "terminated": dones & ~truncated, "truncated": truncated,
+                "terminated": dones & ~truncated, "truncated": truncated, **delayed,
             }, batch_size=[self.num_envs]))
             self.wm_learner.update_normalization(s["state"], self.source.last_action)
             sums["vel_xy_error"] += self._tracking(state, s["commands"], sums)
@@ -514,6 +521,8 @@ class CommandRunner:
         state0 = start["state"]
         rep, aux = self.rep.represent(state0), self.rep.extract_aux_state(state0)
         sim_ctx = start["sim_ctx"]
+        # the replay's targets of the two steps before the start (a delayed env's), then the imagined ones
+        prev_targets = start["prev_target"].unflatten(-1, (2, -1)) if "prev_target" in start.keys() else None
         hc = {a: start[f"hc_{a}"].view(b, 2, h) for a in AGENTS}
         last_u = {a: start[f"latent_{a}"] for a in AGENTS}
         prev_action = start["prev_action"]
@@ -553,7 +562,9 @@ class CommandRunner:
                     aux_loss[a] = aux_loss[a] + latent_bc(z[a], stage1_latent(self.stage1[a], goals[a]), mask,
                                                           cfg.prior_weight)
             action = self._decode(rep, aux, sim_ctx, prev_action, z)
-            next_aux, next_rep = self.dynamics(rep, action, aux, sim_ctx)
+            next_aux, next_rep = self.dynamics(rep, action, aux, sim_ctx, prev_targets)
+            if prev_targets is not None:
+                prev_targets = self.dynamics.roll_targets(action, prev_targets)
             next_state = WMState.from_wm(self.rep, next_aux, next_rep)
             cycle, cycle_mean = cycle_push(cycle, next_state)
             target = self.dynamics.proc(action) - self.rep.encoder_bias(sim_ctx)
