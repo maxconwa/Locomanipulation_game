@@ -59,6 +59,7 @@ def _arm_terms(scale: float) -> dict:
     terms = {}
     for arm, side in enumerate(("left", "right")):
         terms[f"{side}_ee_pos"] = _term("arm_target_pos_exp", scale, arm=arm, std=0.25)
+        terms[f"{side}_ee_quat_coarse"] = _term("arm_target_quat_exp", scale, arm=arm, std=1.5)
         terms[f"{side}_ee_pos_fine"] = _term("arm_target_pos_exp_annealed", 0.0, arm=arm)
         terms[f"{side}_ee_quat"] = _term("arm_target_quat_exp_annealed", 0.0, arm=arm)
         for k, std in (("k20", 0.02), ("k5", 0.005), ("k2", 0.002)):
@@ -422,3 +423,29 @@ def test_main_obs_refuses_an_action_term_it_does_not_model():
     standin.observations.arms.actions = _term("applied_action", action_name="arm_pos")
     with pytest.raises(ValueError, match="arm_pos"):
         MainActorObs(standin, "cpu")
+
+
+def test_coarse_rotation_term_has_a_slope_from_afar(fk):
+    """The fixed coarse rotation kernel (std COARSE_ROT_STD = 1.5 rad): at 1.75 rad of wrist rotation error and none in
+    position it is exp(-(1.75/1.5)^2) ~ 0.256 times its weight, with a nonzero gradient w.r.t. the wrist orientation."""
+    from pretraining.math import quat_mul
+    cfg = MainRewardCfg.from_env_cfg(pulse_cfg_standin(), arm_stage=1)
+    terms = {(t.agent, t.name): t for t in cfg.terms}
+    coarse = terms["arms", "left_ee_quat_coarse"]
+    assert coarse.kind == "ee_quat" and coarse.std == 1.5 and coarse.weight == terms["arms", "left_ee_pos"].weight
+    assert terms["arms", "right_ee_quat_coarse"].arm == 1
+    assert terms["legs", "arms_right_ee_quat_coarse"].weight == 0.5 * coarse.weight
+    state, leaves = _state(fk, requires_grad=True)
+    pos, quat = (x.detach() for x in wrist_poses_in_pelvis(state))
+    # the goal on the wrist's position, its orientation 1.75 rad about x from the wrist's
+    twist = quat_from_euler_xyz(torch.full((8,), 1.75), torch.zeros(8), torch.zeros(8)).view(4, 2, 4)
+    cmd = {"velocity": torch.zeros(4, 3), "arm": torch.cat([pos, quat_mul(quat, twist)], -1)}
+    out = main_rewards(state, state, cmd, cfg, cycle_mean=_inst(state))
+    expected = math.exp(-(1.75 / 1.5) ** 2)
+    assert expected == pytest.approx(0.256, abs=1e-3)
+    for side in ("left", "right"):
+        assert torch.allclose(out[f"arms/{side}_ee_quat_coarse"], torch.full((4,), expected), atol=1e-4)
+        assert torch.allclose(out[f"arms/{side}_ee_pos"], torch.ones(4), atol=1e-4)
+    # weighted, it has a slope in the wrist's orientation (the pelvis-frame wrist pose: through the joints) per env
+    (coarse.weight * out["arms/left_ee_quat_coarse"]).sum().backward()
+    assert leaves[4].grad.norm(dim=-1).min() > 1e-3

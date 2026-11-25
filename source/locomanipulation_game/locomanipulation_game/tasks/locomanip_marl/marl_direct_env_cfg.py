@@ -37,7 +37,7 @@ from .locomanip_marl_env_cfg import MarlEventCfg, MarlRewardsCfg
 
 # each agent's task terms, which the other shares in (lambda_legs, lambda_arms)
 ARM_TRACKING_TERMS = [f"{side}_ee_{kind}" for side in ("left", "right") for kind in (
-    "pos", "pos_fine", "quat", "pos_k20", "pos_k5", "pos_k2", "quat_k200", "quat_k50", "pos_linear")] + ["goal_reached"]
+    "pos", "quat_coarse", "pos_fine", "quat", "pos_k20", "pos_k5", "pos_k2", "quat_k200", "quat_k50", "pos_linear")] + ["goal_reached"]
 LEG_TRACKING_TERMS = ["track_lin_vel_xy", "track_ang_vel_z"]
 
 

@@ -124,6 +124,8 @@ GOLEM_RATE_MARGIN = 0.8
 # kernels' stds per stage, narrowed as the arm goals' errors fall.
 FINE_POS_STDS = (0.10, 0.07, 0.05, 0.035, 0.025, 0.018, 0.012)  # m
 ROT_STDS = (0.5, 0.4, 0.3, 0.22, 0.16, 0.12, 0.08)               # rad
+# the fixed coarse rotation kernel's std: a slope from afar (at 100 deg the annealed kernel's is ~0)
+COARSE_ROT_STD = 1.5  # rad
 # The torso IMU as /lowstate reports it (scene.imu at imu_link; lowstate_imu.py, LocoManipMarlEnvCfg.lowstate_imu).
 # Its gyro is low-passed at this cutoff, as GOLEM's deploy low-passes its IMU's gyro (export.yaml imu.gyro_lowpass_hz)
 GYRO_LOWPASS_HZ = 8.0
@@ -459,14 +461,16 @@ def _arm_joints(func, weight: float) -> RewTerm:
 
 @configclass
 class ArmsRewardsCfg:
-    # exp kernels: the per-step total stays positive. The coarse position kernel is fixed (a slope from afar); the fine
-    # position and the rotation kernels narrow with the arm command's kernel curriculum.
+    # exp kernels: the per-step total stays positive. The coarse position and rotation kernels are fixed (a slope from
+    # afar); the fine position and the rotation kernels narrow with the arm command's kernel curriculum.
     left_ee_pos = _arm_tracking(0, mdp.arm_target_pos_exp, 0.25)
     left_ee_pos_fine = _arm_tracking_annealed(0, mdp.arm_target_pos_exp_annealed)
     left_ee_quat = _arm_tracking_annealed(0, mdp.arm_target_quat_exp_annealed)
+    left_ee_quat_coarse = _arm_tracking(0, mdp.arm_target_quat_exp, COARSE_ROT_STD)
     right_ee_pos = _arm_tracking(1, mdp.arm_target_pos_exp, 0.25)
     right_ee_pos_fine = _arm_tracking_annealed(1, mdp.arm_target_pos_exp_annealed)
     right_ee_quat = _arm_tracking_annealed(1, mdp.arm_target_quat_exp_annealed)
+    right_ee_quat_coarse = _arm_tracking(1, mdp.arm_target_quat_exp, COARSE_ROT_STD)
     # cfg.goal_bonus per goal: sync_derived sets the per-second weight
     goal_reached = RewTerm(func=mdp.arm_goal_reached, weight=1.0, params={"command_name": ARM_COMMAND})
     alive = RewTerm(func=mdp.is_alive, weight=0.15)
