@@ -142,7 +142,7 @@ def _joint_noise():
     """Main's joint_noise module (loaded by path in main_obs: the task package's __init__ imports Isaac Lab)."""
     from pretraining.marl import main_obs
 
-    return main_obs._joint_noise
+    return main_obs._load("joint_noise")
 
 
 class _Spec:

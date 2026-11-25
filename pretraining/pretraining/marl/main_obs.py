@@ -52,6 +52,8 @@ _TASK_DIR = (Path(__file__).resolve().parents[3] / "source" / "locomanipulation_
 
 def _load(name: str):
     """One of main's torch-only modules by path: the package's __init__ imports Isaac Lab."""
+    if f"_main_{name}" in sys.modules:
+        return sys.modules[f"_main_{name}"]
     spec = importlib.util.spec_from_file_location(f"_main_{name}", _TASK_DIR / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module  # dataclasses (joint_noise's configclass, with Isaac Lab up) look it up there
@@ -59,8 +61,7 @@ def _load(name: str):
     return module
 
 
-_imu_filter = _load("imu_filter")
-_joint_noise = _load("joint_noise")
+# loaded at first use: joint_noise imports isaaclab.utils (and with it warp) when it can, which must wait for the app
 
 
 def _pattern_value(table: dict, name: str, default: float = 0.0) -> float:
@@ -125,11 +126,11 @@ class MainActorObs:
         robot = env_cfg.scene.robot.init_state.joint_pos
         self.default_joint_pos = torch.tensor([_pattern_value(robot, j) for j in JOINT_NAMES], device=self.device)
         offsets = env_cfg.encoder_offset_rad or {}
-        self.encoder_offset_range = torch.tensor(_joint_noise.per_joint(list(JOINT_NAMES), offsets, 0.0),
+        self.encoder_offset_range = torch.tensor(_load("joint_noise").per_joint(list(JOINT_NAMES), offsets, 0.0),
                                                  device=self.device)
         self.imu = env_cfg.lowstate_imu
         # imu_filter.discrete_matrices: the exact ZOH of the 2nd-order Butterworth over one policy step
-        ad, bd = _imu_filter.discrete_matrices(env_cfg.gyro_lowpass_hz, self.dt)
+        ad, bd = _load("imu_filter").discrete_matrices(env_cfg.gyro_lowpass_hz, self.dt)
         self._ad, self._bd = ad.float().to(self.device), bd.float().to(self.device)
         self.gen = None
 
@@ -186,7 +187,7 @@ class MainActorObs:
             return x
         if hasattr(noise, "per_speed"):  # joint_noise.SpeedScaledNoiseCfg
             floor = torch.as_tensor(noise.floor, dtype=x.dtype, device=x.device)
-            return x + self._randn(*x.shape) * _joint_noise.joint_vel_noise_std(x, floor, noise.per_speed)
+            return x + self._randn(*x.shape) * _load("joint_noise").joint_vel_noise_std(x, floor, noise.per_speed)
         if hasattr(noise, "n_min"):  # AdditiveUniformNoiseCfg
             return self._uniform(x, noise)
         raise ValueError(f"noise {type(noise).__name__} is not modelled")
