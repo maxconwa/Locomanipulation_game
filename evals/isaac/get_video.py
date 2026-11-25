@@ -3,6 +3,7 @@ following the robot.
 
     python -m evals.isaac.get_video --legs <run>/checkpoints/agent_<N>.pt [--arms <ckpt>|same]
     python -m evals.isaac.get_video --arms <ckpt>                                  (the pelvis pinned)
+    python -m evals.isaac.get_video --latent_run <run dir or checkpoint>           (a latent policy: legs and arms)
         [--every 2] [--out <mp4>] [env.<field>=... overrides]
 
 Legs active: the env's own hoist (the pre-pose reset event, mdp/prepose.py) on the program's fixed schedule: hung with
@@ -10,7 +11,9 @@ the feet HANG_LIFT off the ground, lowered onto its feet, the rope released; the
 (the velocity command's arrows: commanded and actual). Without --arms every arm joint is held at 0 rad. Arms active: a
 goal every GOAL_EVERY_S (the arm command's frame markers: the goal, and the wrist's current frame). Arms alone:
 LocoManip-ArmsOnly-v0, the pelvis pinned, goals only. Both: LocoManip-Marl-Direct-v0 (evals/isaac/env.py checks the
-two runs fit). The env is the main run's (the legs' when given), its overrides replayed, nominal motors, mean actions.
+two runs fit), or the run's own task when it trained both agents (Marl-Torso: `--arms same`). The env is the main
+run's (the legs' when given), its overrides replayed, nominal motors, mean actions. --latent_run: a policy in the
+stage-1 decoders' latent (evals/isaac/latent.py), both agents, as `--legs <ckpt> --arms same`.
 
 Writes logs/evals/<run>/isaac/<legs|arms>/video_<N>[_with_<arms run>_<M>].mp4 and a _small.mp4 (960 px) if ffmpeg is
 there. Needs --enable_cameras (set here).
@@ -29,14 +32,15 @@ from evals.common import outputs, program, runs  # noqa: E402
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("--legs")
 parser.add_argument("--arms", help="An arms checkpoint, or `same` (the legs checkpoint's own arms).")
+parser.add_argument("--latent_run", help="A latent policy's run (or skrl checkpoint): both its agents.")
 parser.add_argument("--every", type=int, default=2)
 parser.add_argument("--out")
 from isaaclab.app import AppLauncher  # noqa: E402
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
-if not (args_cli.legs or args_cli.arms):
-    parser.error("--legs and/or --arms")
+if not (args_cli.legs or args_cli.arms or args_cli.latent_run):
+    parser.error("--legs and/or --arms, or --latent_run")
 args_cli.headless, args_cli.enable_cameras = True, True
 simulation_app = AppLauncher(args_cli).app
 
@@ -55,24 +59,33 @@ from locomanipulation_game.tasks.locomanip_marl.run_files import (  # noqa: E402
     evaluation_cfgs, replay_run, state_checkpoint_for)
 
 from evals.isaac import env as E  # noqa: E402
+from evals.isaac.latent import LatentPolicy  # noqa: E402
 
-LEGS = args_cli.legs is not None
-ARMS = args_cli.arms is not None
-legs_ckpt = os.path.abspath(args_cli.legs) if LEGS else None
-arms_ckpt = (legs_ckpt if args_cli.arms == "same" else os.path.abspath(args_cli.arms)) if ARMS else None
-main_ckpt = legs_ckpt or arms_ckpt
-task = E.MARL_DIRECT if (LEGS and ARMS) else (None if LEGS else "LocoManip-ArmsOnly-v0")
+latent = LatentPolicy.from_run(args_cli.latent_run) if args_cli.latent_run else None
+LEGS = latent is not None or args_cli.legs is not None
+ARMS = latent is not None or args_cli.arms is not None
 extra = list(C.NOMINAL_MOTORS) + hydra_args
-checkpoint, run_dir, task, replayed = replay_run(main_ckpt, task, extra)
-if LEGS and ARMS:
-    E.check_runs_compatible(run_dir, runs.run_dir_of(arms_ckpt))
-if args_cli.out:
-    OUT = args_cli.out
+if latent is not None:
+    checkpoint, run_dir, task, replayed = latent.replay(extra)
+    legs_ckpt = arms_ckpt = main_ckpt = checkpoint
+    tag = "video" if latent.run.step is None else f"video_{latent.run.step}"
+    OUT = args_cli.out or str(outputs.eval_dir(runs.name(run_dir), "isaac", "legs") / f"{tag}.mp4")
 else:
-    tag = f"video_{runs.step_of(main_ckpt)}"
+    legs_ckpt = os.path.abspath(args_cli.legs) if LEGS else None
+    arms_ckpt = (legs_ckpt if args_cli.arms == "same" else os.path.abspath(args_cli.arms)) if ARMS else None
+    main_ckpt = legs_ckpt or arms_ckpt
+    task = (E.two_agent_task(runs.run_dir_of(main_ckpt)) if (LEGS and ARMS)
+            else (None if LEGS else "LocoManip-ArmsOnly-v0"))
+    checkpoint, run_dir, task, replayed = replay_run(main_ckpt, task, extra)
     if LEGS and ARMS:
-        tag += f"_with_{runs.short(runs.run_dir_of(arms_ckpt))}_{runs.step_of(arms_ckpt)}"
-    OUT = str(outputs.eval_dir(runs.name(run_dir), "isaac", "legs" if LEGS else "arms") / f"{tag}.mp4")
+        E.check_runs_compatible(run_dir, runs.run_dir_of(arms_ckpt))
+    if args_cli.out:
+        OUT = args_cli.out
+    else:
+        tag = f"video_{runs.step_of(main_ckpt)}"
+        if LEGS and ARMS:
+            tag += f"_with_{runs.short(runs.run_dir_of(arms_ckpt))}_{runs.step_of(arms_ckpt)}"
+        OUT = str(outputs.eval_dir(runs.name(run_dir), "isaac", "legs" if LEGS else "arms") / f"{tag}.mp4")
 
 
 def hoist_params(params: dict) -> dict:
@@ -94,7 +107,7 @@ def main(env_cfg, agent_cfg: dict):
     env_cfg.sim.device = args_cli.device
     env_cfg.seed = 0
     evaluation_cfgs(env_cfg, agent_cfg, checkpoint, run_dir)
-    if LEGS and ARMS:
+    if LEGS and ARMS and latent is None:
         env_cfg.state_checkpoint_path = E.merged_state(env_cfg.state_checkpoint_path, state_checkpoint_for(arms_ckpt),
                                                        "arms", os.path.dirname(OUT))
     if LEGS and not ARMS:
@@ -122,14 +135,18 @@ def main(env_cfg, agent_cfg: dict):
 
     env = SkrlVecEnvWrapper(gym.make(task, cfg=env_cfg, render_mode="rgb_array"))
     base = env.unwrapped
-    runner = MarlRunner(env, agent_cfg)
-    if LEGS:
-        E.check_agent_fits(base, "legs", run_dir, legs_ckpt)
-        E.load_agent(runner, legs_ckpt, "legs")
-    if ARMS:
-        E.check_agent_fits(base, "arms", runs.run_dir_of(arms_ckpt), arms_ckpt)
-        E.load_agent(runner, arms_ckpt, "arms")
-    runner.agent.enable_training_mode(False, apply_to_models=True)
+    if latent is not None:
+        runner = None
+        latent.bind(env, agent_cfg)
+    else:
+        runner = MarlRunner(env, agent_cfg)
+        if LEGS:
+            E.check_agent_fits(base, "legs", run_dir, legs_ckpt)
+            E.load_agent(runner, legs_ckpt, "legs")
+        if ARMS:
+            E.check_agent_fits(base, "arms", runs.run_dir_of(arms_ckpt), arms_ckpt)
+            E.load_agent(runner, arms_ckpt, "arms")
+        runner.agent.enable_training_mode(False, apply_to_models=True)
     robot, vel = base.scene["robot"], base.command_manager.get_term("base_velocity")
     arm = base.command_manager.get_term("arm_targets")
     arm._judge_kernels = lambda ended: None
@@ -162,14 +179,17 @@ def main(env_cfg, agent_cfg: dict):
             if k in goal_at:
                 arm._resample(ids)
                 goal_n += 1
-            outputs_ = runner.agent.act(obs, {a: states for a in base.possible_agents}, timestep=0, timesteps=0)
-            actions = {a: outputs_[-1][a].get("mean_actions", outputs_[0][a]) for a in base.possible_agents}
+            if latent is not None:
+                actions = latent.act(obs)
+            else:
+                outputs_ = runner.agent.act(obs, {a: states for a in base.possible_agents}, timestep=0, timesteps=0)
+                actions = {a: outputs_[-1][a].get("mean_actions", outputs_[0][a]) for a in base.possible_agents}
             if LEGS and not ARMS:
                 actions["arms"] = torch.zeros_like(actions["arms"])
             obs, _, terminated, truncated, _ = base.step(actions)
             states = base.state()
             agent = base.possible_agents[0]
-            runner.agent.reset_rnn(terminated[agent] | truncated[agent])
+            (latent.reset if latent is not None else runner.agent.reset_rnn)(terminated[agent] | truncated[agent])
             falls += int(bool(terminated[agent][0]))
             if k % args_cli.every:
                 continue

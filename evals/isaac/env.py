@@ -17,6 +17,17 @@ from pathlib import Path
 import torch
 
 MARL_DIRECT = "LocoManip-Marl-Direct-v0"
+# the two-agent tasks: a run of one of these is evaluated with both agents in its own task (Torso's arms drive the
+# torso, 15 wide, which Marl-Direct has no term for); a one-agent run's partner runs in Marl-Direct, as before
+TWO_AGENT_TASKS = (MARL_DIRECT, "LocoManip-Marl-Torso-v0", "LocoManip-Marl-Pulse-v0")
+
+
+def two_agent_task(run_dir: str | Path) -> str:
+    """The task to run both agents in for a run given the other body's policy: the run's own when it is a two-agent
+    task (params/task.txt), else Marl-Direct (a legs-only or arms-only run, or one that did not record its task)."""
+    path = Path(run_dir) / "params" / "task.txt"
+    recorded = path.read_text().strip() if path.is_file() else None
+    return recorded if recorded in TWO_AGENT_TASKS else MARL_DIRECT
 # the curriculum entries (locomanip_marl_env.save_state) that belong to each agent's command
 AGENT_STATE_KEYS = {"legs": ("base_velocity.lin_kernel_stage", "base_velocity.ang_kernel_stage"),
                     "arms": ("arm_targets.kernel_stage", "arm_goals_enabled")}

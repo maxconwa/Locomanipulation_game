@@ -4,13 +4,18 @@ variance (evals/common/arms_scorecard.py), against the IK alone on the same goal
     python -m evals.isaac.arms.get_scorecard --checkpoint <run>/checkpoints/agent_<N>.pt [--legs_checkpoint <ckpt>|same]
     python -m evals.isaac.arms.get_scorecard --run <run> [--steps all|last|<N>,...]   (one process each; the run's IK-only
                                                                                    reference first; cached skipped)
+    python -m evals.isaac.arms.get_scorecard --latent_run <run dir or checkpoint>   (a latent policy, both agents)
         [--num_envs 64] [--goals 8] [--offtable] [--stochastic] [--ik_only] [--steerability] [--force]
 
 The run's own overrides are applied first (as the legs scorecard). The legs: without --legs_checkpoint the env is
 LocoManip-ArmsOnly-v0, the pelvis pinned and the legs at their default pose. With one (`same`: this checkpoint's own
 legs) it is LocoManip-Marl-Direct-v0, the pelvis free and the legs policy balancing; the goals are then scored twice,
 standing (zero velocity) and while the legs walk (a velocity command drawn from the run's ranges, new each goal).
-evals/isaac/env.py checks that each agent fits the env.
+evals/isaac/env.py checks that each agent fits the env. A run that trained both agents (Marl-Direct, Marl-Torso) is
+scored in its own task with --legs_checkpoint (a Torso run's arms, which drive the torso, need `same`).
+
+--latent_run: a policy in the stage-1 decoders' latent (evals/isaac/latent.py: an skrl run of LocoManip-Marl-Pulse-v0,
+or a train_commands run), its arms and its legs together, as `--legs_checkpoint same` (no IK, so no --ik_only).
 
 --ik_only: zero arms actions (the IK and its trajectory alone; the checkpoint only sets the run up): the reference
 the policy's residual is judged against, written as scorecard_ik_only and used as the Reference column of the run's
@@ -36,7 +41,9 @@ parser.add_argument("--checkpoint", default=None)
 parser.add_argument("--run", default=None)
 parser.add_argument("--steps", default="all")
 parser.add_argument("--legs_checkpoint", default=None, help="Run this legs policy meanwhile, the pelvis free (`same`).")
-parser.add_argument("--task", default=None, help="Default: LocoManip-ArmsOnly-v0 (Marl-Direct with --legs_checkpoint).")
+parser.add_argument("--latent_run", default=None, help="A latent policy's run (or skrl checkpoint): both its agents.")
+parser.add_argument("--task", default=None, help="Default: LocoManip-ArmsOnly-v0 (with --legs_checkpoint: Marl-Direct,"
+                    " or the run's own task when it trained both agents).")
 parser.add_argument("--num_envs", type=int, default=D["num_envs"])
 parser.add_argument("--goals", type=int, default=D["goals"], help="Arm goals per env (and per phase).")
 parser.add_argument("--seed", type=int, default=D["seed"])
@@ -77,8 +84,10 @@ from isaaclab.app import AppLauncher  # noqa: E402
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
-if args_cli.checkpoint is None:
-    parser.error("--checkpoint or --run is required")
+if args_cli.checkpoint is None and args_cli.latent_run is None:
+    parser.error("--checkpoint, --run or --latent_run is required")
+if args_cli.latent_run and (args_cli.ik_only or args_cli.steerability):
+    parser.error("--latent_run: no IK to score alone (--ik_only), no steerability benchmark for latent policies")
 args_cli.headless = True
 simulation_app = AppLauncher(args_cli).app
 
@@ -98,14 +107,25 @@ from locomanipulation_game.tasks.locomanip_marl.run_files import (  # noqa: E402
 from evals.common import arms_scorecard as A  # noqa: E402
 from evals.common import scorecard  # noqa: E402
 from evals.isaac import env as E  # noqa: E402
+from evals.isaac.latent import LatentPolicy  # noqa: E402
 
-coupled = args_cli.legs_checkpoint is not None
+latent = LatentPolicy.from_run(args_cli.latent_run) if args_cli.latent_run else None
+coupled = latent is not None or args_cli.legs_checkpoint is not None
 legs_ckpt = None
-if coupled:
-    legs_ckpt = os.path.abspath(args_cli.checkpoint if args_cli.legs_checkpoint == "same" else args_cli.legs_checkpoint)
-checkpoint, run_dir, args_cli.task, replayed = replay_run(
-    args_cli.checkpoint, args_cli.task or (E.MARL_DIRECT if coupled else "LocoManip-ArmsOnly-v0"), hydra_args)
-OUT = args_cli.out or out_base(checkpoint, args_cli)
+if latent is not None:
+    checkpoint, run_dir, args_cli.task, replayed = latent.replay(hydra_args)
+    legs_ckpt = checkpoint
+    OUT = args_cli.out or str(outputs.base(runs.name(run_dir), "isaac", "arms", "scorecard", latent.run.step,
+                                           ("_offtable" if args_cli.offtable else "")
+                                           + ("_sampled" if args_cli.stochastic else "")))
+else:
+    if coupled:
+        legs_ckpt = os.path.abspath(args_cli.checkpoint if args_cli.legs_checkpoint == "same"
+                                    else args_cli.legs_checkpoint)
+    task = args_cli.task or (E.two_agent_task(runs.run_dir_of(args_cli.checkpoint)) if coupled
+                             else "LocoManip-ArmsOnly-v0")
+    checkpoint, run_dir, args_cli.task, replayed = replay_run(args_cli.checkpoint, task, hydra_args)
+    OUT = args_cli.out or out_base(checkpoint, args_cli)
 
 
 def pick(outputs_, agent):
@@ -131,12 +151,15 @@ def run_goals(base, runner, arm, robot, arm_joints, obs, walk_cmds=None):
                 vel.vel_command_b[:] = torch.tensor(walk_cmds[:, g], dtype=torch.float, device=base.device)
                 vel.time_left[:] = 1.0e6
                 vel.is_standing_env[:] = False
-            outputs_ = runner.agent.act(obs, {a: states for a in base.possible_agents}, timestep=0, timesteps=0)
-            actions = {a: pick(outputs_, a) for a in base.possible_agents}
+            if latent is not None:
+                actions = latent.act(obs)
+            else:
+                outputs_ = runner.agent.act(obs, {a: states for a in base.possible_agents}, timestep=0, timesteps=0)
+                actions = {a: pick(outputs_, a) for a in base.possible_agents}
             if args_cli.ik_only:
                 actions["arms"] = torch.zeros_like(actions["arms"])
             obs, _, terminated, truncated, _ = base.step(actions)
-            runner.agent.reset_rnn(terminated["arms"] | truncated["arms"])
+            (latent.reset if latent is not None else runner.agent.reset_rnn)(terminated["arms"] | truncated["arms"])
             fell[:, g] |= (terminated["arms"] | truncated["arms"]).cpu().numpy()
             states = base.state()
             pe, re_ = arm.errors()
@@ -150,7 +173,7 @@ def run_goals(base, runner, arm, robot, arm_joints, obs, walk_cmds=None):
     return A.compute(err, rot_t, pos, qd, fell, dt, reached), obs
 
 
-if coupled:
+if coupled and latent is None:
     E.check_runs_compatible(run_dir, runs.run_dir_of(legs_ckpt))
 
 
@@ -160,7 +183,7 @@ def main(env_cfg, agent_cfg: dict):
     env_cfg.sim.device = args_cli.device
     env_cfg.seed = args_cli.seed
     evaluation_cfgs(env_cfg, agent_cfg, checkpoint, run_dir)
-    if coupled:
+    if coupled and latent is None:
         env_cfg.state_checkpoint_path = E.merged_state(
             env_cfg.state_checkpoint_path, state_checkpoint_for(legs_ckpt), "legs", os.path.dirname(OUT))
     if getattr(env_cfg.events, "prepose", None) is not None:
@@ -175,13 +198,17 @@ def main(env_cfg, agent_cfg: dict):
 
     env = SkrlVecEnvWrapper(gym.make(args_cli.task, cfg=env_cfg))
     base = env.unwrapped
-    runner = MarlRunner(env, agent_cfg)
-    E.check_agent_fits(base, "arms", run_dir, checkpoint)
-    E.load_agent(runner, checkpoint, "arms")
-    if coupled:
-        E.check_agent_fits(base, "legs", runs.run_dir_of(legs_ckpt), legs_ckpt)
-        E.load_agent(runner, legs_ckpt, "legs")
-    runner.agent.enable_training_mode(False, apply_to_models=True)
+    if latent is not None:
+        runner = None
+        latent.bind(env, agent_cfg, args_cli.stochastic)
+    else:
+        runner = MarlRunner(env, agent_cfg)
+        E.check_agent_fits(base, "arms", run_dir, checkpoint)
+        E.load_agent(runner, checkpoint, "arms")
+        if coupled:
+            E.check_agent_fits(base, "legs", runs.run_dir_of(legs_ckpt), legs_ckpt)
+            E.load_agent(runner, legs_ckpt, "legs")
+        runner.agent.enable_training_mode(False, apply_to_models=True)
     robot = base.scene["robot"]
     arm = base.command_manager.get_term("arm_targets")
     arm._judge_kernels = lambda ended: None
@@ -199,17 +226,24 @@ def main(env_cfg, agent_cfg: dict):
                              rng.uniform(*r.lin_vel_y, (base.num_envs, args_cli.goals)),
                              rng.uniform(*r.ang_vel_z, (base.num_envs, args_cli.goals))], -1) * 0.6
             res["walk"], obs = run_goals(base, runner, arm, robot, arm_joints, obs, walk)
-    log_std = runner.agent.policies["arms"].log_std_parameter.detach()
-    ref_base = out_base(checkpoint, argparse.Namespace(**{**vars(args_cli), "ik_only": True}))
-    ref = json.load(open(ref_base + ".json")) if (not args_cli.ik_only and outputs.cached(ref_base)) else None
+    if latent is not None:
+        # no IK, so no IK-only reference: the Reference column stays empty
+        std, ref_base, ref = latent.policy_std("arms"), None, None
+    else:
+        std = runner.agent.policies["arms"].log_std_parameter.detach().exp()
+        ref_base = out_base(checkpoint, argparse.Namespace(**{**vars(args_cli), "ik_only": True}))
+        ref = json.load(open(ref_base + ".json")) if (not args_cli.ik_only and outputs.cached(ref_base)) else None
     res.update(
-        backend="isaac", body="arms", run=runs.name(run_dir), step=runs.step_of(checkpoint), checkpoint=checkpoint,
-        task=args_cli.task, trainer=runs.trainer(run_dir), overrides=replayed + hydra_args,
+        backend="isaac", body="arms", run=runs.name(run_dir),
+        step=latent.run.step if latent is not None else runs.step_of(checkpoint), checkpoint=checkpoint,
+        task=args_cli.task, trainer=latent.trainer if latent is not None else runs.trainer(run_dir),
+        overrides=replayed + hydra_args,
         stochastic=args_cli.stochastic, ik_only=args_cli.ik_only, offtable=args_cli.offtable,
         other_policy=(f"legs policy {legs_ckpt}" if coupled else None),
         reach_tol=[float(arm.cfg.reach_pos_tol), float(arm.cfg.reach_rot_tol)],
-        policy_std_mean=None if args_cli.ik_only else float(log_std.exp().mean()),
-        policy_std=log_std.exp().cpu().tolist(), reference=ref_base + ".json" if ref else None,
+        policy_std_mean=None if (args_cli.ik_only or std is None) else float(std.mean()),
+        policy_std=None if std is None else std.cpu().tolist(), reference=ref_base + ".json" if ref else None,
+        **({"latent": latent.kind} if latent is not None else {}),  # absent for a joint-space run: its json as before
         **C.stamp("isaac", "arms", num_envs=base.num_envs, goals=args_cli.goals, seed=args_cli.seed, motors="run",
                   actions="zero" if args_cli.ik_only else "sampled" if args_cli.stochastic else "mean",
                   legs="policy" if coupled else "pinned", offtable=args_cli.offtable, extra_overrides=hydra_args))

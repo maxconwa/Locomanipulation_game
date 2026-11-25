@@ -27,6 +27,22 @@ python -m evals.mujoco.legs.get_scorecard --run <run>                          #
 python -m evals.mujoco.arms.get_scorecard --run <run>
 ```
 
+**Latent policies** (a policy in the frozen stage-1 decoders' latent, `isaac/latent.py`, `mujoco/latent.py`): an skrl
+run of `LocoManip-Marl-Pulse-v0` (B) or a `pretraining.scripts.train_commands` run (C), both agents together, in place
+of `--checkpoint`; a joint-space run that trained both agents (`LocoManip-Marl-Torso-v0`, A) is scored in its own task
+with the other body `same`. The three then run the same program on the same conditions (C in the Pulse env with the
+prior off and its own stage 1):
+
+```bash
+python -m evals.isaac.legs.get_scorecard --checkpoint <A run>/checkpoints/agent_<N>.pt --arms_checkpoint same
+python -m evals.isaac.arms.get_scorecard --checkpoint <A run>/checkpoints/agent_<N>.pt --legs_checkpoint same
+python -m evals.isaac.legs.get_scorecard --latent_run <B run>[/checkpoints/agent_<N>.pt]   # or <C run>
+python -m evals.isaac.arms.get_scorecard --latent_run <B or C run>
+python -m evals.isaac.get_video --latent_run <B or C run>
+```
+
+A latent arms scorecard has no IK-only reference (no IK). Its json carries `"latent": "skrl"|"commands"`.
+
 Each writes `scorecard_<N>.json` (the eval's results, its rows, the eval conditions and code commit) and
 `scorecard_<N>.md` (one table per section: value, reference, target, met). A scored checkpoint is cached: `--force`
 scores it again.
