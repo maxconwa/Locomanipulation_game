@@ -2,7 +2,7 @@
 # the estop position penalty: golem_aware.yaml with main_plant.yaml's rate changes and 40000 iterations of its own.
 #   python -m pretraining.scripts.train --config pretraining/configs/main_plant_finetune.yaml --plant main --fine-tune \
 #       --run-name <name> --fine-tune-from <main-plant stage-1 run dir>
-num_envs: 5120
+num_envs: 2048  # base.yaml's 5120 do not fit a 16 GB GPU
 runner:
   headless: true
   buffer_size: 1000
@@ -16,7 +16,7 @@ runner:
   wm:
     lr: 0.0002
     num_batches: 10
-    batch_size: 2048
+    batch_size: 1024  # horizon 16 x 1024 keeps base.yaml's 8 x 2048 world-model samples; x2048 ran out of 16 GB
     horizon: 16  # 100 Hz: the same 0.16 s as base.yaml's 8 at 50 Hz
     nominal_error_root_pose_pos: 0.01
     nominal_error_root_pose_ori: 0.02
@@ -35,7 +35,7 @@ runner:
   policy:
     lr: 0.0002
     num_batches: 1
-    batch_size: 1024
+    batch_size: 384  # horizon 64: x1024 and x512 (10.9 GB peak in the policy update) ran out of 16 GB
     horizon: 64  # 0.64 s, base.yaml's 32 steps at 50 Hz
     gamma: 0.995  # the same 1 / (1 - gamma) = 2 s horizon as 0.99 at 50 Hz
     survival_masking: true
