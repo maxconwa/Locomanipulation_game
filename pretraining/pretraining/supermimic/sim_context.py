@@ -244,7 +244,8 @@ class _ActuatorScaleSpec(SimContextSpec):
     """Per env and policy joint (``JOINT_NAMES`` order), a factor of main's ``randomize_actuator_scales`` reset event
     (``actuator_scales``), read live from the explicit actuators against the nominal values the event keeps
     (``env._actuator_nominal``): kp and kd are both nominal x gain x strength and the effort limit nominal x strength.
-    Before the event's first draw the actuators are nominal (1). Normalised with the event's own ranges."""
+    Read live (one gather per read, indices and nominal values cached); a read before the event's first draw raises.
+    An env without the event never builds this spec (``available``). Normalised with the event's own ranges."""
 
     dim = len(JOINT_NAMES)
 
@@ -267,7 +268,12 @@ class _ActuatorScaleSpec(SimContextSpec):
         missing = [j for j in JOINT_NAMES if j not in where]
         if missing:
             raise ValueError(f"{self.name}: no explicit PD actuator drives {missing}")
-        self._robot, self._where = robot, [where[j] for j in JOINT_NAMES]
+        self._robot, self._acts = robot, [n for n in robot.actuators if isinstance(robot.actuators[n], IdealPDActuator)]
+        starts = dict(zip(self._acts, [0] + list(torch.cumsum(torch.tensor(
+            [robot.actuators[n].num_joints for n in self._acts]), 0)[:-1].tolist())))
+        # each policy joint's column in the actuators' concatenated (stiffness | effort limit) tensors
+        self._index = torch.tensor([starts[a] + c for a, c in (where[j] for j in JOINT_NAMES)], device=env.device)
+        self._nominal = None  # (kp, effort limit) of the policy joints, set at the first read after the event's draw
         if self.name == "actuator_strength":
             return [tuple(params["strength_range"])] * self.dim
         ranges = []
@@ -279,20 +285,22 @@ class _ActuatorScaleSpec(SimContextSpec):
             ranges.append(tuple(rng))
         return ranges
 
+    def _gather(self, tensors) -> torch.Tensor:
+        return torch.cat(list(tensors), dim=-1)[:, self._index]
+
     def read(self, env) -> torch.Tensor:
-        nominal = getattr(env, "_actuator_nominal", None)
-        if nominal is None:
-            return torch.ones(env.num_envs, self.dim, device=env.device)
-        cols = []
-        for act_name, col in self._where:
-            act = self._robot.actuators[act_name]
-            kp, _, limit = nominal[act_name]
-            strength = act.effort_limit[:, col] / limit[:, col]
-            if self.name == "actuator_strength":
-                cols.append(strength)
-            else:
-                cols.append(act.stiffness[:, col] / (kp[:, col] * strength))
-        return torch.stack(cols, dim=-1)
+        if self._nominal is None:
+            nominal = getattr(env, "_actuator_nominal", None)
+            if nominal is None:  # the event is on the env's cfg (available) but has not drawn yet
+                raise RuntimeError(f"{self.name}: read before the actuator_scales reset event's first draw "
+                                   "(env._actuator_nominal missing): reset the env first")
+            self._nominal = (self._gather(nominal[a][0] for a in self._acts),
+                             self._gather(nominal[a][2] for a in self._acts))
+        acts = [self._robot.actuators[a] for a in self._acts]
+        strength = self._gather(a.effort_limit for a in acts) / self._nominal[1]
+        if self.name == "actuator_strength":
+            return strength
+        return self._gather(a.stiffness for a in acts) / (self._nominal[0] * strength)
 
 
 class ActuatorGainSpec(_ActuatorScaleSpec):
@@ -367,6 +375,8 @@ def _wider(source: tuple[float, float], here: tuple[float, float]) -> tuple[floa
     return (float(hlo), float(hhi)) if same_centre and hhi - hlo > shi - slo + 1e-9 else tuple(source)
 
 
+# NOTE: assumes the sim context is the LAST block of the layer's input (true of stage 1's Dynamics and critics). Stage
+# 2's critic (command_runner.CommandRunner._critic_obs) puts commands after it: do not apply this there.
 def widen_input_weight(weight: torch.Tensor, src_mean: torch.Tensor, src_scale: torch.Tensor,
                        tgt_mean: torch.Tensor, tgt_scale: torch.Tensor) -> torch.Tensor:
     """A first layer's weight whose input ends with a source sim context (``src_mean`` / ``src_scale``), for the
