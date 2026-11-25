@@ -147,6 +147,14 @@ class EncoderBiasSpec(SimContextSpec):
             raise RuntimeError(f"EncoderBiasSpec: no event '{self.name}' on env.cfg.events")
         params = event_cfg.params
         self.dim = _encoder_bias(env).shape[1]
+        if "half_widths" in params:  # main's per-joint offsets (events.sample_encoder_offsets)
+            import re
+
+            from pretraining.constants import JOINT_NAMES
+
+            widths = [next((w for p, w in params["half_widths"].items() if re.fullmatch(p, j)), 0.0)
+                      for j in JOINT_NAMES]
+            return [(-w, w) for w in widths]
         return [params["bias_range"]] * self.dim
 
     def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
@@ -172,6 +180,46 @@ def _usd_center_of_mass(prim_path: str) -> torch.Tensor:
     return torch.tensor(list(com), dtype=torch.float32)
 
 
+class HeldSpec(SimContextSpec):
+    """A column block of a source run's layout whose event the current env does not have: it reads the source's
+    mean (0 in normalised units), so the world model and critics see the nominal value they were trained around."""
+
+    def __init__(self, name: str, dim: int, mean: torch.Tensor):
+        self.name, self.dim, self._mean = name, dim, mean
+
+    def bind(self, env):
+        raise RuntimeError("HeldSpec is built bound")
+
+    def read(self, env) -> torch.Tensor:
+        return self._mean.to(env.device).expand(env.num_envs, -1)
+
+
+_CANDIDATES = {"foot_friction": FootFrictionSpec, "base_com": CoMOffsetSpec, "encoder_bias": EncoderBiasSpec}
+
+
+def layout_from_mean_scale(names_dims: list[tuple[str, int]], mean, scale) -> list[dict]:
+    """A layout (``SimContext.layout``'s form) from spec names and widths and the normalisation buffers."""
+    out, at = [], 0
+    for name, dim in names_dims:
+        m, sc = mean[at:at + dim].tolist(), scale[at:at + dim].tolist()
+        out.append({"name": name, "dim": dim, "ranges": [[a - b, a + b] for a, b in zip(m, sc)]})
+        at += dim
+    return out
+
+
+def layout_from_bundle(sim_context_state: dict, num_joints: int) -> list[dict]:
+    """The layout of a saved world model's sim context (its ``mean`` / ``scale``) from before run.json recorded it:
+    the specs are those of ``_CANDIDATES``, in that order, whose widths (1, 3, ``num_joints``) add up to its width."""
+    mean, scale = sim_context_state["mean"].cpu(), sim_context_state["scale"].cpu()
+    dims = {"foot_friction": 1, "base_com": 3, "encoder_bias": num_joints}
+    names = list(_CANDIDATES)
+    for mask in range(1, 1 << len(names)):
+        chosen = [(n, dims[n]) for i, n in enumerate(names) if mask >> i & 1]
+        if sum(d for _, d in chosen) == mean.numel():
+            return layout_from_mean_scale(chosen, mean, scale)
+    raise ValueError(f"a sim context {mean.numel()} wide matches no combination of {dims}")
+
+
 class SimContext(nn.Module):
     def __init__(self, specs: list[SimContextSpec], ranges: list[tuple[float, float]]):
         super().__init__()
@@ -181,12 +229,36 @@ class SimContext(nn.Module):
         self.register_buffer("scale", torch.tensor([s for _, s in stats]))
 
     @classmethod
-    def from_env(cls, env: ManagerBasedRlEnv) -> SimContext:
+    def from_env(cls, env: ManagerBasedRlEnv, layout: list[dict] | None = None) -> SimContext:
         """Discover, build, bind, and validate from the env's active DR events.
 
         Spec order here is the column layout of the normalized context: the replay
         buffer's ``sim_ctx`` field and the Dynamics input.
+
+        ``layout`` (``layout()`` of the run a fine-tune or resume starts from): that run's specs, widths and ranges
+        instead, so its world model and critics keep their input. A spec whose event this env lacks reads the
+        source's mean (``HeldSpec``); a live one keeps the source's normalisation, so a wider draw here reads
+        beyond +-1.
         """
+        if layout is not None:
+            specs, ranges, held = [], [], []
+            for entry in layout:
+                name, dim, rng = entry["name"], int(entry["dim"]), [tuple(r) for r in entry["ranges"]]
+                if getattr(env.cfg.events, name, None) is not None:
+                    spec = _CANDIDATES[name]()
+                    spec.bind(env)
+                    if spec.dim != dim:
+                        raise ValueError(f"sim context {name}: {spec.dim} columns here, {dim} in the source run")
+                else:
+                    mean = torch.tensor([_mean_scale(lo, hi)[0] for lo, hi in rng])
+                    spec = HeldSpec(name, dim, mean)
+                    held.append(name)
+                specs.append(spec)
+                ranges += rng
+            if held:
+                print(f"[INFO] Sim Context: {', '.join(held)} held at the source run's mean (normalised 0): this "
+                      "env has no such event, the source run's world model and critics take the columns", flush=True)
+            return cls(specs, ranges).to(env.device)
         candidates: tuple[type[SimContextSpec], ...] = (
             FootFrictionSpec,
             CoMOffsetSpec,
@@ -200,6 +272,10 @@ class SimContext(nn.Module):
                 "in the task cfg."
             )
         return cls(specs, [r for s in specs for r in s.bind(env)]).to(env.device)
+
+    def layout(self) -> list[dict]:
+        """Each spec's name, width and per-column range (from the normalisation), for run.json and ``from_env``."""
+        return layout_from_mean_scale([(s.name, s.dim) for s in self.specs], self.mean.cpu(), self.scale.cpu())
 
     @property
     def output_dim(self) -> int:

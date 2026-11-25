@@ -183,7 +183,7 @@ class TwoAgentRunner(BaseRunner[TwoAgentRunnerCfg]):
 
     def _init_common(self) -> None:
         """Do ``BaseRunner._init_common``'s set-up with the torso-IMU world model."""
-        wm = build_world_model(self.cfg, self.env, self.device)
+        wm = build_world_model(self.cfg, self.env, self.device, getattr(self, "sim_context_layout", None))
         self._wm = wm
         self._representation = wm.representation
         self._dynamics = wm.dynamics
@@ -572,9 +572,12 @@ class ImitationRunner(TwoAgentRunner):
         task_id: str = "imitation",
         registry_name: str | None = None,
         device: str = "cuda:0",
+        sim_context_layout: list[dict] | None = None,
     ):
         """Hold the reward cfg, the run directory and the motion files (recorded in ``run.json``), then build
-        everything. ``env`` is the env wrapped in ``EnvAdapter``."""
+        everything. ``env`` is the env wrapped in ``EnvAdapter``; ``sim_context_layout`` is the sim-context layout of
+        the run a fine-tune or resume starts from (``SimContext.from_env``)."""
+        self.sim_context_layout = sim_context_layout
         self.reward_cfg = rewards or ImitationRewardCfg()
         self.run_dir = None if run_dir is None else Path(run_dir)
         self.motion_files = list(motion_files or [])

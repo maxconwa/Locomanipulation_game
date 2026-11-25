@@ -95,6 +95,24 @@ def run_json_entries(p: dict) -> dict:
     return {"plant": p["plant"], "task": p["task"]}
 
 
+def source_sim_context_layout(run_dir: Path) -> list[dict]:
+    """The sim-context layout of ``run_dir``'s world model: run.json's ``sim_context``, or for a run from before it
+    was recorded, inferred from its saved normalisation (``world_model.pt``, else ``checkpoint.pt``)."""
+    import torch
+
+    from pretraining.constants import JOINT_NAMES
+    from pretraining.supermimic.sim_context import layout_from_bundle
+
+    meta = json.loads((run_dir / "run.json").read_text())
+    if "sim_context" in meta:
+        return meta["sim_context"]
+    if (run_dir / "world_model.pt").exists():
+        bundle = torch.load(run_dir / "world_model.pt", map_location="cpu", weights_only=False)
+    else:
+        bundle = torch.load(run_dir / "checkpoint.pt", map_location="cpu", weights_only=False)["world_model"]
+    return layout_from_bundle(bundle["sim_context"], len(JOINT_NAMES))
+
+
 def _checkpoint(run_dir: Path) -> int:
     """Return the iteration of ``run_dir``'s checkpoint; refuse a directory without one."""
     from pretraining.marl.runs import read_checkpoint_info
@@ -208,7 +226,11 @@ def train(p: dict, max_seconds: float | None, device: str) -> Path:
     if env_plant != p["plant"]:
         raise RuntimeError(f"{p['task']} is on the {env_plant} plant, the run's is {p['plant']}")
     env = EnvAdapter(gym.make(p["task"], cfg=env_cfg).unwrapped)
-    runner = ImitationRunner(env, cfg, rewards=p["rewards"], run_dir=run_dir, motion_files=p["files"], device=device)
+    # a fine-tune or resume keeps its source's sim-context columns (the world model's and critics' input)
+    source = {"resume": run_dir, "fine_tune": p.get("source")}.get(p["mode"])
+    layout = source_sim_context_layout(source) if source is not None else None
+    runner = ImitationRunner(env, cfg, rewards=p["rewards"], run_dir=run_dir, motion_files=p["files"], device=device,
+                             sim_context_layout=layout)
     if p["mode"] == "resume":
         runner.load_checkpoint(run_dir / "checkpoint.pt")
     elif p["mode"] == "fine_tune":
@@ -217,17 +239,18 @@ def train(p: dict, max_seconds: float | None, device: str) -> Path:
     # written, so that it records the budget used
     runner.cfg.max_seconds = max_seconds + runner._wall_offset if max_seconds else 0.0
     if p["mode"] == "fine_tune":
-        source = p["source"]
         run_dir.mkdir(parents=True)
         if (source / "progress.csv").exists():
             shutil.copy2(source / "progress.csv", run_dir / "progress.csv")  # the curves carry on
         run_json = {
             "stage": runner.stage, "runner": dataclasses.asdict(runner.cfg), **runner._run_meta(), "config": p["config"],
             "fine_tuned_from": f"{to_repo_path(source)} at iteration {p['start'] - 1}", **run_json_entries(p),
+            "sim_context": runner._sim_context.layout(),
         }
         atomic_write_text(run_dir / "run.json", json.dumps(run_json, indent=2, default=str))
     print(f"[train] run directory: {run_dir}", flush=True)
-    meta = {**runner._run_meta(), "config": p["config"], **run_json_entries(p)} if p["mode"] == "new" else None
+    meta = {**runner._run_meta(), "config": p["config"], **run_json_entries(p),
+            "sim_context": runner._sim_context.layout()} if p["mode"] == "new" else None
     return runner.run(meta, resume=p["mode"] != "new")
 
 

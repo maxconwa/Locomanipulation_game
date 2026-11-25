@@ -157,3 +157,50 @@ def test_fine_tune_from_refuses_another_plant(tmp_path, monkeypatch):
                                                     "--plant", "main"]))
     p = train.plan(train.build_parser().parse_args([*argv, "--run-name", "ft", "--fine-tune-from", str(source)]))
     assert p["plant"] == "pretrain"
+
+
+@pytest.mark.sim
+def test_main_fine_tune_from_a_main_base_run_keeps_its_world_model(tmp_path):
+    """A main-plant base run (31 sim-context columns: friction, torso COM, encoder bias), then --fine-tune from it in
+    the fine-tune env (no friction or COM event): the layout is the source's, with friction and COM held at its mean,
+    the loaded world model and actors are the source's before the first update, and the fine-tune trains."""
+    import csv
+    import math
+
+    from test_train_smoke import TRAIN_ENVS, _train, _train_setup
+
+    _, config = _train_setup(tmp_path)
+    common = ["--config", config, "--motion-dir", tmp_path / "motions", "--num-envs", TRAIN_ENVS, "--plant", "main"]
+    _train(tmp_path, *common, "--run-name", "base", "--max-iterations", 6)
+    base = tmp_path / "runs" / "base"
+    layout = json.loads((base / "run.json").read_text())["sim_context"]
+    assert [(e["name"], e["dim"]) for e in layout] == [("foot_friction", 1), ("base_com", 3), ("encoder_bias", 27)]
+
+    # resume_warmup (2) iterations of collection only: what it saves is what it loaded
+    proc = _train(tmp_path, *common, "--fine-tune", "--run-name", "ft0", "--fine-tune-from", base,
+                  "--max-iterations", 2)
+    assert "foot_friction, base_com held at the source run's mean" in proc.stdout_text
+    ft0 = tmp_path / "runs" / "ft0"
+    meta = json.loads((ft0 / "run.json").read_text())
+    assert (meta["plant"], meta["task"]) == ("main", FINETUNE_TASK) and meta["sim_context"] == layout
+    for name in ("world_model.pt", "actors.pt"):
+        ours, theirs = (torch.load(d / name, map_location="cpu", weights_only=False) for d in (ft0, base))
+        flat_ours, flat_theirs = _flatten(ours), _flatten(theirs)
+        assert flat_ours.keys() == flat_theirs.keys(), name
+        for k in flat_ours:
+            torch.testing.assert_close(flat_ours[k], flat_theirs[k], msg=f"{name}: {k}")
+
+    _train(tmp_path, *common, "--fine-tune", "--run-name", "ft1", "--fine-tune-from", base, "--max-iterations", 6)
+    with open(tmp_path / "runs" / "ft1" / "progress.csv") as fh:
+        rows = [r for r in csv.DictReader(fh) if int(r["iteration"]) >= 6]
+    losses = [float(r["Loss/state"]) for r in rows if r.get("Loss/state")]
+    assert losses and all(math.isfinite(v) for v in losses)
+
+
+def _flatten(tree, prefix=""):
+    """{dotted key: tensor} of a nested dict of tensors."""
+    if isinstance(tree, torch.Tensor):
+        return {prefix: tree}
+    if isinstance(tree, dict):
+        return {k: v for key, sub in tree.items() for k, v in _flatten(sub, f"{prefix}.{key}").items()}
+    return {}
