@@ -1,6 +1,6 @@
 """Do the frozen stage-1 decoders stand under main's randomisation? LocoManip-Marl-Pulse-v0 with a zero policy output.
 
-  python -m pretraining.scripts.pulse_baseline [--num-envs 4096] [--steps 1000] [--no-prior] [--nominal] [--out <json>]
+  python -m pretraining.scripts.pulse_baseline [--num-envs 4096] [--steps 1000] [--stage1-run <run>] [--no-prior] [--nominal] [--out <json>]
 
 Every agent's latent residual u is 0, so z = tanh(prior(proprio)) (with --no-prior, z = 0): the prior's guess of what
 the stage-1 policy would do, decoded, under the task's full randomisation, commands and resets (training mode, so the
@@ -33,6 +33,8 @@ def run(args) -> dict:
     cfg = load_cfg_from_registry(TASK, "env_cfg_entry_point")
     cfg.scene.num_envs = args.num_envs
     cfg.seed = args.seed
+    if args.stage1_run:
+        cfg.pulse_stage1_run = args.stage1_run
     if args.no_prior:
         cfg.pulse_prior = None
     if args.nominal:  # main's pre-pose resets, gain draws, action delay and encoder offsets off
@@ -109,6 +111,7 @@ def main() -> None:
     p.add_argument("--num-envs", type=int, default=4096)
     p.add_argument("--steps", type=int, default=1000)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--stage1-run", default=None, help="the decoders' stage-1 run (default: the env cfg's)")
     p.add_argument("--no-prior", action="store_true")
     p.add_argument("--nominal", action="store_true", help="without the pre-pose resets, gain draws, delay, offsets")
     p.add_argument("--out", default=None, help="write the result as json here")
