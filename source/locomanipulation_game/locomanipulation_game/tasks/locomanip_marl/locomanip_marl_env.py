@@ -92,6 +92,12 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._walk_falls = torch.tensor(1.0, device=self.device)
         self._walk_minutes = torch.tensor(1.0, device=self.device)
         self._sport_streak = 0
+        # the step the action_accel ramp started (cfg.action_accel_*; None: not yet); outside training a full ramp ago,
+        # and at the start when the deadline is 0
+        done_ago = -max(self.cfg.action_accel_ramp_steps, 0)
+        self._accel_started_at: int | None = (
+            None if self.cfg.training and self.cfg.action_accel_start_deadline_steps > 0 else
+            (0 if self.cfg.training else done_ago))
         self._sport_metrics: dict[str, float] = {}
         self._warm_start_log: dict[str, torch.Tensor] = {}
         self.golem_monitor = GolemEstopMonitor(self._robot, self.cfg.golem_estop, self.num_envs, self.device)
@@ -400,6 +406,11 @@ class LocoManipMarlEnv(DirectMARLEnv):
             self._walk_minutes = keep * self._walk_minutes + (1.0 - keep) * minutes.mean()
         falls_per_min = self._walk_falls / self._walk_minutes
         sport = self._sport_gate()  # every check, so the metrics are logged before and after the goals start
+        if self._accel_started_at is None and (sport or self.common_step_counter >= cfg.action_accel_start_deadline_steps):
+            self._accel_started_at = self.common_step_counter
+            print(f"[INFO] action_accel ramps in from step {self.common_step_counter}"
+                  f"{' (sport-mode gate passed)' if sport else ' (deadline)'} over {cfg.action_accel_ramp_steps} steps")
+        self._warm_start_log["Curriculum/action_accel_scale"] = torch.tensor(self.action_accel_scale, device=self.device)
         max_falls = cfg.warm_start_max_falls_per_min
         walks = (max_falls is None or bool(falls_per_min <= max_falls)) and sport
         deadline = 0 < cfg.warm_start_deadline_steps <= self.common_step_counter
@@ -465,6 +476,17 @@ class LocoManipMarlEnv(DirectMARLEnv):
     Curriculum state.
     """
 
+    @property
+    def action_accel_scale(self) -> float:
+        """The share of its weight that the legs' action_accel penalty pays now (mdp.action_term_accel_l2): 0 until the
+        ramp starts (cfg.action_accel_start_deadline_steps, the sport-mode gate), then linearly to 1 over
+        cfg.action_accel_ramp_steps env steps; 1 outside training and after a resume past the ramp's start."""
+        at = self._accel_started_at
+        if at is None:
+            return 0.0
+        ramp = self.cfg.action_accel_ramp_steps
+        return 1.0 if ramp <= 0 else min(1.0, max(0.0, (self.common_step_counter - at) / ramp))
+
     def save_state(self):
         """Save the curriculum state (the arm and velocity commands' kernel stages, whether the arm goals have
         started) to <log_dir>/curriculum/state_<step>.pt and state_latest.pt: a resumed or evaluated run
@@ -473,6 +495,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
             "arm_targets": self._arm_command.state_dict(),
             "base_velocity": self.command_manager.get_term("base_velocity").state_dict(),
             "arm_goals_enabled": self._arm_command.goals_enabled,
+            "action_accel_started": self._accel_started_at is not None,
         }
         directory = os.path.join(self.cfg.log_dir, "curriculum")
         os.makedirs(directory, exist_ok=True)
@@ -484,6 +507,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._arm_command.load_state_dict(state["arm_targets"])
         self.command_manager.get_term("base_velocity").load_state_dict(state["base_velocity"])
         self._arm_command.goals_enabled |= state["arm_goals_enabled"]
+        if state.get("action_accel_started"):  # a resumed run restarts its step count: the full weight at once
+            self._accel_started_at = -max(self.cfg.action_accel_ramp_steps, 0)
         print(
             f"[INFO] Restored curriculum: arm kernel stage {self._arm_command.kernel_stage}, arm goals"
             f" {self._arm_command.goals_enabled}, velocity kernel stages lin"

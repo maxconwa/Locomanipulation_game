@@ -50,7 +50,8 @@ def _action_term_slice(env: ManagerBasedRLEnv, action_name: str) -> slice:
 class action_term_accel_l2(ManagerTermBase):
     """The second difference of one action term's raw actions, |a_t - 2 a_t-1 + a_t-2|^2 summed: a reversal of the
     action costs, a steady change does not. Zero for the first two steps of an episode (their history is the reset's).
-    The same slice as action_term_rate_l2."""
+    The same slice as action_term_rate_l2. Times env.action_accel_scale where the env has one (the ramp in
+    LocoManipMarlEnv: 0 until the robot walks)."""
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
@@ -70,7 +71,7 @@ class action_term_accel_l2(ManagerTermBase):
         self._prev2[:] = self._prev
         self._prev[:] = a
         self._seen[:] = (self._seen + 1).clamp(max=2)
-        return accel
+        return accel * getattr(env, "action_accel_scale", 1.0)
 
 
 def ang_vel_xy_standing_l2(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:

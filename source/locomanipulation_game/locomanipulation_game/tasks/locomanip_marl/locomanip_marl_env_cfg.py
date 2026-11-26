@@ -668,6 +668,15 @@ class LocoManipMarlEnvCfg(DirectMARLEnvCfg):
     warm_start_sport_every: int = 100
     warm_start_sport_checks: int = 3
     warm_start_deadline_steps: int = 0
+    # The legs' action_accel penalty (a reversal of the leg actions) ramps in once the robot walks: from 0 until the
+    # sport-mode gate above passes (its thresholds, warm_start_sport_checks checks in a row; checked whether or not the
+    # warm start is on) or at action_accel_start_deadline_steps, whichever comes first, then linearly to its full
+    # weight over action_accel_ramp_steps. At its full weight from the start it held SmoothCoop300k_s42 in a shuffle
+    # (both feet down 86%, cos 0.06 at 50k): it cost more than the swing reward a first step earns.
+    action_accel_start_deadline_steps: int = 60000
+    """Env steps: the action_accel ramp starts here at the latest (0: at the start, the full weight at once)."""
+    action_accel_ramp_steps: int = 20000
+    """Env steps from the ramp's start to action_accel's full weight (0: at once)."""
     policy_output_init_scale: dict[str, float] = {}
     """Per agent, its fresh actor's last layer at initialisation: the weights times this and the bias zeroed, so the
     actions start near 0 (scripts/skrl/train.py, before any checkpoint loads over them). Agents not listed keep skrl's
