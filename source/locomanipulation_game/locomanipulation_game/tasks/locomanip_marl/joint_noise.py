@@ -14,8 +14,14 @@ Refitted 2026-11-26 (~/bags/coop150k_2026-11-24/analysis/dr_audit/velnoise.py, a
 walks): most of the "noise" above on the hips and knees was the drivers' 21 Hz velocity lag (JOINT_VEL_LOWPASS_HZ),
 measured later. Against the derivative through that filter, which training now applies before this noise, the hips'
 and knees' residual is 0.03 + 0.03 |dq| (0.044 at 0.34 rad/s, 0.078 at 1.4, 0.11 at 2.7): 0.6 counted the lag twice,
-~10x too much at walking speed, so 0.06 there. The ankles (no lag) measure 0.12 + 0.23 |dq| (0.27 at 0.7 rad/s): 0.3,
-from 0.6. The arms were not refitted and keep 0.6. Standing still is unchanged (the floors). Until 2026-11-23 every run
+~10x too much at walking speed. The ankles (no lag) measure 0.12 + 0.23 |dq| (0.27 at 0.7 rad/s). The arms were not
+refitted.
+
+Training still uses 0.6 on every joint, deliberately (2026-11-27): DrBags120k_s42, trained with the measured slopes
+(hips and knees 0.06, ankles 0.3) and otherwise Coop200k_s42's code and seed, learned to use hip-roll velocity twice as
+hard (|target / dq| at 20 Hz 0.104 against 0.056), so the predicted 20 Hz loop gain on the robot rose from 0.71-0.78 to
+1.38-1.47 at 100-120k (analysis/loopgain.py; Coop150k, which buzzed on the robot, 0.96). The extra noise discourages
+that 20 Hz damping on the lagged velocity; keep it until something else holds the loop down. Until 2026-11-23 every run
 trained on uniform +-1.5 rad/s (std 0.87) on every joint and +-0.01 rad on the positions, 2.5x the walking robot's
 velocity noise and 100-1000x the standing one's: MuJoCo with that noise jittered its targets ~0.017 rad per step
 standing, the robot 0.001-0.002 (the engage grid's noise ablation, 2026-11-23).
@@ -46,8 +52,9 @@ except ImportError:  # loaded by path outside Isaac Lab (the MuJoCo evals): the 
 JOINT_VEL_NOISE_FLOOR = {r".*_ankle_.*_joint": 0.02, r".*_(shoulder|elbow|wrist)_.*_joint": 0.015}
 JOINT_VEL_NOISE_FLOOR_DEFAULT = 0.002
 # rad/s of velocity noise std per rad/s of the joint's speed, per joint group (first matching pattern; the default
-# otherwise): the hips and knees after their 21 Hz lag, the ankles; the arms not refitted (module docstring)
-JOINT_VEL_NOISE_PER_SPEED = {r".*_(hip_.*|knee)_joint": 0.06, r".*_ankle_.*_joint": 0.3}
+# otherwise). Empty: 0.6 on every joint, about 10x the hips' and knees' measured 0.03-0.06 and 2x the ankles', kept on
+# purpose because the measured values doubled the predicted 20 Hz loop gain (module docstring)
+JOINT_VEL_NOISE_PER_SPEED: dict[str, float] = {}
 JOINT_VEL_NOISE_PER_SPEED_DEFAULT = 0.6
 # rad: the position noise, uniform +- (the walking robot's worst 0.0025)
 JOINT_POS_NOISE = 0.003
