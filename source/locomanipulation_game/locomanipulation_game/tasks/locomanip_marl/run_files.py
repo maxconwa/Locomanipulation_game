@@ -13,24 +13,20 @@ import re
 
 
 def state_checkpoint_for(agent_checkpoint: str) -> str | None:
-    """The curriculum state saved with an skrl checkpoint: <run>/curriculum/state_<step>.pt, else the newest one;
-    runs from before 2026-10-25 saved it in <run>/estimator/estimator_<step>.pt."""
-    run_dir = os.path.dirname(os.path.dirname(os.path.abspath(agent_checkpoint)))
+    """The curriculum state saved with an skrl checkpoint: <run>/curriculum/state_<step>.pt, else the newest one."""
+    folder = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(agent_checkpoint))), "curriculum")
     step = re.search(r"_(\d+)\.pt$", os.path.basename(agent_checkpoint))
-    for folder, prefix in (("curriculum", "state"), ("estimator", "estimator")):
-        if step:
-            same_step = os.path.join(run_dir, folder, f"{prefix}_{step.group(1)}.pt")
-            if os.path.isfile(same_step):
-                return same_step
-        latest = os.path.join(run_dir, folder, f"{prefix}_latest.pt")
-        saved = sorted(glob.glob(os.path.join(run_dir, folder, f"{prefix}_*.pt")), key=os.path.getmtime)
-        other = latest if os.path.isfile(latest) else saved[-1] if saved else None
-        if other:
-            if step:
-                print(f"[WARNING] no curriculum state was saved at step {step.group(1)}: using {other}, which may be"
-                      f" from another step of the run")
-            return other
-    return None
+    if step:
+        same_step = os.path.join(folder, f"state_{step.group(1)}.pt")
+        if os.path.isfile(same_step):
+            return same_step
+    latest = os.path.join(folder, "state_latest.pt")
+    saved = sorted(glob.glob(os.path.join(folder, "state_*.pt")), key=os.path.getmtime)
+    other = latest if os.path.isfile(latest) else saved[-1] if saved else None
+    if other and step:
+        print(f"[WARNING] no curriculum state was saved at step {step.group(1)}: using {other}, which may be"
+              f" from another step of the run")
+    return other
 
 
 def run_overrides(run_dir: str) -> list[str]:
@@ -65,24 +61,21 @@ def known_overrides(overrides: list[str], task: str) -> tuple[list[str], list[st
     return kept, dropped
 
 
-def run_task(run_dir: str, asked: str | None = None, fallback: str = "LocoManip-Marl-Direct-v0") -> str:
+def run_task(run_dir: str, asked: str | None = None) -> str:
     """The task a script should build for a run: `asked` (its --task) if given, else the one the run was trained on
-    (<run>/params/task.txt), else `fallback`, said aloud: runs from before 2026-11-16 did not record theirs, and a
-    legs-only or arms-only run rebuilt as the walking task moves joints its policy never trained."""
+    (<run>/params/task.txt); a run without one is an error."""
     path = os.path.join(run_dir, "params", "task.txt")
     recorded = open(path).read().strip() if os.path.isfile(path) else None
     if asked:
         if recorded and recorded != asked:
             print(f"[WARNING] --task {asked}, but {run_dir} was trained on {recorded}")
         return asked
-    if recorded:
-        return recorded
-    print(f"[WARNING] {run_dir} does not record its task; assuming {fallback} (pass --task if it was another)")
-    return fallback
+    if not recorded:
+        raise SystemExit(f"{run_dir} does not record its task ({path}): pass --task")
+    return recorded
 
 
-def replay_run(checkpoint: str, task: str | None, extra_overrides: list[str], fallback: str = "LocoManip-Marl-Direct-v0"
-               ) -> tuple[str, str, str, list[str]]:
+def replay_run(checkpoint: str, task: str | None, extra_overrides: list[str]) -> tuple[str, str, str, list[str]]:
     """What every script that rebuilds a run for a checkpoint does first: (the checkpoint's absolute path, its run's
     folder, the task (run_task), the run's overrides the current cfgs still have). Sets sys.argv to those overrides
     followed by extra_overrides, for hydra_task_config. Call it after the app is up."""
@@ -90,7 +83,7 @@ def replay_run(checkpoint: str, task: str | None, extra_overrides: list[str], fa
 
     checkpoint = os.path.abspath(checkpoint)
     run_dir = os.path.dirname(os.path.dirname(checkpoint))
-    task = run_task(run_dir, task, fallback)
+    task = run_task(run_dir, task)
     replayed, dropped = known_overrides(run_overrides(run_dir), task)
     if dropped:
         print(f"[INFO] run overrides the current cfg no longer has (their values are the defaults now): {dropped}")
@@ -104,7 +97,6 @@ def evaluation_cfgs(env_cfg, agent_cfg: dict, checkpoint: str, run_dir: str):
     env_cfg.log_dir = run_dir
     env_cfg.training = False
     run_imu(env_cfg, run_dir)
-    run_engage_blend(env_cfg, run_dir)
     run_joint_vel_lowpass(env_cfg, run_dir)
     env_cfg.state_checkpoint_path = state_checkpoint_for(checkpoint)
     agent_cfg["trainer"]["close_environment_at_exit"] = False
@@ -150,19 +142,6 @@ def run_imu(env_cfg, run_dir: str) -> None:
     imu.orientation = saved.get("orientation", "raw")
     imu.quat_bias_deg = {k: tuple(float(v) for v in saved["quat_bias_deg"][k]) for k in ("roll", "pitch", "yaw")}
     print(f"[INFO] torso IMU as the run trained: orientation {imu.orientation}, bias {imu.quat_bias_deg}")
-
-
-def run_engage_blend(env_cfg, run_dir: str) -> None:
-    """Give env_cfg the legs' engage blend the run trained with (<run>/params/env.yaml actions.joint_pos
-    engage_blend_s; a run from before 2026-11-22 has none and trained without one)."""
-    legs = getattr(getattr(env_cfg, "actions", None), "joint_pos", None)
-    saved = read_run_env(run_dir)
-    if legs is None or saved is None:
-        return
-    blend = float(((saved.get("actions") or {}).get("joint_pos") or {}).get("engage_blend_s") or 0.0)
-    if blend != legs.engage_blend_s:
-        print(f"[INFO] legs' engage blend as the run trained: {blend:g} s")
-    legs.engage_blend_s = blend
 
 
 def run_joint_vel_lowpass(env_cfg, run_dir: str) -> None:

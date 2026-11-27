@@ -19,7 +19,7 @@ import torch
 MARL_DIRECT = "LocoManip-Marl-Direct-v0"
 # the curriculum entries (locomanip_marl_env.save_state) that belong to each agent's command
 AGENT_STATE_KEYS = {"legs": ("base_velocity.lin_kernel_stage", "base_velocity.ang_kernel_stage"),
-                    "arms": ("arm_targets.kernel_stage", "arm_goals_enabled")}
+                    "arms": ("arm_goals_enabled",)}
 
 
 def read_env_yaml(run_dir: str | Path) -> dict:
@@ -53,8 +53,6 @@ def check_agent_fits(base, agent: str, run_dir: str | Path, checkpoint: str | Pa
     width = base.observation_manager.group_obs_dim[agent][0]
     policy = torch.load(str(checkpoint), map_location="cpu", weights_only=False).get(agent, {}).get("policy", {})
     w_in = next((v.shape[1] for k, v in policy.items() if k.endswith("weight_ih_l0")), None)
-    if w_in is None:
-        w_in = next((v.shape[1] for k, v in policy.items() if k.endswith(".weight") and v.dim() == 2), None)
     if w_in is not None and w_in != width:
         raise SystemExit(f"[evals] {agent} from {checkpoint}: its network reads {w_in} observation values, this env"
                          f" gives {width} ({here})")
@@ -110,7 +108,7 @@ def load_agent(runner, checkpoint: str | Path, uid: str) -> None:
 
 def merged_state(main_state: str | None, other_state: str | None, other_agent: str, out_dir: str | Path) -> str | None:
     """A curriculum state file: the main run's, with the other agent's entries from the other run's (so, e.g., an
-    arms policy runs at the arm kernel stage it reached, with its goals on)."""
+    arms policy runs with its goals on)."""
     if other_state is None:
         return main_state
     main = torch.load(main_state, map_location="cpu", weights_only=False)["env_state"] if main_state else {}

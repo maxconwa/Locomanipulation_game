@@ -1,7 +1,7 @@
 """A run's TensorBoard scalars, with each event's wall time: the training curves and the wall-clock axis.
 
-Both trainers (skrl PPO and SuperMimic) log on the env-policy-step axis into the run folder. A run's start is its
-first event's wall time; a checkpoint's wall-clock hours are those of the first event at or after its step.
+skrl logs on the env-policy-step axis into the run folder. A run's start is its first event's wall time; a
+checkpoint's wall-clock hours are those of the first event at or after its step.
 """
 
 from __future__ import annotations

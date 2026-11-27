@@ -34,10 +34,8 @@ read -r -a EXTRA <<< "${OVERRIDES:-}"
 if [ -n "${SMOKE:-}" ]; then
   ITERATIONS=$SMOKE
   SEEDS=(${SEEDS[0]})
-  # the arm goals start at 600 steps whatever the gate says, so the switch-on path runs too
-  # (the curriculum state is saved with every checkpoint)
-  EXTRA+=(agent.agent.experiment.directory=smoke env.warm_start_deadline_steps=600
-          agent.agent.experiment.checkpoint_interval=480)
+  # a checkpoint (and the curriculum state saved with it) every 480 steps
+  EXTRA+=(agent.agent.experiment.directory=smoke agent.agent.experiment.checkpoint_interval=480)
 fi
 FINAL=$((ITERATIONS * 48))
 MID=${MID:-$((FINAL * 2 / 3 / 9600 * 9600))}   # the checkpoint (every 9600) at or before two thirds: 393600 of 600000

@@ -132,7 +132,6 @@ def main(env_cfg, agent_cfg: dict):
     runner.agent.enable_training_mode(False, apply_to_models=True)
     robot, vel = base.scene["robot"], base.command_manager.get_term("base_velocity")
     arm = base.command_manager.get_term("arm_targets")
-    arm._judge_kernels = lambda ended: None
     if ARMS:
         arm.goals_enabled, arm.goals_enabled_at = True, None
         arm.cfg.rest_goal_prob = 0.0

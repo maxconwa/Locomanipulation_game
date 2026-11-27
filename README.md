@@ -23,9 +23,8 @@ metrics pass. These are the defaults: `train.py` with no overrides trains the re
     `arms_only_env_cfg.py`) and `LocoManip-Marl-Direct-v0` (both at once on a free pelvis, each agent on exactly its
     own task, neither's depending on the other's; `marl_direct_env_cfg.py`).
     - `locomanip_marl_env_cfg.py`: everything configurable; `scene_cfg.py`: the scene.
-    - `locomanip_marl_env.py`: a DirectMARLEnv that runs Isaac Lab's managers, the warm start and the arm goals'
-      odometry.
-    - `mdp/`: commands (velocity with the sport-mode metrics; arm goals with their kernel curriculum), rewards,
+    - `locomanip_marl_env.py`: a DirectMARLEnv that runs Isaac Lab's managers and the warm start.
+    - `mdp/`: commands (velocity with the sport-mode metrics and its kernel curriculum; arm goals), rewards,
       actions, observations, events, terminations.
     - `recurrent.py`: the LSTM actors and recurrent MAPPO; `golem_safety.py`: GOLEM's e-stops;
       `run_files.py`: a run's saved state, task and overrides.

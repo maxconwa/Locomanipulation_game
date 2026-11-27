@@ -11,8 +11,7 @@ them onto the per-agent dicts:
                   golem_estop_penalty on the step a GOLEM e-stop trip starts
     dones:        one TerminationManager, shared (one body, one episode)
 
-After every step it moves the arm command by the pelvis's motion (on the robot, FAST-LIO's odometry does). Each
-episode's length is drawn at its reset (cfg.episode_length_range_s). While training, every task is navigation until
+Each episode's length is drawn at its reset (cfg.episode_length_range_s). While training, every task is navigation until
 the robot walks like sport mode (cfg.warm_start_*, _update_warm_start); then the arm goals start. GolemEstopMonitor
 (golem_safety.py) checks GOLEM's e-stops after every physics substep; trips are logged and charged, never end an
 episode.
@@ -33,7 +32,7 @@ from isaaclab.managers import (
     RewardManager,
     TerminationManager,
 )
-from isaaclab.utils.math import quat_apply_inverse, subtract_frame_transforms
+from isaaclab.utils.math import quat_apply_inverse
 
 from .golem_safety import GolemEstopMonitor
 from .imu_filter import GyroLowpass
@@ -86,11 +85,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
                                                  self.device, axes=len(self.joint_vel_lowpass_ids))
             print(f"[INFO] reported joint velocities low-passed at {self.cfg.joint_vel_lowpass_hz:g} Hz: "
                   + ", ".join(self._robot.joint_names[i] for i in self.joint_vel_lowpass_ids))
-        # the warm start: exponential means over the ending episodes of their falls and their minutes (falls per
-        # minute is their ratio, from 1: a start far above any threshold that the means forget within ~10k episodes),
-        # the sport-mode gate's consecutive passing checks and the last check's metrics
-        self._walk_falls = torch.tensor(1.0, device=self.device)
-        self._walk_minutes = torch.tensor(1.0, device=self.device)
+        # the warm start: the sport-mode gate's consecutive passing checks and the last check's metrics
         self._sport_streak = 0
         # the step the action_accel ramp started (cfg.action_accel_*; None: not yet); outside training a full ramp ago,
         # and at the start when the deadline is 0
@@ -125,13 +120,8 @@ class LocoManipMarlEnv(DirectMARLEnv):
             f" actions {self.cfg.action_spaces}"
         )
 
-        # -- the arm command's odometry: the pelvis pose at the last step; envs whose last pose belongs to an
-        # earlier episode
         self._arm_command = self.command_manager.get_term(ARM_COMMAND)
         self._arm_command.goals_enabled = not self.cfg.training
-        self._prev_root_pos = self._robot.data.root_pos_w.clone()
-        self._prev_root_quat = self._robot.data.root_quat_w.clone()
-        self._fresh = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         if self.cfg.state_checkpoint_path:
             print(f"[INFO] Curriculum state: {self.cfg.state_checkpoint_path}")
             self._load_state(torch.load(self.cfg.state_checkpoint_path, map_location=self.device, weights_only=False)["env_state"])
@@ -229,7 +219,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self.termination_manager.compute()
         terminated = self.termination_manager.terminated
         time_outs = self.termination_manager.time_outs
-        self._update_warm_start(terminated | time_outs)
+        self._update_warm_start()
         return (
             {agent: terminated for agent in self.cfg.possible_agents},
             {agent: time_outs for agent in self.cfg.possible_agents},
@@ -261,7 +251,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
     def _get_observations(self) -> dict[str, torch.Tensor]:
         # the last substep's IMU sample (after a reset, the refreshed reading the model restarts from)
         self._sample_imu()
-        self._update_odometry()
+        # while training, the curriculum state every cfg.state_save_every steps
+        if (self.cfg.training and self.common_step_counter % self.cfg.state_save_every == 0
+                and getattr(self.cfg, "log_dir", None)):
+            self.save_state()
         self.command_manager.compute(dt=self.step_dt)
         groups = list(self.cfg.possible_agents) + ["critic"]
         self._obs_buf = {g: self.observation_manager.compute_group(g) for g in groups}
@@ -283,7 +276,6 @@ class LocoManipMarlEnv(DirectMARLEnv):
             steps = torch.ceil(seconds / self.step_dt)
             self.episode_limit[ids] = steps.clamp(max=self.max_episode_length).long()
         self._refresh_sensors_after_reset(env_ids)
-        self._fresh[env_ids] = True
         self.lowstate_imu.reset(env_ids)
         if self.joint_vel_lowpass is not None:
             self.joint_vel_lowpass.reset(env_ids)
@@ -312,10 +304,6 @@ class LocoManipMarlEnv(DirectMARLEnv):
         log.update(self.command_manager.reset(env_ids))
         if self._prepose is not None:
             log.update(self._hand_over(torch.as_tensor(env_ids, device=self.device)))
-        # the legs' engage blend starts from the target held before the first step (the pre-pose's hold at its resets)
-        held = (self._target_history[self._delay_terms.index(self._legs_term)][env_ids, 0] if self._target_history
-                else self._legs_term._applied[env_ids])
-        self._legs_term.start_blend(env_ids, held)
         log.update(self.event_manager.reset(env_ids))
         log.update(self.termination_manager.reset(env_ids))
         # skrl logs only one-element tensors; the managers also return floats
@@ -371,58 +359,28 @@ class LocoManipMarlEnv(DirectMARLEnv):
         return self._prepose.support_share(self.episode_length_buf * self.step_dt)
 
     """
-    Arm-command odometry and the warm start.
+    The warm start.
     """
 
-    def _update_odometry(self):
-        """Move each arm goal by the pelvis's motion since the last step, as the robot's SLAM odometry moves it (reset
-        envs are skipped: their last pose is the old episode's, and the reset gave them an exact command). While
-        training, save the curriculum state every cfg.state_save_every steps."""
-        root_pos = self._robot.data.root_pos_w.clone()
-        root_quat = self._robot.data.root_quat_w.clone()
-        delta_pos, delta_quat = subtract_frame_transforms(self._prev_root_pos, self._prev_root_quat, root_pos, root_quat)
-        self._arm_command.apply_pelvis_motion(delta_pos, delta_quat, env_mask=~self._fresh)
-        self._prev_root_pos, self._prev_root_quat = root_pos, root_quat
-        self._fresh[:] = False
-        if (self.cfg.training and self.common_step_counter % self.cfg.state_save_every == 0
-                and getattr(self.cfg, "log_dir", None)):
-            self.save_state()
-
-    def _update_warm_start(self, ending: torch.Tensor):
+    def _update_warm_start(self):
         """End the warm start (goals_enabled: the arm goals and the arms' residual ramp in) once the robot walks like
-        sport mode: the sport-mode gate passes (_sport_gate)
-        and, if cfg.warm_start_max_falls_per_min is set, over the ending episodes (exponential means, decay
-        cfg.warm_start_episode_decay per episode) at most that many falls per minute; or at
-        cfg.warm_start_deadline_steps. Per minute, not per episode: the share of episodes that
-        fall grows with their length. Runs before the resets, while the velocity command still holds the ending
-        episodes' sums and episode_length_buf their lengths."""
+        sport mode, the sport-mode gate passing (_sport_gate), or at cfg.warm_start_deadline_steps; and start the
+        action_accel ramp (cfg.action_accel_*)."""
         cfg = self.cfg
-        ids = ending.nonzero(as_tuple=False).flatten()
-        if len(ids):
-            fell = self.termination_manager.get_term("fell")[ids]
-            minutes = self.episode_length_buf[ids].float() * self.step_dt / 60.0
-            keep = cfg.warm_start_episode_decay ** len(ids)
-            self._walk_falls = keep * self._walk_falls + (1.0 - keep) * fell.float().mean()
-            self._walk_minutes = keep * self._walk_minutes + (1.0 - keep) * minutes.mean()
-        falls_per_min = self._walk_falls / self._walk_minutes
         sport = self._sport_gate()  # every check, so the metrics are logged before and after the goals start
         if self._accel_started_at is None and (sport or self.common_step_counter >= cfg.action_accel_start_deadline_steps):
             self._accel_started_at = self.common_step_counter
             print(f"[INFO] action_accel ramps in from step {self.common_step_counter}"
                   f"{' (sport-mode gate passed)' if sport else ' (deadline)'} over {cfg.action_accel_ramp_steps} steps")
         self._warm_start_log["Curriculum/action_accel_scale"] = torch.tensor(self.action_accel_scale, device=self.device)
-        max_falls = cfg.warm_start_max_falls_per_min
-        walks = (max_falls is None or bool(falls_per_min <= max_falls)) and sport
         deadline = 0 < cfg.warm_start_deadline_steps <= self.common_step_counter
         arm = self._arm_command
-        if not arm.goals_enabled and (walks or deadline):
+        if not arm.goals_enabled and (sport or deadline):
             arm.goals_enabled = True
             arm.goals_enabled_at = self.common_step_counter  # the arm-goal share ramps up from here
             metrics = ", ".join(f"{k} {v:.3f}" for k, v in self._sport_metrics.items() if not k.startswith("n_"))
-            print(f"[INFO] Warm start over at step {self.common_step_counter}{' (deadline)' if not walks else ''}:"
-                  f" {falls_per_min.item():.3f} falls per minute; sport metrics {metrics or 'none yet'};"
-                  " the arm goals start")
-        self._warm_start_log["Curriculum/warm_start_falls_per_min"] = falls_per_min
+            print(f"[INFO] Warm start over at step {self.common_step_counter}{' (deadline)' if not sport else ''}:"
+                  f" sport metrics {metrics or 'none yet'}; the arm goals start")
         self._warm_start_log["Curriculum/arm_goals_enabled"] = torch.tensor(float(arm.goals_enabled), device=self.device)
 
     def _sport_gate(self) -> bool:
@@ -439,10 +397,7 @@ class LocoManipMarlEnv(DirectMARLEnv):
         self._sport_metrics = m
         for key, value in m.items():
             self._warm_start_log[f"Metrics/sport/{key}"] = torch.tensor(value, device=self.device)
-        speed, turn = cfg.warm_start_speed_ratio_range, cfg.warm_start_turn_ratio_range
         passes = (m["turn_sense"] >= cfg.warm_start_min_turn_sense
-                  and (speed is None or speed[0] <= m["speed_ratio"] <= speed[1])
-                  and (turn is None or turn[0] <= m["turn_ratio"] <= turn[1])
                   and m["cos"] >= cfg.warm_start_min_sport_cos
                   and m["ang_err"] <= cfg.warm_start_max_ang_err
                   and m["lin_err"] <= cfg.warm_start_max_lin_err)  # nan compares False
@@ -488,11 +443,10 @@ class LocoManipMarlEnv(DirectMARLEnv):
         return 1.0 if ramp <= 0 else min(1.0, max(0.0, (self.common_step_counter - at) / ramp))
 
     def save_state(self):
-        """Save the curriculum state (the arm and velocity commands' kernel stages, whether the arm goals have
-        started) to <log_dir>/curriculum/state_<step>.pt and state_latest.pt: a resumed or evaluated run
+        """Save the curriculum state (the velocity command's kernel stages, whether the arm goals and the action_accel
+        ramp have started) to <log_dir>/curriculum/state_<step>.pt and state_latest.pt: a resumed or evaluated run
         starts from it (cfg.state_checkpoint_path)."""
         env_state = {
-            "arm_targets": self._arm_command.state_dict(),
             "base_velocity": self.command_manager.get_term("base_velocity").state_dict(),
             "arm_goals_enabled": self._arm_command.goals_enabled,
             "action_accel_started": self._accel_started_at is not None,
@@ -503,15 +457,14 @@ class LocoManipMarlEnv(DirectMARLEnv):
             torch.save({"env_state": env_state}, os.path.join(directory, name))
 
     def _load_state(self, state: dict):
-        """The kernel stages and the end of the warm start saved by save_state."""
-        self._arm_command.load_state_dict(state["arm_targets"])
+        """The kernel stages and the end of the warm start saved by save_state. States saved before 2026-11-26 also
+        hold the arm command's kernel stage ("arm_targets"), now unused: ignored."""
         self.command_manager.get_term("base_velocity").load_state_dict(state["base_velocity"])
         self._arm_command.goals_enabled |= state["arm_goals_enabled"]
         if state.get("action_accel_started"):  # a resumed run restarts its step count: the full weight at once
             self._accel_started_at = -max(self.cfg.action_accel_ramp_steps, 0)
         print(
-            f"[INFO] Restored curriculum: arm kernel stage {self._arm_command.kernel_stage}, arm goals"
-            f" {self._arm_command.goals_enabled}, velocity kernel stages lin"
+            f"[INFO] Restored curriculum: arm goals {self._arm_command.goals_enabled}, velocity kernel stages lin"
             f" {state['base_velocity']['lin_kernel_stage']} ang {state['base_velocity']['ang_kernel_stage']}"
         )
 

@@ -102,15 +102,7 @@ class RecurrentMAPPO(MAPPO):
     produced, zeroed for envs whose episode ended. Outside training (evaluation scripts, which call act only) act
     moves on itself, and the script has to call reset_rnn(done) after every env step: an env that was reset would
     otherwise go on with its last episode's state, which no training episode started from.
-
-    lipschitz_penalty[uid] > 0 adds a smoothness term to that agent's loss, after LCP (Chen et al. 2024, "Learning
-    Smooth Humanoid Locomotion through Lipschitz-Constrained Policies"): the penalty times the squared gradient of the
-    policy's mean action with respect to its (scaled) observations, ||J||_F^2 estimated with one random projection
-    (E_v ||J^T v||^2, v ~ N(0, I)). LCP penalizes the gradient of log pi(a | s) instead, which scales as 1 / std^2 and
-    so would also pay the policy for a wider std. The LSTM then runs without cuDNN in the update (no double backward).
     """
-
-    lipschitz_penalty: dict[str, float] = {}
 
     def init(self, *, trainer_cfg=None) -> None:
         super().init(trainer_cfg=trainer_cfg)
@@ -253,8 +245,7 @@ class RecurrentMAPPO(MAPPO):
         batches = memory.sample_all(names=names, mini_batches=mini_batches, sequence_length=length)
         rnn_batches = memory.sample_all(names=self._rnn_names[uid], mini_batches=mini_batches, sequence_length=length)
 
-        lipschitz = self.lipschitz_penalty.get(uid, 0.0)
-        cumulative_policy_loss = cumulative_entropy_loss = cumulative_value_loss = cumulative_lipschitz_loss = 0
+        cumulative_policy_loss = cumulative_entropy_loss = cumulative_value_loss = 0
         for epoch in range(self.cfg.learning_epochs[uid]):
             kl_divergences = []
             for batch, rnn_batch in zip(batches, rnn_batches):
@@ -265,21 +256,11 @@ class RecurrentMAPPO(MAPPO):
                         "observations": self._observation_preprocessor[uid](sampled_observations, train=not epoch),
                         "states": self._state_preprocessor[uid](sampled_states, train=not epoch),
                     }
-                    if lipschitz:
-                        inputs["observations"] = inputs["observations"].detach().requires_grad_(True)
-                    with torch.backends.cudnn.flags(enabled=not lipschitz):
-                        _, outputs = policy.act({
-                            **inputs, "taken_actions": sampled_actions, "rnn": [s.transpose(0, 1) for s in rnn_batch],
-                            "terminated": sampled_terminated, "truncated": sampled_truncated,
-                        }, role="policy")
+                    _, outputs = policy.act({
+                        **inputs, "taken_actions": sampled_actions, "rnn": [s.transpose(0, 1) for s in rnn_batch],
+                        "terminated": sampled_terminated, "truncated": sampled_truncated,
+                    }, role="policy")
                     next_log_prob = outputs["log_prob"]
-                    if lipschitz:
-                        mean = outputs["mean_actions"]
-                        (grad,) = torch.autograd.grad((mean * torch.randn_like(mean)).sum(), inputs["observations"],
-                                                      create_graph=True)
-                        lipschitz_loss = lipschitz * grad.square().sum(dim=-1).mean()
-                    else:
-                        lipschitz_loss = 0
 
                     with torch.no_grad():
                         ratio = next_log_prob - sampled_log_prob
@@ -308,7 +289,7 @@ class RecurrentMAPPO(MAPPO):
                     value_loss = self.cfg.value_loss_scale[uid] * F.mse_loss(sampled_returns, predicted_values)
 
                 self.optimizers[uid].zero_grad()
-                self.scaler.scale(policy_loss + entropy_loss + value_loss + lipschitz_loss).backward()
+                self.scaler.scale(policy_loss + entropy_loss + value_loss).backward()
                 if config.torch.is_distributed:
                     policy.reduce_parameters()
                     value.reduce_parameters()
@@ -323,8 +304,6 @@ class RecurrentMAPPO(MAPPO):
                 cumulative_value_loss += value_loss.item()
                 if self.cfg.entropy_loss_scale[uid]:
                     cumulative_entropy_loss += entropy_loss.item()
-                if lipschitz:
-                    cumulative_lipschitz_loss += lipschitz_loss.item()
 
             if self.schedulers[uid]:
                 if isinstance(self.schedulers[uid], KLAdaptiveLR):
@@ -341,8 +320,6 @@ class RecurrentMAPPO(MAPPO):
         self.track_data(f"Loss / Value loss ({uid})", cumulative_value_loss / steps)
         if self.cfg.entropy_loss_scale[uid]:
             self.track_data(f"Loss / Entropy loss ({uid})", cumulative_entropy_loss / steps)
-        if lipschitz:
-            self.track_data(f"Loss / Lipschitz loss ({uid})", cumulative_lipschitz_loss / steps)
         self.track_data(f"Policy / Standard deviation ({uid})", policy.distribution(role="policy").stddev.mean().item())
         if self.schedulers[uid]:
             self.track_data(f"Learning / Learning rate ({uid})", self.schedulers[uid].get_last_lr()[0])

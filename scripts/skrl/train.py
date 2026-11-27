@@ -48,19 +48,14 @@ from locomanipulation_game.tasks.locomanip_marl.run_files import (  # noqa: E402
 )
 
 
-def bound_log_std(agent, bounds: dict, anneal: dict | None = None):
+def bound_log_std(agent, bounds: dict):
     """Clamp each agent's log_std parameter into bounds[uid] ((low, high): MarlRunner.log_std_bounds), now and after
     every update. skrl clamps log_std only in the forward pass; a parameter pushed past the bound then gets no
-    gradient and the std stays pinned. anneal[uid] ([high_end, end_timestep]) lowers that agent's upper bound
-    linearly from high to high_end by end_timestep."""
-    anneal = {uid: tuple(v) for uid, v in (anneal or {}).items() if v}
-    print(f"[INFO] log_std bounds per agent: {bounds}; upper bound annealed: {anneal}")
+    gradient and the std stays pinned."""
+    print(f"[INFO] log_std bounds per agent: {bounds}")
 
-    def project(uid, timestep=0):
+    def project(uid):
         low, high = bounds[uid]
-        if uid in anneal:
-            high_end, end = anneal[uid]
-            high += (high_end - high) * min(timestep / end, 1.0)
         with torch.no_grad():
             agent.policies[uid].log_std_parameter.clamp_(low, high)
 
@@ -70,7 +65,7 @@ def bound_log_std(agent, bounds: dict, anneal: dict | None = None):
 
     def update_and_project(*, timestep, timesteps, uid):
         update(timestep=timestep, timesteps=timesteps, uid=uid)
-        project(uid, timestep)
+        project(uid)
 
     agent.update = update_and_project
 
@@ -145,13 +140,12 @@ def main(env_cfg, agent_cfg: dict):
     env = SkrlVecEnvWrapper(gym.make(args_cli.task, cfg=env_cfg))
     runner = MarlRunner(env, agent_cfg)
     drop_value_preprocessors(runner.agent, agent_cfg["no_value_preprocessor"])
-    runner.agent.lipschitz_penalty = {uid: w for uid, w in (agent_cfg.get("lipschitz_penalty") or {}).items() if w}
     scale_policy_outputs(runner.agent, env_cfg.policy_output_init_scale)
     set_initial_std(runner.agent, env_cfg.policy_initial_std)
     if args_cli.checkpoint:
         print(f"[INFO] Loading model checkpoint from: {args_cli.checkpoint}")
         runner.agent.load(os.path.abspath(args_cli.checkpoint))
-    bound_log_std(runner.agent, runner.log_std_bounds, agent_cfg.get("log_std_anneal"))
+    bound_log_std(runner.agent, runner.log_std_bounds)
 
     start_time = time.time()
     runner.run()

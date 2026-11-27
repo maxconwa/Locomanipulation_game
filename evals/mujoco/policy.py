@@ -27,28 +27,23 @@ LEG_JOINTS, ARM_JOINTS = range(12), range(13, 27)
 
 
 class Recurrent:
-    """An exported actor called as actor(obs[None]) -> action[None], carrying its LSTM state."""
+    """An exported actor (an LSTM, export_marl.py) called as actor(obs[None]) -> action[None], carrying its state."""
 
     def __init__(self, net):
         self.net = net
-        self.recurrent = hasattr(net, "hidden_size")
-        if self.recurrent:
-            self.h = torch.zeros(net.num_layers, 1, net.hidden_size)
-            self.c = torch.zeros_like(self.h)
+        self.h = torch.zeros(net.num_layers, 1, net.hidden_size)
+        self.c = torch.zeros_like(self.h)
 
     def __call__(self, x):
-        if not self.recurrent:
-            return self.net(x)
         a, self.h, self.c = self.net(x, self.h, self.c)
         return a
 
     def reset_state(self):
-        if self.recurrent:
-            self.h.zero_()
-            self.c.zero_()
+        self.h.zero_()
+        self.c.zero_()
 
     def state_norm(self) -> float:
-        return float(self.c.abs().mean()) if self.recurrent else 0.0
+        return float(self.c.abs().mean())
 
 
 def actor(export_dir: str | Path, agent: str) -> Recurrent:

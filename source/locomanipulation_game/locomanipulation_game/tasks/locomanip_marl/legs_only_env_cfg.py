@@ -3,11 +3,11 @@
 The walking task (locomanip_marl_env_cfg.py) with no arm goals and the arms held at their rest pose by IK alone
 (the arms' residual 0), the legs' actor without the wrist targets (ee_targets: the rest pose here, always) or the
 arm-goal flag (always 0 here; the critic's state drops it too), and on top of its legs terms:
-- the feet and knee bands on the lateral component of each pair's offset in the pelvis heading frame instead of its
-  horizontal distance, and a standing band on the feet's fore-aft offset, so the stance's width and stagger are
-  scored apart. Against sport mode's bags (lateral in the levelled pelvis frame): feet lateral (0.28, 0.45), stepping
-  p1 0.267, p99 0.441, standing 0.297-0.338; knees lateral, KNEE_DISTANCE_RANGE (0.286, 0.376), stepping p1 0.284,
-  p99 0.394; feet fore-aft while standing is commanded |dx| <= 0.05, the bags' standing p99 0.047;
+- a standing band on the feet's fore-aft offset in the pelvis heading frame, beside the walking task's feet and knee
+  bands on the lateral one, so the stance's width and stagger are scored apart. Against sport mode's bags (lateral in
+  the levelled pelvis frame): feet lateral (0.28, 0.45), stepping p1 0.267, p99 0.441, standing 0.297-0.338; knees
+  lateral, KNEE_DISTANCE_RANGE (0.286, 0.376), stepping p1 0.284, p99 0.394; feet fore-aft while standing is
+  commanded |dx| <= 0.05, the bags' standing p99 0.047;
 - a standing band on the feet's load split, 1 up to 52/48, weight 3;
 - the mechanical-power penalty on (energy, -1e-3 per W). The pelvis-height band stays on: off (LegsEnergy200k_s42's
   recipe, the defaults 11-19 to 11-20) the policy tracked as well but stood in a deep crouch, knees 1.5-1.6 rad, and
@@ -26,11 +26,10 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
-from locomanipulation_game.assets.h1_2 import FOOT_LINK_NAMES, KNEE_LINK_NAMES
+from locomanipulation_game.assets.h1_2 import FOOT_LINK_NAMES
 
 from . import mdp
-from .locomanip_marl_env_cfg import (FEET_DISTANCE_RANGE, KNEE_DISTANCE_RANGE, LegsRewardsCfg, LocoManipMarlEnvCfg,
-                                     MarlRewardsCfg)
+from .locomanip_marl_env_cfg import LegsRewardsCfg, LocoManipMarlEnvCfg, MarlRewardsCfg
 
 _FEET = SceneEntityCfg("robot", body_names=FOOT_LINK_NAMES, preserve_order=True)
 STANDING_STAGGER_MAX = 0.05  # m
@@ -38,12 +37,6 @@ STANDING_STAGGER_MAX = 0.05  # m
 
 @configclass
 class LegsOnlyLegsRewardsCfg(LegsRewardsCfg):
-    # the walking task's bands at the same ranges and weights, on the lateral width alone
-    feet_distance = RewTerm(func=mdp.body_pair_offset_band, weight=0.5, params={
-        "asset_cfg": _FEET, "axis": 1, "min_dist": FEET_DISTANCE_RANGE[0], "max_dist": FEET_DISTANCE_RANGE[1]})
-    knee_distance = RewTerm(func=mdp.body_pair_offset_band, weight=0.5, params={
-        "asset_cfg": SceneEntityCfg("robot", body_names=KNEE_LINK_NAMES, preserve_order=True), "axis": 1,
-        "min_dist": KNEE_DISTANCE_RANGE[0], "max_dist": KNEE_DISTANCE_RANGE[1]})
     # standing, the feet side by side: at most 1 per second, 0.37 of it at 6 cm of stagger, 0.05 at 8 cm
     feet_stagger_standing = RewTerm(func=mdp.body_pair_offset_band, weight=1.0, params={
         "asset_cfg": _FEET, "axis": 0, "min_dist": 0.0, "max_dist": STANDING_STAGGER_MAX,

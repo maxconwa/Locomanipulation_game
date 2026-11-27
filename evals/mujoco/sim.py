@@ -12,15 +12,15 @@ for an exported policy and its deploy settings (`settings`: the export's <name>.
                       [p_t - p, axis-angle(q_t q^-1)] in the pelvis frame; the wrist Jacobian in the pelvis frame at the
                       link's centre of mass, as PhysX computes it; lambda 0.05; capped at max_ik_step), plus the
                       residual low-passed at arms.residual_cutoff_hz times arm_residual_scales, with the same bounds;
-                      with arm_ik (mdp.IKPostureArmAction, LocoManip-ArmsOnly-v0) the step is that term's instead:
-                      position weighted over rotation, joints locked short of their bounds, the null-space pull toward
-                      the default angles plus the action's second half (the posture offset), see _posture_step
+                      with arm_ik (mdp.IKPostureArmAction, LocoManip-ArmsOnly-v0 and -Marl-Direct-v0) that term's
+                      instead: the trajectory to the posture, the integrated residual, the gravity offset, the
+                      pose-error integral and the freeze
     PD                tau = kp (target - q) - kd qd, clipped to the effort limit (kp, kd from the export)
     command           vel_cmd through the run's command_filter_tau low-pass (zero during an arm goal); the gait clock
                       stands under zero_cmd_eps
     observations      legs 97 / arms 125 values, term by term in the cfg's order: the run's IMU (the MID-360 chip or
                       the torso) with its gyro low-pass sampled at every MuJoCo step, the gait phase's sin and cos
-    arm command       moved by the pelvis's true motion during an arm goal (FAST-LIO's on the robot)
+    arm command       a pose per wrist in the pelvis frame (believed), set by the caller
 
 Joint limits for the target bounds are the URDF's (as Isaac imported them, and as GOLEM's safety layer clips); the
 MJCF's own ranges act as the physical stops.
@@ -229,9 +229,6 @@ class MarlMujoco:
         arms_cfg = settings["arms"]
         self.policy_dt = float(settings["control_dt"])
         self.substeps = int(round(self.policy_dt / m.opt.timestep))
-        # lmg_deploy's engage blend (export.yaml engage_blend_s; absent: none): over the first steps after a reset the
-        # legs' target goes from the last command sent (blend_from) to the policy's, linearly, then is bounded
-        self.blend_steps = int(round(float(settings.get("engage_blend_s") or 0.0) / self.policy_dt))
         cutoff = float(settings.get("residual_cutoff_hz", arms_cfg["residual_cutoff_hz"]))  # the run's, else the template's
         self.residual_alpha = 1.0 - math.exp(-2.0 * math.pi * cutoff * self.policy_dt)
         self.ik_damping = float(settings.get("ik_damping", arms_cfg.get("ik_damping", 0.05)))
@@ -241,10 +238,9 @@ class MarlMujoco:
             self.leg_scale = np.zeros(12)
         self.arm_scale = np.asarray(settings.get("arm_residual_scales", arms_cfg["residual_scale"]), float) * np.ones(14)
         self.max_ik_step = float(settings.get("max_ik_step", arms_cfg["max_ik_step"]))
-        # mdp.IKPostureArmAction's IK (export.yaml arm_ik), its action twice as wide: the residual, then the posture
-        # (posture_actions False: the residual alone)
+        # mdp.IKPostureArmAction's arms (export.yaml arm_ik); without it IKResidualArmAction's
         self.arm_ik = settings.get("arm_ik")
-        self.n_arm_actions = 28 if self.arm_ik and self.arm_ik.get("posture_actions", True) else 14
+        self.n_arm_actions = 14
         # IKPostureArmAction's freeze_residual_on_goal: the residual latched once the wrists settle on the command
         self.freeze = (self.arm_ik or {}).get("freeze")
         # its residual_integrate ({gain, leak_s, clamp}: the residual integrated, not low-passed) and integral ({gain,
@@ -318,9 +314,9 @@ class MarlMujoco:
         self._gyro = None
         # the reported joint velocities' low-pass the run trained with (export joint_vel_lowpass; absent: none)
         self.set_dq_lowpass(settings.get("joint_vel_lowpass"))
-        # LocoManip-Marl-Direct-v0 (ArmTargetsCommandCfg.pelvis_fixed_goals, independent_of_legs): an arm goal rides
-        # on the pelvis, and the velocity command runs through it. The caller sets it.
-        self.pelvis_goals = False
+        # LocoManip-Marl-Direct-v0 (ArmTargetsCommandCfg.independent_of_legs): the velocity command runs through an arm
+        # goal (else it is zeroed). The caller sets it.
+        self.arm_goal_keeps_walking = False
         # /lowstate's torso IMU (export imu.source lowstate): its quaternion, as the policy reads it, reads this
         # rotation when level (the trained range's centre; set imu_bias_deg to move it): for imu.orientation
         # calibrated what lmg_deploy's calibration leaves (residual_deg, 0 at its centre), for raw the offset itself
@@ -358,7 +354,6 @@ class MarlMujoco:
         mujoco.mj_forward(m, d)
         self.applied = d.qpos[self.qadr].copy()
         self.residual = np.zeros(self.n_arm_actions)
-        self.blend_from = self.applied[self.leg_idx].copy()  # the target held before the first step: here the pose
         self.ik_q = d.qpos[self.qadr][self.arm_idx].copy()  # arm_ik.trajectory: the target's own last value
         self.traj_v = np.zeros(14)  # arm_ik.trajectory_max_vel: the target's velocity (rad/s)
         self.frozen, self.settled_steps = False, 0  # arm_ik.freeze
@@ -369,7 +364,6 @@ class MarlMujoco:
         self.vel_cmd = np.zeros(3)
         self.cmd_filtered = np.zeros(3)
         self.steps = 0
-        self._prev_root = (d.qpos[0:3].copy(), d.qpos[3:7].copy())
         if self.gyro_lowpass is not None:
             self.gyro_lowpass.reset()
             self._gyro = self.gyro_lowpass(self._raw_gyro(), m.opt.timestep)
@@ -448,9 +442,6 @@ class MarlMujoco:
         a_legs, a_arms = np.clip(a_legs, -clip, clip), np.clip(a_arms, -clip, clip)
         idx = self.leg_idx
         t = self.default[idx] + self.leg_scale * a_legs
-        self.policy_target = t.copy()  # the policy's own leg targets, before the blend and the bounds
-        if self.steps < self.blend_steps:
-            t = self.blend_from + (self.steps + 1) / self.blend_steps * (t - self.blend_from)
         t = np.clip(t, self.lower[idx], self.upper[idx])
         lo, hi = self._torque_bounds(idx)
         self.applied[idx] = np.clip(t, lo, hi)
@@ -472,21 +463,17 @@ class MarlMujoco:
         mujoco.mju_quat2Mat(Rr, qr)
         Rr = Rr.reshape(3, 3)
         ik = d.qpos[self.qadr][self.arm_idx].copy()
-        if self.arm_ik and self.arm_ik.get("trajectory"):
+        if self.arm_ik:
             # IKPostureArmAction's trajectory: the target from its own last value straight to the posture, no IK
             c, idx = self.arm_ik, self.arm_idx
             low, high = self.lower[idx] + c["limit_margin"], self.upper[idx] - c["limit_margin"]
             base = np.concatenate([self.seed_q(0), self.seed_q(1)]) if self.seed_table is not None else self.default[idx]
-            offset = self.residual[14:] if self.n_arm_actions == 28 else 0.0
-            posture = np.clip(base + c["posture_scale"] * c["posture_gain"] * offset, low, high)
-            if c.get("trajectory_max_vel") is None:
-                ik = self.ik_q + np.clip(posture - self.ik_q, -self.max_ik_step, self.max_ik_step)
-            else:
-                ik = self._synchronized_step(posture)
+            posture = np.clip(base, low, high)
+            ik = self._synchronized_step(posture)
             self.ik_q = np.clip(ik, self.lower[idx], self.upper[idx])
             if self.integral_cfg:
                 self._update_integral(posture, Rr)
-            t = np.clip(self.ik_q + self.gravity_target_offset(Rr) + self.integral + self.arm_scale * self.residual[:14],
+            t = np.clip(self.ik_q + self.gravity_target_offset(Rr) + self.integral + self.arm_scale * self.residual,
                         self.lower[idx], self.upper[idx])
             lo, hi = self._torque_bounds(idx)
             self.applied[idx] = np.clip(t, lo, hi)
@@ -504,14 +491,10 @@ class MarlMujoco:
             tgt = self.believed[arm]
             err = np.r_[tgt[:3] - cur[arm, :3], axis_angle(qmul(tgt[3:], qconj(cur[arm, 3:])))]
             sl = slice(7 * arm, 7 * arm + 7)
-            if self.arm_ik:
-                ik[sl] = ik[sl] + self._posture_step(J, err, ik[sl], self.residual[14:][sl], self.arm_idx[sl])
-                continue
             step = J.T @ np.linalg.solve(J @ J.T + self.ik_damping ** 2 * np.eye(6), err)
             ik[sl] = ik[sl] + np.clip(step, -self.max_ik_step, self.max_ik_step)
         idx = self.arm_idx
-        self.ik_q = np.clip(ik, self.lower[idx], self.upper[idx])  # where trajectory would start from
-        t = np.clip(ik + self.arm_scale * self.residual[:14], self.lower[idx], self.upper[idx])
+        t = np.clip(ik + self.arm_scale * self.residual, self.lower[idx], self.upper[idx])
         lo, hi = self._torque_bounds(idx)
         self.applied[idx] = np.clip(t, lo, hi)
         self.applied[12] = 0.0                                    # torso held at default by its own actuator
@@ -555,19 +538,16 @@ class MarlMujoco:
         """mdp.IKPostureArmAction._synchronized_step: per arm, all joints along the straight line to the posture, the
         fastest at trajectory_max_vel, slowed to stop there, the velocity changed by at most trajectory_max_acc."""
         c, dt = self.arm_ik, self.policy_dt
-        vmax, amax = c["trajectory_max_vel"], c.get("trajectory_max_acc")
+        vmax, amax = c["trajectory_max_vel"], c["trajectory_max_acc"]
         ik = self.ik_q.copy()
         for arm in range(2):
             sl = slice(7 * arm, 7 * arm + 7)
             delta = posture[sl] - self.ik_q[sl]
             dist = max(np.abs(delta).max(), 1e-9)
-            cap = min(vmax, math.sqrt(2.0 * amax * dist)) if amax is not None else vmax
+            cap = min(vmax, math.sqrt(2.0 * amax * dist))
             v_want = delta / dt * min(1.0, cap * dt / dist)
-            if amax is not None:
-                dv = v_want - self.traj_v[sl]
-                v = self.traj_v[sl] + dv * min(1.0, amax * dt / max(np.abs(dv).max(), 1e-12))
-            else:
-                v = v_want
+            dv = v_want - self.traj_v[sl]
+            v = self.traj_v[sl] + dv * min(1.0, amax * dt / max(np.abs(dv).max(), 1e-12))
             self.traj_v[sl] = v
             ik[sl] = self.ik_q[sl] + v * dt
         return ik
@@ -616,32 +596,6 @@ class MarlMujoco:
         q = self._kin.solve(goal, q0, low, high, iters=c["iters"], damping=c["damping"], rot_weight=c["rot_weight"])
         return q[0].numpy()
 
-    def _posture_step(self, J, err, q, offset, idx) -> np.ndarray:
-        """mdp.IKPostureArmAction._step for one arm: the weighted DLS task step and the null-space pull toward the
-        posture (the default angles, or with posture_from_command seed_q, plus posture_scale x posture_gain x offset,
-        inside the IK's bounds), joints that would pass limit_margin short of their bounds locked and solved out,
-        ik_passes times; capped at max_ik_step."""
-        c = self.arm_ik
-        low, high = self.lower[idx] + c["limit_margin"], self.upper[idx] - c["limit_margin"]
-        base = self.seed_q(0 if idx[0] == self.arm_idx[0] else 1) if self.seed_table is not None else self.default[idx]
-        posture = np.clip(base + c["posture_scale"] * c["posture_gain"] * offset, low, high)
-        w = np.r_[1.0, 1.0, 1.0, c["rot_weight"], c["rot_weight"], c["rot_weight"]]
-        jac_w, err_w = J * w[:, None], err * w
-        pull = c["null_gain"] * (posture - q)
-        free = np.ones(len(q), bool)
-        for _ in range(int(c["ik_passes"])):
-            f = free.astype(float)
-            jf = jac_w * f[None, :]
-            pinv = jf.T @ np.linalg.inv(jf @ jf.T + c["ik_damping"] ** 2 * np.eye(6))
-            step = (pinv @ err_w + (np.eye(len(q)) - pinv @ jf) @ (pull * f)) * f
-            step = np.clip(step, -self.max_ik_step, self.max_ik_step)
-            new = q + step
-            hit = ((new < low) & (step < 0)) | ((new > high) & (step > 0))
-            if not (hit & free).any():
-                break
-            free &= ~hit
-        return step
-
     def physics_step(self):
         for _ in range(self.substeps):
             self.d.ctrl[self.act_id] = self.pd_torque(self.applied)
@@ -651,15 +605,6 @@ class MarlMujoco:
             self._sample_dq()
         self.last_tau = self.pd_torque(self.applied)
 
-    def _update_odometry(self):
-        """During an arm goal, move the believed command by the pelvis's true motion since the last step."""
-        p, q = self.root()
-        if self.arm_mode and not self.pelvis_goals:
-            pp, pq = self._prev_root
-            dp, dq = qrot(qconj(pq), p - pp), qmul(qconj(pq), q)
-            self.believed = np.stack([relative(dp, dq, b) for b in self.believed])
-        self._prev_root = (p, q)
-
     # -- the command and the gait clock
     def observed_cmd(self) -> np.ndarray:
         return self.cmd_filtered.copy() if self.cmd_alpha is not None else np.asarray(self.vel_cmd, float)
@@ -667,7 +612,7 @@ class MarlMujoco:
     def _filter_command(self):
         if self.cmd_alpha is None:
             return
-        if self.arm_mode and not self.pelvis_goals:
+        if self.arm_mode and not self.arm_goal_keeps_walking:
             self.cmd_filtered[:] = 0.0
         else:
             self.cmd_filtered += self.cmd_alpha * (np.asarray(self.vel_cmd, float) - self.cmd_filtered)
@@ -730,7 +675,6 @@ class MarlMujoco:
         self.process_actions(a_l, a_a)
         self.physics_step()
         self.steps += 1                    # the env's episode_length_buf counts the step before its observations
-        self._update_odometry()
         self._filter_command()
         return self.observations()
 

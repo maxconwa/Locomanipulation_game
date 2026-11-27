@@ -2,10 +2,9 @@
 
 At every command event ArmTargetsCommand gives an env either navigation (the velocity command is live, each wrist
 holds its rest pose, fixed in the pelvis frame) or, once the env's warm start is over, an arm goal (zero velocity, a
-wrist pose per arm from a table of standing-reachable poses, lowered by the depth curriculum and fixed in the world).
-The policies see the arm command in the pelvis frame, exact at the event and then moved by the pelvis motion
-(apply_pelvis_motion; on the robot, FAST-LIO's odometry); rewards, reach detection and the curriculum use the world
-target.
+wrist pose per arm from a table of standing-reachable poses, lowered by the depth curriculum). Every arm command is a
+pose in the pelvis frame, held for the task whatever the pelvis does: what the policies see, and what the rewards and
+reach detection score.
 """
 
 from __future__ import annotations
@@ -33,7 +32,6 @@ from isaaclab.utils.math import (
     quat_mul,
     quat_unique,
     subtract_frame_transforms,
-    yaw_quat,
 )
 
 from ..terrain import ground_height
@@ -48,7 +46,6 @@ __all__ = [
     "ArmTargetsCommandCfg",
     "ModalVelocityCommand",
     "ModalVelocityCommandCfg",
-    "ground_height",
 ]
 
 
@@ -433,7 +430,8 @@ class ModalVelocityCommandCfg(UniformVelocityCommandCfg):
 
 
 class ArmTargetsCommand(CommandTerm):
-    """Per env, either navigation (each wrist holds its rest pose) or an arm goal (one wrist pose per arm in the world).
+    """Per env, either navigation (each wrist holds its rest pose) or an arm goal (one wrist pose per arm), each a pose
+    in the pelvis frame.
 
     **Events.** Reset or the timer running out. Once goals_enabled (the env sets it when its warm start ends), the
     next task is an arm goal with probability arm_goal_prob, lasting resampling_time_range; otherwise navigation for
@@ -447,13 +445,8 @@ class ArmTargetsCommand(CommandTerm):
     uniformly from [z_min, z_max]. Each arm's pose is drawn uniformly from its table rows within arm_height_spread
     of h, so the wrists sit at h +- arm_height_spread with their table's reach at that height. Below what the
     standing table reaches, the rows come from its lowest band and both are lowered together by the difference
-    (target_drop): the robot has to crouch. The poses are placed in the standing frame (the pelvis's x, y and yaw,
-    standing_height above the scanned ground: the stance the tables were built at, assets.h1_2.TABLE_PELVIS_HEIGHT)
-    and kept fixed in the world for the goal.
-
-    **Kernels.** The annealed tracking rewards read fine_pos_std and rot_std, one stage of cfg.fine_pos_stds /
-    cfg.rot_stds for all envs. After every kernel_window_goals ended arm goals the stage narrows when enough of them
-    came within its kernels, and widens when too few did (_judge_kernels), so the kernels follow the error down.
+    (target_drop): the robot has to crouch. The poses, drawn in the frame of the stance the tables were built at
+    (assets.h1_2.TABLE_PELVIS_HEIGHT), are the pelvis-frame command for the whole goal: the goal rides on the pelvis.
 
     **Off-table goals.** With offtable_prob, an arm goal's poses are moved from each wrist's rest pose a random
     U[offtable_scale_range] of the way to the drawn ones (position linearly, orientation along the shortest rotation)
@@ -467,13 +460,12 @@ class ArmTargetsCommand(CommandTerm):
     seed_solve, the nearest row's angles start a damped-least-squares solve for the commanded pose itself (an off-table
     goal's own solution). With collision_check, an arm goal whose seed, or the straight joint-space path to it from the
     arms' measured angles, overlaps cuRobo's self-collision spheres is drawn again. With rest_goal_prob, that share of
-    arm goals is the rest pose, fixed in the world, its seed the default angles.
+    arm goals is the rest pose, its seed the default angles.
 
     **Reach.** A goal lasts its timer. It is reached once, when both wrists are first held inside the tolerances
     for reach_hold_s (the bonus is paid then); the tracking terms keep paying for staying on target.
 
-    **What the policies see.** believed_b, the targets in the pelvis frame: exact at the event, then moved each
-    step by the pelvis motion the env reports (apply_pelvis_motion).
+    **What the policies see.** believed_b, the targets in the pelvis frame, the same the rewards score (targets_w).
     """
 
     cfg: ArmTargetsCommandCfg
@@ -492,17 +484,13 @@ class ArmTargetsCommand(CommandTerm):
         self.goals_enabled = False  # set by the env
         self.goals_enabled_at: int | None = None  # the env step the warm start ended (training only): the ramp's start
         self.arm_mode = flags()
-        self.anchor_w = torch.zeros(shape, device=self.device)  # arm goal: world-fixed targets
-        self.believed_b = torch.zeros(shape, device=self.device)  # what the policies see
-        self.anchor_w[..., 3] = 1.0
+        self.believed_b = torch.zeros(shape, device=self.device)  # the command, pelvis frame
         self.believed_b[..., 3] = 1.0
         self.target_drop = zeros()  # how far both poses were lowered below the standing table (m)
-        self.goal_height = zeros()  # the goal's height h above the ground (m)
         self.needs_crouch = flags()  # a target below anything the table reaches standing
         self.hold_time = zeros()
         self.just_reached = flags()
         self.goal_reached = flags()  # this goal, once
-        self._at_reset = False
         self._errors_cache: tuple[torch.Tensor, torch.Tensor] | None = None
         self._errors_step = -1
 
@@ -510,16 +498,8 @@ class ArmTargetsCommand(CommandTerm):
         self.goal_best_error = torch.full((self.num_envs,), float("inf"), device=self.device)
         self.goal_best_rot_error = torch.full((self.num_envs,), float("inf"), device=self.device)
 
-        # -- tracking-kernel curriculum: one stage for all envs, judged on windows of ended arm goals
-        if len(cfg.fine_pos_stds) != len(cfg.rot_stds):
-            raise ValueError("fine_pos_stds and rot_stds need one entry per kernel stage")
-        self.kernel_stage = 0
-        self._kernel_hits = torch.zeros((), device=self.device)
-        self._kernel_goals = torch.zeros((), device=self.device)
-        self.kernel_window_share = torch.tensor(float("nan"), device=self.device)  # the last judged window's
-
         # -- metrics. CommandTerm.reset logs their mean over the reset envs, then zeroes them.
-        for name in ("command_drift", "goals_reached", "goals_missed", "crouch_goals_reached", "crouch_goals_missed"):
+        for name in ("goals_reached", "goals_missed", "crouch_goals_reached", "crouch_goals_missed"):
             self.metrics[name] = zeros()
         # per-episode sums for the mode-split metrics, logged as weighted means by reset()
         self._goal_steps, self._goal_pos_err, self._goal_rot_err = zeros(), zeros(), zeros()
@@ -570,8 +550,6 @@ class ArmTargetsCommand(CommandTerm):
             limits = torch.stack([self.robot.data.soft_joint_pos_limits[0, ids] for ids in self._arm_joint_ids])
             self._solve_low = limits[..., 0] + cfg.joint_range_margin
             self._solve_high = limits[..., 1] - cfg.joint_range_margin
-        self.goals_redrawn = 0  # arm goals drawn again for a collision, since the start
-        self.goals_unscreened = 0  # arm goals kept colliding after collision_retries
 
     def __str__(self) -> str:
         cfg = self.cfg
@@ -598,20 +576,9 @@ class ArmTargetsCommand(CommandTerm):
         cfg.independent_of_legs."""
         return torch.zeros_like(self.arm_mode) if self.cfg.independent_of_legs else self.arm_mode
 
-    def standing_frame_w(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """(origin, yaw-only quaternion) of the standing frame in world."""
-        origin = self.robot.data.root_pos_w.clone()
-        origin[:, 2] = ground_height(self._env) + self.cfg.standing_height
-        return origin, yaw_quat(self.robot.data.root_quat_w)
-
     def targets_w(self) -> torch.Tensor:
-        """True targets in world, (num_envs, num_arms, 7): the anchor for an arm goal, the rest pose on the pelvis
-        otherwise."""
-        if self.cfg.pelvis_fixed_goals:  # the command itself, on the pelvis (the rest pose while navigating)
-            return _apply(self.robot.data.root_pos_w, self.robot.data.root_quat_w, self.believed_b)
-        rest = self.rest_pose_b.unsqueeze(0).expand(self.num_envs, -1, -1)
-        rest_w = _apply(self.robot.data.root_pos_w, self.robot.data.root_quat_w, rest)
-        return torch.where(self.arm_mode.view(-1, 1, 1), self.anchor_w, rest_w)
+        """The targets in world, (num_envs, num_arms, 7): the command (the rest pose while navigating) on the pelvis."""
+        return _apply(self.robot.data.root_pos_w, self.robot.data.root_quat_w, self.believed_b)
 
     def true_targets_in_root(self) -> torch.Tensor:
         """True targets in the pelvis frame, (num_envs, num_arms, 7), qw >= 0. Privileged: the critic's."""
@@ -637,16 +604,6 @@ class ArmTargetsCommand(CommandTerm):
     def invalidate_errors(self):
         self._errors_cache = None
 
-    def apply_pelvis_motion(self, delta_pos: torch.Tensor, delta_quat: torch.Tensor, env_mask: torch.Tensor):
-        """Re-express the arm-goal commands of env_mask's envs after the pelvis moved by (delta_pos, delta_quat), in
-        the previous pelvis frame. A world-fixed target obeys T_prev o c_prev = T_new o c_new, so
-        c_new = delta^-1 o c_prev. With cfg.pelvis_fixed_goals the command rides on the pelvis: unchanged."""
-        if self.cfg.pelvis_fixed_goals:
-            return
-        mask = env_mask & self.arm_mode
-        moved = _relative(delta_pos, delta_quat, self.believed_b)
-        self.believed_b[mask] = moved[mask]
-
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
         ids = slice(None) if env_ids is None else env_ids
         extras = {}
@@ -662,53 +619,8 @@ class ArmTargetsCommand(CommandTerm):
                        self._best_err_n):
             buffer[ids] = 0.0
         self.invalidate_errors()
-        self._at_reset = True
-        try:
-            extras.update(super().reset(env_ids))
-        finally:
-            self._at_reset = False
+        extras.update(super().reset(env_ids))
         return extras
-
-    """
-    Curriculum.
-    """
-
-    @property
-    def fine_pos_std(self) -> float:
-        """The fine wrist-position kernel's std at the current kernel stage (m)."""
-        return self.cfg.fine_pos_stds[self.kernel_stage]
-
-    @property
-    def rot_std(self) -> float:
-        """The wrist-rotation kernel's std at the current kernel stage (rad)."""
-        return self.cfg.rot_stds[self.kernel_stage]
-
-    def _judge_kernels(self, ended: torch.Tensor):
-        """Count the ended arm goals that came within the current stage's kernels (closest approach under
-        fine_pos_std and least rotation error under rot_std, each the mean of both wrists, not necessarily at the same
-        instant). After every kernel_window_goals of them: narrow the kernels a stage if at least kernel_promote_share
-        did, widen them a stage if fewer than kernel_demote_share did, and start a new window."""
-        cfg = self.cfg
-        hit = ended & (self.goal_best_error < self.fine_pos_std) & (self.goal_best_rot_error < self.rot_std)
-        self._kernel_hits += hit.sum()
-        self._kernel_goals += ended.sum()
-        if self._kernel_goals.item() < cfg.kernel_window_goals:
-            return
-        share = self._kernel_hits / self._kernel_goals
-        self.kernel_window_share = share
-        if share.item() >= cfg.kernel_promote_share and self.kernel_stage < len(cfg.fine_pos_stds) - 1:
-            self.kernel_stage += 1
-        elif share.item() < cfg.kernel_demote_share and self.kernel_stage > 0:
-            self.kernel_stage -= 1
-        self._kernel_hits.zero_()
-        self._kernel_goals.zero_()
-
-    def state_dict(self) -> dict[str, torch.Tensor]:
-        """Curriculum state, saved with the env's state so a resumed or evaluated run keeps its kernel stage."""
-        return {"kernel_stage": torch.tensor(self.kernel_stage)}
-
-    def load_state_dict(self, state: dict[str, torch.Tensor]):
-        self.kernel_stage = min(max(int(state["kernel_stage"]), 0), len(self.cfg.fine_pos_stds) - 1)
 
     """
     Table construction.
@@ -850,11 +762,6 @@ class ArmTargetsCommand(CommandTerm):
         self._nav_n += walking
         self._nav_p += pelvis_drop * walking
 
-        root_pos, root_quat = self.robot.data.root_pos_w, self.robot.data.root_quat_w
-        believed_w = _apply(root_pos, root_quat, self.believed_b)
-        drift = torch.norm(believed_w[..., :3] - self.anchor_w[..., :3], dim=-1).mean(1) * arm
-        self.metrics["command_drift"] = torch.zeros_like(drift) if self.cfg.pelvis_fixed_goals else drift
-
         within = (pos_error < self.cfg.reach_pos_tol).all(dim=1) & (rot_error < self.cfg.reach_rot_tol).all(dim=1)
         step_dt = self._env.step_dt
         self.hold_time = torch.where(within & self.arm_mode, self.hold_time + step_dt, torch.zeros_like(self.hold_time))
@@ -873,7 +780,6 @@ class ArmTargetsCommand(CommandTerm):
         self.goal_best_rot_error = torch.where(self.arm_mode, best_rot, self.goal_best_rot_error)
         self._best_err_sum += torch.where(ended, self.goal_best_error.clamp(max=10.0), 0.0)
         self._best_err_n += ended.float()
-        self._judge_kernels(ended)
 
     def _resample_command(self, env_ids: Sequence[int]):
         self.invalidate_errors()
@@ -887,7 +793,6 @@ class ArmTargetsCommand(CommandTerm):
         self.goal_reached[env_ids] = False
         self.hold_time[env_ids] = 0.0
         self.target_drop[env_ids] = 0.0
-        self.goal_height[env_ids] = 0.0
         self.needs_crouch[env_ids] = False
 
         # -- navigation: the rest pose in the pelvis frame, a fresh velocity command
@@ -918,8 +823,6 @@ class ArmTargetsCommand(CommandTerm):
             bad = self._kin.path_collides(start_q.repeat(k, 1, 1), goal["seed_q"]).view(k, m)
             # the first clear candidate, or the last
             pick = torch.where(bad.all(dim=0), k - 1, (~bad).float().argmax(dim=0))
-            self.goals_redrawn += int(pick.sum())
-            self.goals_unscreened += int(bad.all(dim=0).sum())
             sel = pick * m + torch.arange(m, device=self.device)
             goal = {key: value[sel] for key, value in goal.items()}
         for key, value in goal.items():
@@ -927,8 +830,8 @@ class ArmTargetsCommand(CommandTerm):
 
     def _draw_arm_goals(self, arm_ids: torch.Tensor) -> dict[str, torch.Tensor]:
         """Arm goals for arm_ids (repeats allowed), not yet set: a height in [z_min, z_max], table poses near it
-        (lowered below the table), anchored in the world, moved toward the rest pose (offtable_prob) or
-        the rest pose itself (rest_goal_prob), and their seeds. {attribute: its values for arm_ids}."""
+        (lowered below the table) placed on the pelvis, moved toward the rest pose (offtable_prob) or the rest pose
+        itself (rest_goal_prob), and their seeds. {attribute: its values for arm_ids}."""
         m = len(arm_ids)
         cfg = self.cfg
         height = cfg.z_min + torch.rand(m, device=self.device) * (cfg.z_max - cfg.z_min)
@@ -939,14 +842,9 @@ class ArmTargetsCommand(CommandTerm):
         targets_s[..., 2] -= drop.unsqueeze(1)
         needs_crouch = (targets_s[..., 2] < self._standing_min_z).any(dim=1)
 
-        origin, quat = self.standing_frame_w()
-        if cfg.pelvis_fixed_goals:
-            # the standing-frame poses are the pelvis-frame command: place them on the pelvis as it is (believed_b
-            # below is then the drawn pose; anchor_w is only where that was at the event)
-            origin, quat = self.robot.data.root_pos_w.clone(), self.robot.data.root_quat_w
-        elif self._at_reset:
-            # the height scan still shows where the robot was before the reset teleported it
-            origin[arm_ids, 2] = self._env.scene.env_origins[arm_ids, 2] + self.cfg.standing_height
+        # the standing-frame poses are the pelvis-frame command: placed on the pelvis as it is, in world for the
+        # off-table and rest moves, then back in the pelvis frame (believed_b)
+        origin, quat = self.robot.data.root_pos_w.clone(), self.robot.data.root_quat_w
         anchor = _apply(origin[arm_ids], quat[arm_ids], targets_s)
         if cfg.offtable_prob > 0.0:
             low, high = cfg.offtable_scale_range
@@ -959,8 +857,7 @@ class ArmTargetsCommand(CommandTerm):
             anchor[rest] = _apply(root_pos[rest], root_quat[rest], self.rest_pose_b.expand(int(rest.sum()), -1, -1))
             drop = torch.where(rest, 0.0, drop)
             needs_crouch = needs_crouch & ~rest
-        goal = {"target_drop": drop, "goal_height": height, "needs_crouch": needs_crouch, "anchor_w": anchor,
-                "believed_b": _relative(root_pos, root_quat, anchor)}
+        goal = {"target_drop": drop, "needs_crouch": needs_crouch, "believed_b": _relative(root_pos, root_quat, anchor)}
         if self._table_joints is not None:
             seed = self.nearest_joints(goal["believed_b"])
             if cfg.seed_solve:
@@ -1100,10 +997,6 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     independent_of_legs: bool = False
     """The arm goals leave the legs' task alone: no event zeroes or resamples the velocity command (it resamples on
     its own timer), and the legs' terms never see an arm goal (legs_arm_mode is all False)."""
-    pelvis_fixed_goals: bool = False
-    """An arm goal rides on the pelvis instead of staying in the world: the pose drawn in the standing frame is the
-    pelvis-frame command for the whole goal, whatever the pelvis does (what a pinned pelvis's goal is). The pelvis's
-    motion then doesn't move the command (apply_pelvis_motion)."""
     reach_pos_tol: float = 0.05
     reach_rot_tol: float = 0.35
     reach_hold_s: float = 1.0
@@ -1115,17 +1008,6 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     """m: the lowest goal height (about the lowest the standing arms reach)."""
     arm_height_spread: float = 0.15
     """m: each wrist sits within this of the goal height."""
-
-    # -- tracking-kernel curriculum (ArmTargetsCommand._judge_kernels): the annealed reward terms' stds per stage,
-    # narrowest last
-    fine_pos_stds: tuple[float, ...] = MISSING
-    """m: the fine wrist-position kernel."""
-    rot_stds: tuple[float, ...] = MISSING
-    """rad: the wrist-rotation kernel."""
-    kernel_window_goals: int = 20000
-    """Ended arm goals (all envs) per judged window."""
-    kernel_promote_share: float = 0.5
-    kernel_demote_share: float = 0.25
 
     offtable_prob: float = 0.0
     """Share of arm goals moved toward the rest pose by a random U[offtable_scale_range] (the class doc)."""
@@ -1158,9 +1040,9 @@ class ArmTargetsCommandCfg(CommandTermCfg):
     """Draw an arm goal again when its seed_q, or the straight joint-space path to it from the arms' measured angles,
     overlaps the cuRobo spheres of kinematics_spheres (table_joints)."""
     collision_retries: int = 8
-    """Draws after the first; a goal still colliding after them is kept (goals_unscreened counts them)."""
+    """Draws after the first; a goal still colliding after them is kept."""
     rest_goal_prob: float = 0.0
-    """Share of arm goals that are each wrist's rest pose (the default joint angles), fixed in the world."""
+    """Share of arm goals that are each wrist's rest pose (the default joint angles)."""
     kinematics_urdf: str = ""
     """The robot's URDF, for seed_solve and collision_check."""
     kinematics_spheres: str = ""

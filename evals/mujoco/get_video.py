@@ -85,7 +85,7 @@ def main():
     rng = np.random.default_rng(a.seed)
     sim.reset(rng)
     R.reset_actors(sim)
-    sim.pelvis_goals = legs and arms
+    sim.arm_goal_keeps_walking = legs and arms
     r = settings.get("command_ranges") or {}
     full = tuple(float(max(abs(v[0]), abs(v[1]))) for v in (r.get("lin_vel_x", [-0.55, 0.55]),
                                                             r.get("lin_vel_y", [-0.54, 0.54]),
@@ -109,7 +109,6 @@ def main():
         mujoco.mj_forward(model, d)
         sim.applied = sim.default.copy()
         sim.ik_q = d.qpos[sim.qadr][sim.arm_idx].copy()
-        sim._prev_root = (d.qpos[0:3].copy(), d.qpos[3:7].copy())
         anchor0 = hook_point().copy()
 
     def rope(t):

@@ -59,7 +59,7 @@ A new metric: compute it in `common/legs_metrics.py` / `arms_scorecard.py`, add 
 python -m evals.isaac.legs.get_plot --run LegsDeploy200k_s42 [--prior 4] [--with <run>]
 ```
 
-The run's scorecards against the newest prior runs of the same task (any trainer: PPO or SuperMimic), by env steps
+The run's scorecards against the newest prior runs of the same task, by env steps
 (`plot_steps.png`) and wall-clock hours from TensorBoard (`plot_hours.png`), the reference dashed and the target
 shaded; and the runs' training curves the same two ways (`plot_training_*.png`). Seeds of one run are one series
 with their range as a band. Points scored under other conditions (the history imported from `logs/candidates`,

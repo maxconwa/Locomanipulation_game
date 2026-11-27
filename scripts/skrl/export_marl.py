@@ -12,9 +12,8 @@ candidate folder under logs/):
                      every joint target into GOLEM's position e-stop range), gait_phase_cos, imu (the body its IMU
                      sat on and the gyro low-pass), and (evals.mujoco.common.read_deploy_settings) control_dt, kp, kd,
                      default_joint_pos, the per-joint action scales, max_ik_step, gait_period, zero_cmd_eps,
-                     command_ranges, command_filter_tau, engage_blend_s (the legs' engage blend, when the run had one) and
-                     arm_goals (false: the run never trained an arm goal,
-                     and the deploy refuses one), arm_ik (mdp.IKPostureArmAction's IK, when the run used it); and the
+                     command_ranges, command_filter_tau and arm_goals (false: the run never trained an arm goal, and
+                     the deploy refuses one), arm_ik (mdp.IKPostureArmAction's IK, when the run used it); and the
                      source files.
   arm_seed_table.npz with arm_ik.posture_from_command: per arm the run's goal-table poses (poses_<arm>, pelvis frame,
                      x y z qw qx qy qz) and their joint angles (joints_<arm>), for the IK's posture lookup.
@@ -102,16 +101,15 @@ if os.path.basename(os.path.normpath(args.out)) == "export":
                      "yaml")
 ckpt_path = os.path.abspath(args.checkpoint)
 run_dir = os.path.dirname(os.path.dirname(ckpt_path))
+task_file = Path(run_dir, "params", "task.txt")
+task = args.task or (task_file.read_text().strip() if task_file.is_file() else None)
+if task is None:
+    raise SystemExit(f"{run_dir} does not record its task ({task_file}): pass --task")
 ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 os.makedirs(args.out, exist_ok=True)
 env_yaml = Path(run_dir, "params", "env.yaml").read_text()
 env_cfg = _yaml_load_any(env_yaml)
 clip_actions = args.clip_actions if args.clip_actions is not None else float(env_cfg.get("clip_actions", 10.0))
-task_file = Path(run_dir, "params", "task.txt")
-task = args.task or (task_file.read_text().strip() if task_file.is_file() else None)
-if task is None:
-    print("[WARNING] the run does not record its task (trained before 2026-11-16) and --task is not given:"
-          " export.yaml's source.task is left empty")
 sizes = {}  # agent -> (inputs, actions), for the policy yaml
 for agent in ("legs", "arms"):
     pre, policy = ckpt[agent]["observation_preprocessor"], ckpt[agent]["policy"]

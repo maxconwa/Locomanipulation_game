@@ -27,7 +27,7 @@ def _xyzw_flat(env: ManagerBasedRLEnv, poses: torch.Tensor) -> torch.Tensor:
 
 
 def arm_targets_in_root_xyzw(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
-    """The arm command the policies act on: the believed targets, kept on the world target by odometry."""
+    """The arm command the policies act on: its targets in the pelvis frame."""
     term: ArmTargetsCommand = env.command_manager.get_term(command_name)
     return _xyzw_flat(env, term.believed_b)
 

@@ -82,19 +82,6 @@ def ang_vel_xy_standing_l2(env: ManagerBasedRLEnv, command_name: str) -> torch.T
     return torch.sum(torch.square(w), dim=1) * standing.float()
 
 
-def engage_target_smooth_exp(env, action_name: str, window_s: float, std: float) -> torch.Tensor:
-    """In the first window_s of an episode from the pre-pose (mdp.prepose_reset), exp(-sum_j dq_j^2 / std^2) for the
-    change dq of the policy's own targets (rad, before the engage blend) since the last step, the first step's from the
-    held target: positive, so the legs' reward floor at 0 never swallows it. 0 elsewhere."""
-    term = env.action_manager.get_term(action_name)
-    prepose = getattr(env, "_prepose", None)
-    if prepose is None:
-        return torch.zeros(env.num_envs, device=env.device)
-    change = (term.policy_target - term.prev_policy_target).square().sum(dim=1)
-    early = (env.episode_length_buf.float() * env.step_dt < window_s) & prepose.active
-    return torch.exp(-change / std ** 2) * early.float()
-
-
 def action_beyond_clip(env, agent: str, action_name: str, clip: float) -> torch.Tensor:
     """How far the agent's raw actions for action_name's joints are beyond the env's clip, plus what that action
     term's position bound cut off, summed over its joints (action units). Nothing else pulls a policy mean back once
@@ -194,19 +181,6 @@ def arm_target_pos_exp(env: ManagerBasedRLEnv, command_name: str, arm: int, std:
     return torch.exp(-pos_error[:, arm].square() / std**2)
 
 
-def arm_target_pos_exp_annealed(env: ManagerBasedRLEnv, command_name: str, arm: int) -> torch.Tensor:
-    """arm_target_pos_exp with the command's current fine_pos_std (its tracking-kernel curriculum)."""
-    return arm_target_pos_exp(env, command_name, arm, env.command_manager.get_term(command_name).fine_pos_std)
-
-
-def arm_target_quat_exp_annealed(env: ManagerBasedRLEnv, command_name: str, arm: int) -> torch.Tensor:
-    """exp(-theta^2 / std^2) on one arm's wrist rotation error (rad), std the command's current rot_std (its
-    tracking-kernel curriculum)."""
-    term = env.command_manager.get_term(command_name)
-    _, rot_error = term.errors()
-    return torch.exp(-rot_error[:, arm].square() / term.rot_std**2)
-
-
 def arm_target_quat_exp(env: ManagerBasedRLEnv, command_name: str, arm: int, std: float) -> torch.Tensor:
     """exp(-theta^2 / std^2) on one arm's wrist rotation error (rad)."""
     _, rot_error = env.command_manager.get_term(command_name).errors()
@@ -223,7 +197,7 @@ def arm_target_pos_capped(env: ManagerBasedRLEnv, command_name: str, arm: int, c
 def base_height_band(env: ManagerBasedRLEnv, min_height: float, max_height: float) -> torch.Tensor:
     """In [0, 1]: 1 while the pelvis's height above the ground (terrain.py) is within [min_height, max_height],
     exp(-100 x) at x m outside (0.37 at 1 cm, 0.05 at 3 cm). A reward for staying in the band only, as
-    body_pair_distance_band."""
+    body_pair_offset_band."""
     height = env.scene["robot"].data.root_pos_w[:, 2] - ground_height(env)
     outside = torch.clamp(min_height - height, min=0.0) + torch.clamp(height - max_height, min=0.0)
     return torch.exp(-outside * 100.0)
@@ -290,12 +264,6 @@ def joint_power_l1(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.T
     data = env.scene[asset_cfg.name].data
     return torch.sum(torch.abs(data.applied_torque[:, asset_cfg.joint_ids] * data.joint_vel[:, asset_cfg.joint_ids]),
                      dim=1)
-
-
-def yaw_rate_l2_during_arm_goal(env: ManagerBasedRLEnv, arm_command_name: str) -> torch.Tensor:
-    """Squared pelvis yaw rate during an arm goal: turning moves the world-fixed targets in the pelvis frame."""
-    yaw_rate = env.scene["robot"].data.root_ang_vel_b[:, 2]
-    return torch.square(yaw_rate) * env.command_manager.get_term(arm_command_name).arm_mode
 
 
 class sport_gait_exp(_CycleMean):
@@ -395,8 +363,6 @@ def feet_swing_height_tracking_exp(
     command_name: str = "base_velocity",
     above_ground: bool = False,
     std: float = 0.03,
-    loose_std: float = 0.1,
-    loose_weight: float = 0.0,
 ) -> torch.Tensor:
     """sin(pi * s) * exp(-(foot_z - reference)^2 / std^2) per foot in its swing phase, summed over the feet; stance
     feet give 0.
@@ -406,10 +372,6 @@ def feet_swing_height_tracking_exp(
     it) and weighted by the reference's own lift share sin(pi * s): at the swing's ends the reference sits at
     rest_height, where a dragged foot matches it (unweighted, that paid a dragged foot 0.31 of a full lift; weighted,
     0.15 at std 0.03, and 0.54 at half the lift height).
-
-    loose_weight (0: off) is the share of the kernel given to a second, looser one at loose_std, for lifts several
-    std high: at a 15 cm lift the 0.03 kernel alone paid a foot lifting 0-6 cm 0.02-0.06 of a full lift, no slope to
-    climb (LegsLift15_200k_s42 never lifted); half of it at 0.1 pays 0.15 dragged, 0.33 at 6 cm, 0.74 at 12 cm.
     """
     asset = env.scene[asset_cfg.name]
     foot_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
@@ -421,7 +383,7 @@ def feet_swing_height_tracking_exp(
     lift_share = torch.sin(torch.pi * progress)
     reference = rest_height + lift_height * lift_share
     error_sq = torch.square(foot_z - reference)
-    kernel = (1.0 - loose_weight) * torch.exp(-error_sq / std**2) + loose_weight * torch.exp(-error_sq / loose_std**2)
+    kernel = torch.exp(-error_sq / std**2)
     kernel = torch.nan_to_num(kernel, nan=0.0)
     return torch.sum(lift_share * kernel * swing, dim=1)
 

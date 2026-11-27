@@ -16,8 +16,7 @@ errors during the program). See evals/isaac/env.py for what must match between t
 
 Setup: no pushes, nominal starts (no pre-pose), terrain row 0, the run's domain randomization with nominal motors
 (conditions.NOMINAL_MOTORS; --run_motors keeps the run's), observation noise and action delay; mean actions
-(--stochastic samples). The segment program and the scoring: evals/common/legs_scorecard.py. With --wrist_goals the
-legs then stand while the arms get that many goals in a row (needs an arms policy).
+(--stochastic samples). The segment program and the scoring: evals/common/legs_scorecard.py.
 
 Writes logs/evals/<run>/isaac/legs/scorecard_<N>[_sampled][_with_<arms run>_<M>].{json,md} (or --out <base>).
 """
@@ -39,10 +38,8 @@ parser.add_argument("--task", default=None, help="Default: the run's task (LocoM
 parser.add_argument("--num_envs", type=int, default=C.DEFAULTS[("isaac", "legs")]["num_envs"])
 parser.add_argument("--segments_per_env", type=int, default=C.DEFAULTS[("isaac", "legs")]["segments_per_env"])
 parser.add_argument("--seed", type=int, default=C.DEFAULTS[("isaac", "legs")]["seed"])
-parser.add_argument("--wrist_goals", type=int, default=0, help="Standing arm goals after the program (arms policy only).")
 parser.add_argument("--run_motors", action="store_true", help="Keep the run's motor randomization (default: nominal).")
 parser.add_argument("--stochastic", action="store_true", help="Sample the actions (default: the mean, as deployed).")
-parser.add_argument("--save_raw", action="store_true", help="Also save the policy-rate series (npz).")
 parser.add_argument("--force", action="store_true", help="Score again even if the json exists.")
 parser.add_argument("--out", default=None, help="Output path without extension (default: logs/evals/...).")
 
@@ -97,7 +94,6 @@ extra = ([] if args_cli.run_motors else list(C.NOMINAL_MOTORS)) + hydra_args
 checkpoint, run_dir, args_cli.task, replayed = replay_run(
     args_cli.checkpoint, args_cli.task or (E.MARL_DIRECT if coupled else None), extra)
 OUT = args_cli.out or out_base(checkpoint, args_cli.arms_checkpoint, args_cli.stochastic)
-WRIST_GOAL_S = 4.0
 
 
 def pick(outputs_, agent: str) -> torch.Tensor:
@@ -110,33 +106,6 @@ def act(runner, base, obs, states) -> dict:
     if not coupled and "arms" in actions:
         actions["arms"] = torch.zeros_like(actions["arms"])  # hold_zero ignores it; zero for the record
     return actions
-
-
-def wrist_phase(base, runner, arm, obs, goals: int) -> dict:
-    """Every env standing, `goals` arm goals in a row: reached share, closest approach and final errors (m, rad)
-    over the goals without a fall, and the number of goals with one."""
-    n, dt = base.num_envs, base.step_dt
-    ids = torch.arange(n, device=base.device)
-    arm.cfg.arm_goal_prob, arm.goals_enabled, arm.goals_enabled_at = 1.0, True, None
-    steps = int(round(WRIST_GOAL_S / dt))
-    reached, best, final, final_rot, fell = (np.zeros((n, goals)) for _ in range(5))
-    states = base.state()
-    for g in range(goals):
-        arm._resample(ids)
-        for _ in range(steps):
-            obs, _, terminated, truncated, _ = base.step(act(runner, base, obs, states))
-            states = base.state()
-            agent = base.possible_agents[0]
-            runner.agent.reset_rnn(terminated[agent] | truncated[agent])
-            fell[:, g] = np.maximum(fell[:, g], terminated[agent].cpu().numpy())
-        pos_error, rot_error = arm.errors()
-        reached[:, g] = arm.goal_reached.cpu().numpy()
-        best[:, g] = arm.goal_best_error.cpu().numpy()
-        final[:, g], final_rot[:, g] = pos_error.mean(1).cpu().numpy(), rot_error.mean(1).cpu().numpy()
-    ok = fell == 0
-    return {"goals": int(ok.sum()), "fell": int((~ok).sum()), "reached": float(reached[ok].mean()),
-            "best_error": float(best[ok].mean()), "final_error": float(final[ok].mean()),
-            "final_rot_error": float(final_rot[ok].mean())}
 
 
 def coupled_rows(pos_err: np.ndarray, rot_err: np.ndarray, arm_mode: np.ndarray, fell_at: np.ndarray) -> list[dict]:
@@ -193,7 +162,6 @@ def main(env_cfg, agent_cfg: dict):
     runner.agent.enable_training_mode(False, apply_to_models=True)
     robot, vel = base.scene["robot"], base.command_manager.get_term("base_velocity")
     arm = base.command_manager.get_term("arm_targets")
-    arm._judge_kernels = lambda ended: None  # the kernel stage the run reached, not moved by this evaluation
     contacts = base.scene["contact_forces"]
     legs = robot.find_joints(LOWER_JOINT_NAMES, preserve_order=True)[0]
     feet = robot.find_bodies(FOOT_LINK_NAMES, preserve_order=True)[0]
@@ -207,7 +175,7 @@ def main(env_cfg, agent_cfg: dict):
     T = cmds.shape[1]
     cmd_t = torch.tensor(cmds, dtype=torch.float, device=base.device)
     rec = {k: np.zeros((N, T) + s, np.float32) for k, s in
-           (("vel", (3,)), ("q", (12,)), ("rp", (2,)), ("seen", (3,)), ("foot_z", (2,)))}
+           (("vel", (3,)), ("q", (12,)), ("rp", (2,)), ("foot_z", (2,)))}
     rec["contact"] = np.zeros((N, T, 2), bool)
     arm_rec = {"pos": np.zeros((N, T, 2), np.float32), "rot": np.zeros((N, T, 2), np.float32),
                "mode": np.zeros((N, T), bool)} if coupled else None
@@ -238,7 +206,6 @@ def main(env_cfg, agent_cfg: dict):
             rec["q"][:, k] = robot.data.joint_pos[:, legs].cpu().numpy()
             roll, pitch, _ = euler_xyz_from_quat(robot.data.body_quat_w[:, torso])
             rec["rp"][:, k] = torch.stack([roll, pitch], 1).cpu().numpy()
-            rec["seen"][:, k] = vel.command.cpu().numpy()
             rec["foot_z"][:, k] = robot.data.body_pos_w[:, feet, 2].cpu().numpy()
             rec["contact"][:, k] = (contacts.data.net_forces_w_history[:, :, feet_c, 2].max(dim=1).values > 5.0).cpu().numpy()
             if coupled:
@@ -247,7 +214,6 @@ def main(env_cfg, agent_cfg: dict):
                 arm_rec["mode"][:, k] = arm.arm_mode.cpu().numpy()
             if k % 500 == 0:
                 print(f"[INFO] step {k}/{T}: {int((fell_at < T).sum())} fallen")
-        wrist = wrist_phase(base, runner, arm, obs, args_cli.wrist_goals) if (coupled and args_cli.wrist_goals) else None
 
     res = L.compute(cmds, kinds, {k: rec[k] for k in ("vel", "q", "rp", "foot_z", "contact")}, fell_at, dt,
                     base.cfg.gait_period, estop)
@@ -255,17 +221,15 @@ def main(env_cfg, agent_cfg: dict):
         res["coupled_rows"] = coupled_rows(arm_rec["pos"], arm_rec["rot"], arm_rec["mode"], fell_at)
     res.update(
         backend="isaac", body="legs", run=runs.name(run_dir), step=runs.step_of(checkpoint), checkpoint=checkpoint,
-        task=args_cli.task, trainer=runs.trainer(run_dir), overrides=replayed + extra, stochastic=args_cli.stochastic,
-        full=list(full), wrist=wrist,
+        task=args_cli.task, overrides=replayed + extra, stochastic=args_cli.stochastic, full=list(full),
         other_policy=(f"arms policy {arms_ckpt}" if coupled else None),
+        # wrist_goals: the wrist-goal phase is gone; stamped 0, as before, so the conditions hash still joins old points
         **C.stamp("isaac", "legs", num_envs=N, segments_per_env=args_cli.segments_per_env, seed=args_cli.seed,
-                  wrist_goals=args_cli.wrist_goals, motors="run" if args_cli.run_motors else "nominal",
+                  wrist_goals=0, motors="run" if args_cli.run_motors else "nominal",
                   actions="sampled" if args_cli.stochastic else "mean",
                   arms=("policy" if coupled else "zero"), extra_overrides=hydra_args))
     rows = L.rows(res)
     scorecard.write(OUT, res, rows, L.header(res), L.footer(res))
-    if args_cli.save_raw:
-        np.savez_compressed(OUT + "_raw.npz", cmds=cmds, kinds=kinds, fell_at=fell_at, dt=dt, **rec)
     print(open(OUT + ".md").read())
     print(f"[INFO] wrote {OUT}.json / .md")
     env.close()

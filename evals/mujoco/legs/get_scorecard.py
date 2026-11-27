@@ -50,7 +50,8 @@ def job(spec):
     torso = mujoco.mj_name2id(sim.m, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
     coupled = arms_export is not None
     if coupled:
-        sim.pelvis_goals, tables, goal_rng = True, R.goal_table(settings), np.random.default_rng(seed + 10_000 + e)
+        sim.arm_goal_keeps_walking = True
+        tables, goal_rng = R.goal_table(settings), np.random.default_rng(seed + 10_000 + e)
         every = int(round(GOAL_EVERY_S / sim.policy_dt))
     T = len(cmds)
     rec = {"vel": np.zeros((T, 3), np.float32), "q": np.zeros((T, 12), np.float32), "rp": np.zeros((T, 2), np.float32),

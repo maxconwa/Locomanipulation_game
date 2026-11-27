@@ -18,7 +18,7 @@ from .policy import actor
 from .sim import MarlMujoco, qconj, qmul
 
 TABLE_FILE = C.REPO / "source" / "locomanipulation_game" / "locomanipulation_game" / "data" / "arm_target_tables_v3.pt"
-FALL_TILT, FALL_HEIGHT = 1.0, 0.55   # rad, m: the episode ends (as the env's fall termination)
+FALL_HEIGHT = 0.55                   # m: the episode ends below it, or tilted past 1 rad (sim.fell)
 CONTACT_N = 5.0                      # N: a foot counts as down (as the Isaac scorecard's contact sensor threshold)
 
 

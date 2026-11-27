@@ -6,12 +6,9 @@ observations, all from the export's settings) and adds the perturbations (CONDIT
   plant          robocasa: the MJCF's joint dynamics (damping 10, frictionloss 0.2, armature 0.1, as RoboCasa);
                  isaac: the training plant's (none, armature 0.01)
   strength       the motors' torque x s (kp, kd and the effort limit together); gain: kp and kd x g
-  dq_lag         the observed hip pitch and knee velocity (LowState dq) this many ms late
   dq_lowpass_hz  the observed hip yaw, pitch, roll, knee and torso velocity through the motor drivers' 2nd-order
                  low-pass at this cutoff (sim.ROBOT_JOINT_VEL_LOWPASS; the robot's, 2026-11-24 bags); 0: the export's
                  own (joint_vel_lowpass, what its run trained with), if any
-  gyro_k         the head's 20-21 Hz pitch resonance added to the gyro before its low-pass, at gyro_k x the measured
-                 amplitude
   delay_ms       the joint targets this late; torso_kg: added to the torso; enc: encoder offsets on the legs (rad)
   hang_s         held on the gantry (feet 8 cm up) this long, then lowered onto the feet over LOWER_S
   prepose        the engage from lmg_deploy's pre-pose (pp_* conditions; GOLEM's marl_deploy_node._prepose and
@@ -26,12 +23,11 @@ observations, all from the export's settings) and adds the perturbations (CONDIT
                  Run for PP_AFTER_S with a zero command; scored on the first 0.5 s, 0.5-1 s and the stance after (pp
                  table). The sag comes from the pre-pose commanding the start pose (this MJCF's ankles are stiffer
                  than the robot's, which sags under the default pose's command): the jumps count from the measured
-                 pose, the robot's from the default. An export's engage blend (engage_blend_s) starts from that
-                 command, as lmg_deploy's starts from the pre-pose's last
+                 pose, the robot's from the default
   imu_pitch, vib_k   for an export on the torso IMU (export imu.source lowstate): the quaternion's pitch bias as the
                  policy reads it ("lo" / "hi": the trained range's ends; default its centre): for imu.orientation
                  calibrated the error lmg_deploy's calibration leaves, for raw the offset itself; and its gyro's
-                 vibration tied to leg motion, x TORSO_GYRO_PER_DQ
+                 vibration tied to leg motion, x TORSO_GYRO_PER_DQ (a 20-21 Hz wave)
 Per job (one condition, profile, plant and seed) one robot for --seconds; jobs run in parallel processes. --video COND
 renders one job of COND (seed 0) to an mp4 instead.
 
@@ -61,30 +57,25 @@ import torch
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from evals.mujoco.common import load_deploy_cfg  # noqa: E402
-from evals.mujoco.policy import Recurrent  # noqa: E402, F401  (bag_replay uses H.Recurrent)
+from evals.mujoco.policy import Recurrent  # noqa: E402
 from evals.mujoco.sim import (  # noqa: E402
     ALL_NAMES, ROBOT_JOINT_VEL_LOWPASS, MarlMujoco, imu_bias_ranges, mjcf_path, qrot)
 
-# the conditions; hw: the measured hardware effects together. Its velocity lag is the drivers' 21 Hz low-pass on the
-# hips, knees and torso since 2026-11-24 (was dq_lag 12 ms on the hip pitches and knees only)
-_HW = {"strength": 0.85, "dq_lowpass_hz": 21.0, "gyro_k": 1.0, "delay_ms": 20.0, "enc": 0.02}
+# the conditions; hw: the measured hardware effects together, its velocity lag the drivers' 21 Hz low-pass on the hips,
+# knees and torso
+_HW = {"strength": 0.85, "dq_lowpass_hz": 21.0, "delay_ms": 20.0, "enc": 0.02}
 CONDITIONS = {
     "nominal": {},
     "strength085": {"strength": 0.85},
     "strength075": {"strength": 0.75},
     "gain080": {"gain": 0.8},
     "gain120": {"gain": 1.2},
-    "dqlag12": {"dq_lag": 12.0},
-    "dqlag24": {"dq_lag": 24.0},
-    "gyro1": {"gyro_k": 1.0},
-    "gyro2": {"gyro_k": 2.0},
     "delay20": {"delay_ms": 20.0},
     "delay30": {"delay_ms": 30.0},
     "delay40": {"delay_ms": 40.0},
     "torso5kg": {"torso_kg": 5.0},
     "enc002": {"enc": 0.02},
     "hw": dict(_HW),
-    "hw_no_gyro": {k: v for k, v in _HW.items() if k != "gyro_k"},
     "hw_no_dqlag": {k: v for k, v in _HW.items() if k != "dq_lowpass_hz"},
     "hw_no_strength": {k: v for k, v in _HW.items() if k != "strength"},
     "hw_no_delay": {k: v for k, v in _HW.items() if k != "delay_ms"},
@@ -111,12 +102,10 @@ for _start in ("settled", "bag"):
                                                                imu_pitch=_end)
 # delay_ms: the robot's /lowstate to command 1.1 ms (p99 2.1) plus the safety relay's up to 2 ms (2026-11-23 bags; the
 # motors' own latency unmeasured): 4 ms nominal, 20 in the hardware bundle (_HW). 10 until 2026-11-23
-NOMINAL = {"strength": 1.0, "gain": 1.0, "dq_lag": 0.0, "dq_lowpass_hz": 0.0, "gyro_k": 0.0, "delay_ms": 4.0, "torso_kg": 0.0, "enc": 0.0,
+NOMINAL = {"strength": 1.0, "gain": 1.0, "dq_lowpass_hz": 0.0, "delay_ms": 4.0, "torso_kg": 0.0, "enc": 0.0,
            "hang_s": 0.0, "lstm_reset_s": 0.0, "lstm_reset_which": "both", "prepose": "", "rope": 0.4,
            "release": False, "imu_pitch": None, "vib_k": 0.0}
 HANG_LIFT, LOWER_S = 0.08, 1.0
-GYRO_RMS_PER_DQ_RMS = 3.4
-LAG_IDX = [ALL_NAMES.index(f"{s}_{j}_joint") for s in ("left", "right") for j in ("hip_pitch", "knee")]
 ANKLE_IDX = [ALL_NAMES.index(n) for n in ("left_ankle_pitch_joint", "right_ankle_pitch_joint")]
 KNEE_IDX = [ALL_NAMES.index(n) for n in ("left_knee_joint", "right_knee_joint")]
 FALL_TILT, FALL_HEIGHT = 0.8, 0.55
@@ -150,8 +139,8 @@ PP_MAX_STANCE_PITCH_DEG = 2.0
 
 class StressMujoco(MarlMujoco):
     """MarlMujoco with the perturbations of one condition (CONDITIONS, f): the motors' strength and gain, the encoders'
-    offsets, LowState's joint-velocity lag, the joint targets' delay, the head's gyro resonance, a heavier torso, and
-    the gantry (held, then lowered onto the feet)."""
+    offsets, the drivers' joint-velocity low-pass, the joint targets' delay, the torso IMU as /lowstate reports it, a
+    heavier torso, and the gantry (held, then lowered onto the feet)."""
 
     def __init__(self, actors, f: dict, deploy: dict, physics: str, rng: np.random.Generator):
         model = mujoco.MjModel.from_xml_path(str(mjcf_path()))
@@ -159,12 +148,10 @@ class StressMujoco(MarlMujoco):
         model.body_mass[torso] += f["torso_kg"]
         super().__init__(actors, deploy, physics=physics, model=model)
         m = self.m
-        self.head = (deploy.get("imu") or {}).get("frame", "imu_link") != "imu_link"
         self.f = f
         self.enc = np.zeros(len(ALL_NAMES))
         self.enc[:12] = rng.uniform(-f["enc"], f["enc"], 12)
         self.delay = int(round(f["delay_ms"] / 1000 / m.opt.timestep))
-        self.lag = int(round(f["dq_lag"] / 1000 / m.opt.timestep))
         if f["dq_lowpass_hz"] > 0.0:  # the robot's drivers' velocity low-pass, over the export's own
             self.set_dq_lowpass(dict(ROBOT_JOINT_VEL_LOWPASS, cutoff_hz=f["dq_lowpass_hz"]))
         self.res_freq = 20.0 + rng.uniform()
@@ -206,7 +193,6 @@ class StressMujoco(MarlMujoco):
 
     def reset(self, rng):
         self.targets = deque(maxlen=self.delay + 1)
-        self.qd_hist = deque(maxlen=self.lag + 1)
         self.leg_rms = 0.0
         self.sub = 0
         super().reset(rng)
@@ -214,7 +200,6 @@ class StressMujoco(MarlMujoco):
         if self.f["hang_s"] > 0:
             self.d.qpos[2] += HANG_LIFT
             mujoco.mj_forward(self.m, self.d)
-        self.qd_hist.append(self.d.qvel[self.vadr].copy())
         if self.lowstate:
             self.R_hist.clear()
             self.R_hist.append(self.d.site_xmat[self.imu_site].reshape(3, 3).copy())
@@ -245,12 +230,6 @@ class StressMujoco(MarlMujoco):
     def measured_q(self) -> np.ndarray:
         return self.d.qpos[self.qadr] + self.enc
 
-    def measured_dq(self) -> np.ndarray:
-        qd = super().measured_dq()
-        if self.lag:
-            qd[LAG_IDX] = self.qd_hist[0][LAG_IDX]  # lag substeps old once the deque is full
-        return qd
-
     def pd_torque(self, target):
         q, qd = self.measured_q(), self.d.qvel[self.vadr]
         k = self.f["strength"] * self.f["gain"]
@@ -271,7 +250,6 @@ class StressMujoco(MarlMujoco):
                 d.qpos[0:2], d.qpos[2], d.qpos[3:7] = self.hold_pose[0:2], held, self.hold_pose[3:7]
                 d.qvel[0:6] = 0.0
             qd = d.qvel[self.vadr].copy()
-            self.qd_hist.append(qd)
             self._sample_dq()
             self.sub += 1
             # the legs' motion, rad/s rms over 0.1 s: what drives the structure-borne shake
@@ -281,9 +259,6 @@ class StressMujoco(MarlMujoco):
                 self.R_hist.append(d.site_xmat[self.imu_site].reshape(3, 3).copy())
             if self.gyro_lowpass is not None:
                 u = self._raw_gyro()
-                if self.f["gyro_k"] > 0 and self.head:
-                    amp = self.f["gyro_k"] * GYRO_RMS_PER_DQ_RMS * math.sqrt(2) * self.leg_rms
-                    u[1] += amp * wave
                 if self.lowstate:
                     u += self.gyro_bias + LOWSTATE_GYRO_NOISE * self.rng.standard_normal(3)
                     u += self.f["vib_k"] * TORSO_GYRO_PER_DQ * math.sqrt(2) * self.leg_rms * wave * TORSO_GYRO_AXES
@@ -383,9 +358,6 @@ def run_prepose_job(job, video: str | None = None):
                 for a in actors.values():
                     a.reset_state()
                 q = sim.measured_q()
-                # the engage blend (export.yaml engage_blend_s) starts from the last command sent, the pre-pose's
-                sim.blend_from = sim.applied[sim.leg_idx].copy()
-                sim.policy_target = sim.blend_from.copy()
                 sim.applied[:] = q
                 sim.residual[:] = 0.0
                 sim.ik_q = q[sim.arm_idx].copy()
@@ -396,7 +368,6 @@ def run_prepose_job(job, video: str | None = None):
                 obs = sim.observations()
                 w0 = np.linalg.norm(sim.wrist_poses_b()[:, :3] - sim.believed[:, :3], axis=1).mean()
             prev = sim.applied.copy()
-            prev_policy = getattr(sim, "policy_target", sim.applied[:12]).copy()
             if engaged:
                 obs = sim.step(obs)
             else:
@@ -409,7 +380,6 @@ def run_prepose_job(job, video: str | None = None):
             q = sim.measured_q()
             tilt = sim.tilt()
             rec.append({"t": t - PP_ENGAGE_S, "engaged": engaged, "jump_legs": jump[:12].copy(), "jump_arms": jump[13:].copy(),
-                        "jump_policy": np.abs(sim.policy_target - prev_policy) if engaged else np.zeros(12),
                         "tau_share": float(np.max(np.abs(sim.last_tau[:12]) / sim.effort[:12])),
                         "knee_off": float(np.abs(q[KNEE_IDX] - sim.default[KNEE_IDX]).mean()),
                         "target": sim.applied[:12].copy(), "tilt": tilt, "pitch": sim.pitch(), "z": float(d.qpos[2]),
@@ -452,11 +422,8 @@ def run_prepose_job(job, video: str | None = None):
             "fell": fell_t is not None, "fall_t": fell_t,
             "first_mean_jump": float(np.mean([r["jump_legs"].mean() for r in first])),
             "first_max_jump": float(np.max([r["jump_legs"].max() for r in first])),
-            # 0.5-1 s after the engage (a blend must not just move the jump past the first 0.5 s), and the policy's own
-            # targets before the engage blend (what the robot would get without it)
+            # 0.5-1 s after the engage
             "second_mean_jump": float(np.mean([r["jump_legs"].mean() for r in eng if 0.5 <= r["t"] < 1.0])),
-            "policy_mean_jump": float(np.mean([r["jump_policy"].mean() for r in first])),
-            "policy_max_jump": float(np.max([r["jump_policy"].max() for r in first])),
             "first_torque_share": float(np.max([r["tau_share"] for r in first])),
             "knee_off": float(np.mean([r["knee_off"] for r in after])) if after else None,
             "at_limit": at_limit,
@@ -575,12 +542,9 @@ def main():
         print(json.dumps(r), flush=True)
         print(f"[stress-mj] wrote {path}", flush=True)
         return
-    head = deploy.get("imu", {}).get("frame", "imu_link") != "imu_link"
     names = args.conditions.split(",") if args.conditions else [c for c in CONDITIONS if not c.startswith("pp_")]
     if "pp" in names:  # the pre-pose grid
         names = [c for c in names if c != "pp"] + [c for c in CONDITIONS if c.startswith("pp_")]
-    if not head:
-        names = [c for c in names if not (CONDITIONS[c].get("gyro_k") and not CONDITIONS[c].get("prepose"))]
     jobs = [(os.path.abspath(args.export), deploy, c, p, pl, s, args.seconds) for c in names
             for p in (["zero"] if CONDITIONS[c].get("prepose") else args.profiles.split(","))
             for pl in args.plants.split(",") for s in range(args.seeds)]
@@ -602,8 +566,6 @@ def main():
                     "first_mean_jump": med("first_mean_jump"), "first_mean_jump_worst": worst("first_mean_jump"),
                     "first_max_jump": worst("first_max_jump"), "first_torque_share": worst("first_torque_share"),
                     "second_mean_jump_worst": worst("second_mean_jump"),
-                    "policy_mean_jump": med("policy_mean_jump"), "policy_mean_jump_worst": worst("policy_mean_jump"),
-                    "policy_max_jump": worst("policy_max_jump"),
                     "knee_off": med("knee_off"), "knee_off_worst": worst("knee_off"), "at_limit": worst("at_limit"),
                     "pre_knee_off": med("pre_knee_off"), "arm_max_jump": worst("arm_max_jump"),
                     "max_tilt_deg": worst("max_tilt_deg"),
@@ -667,19 +629,15 @@ def main():
                f" of the limit, knees within {PP_MAX_KNEE_OFFSET} rad of default, targets at a limit"
                f" < {PP_MAX_AT_LIMIT:.0%} of steps, the stance's pelvis pitch from 2 s on within"
                f" +-{PP_MAX_STANCE_PITCH_DEG} deg (every seed; + nose down).", "",
-               "The policy's own jump: its leg targets before lmg_deploy's engage blend (export.yaml engage_blend_s; the"
-               " same as the sent ones without it), reported only.", "",
-               "| cell | pass | fell % | 0.5 s mean jump med / worst | 0.5-1 s worst | 0.5 s max jump | policy's own"
-               " 0.5 s mean jump med / worst / max | 0.5 s torque/limit | knee off"
-               " med / worst | at limit | knee off pre-pose | wrist err mm at 0/0.25/0.5/1 s | arm max jump | max tilt deg |"
-               " stance pitch deg med (min / max) |",
-               "|" + "---|" * 15]
+               "| cell | pass | fell % | 0.5 s mean jump med / worst | 0.5-1 s worst | 0.5 s max jump |"
+               " 0.5 s torque/limit | knee off med / worst | at limit | knee off pre-pose |"
+               " wrist err mm at 0/0.25/0.5/1 s | arm max jump | max tilt deg | stance pitch deg med (min / max) |",
+               "|" + "---|" * 14]
         for key, r in pp_cells.items():
             md.append(f"| {key} | {'yes' if r['pass'] else 'NO'} | {r['fell_pct']:.0f} | {fmt(r['first_mean_jump'], '{:.3f}')} /"
                       f" {fmt(r['first_mean_jump_worst'], '{:.3f}')} | {fmt(r.get('second_mean_jump_worst'), '{:.3f}')} |"
-                      f" {fmt(r['first_max_jump'])} | {fmt(r.get('policy_mean_jump'), '{:.3f}')} /"
-                      f" {fmt(r.get('policy_mean_jump_worst'), '{:.3f}')} / {fmt(r.get('policy_max_jump'))} |"
-                      f" {fmt(r['first_torque_share'])} | {fmt(r['knee_off'])} / {fmt(r['knee_off_worst'])} |"
+                      f" {fmt(r['first_max_jump'])} | {fmt(r['first_torque_share'])} |"
+                      f" {fmt(r['knee_off'])} / {fmt(r['knee_off_worst'])} |"
                       f" {fmt(r['at_limit'], '{:.1%}')} | {fmt(r['pre_knee_off'])} | {fmt(r['wrist_err_mm'], '{:.0f}')} |"
                       f" {fmt(r['arm_max_jump'])} | {fmt(r['max_tilt_deg'], '{:.1f}')} |"
                       f" {fmt(r.get('stance_pitch_deg'), '{:+.1f}')} ({fmt(r.get('stance_pitch_range'), '{:+.1f}')}) |")

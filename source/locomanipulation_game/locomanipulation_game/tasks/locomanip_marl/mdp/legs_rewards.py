@@ -74,21 +74,6 @@ def feet_contact_forces(
     return torch.sum((force.max(dim=1)[0] - max_force).clip(min=0.0), dim=1)
 
 
-def body_pair_distance_band(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg,
-    min_dist: float = 0.3,
-    max_dist: float = 0.6,
-) -> torch.Tensor:
-    """In [0, 1]: 1 while the two bodies' horizontal distance is within [min_dist, max_dist], exp(-100 x) at x m
-    outside (0.37 at 1 cm, 0.05 at 3 cm). A reward for staying in the band only."""
-    asset: Articulation = env.scene[asset_cfg.name]
-    pos = asset.data.body_pos_w[:, asset_cfg.body_ids, :2]
-    dist = torch.norm(pos[:, 0, :] - pos[:, 1, :], dim=1)
-    outside = torch.clamp(min_dist - dist, min=0.0) + torch.clamp(dist - max_dist, min=0.0)
-    return torch.exp(-outside * 100.0)
-
-
 def body_pair_offset_band(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
@@ -97,9 +82,10 @@ def body_pair_offset_band(
     max_dist: float = 0.05,
     command_name: str | None = None,
 ) -> torch.Tensor:
-    """In [0, 1]: body_pair_distance_band on one component of the two bodies' offset in the pelvis heading frame,
-    |offset[axis]| (0 fore-aft, 1 lateral), so the stance's width and stagger are scored apart. With command_name,
-    paid only while standing is commanded (0 otherwise)."""
+    """In [0, 1]: 1 while one component of the two bodies' offset in the pelvis heading frame, |offset[axis]| (0
+    fore-aft, 1 lateral), is within [min_dist, max_dist], exp(-100 x) at x m outside (0.37 at 1 cm, 0.05 at 3 cm): a
+    reward for staying in the band only, the stance's width and stagger scored apart. With command_name, paid only
+    while standing is commanded (0 otherwise)."""
     data = env.scene[asset_cfg.name].data
     offset = data.body_pos_w[:, asset_cfg.body_ids[0]] - data.body_pos_w[:, asset_cfg.body_ids[1]]
     dist = quat_apply_inverse(yaw_quat(data.root_quat_w), offset)[:, axis].abs()
@@ -121,15 +107,6 @@ def feet_load_balance_band(
     share = fz[:, 0] / fz.sum(dim=1).clamp(min=1.0)
     score = torch.exp(-torch.clamp((share - 0.5).abs() - max_imbalance, min=0.0) * 20.0)
     return score * standing_command(env, env.command_manager.get_command(command_name)).float()
-
-
-def joint_deviation_l2(
-    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """Squared deviation of asset_cfg's joints from their defaults, summed."""
-    asset: Articulation = env.scene[asset_cfg.name]
-    dev = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
-    return torch.sum(torch.square(dev), dim=1)
 
 
 def ankle_action_rate_l2(

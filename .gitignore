@@ -12,10 +12,9 @@
 **/*.usdc
 **/*.usdz
 
-# IDE (the top-level .vscode is tracked)
+# IDE
 **/.idea/
 **/.vscode/
-!.vscode
 
 # Outputs: training runs, evaluations and exports under logs/, Hydra's outputs/
 **/logs/*

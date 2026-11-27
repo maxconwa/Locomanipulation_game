@@ -72,11 +72,6 @@ def rows_to_json(rows: list[Row]) -> list[dict]:
     return [dict(asdict(r), met=r.met) for r in rows]
 
 
-def row_values(result: dict) -> dict[str, float]:
-    """{key: value} of a written scorecard's rows."""
-    return {r["key"]: num(r["value"]) for r in result.get("rows", [])}
-
-
 def write(out_base: str, result: dict, rows: list[Row], header: str, footer: str = "") -> None:
     """<out_base>.json and <out_base>.md."""
     os.makedirs(os.path.dirname(out_base) or ".", exist_ok=True)

@@ -43,7 +43,7 @@ def job(spec):
     rng = np.random.default_rng(seed + e)
     sim.reset(rng)
     R.reset_actors(sim)
-    sim.pelvis_goals = legs_export is not None
+    sim.arm_goal_keeps_walking = legs_export is not None
     tables, goal_rng = R.goal_table(settings), np.random.default_rng(seed + 10_000 + e)
     steps = int(round(A.GOAL_S / sim.policy_dt))
     obs = sim.observations()

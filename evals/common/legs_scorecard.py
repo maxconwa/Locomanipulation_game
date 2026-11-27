@@ -20,7 +20,7 @@ import numpy as np
 
 from . import legs_metrics as lm
 from . import sportmode as S
-from .scorecard import Row, fmt, num
+from .scorecard import Row, num
 
 SETTLE_S, HOLD_S, FLICK_S, GAP_S = 2.0, 4.0, 5.0, 2.0
 PULSE_S, PULSE_EVERY = 0.15, (0.3, 0.5)
@@ -220,19 +220,7 @@ def header(res: dict) -> str:
 
 
 def footer(res: dict) -> str:
-    lines = []
-    w = res.get("wrist")
-    if w:
-        lines += [f"Wrist tracking ({w['goals']} standing arm goals, goals during a fall left out: {w['fell']}):"
-                  f" reached {100 * w['reached']:.1f}%, closest approach {100 * w['best_error']:.1f} cm, final error"
-                  f" {100 * w['final_error']:.1f} cm / {w['final_rot_error']:.2f} rad", ""]
-    lines.append(f"Run overrides: `{' '.join(res.get('overrides', [])) or '(none)'}`")
-    return "\n".join(lines)
-
-
-def fmt_line(res: dict) -> str:
-    lag = res.get("tracking_vs_lagged", {})
-    return " ".join(f"{k} {fmt(num(lag.get(k)))}" for k, *_ in S.TARGETS)
+    return f"Run overrides: `{' '.join(res.get('overrides', [])) or '(none)'}`"
 
 
 # the comparison plots' panels (row keys), direction and turn sense first

@@ -209,7 +209,3 @@ def foot_stats(q_series, rp_series, masks, foot_z_series=None, contact_series=No
 def commanded(cmd: np.ndarray, threshold: float = 0.05) -> np.ndarray:
     """Samples with a non-zero command, as the report counts them: |vx| or |vy| or |wz| over 0.05."""
     return (np.abs(cmd[:, :2]).max(1) > threshold) | (np.abs(cmd[:, 2]) > threshold)
-
-
-def verdict(value: float, target: float, sense: str) -> bool:
-    return bool(np.isfinite(value) and (value >= target if sense == "ge" else value <= target))

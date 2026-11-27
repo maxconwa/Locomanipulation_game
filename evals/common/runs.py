@@ -1,7 +1,7 @@
 """Training runs: where they are, what they trained, their checkpoints, and the runs a plot compares against.
 
-A run is logs/skrl/locomanip_marl/<YYYY-MM-DD_HH-MM-SS>_<name>/ (PPO, scripts/skrl/train.py, and SuperMimic,
-scripts/supermimic/train.py: same layout) with params/task.txt, params/env.yaml and checkpoints/agent_<env steps>.pt.
+A run is logs/skrl/locomanip_marl/<YYYY-MM-DD_HH-MM-SS>_<name>/ (scripts/skrl/train.py) with params/task.txt,
+params/env.yaml and checkpoints/agent_<env steps>.pt.
 """
 
 from __future__ import annotations
@@ -51,10 +51,6 @@ def seed_group(run_dir: Path | str) -> str:
 def task(run_dir: Path) -> str | None:
     f = Path(run_dir) / "params" / "task.txt"
     return f.read_text().strip() if f.is_file() else None
-
-
-def trainer(run_dir: Path) -> str:
-    return "supermimic" if (Path(run_dir) / "params" / "supermimic.yaml").is_file() else "skrl"
 
 
 def checkpoints(run_dir: Path) -> list[tuple[int, Path]]:

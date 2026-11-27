@@ -56,13 +56,8 @@ parser.add_argument("--imu_calibration_file", default=None,
 parser.add_argument("--urdf", default=os.path.join(os.environ.get("CL_ASSETS_DIR", str(REPO / "third_party/CL_Assets")),
                                                    "ros_assets", "h1_2_magpie.urdf"))
 parser.add_argument("--template", default=str(REPO / "evals/deploy/hw_deploy_template.yaml"))
-parser.add_argument("--imu", choices=("livox", "lowstate"), default="livox",
-                    help="the deployed policy's IMU. lowstate: LowState.imu_state, as the node did up to GOLEM 8d1eddd "
-                         "(2026-10-16 bags); the other policies always read /livox/imu as today's node does")
 parser.add_argument("--attitude", choices=("fastlio", "filter"), default="fastlio")
 parser.add_argument("--odom_timeout", type=float, default=1.0)
-parser.add_argument("--imu_trim_deg", type=float, nargs=3, default=(0.0, 0.0, 0.0), metavar=("ROLL", "PITCH", "YAW"),
-                    help="the deployed node's imu_offset_*_deg (Explicit500 on 10-16: 0.5 -2.5 0)")
 parser.add_argument("--steps_offset", type=int, default=-1,
                     help="joined mid-episode: the node's gait-clock step count at the first tick (unknown from the bag); "
                          "-1 picks the one whose replayed leg targets match the recording best over --fit_seconds")
@@ -86,15 +81,12 @@ from lmg_deploy.kinematics import ArmKinematics  # noqa: E402
 from lmg_deploy.livox_attitude import LivoxAttitude, in_imu_frame  # noqa: E402
 from lmg_deploy.livox_imu import LIVOX_IMU_FRAME, LivoxImu, livox_to_imu_rotation  # noqa: E402
 from lmg_deploy.networks import load_network  # noqa: E402
-from lmg_deploy.rotations import imu_mount_quat, quat_apply, quat_conjugate, quat_mul, xyzw_to_wxyz  # noqa: E402
+from lmg_deploy.rotations import xyzw_to_wxyz  # noqa: E402
+from lmg_deploy.imu_calibration import load_calibration  # noqa: E402
 
-try:  # lmg_deploy from 2026-11-21 on: the robot's torso-IMU calibration, which the node hands its controller
-    from lmg_deploy.imu_calibration import load_calibration  # noqa: E402
-    IMU_CALIBRATION = load_calibration(args.imu_calibration_file or os.path.join(
-        args.golem, "core_ws/src/lmg_deploy/config/imu_calibration.yaml"), "h12")
-    CONTROLLER_KW = {"imu_calibration": IMU_CALIBRATION}
-except ImportError:
-    CONTROLLER_KW = {}
+# the robot's torso-IMU calibration, which the node hands its controller
+IMU_CALIBRATION = load_calibration(args.imu_calibration_file or os.path.join(
+    args.golem, "core_ws/src/lmg_deploy/config/imu_calibration.yaml"), "h12")
 try:  # the rosbags package where it is installed; else ROS 2's own reader (GOLEM's ros container, gate.py)
     from rosbags.highlevel import AnyReader  # noqa: E402
     from rosbags.typesys import Stores, get_types_from_msg, get_typestore  # noqa: E402
@@ -112,7 +104,6 @@ class Probe:
     def __init__(self, path: str, num_obs: int, num_actions: int):
         self.net = load_network(path, num_obs, num_actions)
         module = self.net.module
-        self.recurrent = hasattr(module, "hidden_size")
         self.mean = module.mean.numpy().astype(np.float64)
         self.std = module.std.numpy().astype(np.float64)
         self.eps = float(getattr(module, "epsilon", 1e-8))
@@ -124,7 +115,7 @@ class Probe:
     def __call__(self, x):
         out = self.net(x)
         self.z.append((x - self.mean) / (self.std + self.eps))
-        self.c.append(self.net._c[-1, 0].numpy().copy() if self.recurrent else np.zeros(0))
+        self.c.append(self.net._c[-1, 0].numpy().copy())
         return out
 
 
@@ -146,11 +137,8 @@ class Replayer:
         self.attitude = LivoxAttitude() if args.attitude == "fastlio" else None
         self.probes = {a: Probe(os.path.join(folder, cfg[a]["policy"]), cfg[a]["num_obs"], cfg[a]["num_actions"])
                        for a in ("legs", "arms")}
-        self.ctrl = MarlController(cfg, self.kin, self.probes["legs"], self.probes["arms"], **CONTROLLER_KW)
-        # --imu lowstate and the trim were the deployed node's settings; the others read today's node (livox, no trim)
-        self.deployed = name == args.deployed
-        trim = np.radians(args.imu_trim_deg) if self.deployed else np.zeros(3)
-        self.mount = imu_mount_quat(*trim) if np.any(trim) else None
+        self.ctrl = MarlController(cfg, self.kin, self.probes["legs"], self.probes["arms"],
+                                   imu_calibration=IMU_CALIBRATION)
         self.slam_time = None
         self.targets, self.attitude_source, self.times = [], [], []
         # a policy at another rate than the node's ticks (the sport-mode runs' 100 Hz) steps on its own clock, on
@@ -172,13 +160,7 @@ class Replayer:
 
     def robot_state(self, msg, now: float) -> RobotState:
         motors = msg.motor_state
-        if args.imu == "lowstate" and self.deployed:
-            # the node before 2026-10-16 14:50 (GOLEM 8d1eddd): the torso IMU's LowState.imu_state as it came
-            imu = msg.imu_state
-            quat, gyro, acc, source = (np.asarray(imu.quaternion, dtype=np.float64),
-                                       np.asarray(imu.gyroscope, dtype=np.float64),
-                                       np.asarray(imu.accelerometer, dtype=np.float64), "lowstate")
-        elif self.livox.ready:
+        if self.livox.ready:
             gyro, acc = self.livox.gyro.copy(), self.livox.acc.copy()
             fresh = self.slam_time is not None and now - self.slam_time <= args.odom_timeout
             if self.attitude is not None and self.attitude.calibrated and fresh:
@@ -187,9 +169,6 @@ class Replayer:
                 quat, source = self.livox.quat(), "filter"
         else:
             quat, gyro, acc, source = np.array([1.0, 0, 0, 0]), np.zeros(3), np.zeros(3), "none"
-        if self.mount is not None:
-            quat = quat_mul(quat, quat_conjugate(self.mount))
-            gyro, acc = quat_apply(self.mount, gyro), quat_apply(self.mount, acc)
         self.attitude_source.append(source)
         return RobotState(q=np.array([motors[i].q for i in range(NUM_JOINTS)], dtype=np.float64),
                           dq=np.array([motors[i].dq for i in range(NUM_JOINTS)], dtype=np.float64),
@@ -354,8 +333,6 @@ def sim_reference(folder: str, cmds: np.ndarray, seeds: int, tick_t: np.ndarray)
     out = {"legs": {"c": [], "z": []}, "arms": {"c": [], "z": []}}
 
     class SimProbe:
-        recurrent = True
-
         def __init__(self, path):
             self.net = torch.jit.load(path, map_location="cpu").eval()
             self.mean, self.std = self.net.mean.numpy(), self.net.std.numpy()
@@ -450,8 +427,8 @@ def main():
                "events": [(float(e[0] - ticks[0]), e[1], e[2]) for e in events], "policies": {}}
     npz = {"t": t, "recorded_legs_target": recorded, "cmd": cmds}
     md = [f"# Bag replay: {Path(args.bag).name}", "",
-          f"{len(ticks)} policy steps ({t[-1]:.1f} s) after engage; attitude {args.attitude}, IMU trim "
-          f"{tuple(args.imu_trim_deg)} deg. Open loop for every policy but the deployed one ({args.deployed}).", ""]
+          f"{len(ticks)} policy steps ({t[-1]:.1f} s) after engage; attitude {args.attitude}. Open loop for every"
+          f" policy but the deployed one ({args.deployed}).", ""]
     for p in players:
         info = {"attitude": {s: p.attitude_source.count(s) for s in set(p.attitude_source)}}
         targets = np.array(p.targets)

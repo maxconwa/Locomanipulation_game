@@ -126,9 +126,6 @@ def read_deploy_settings(run_dir: Path) -> dict:
         pose["arm_residual_scales"] = [float(gain) * s for s in pose["arm_residual_scales"]]
     if (actions.get("arm_pos") or {}).get("max_ik_step") is not None:
         pose["max_ik_step"] = float(actions["arm_pos"]["max_ik_step"])
-    # the legs' engage blend (mdp.BoundedJointPositionAction; lmg_deploy's engage_blend_s), when the run had one
-    if (actions.get("joint_pos") or {}).get("engage_blend_s"):
-        pose["engage_blend_s"] = float(actions["joint_pos"]["engage_blend_s"])
     # the drivers' low-pass on the reported joint velocities the run trained with (LocoManipMarlEnvCfg
     # joint_vel_lowpass_hz): the robot does it itself, so lmg_deploy reads nothing of it; the MuJoCo evals apply it
     if env.get("joint_vel_lowpass_hz"):
@@ -140,25 +137,23 @@ def read_deploy_settings(run_dir: Path) -> dict:
             pose[key] = float(actions["arm_pos"][key])
     if env.get("clip_actions") is not None:
         pose["clip_actions"] = float(env["clip_actions"])
-    # mdp.IKPostureArmAction's IK (LocoManip-ArmsOnly-v0): its settings, and its action twice as wide
+    # mdp.IKPostureArmAction's arms (LocoManip-ArmsOnly-v0, -Marl-Direct-v0): the trajectory to the posture, the
+    # integrated residual. trajectory and posture_actions are what lmg_deploy checks the format by (_check_format), the
+    # posture_scale / posture_gain pair what older lmg_deploys index (inert without posture actions)
     arm_pos = actions.get("arm_pos") or {}
     if "rot_weight" in arm_pos:
-        pose["arm_ik"] = {key: float(arm_pos[key]) for key in ("rot_weight", "null_gain", "posture_scale",
-                                                              "posture_gain", "limit_margin", "ik_damping")}
-        pose["arm_ik"]["ik_passes"] = int(arm_pos["ik_passes"])
-        pose["arm_ik"]["posture_from_command"] = bool(arm_pos.get("posture_from_command", False))
-        pose["arm_ik"]["trajectory"] = bool(arm_pos.get("trajectory", False))
-        pose["arm_ik"]["seed_rot_weight"] = float(env["commands"]["arm_targets"].get("seed_rot_weight", 0.3))
-        pose["arm_ik"]["posture_actions"] = bool(arm_pos.get("posture_actions", True))
-        for key in ("trajectory_max_vel", "trajectory_max_acc"):
-            pose["arm_ik"][key] = None if arm_pos.get(key) is None else float(arm_pos[key])
+        pose["arm_ik"] = {"rot_weight": float(arm_pos["rot_weight"]), "posture_scale": 0.5, "posture_gain": 1.0,
+                          "limit_margin": float(arm_pos["limit_margin"]), "ik_damping": float(arm_pos["ik_damping"]),
+                          "posture_from_command": bool(arm_pos.get("posture_from_command", False)), "trajectory": True,
+                          "seed_rot_weight": float(env["commands"]["arm_targets"].get("seed_rot_weight", 0.3)),
+                          "posture_actions": False,
+                          **{key: float(arm_pos[key]) for key in ("trajectory_max_vel", "trajectory_max_acc")}}
         # IKPostureArmActionCfg.gravity_offset: the arm joints' gravity torque at the target over kp, on the target
         pose["arm_ik"]["gravity_offset"] = bool(arm_pos.get("gravity_offset", False))
-        # residual_integrate: the residual integrated (leak, gain, clamp), not low-passed
-        if arm_pos.get("residual_integrate"):
-            pose["arm_ik"]["residual_integrate"] = {"gain": float(arm_pos["residual_integrate_gain"]),
-                                                    "leak_s": float(arm_pos["residual_leak_s"]),
-                                                    "clamp": float(arm_pos["residual_clamp"])}
+        # the residual integrated (gain, leak, clamp)
+        pose["arm_ik"]["residual_integrate"] = {"gain": float(arm_pos["residual_integrate_gain"]),
+                                                "leak_s": float(arm_pos["residual_leak_s"]),
+                                                "clamp": float(arm_pos["residual_clamp"])}
         # integral_gain: the measured wrists' pose error integrated onto the target once it has stopped
         if float(arm_pos.get("integral_gain") or 0.0) > 0.0:
             pose["arm_ik"]["integral"] = {"gain": float(arm_pos["integral_gain"]),
@@ -184,9 +179,9 @@ def read_deploy_settings(run_dir: Path) -> dict:
                            for axis in ("lin_vel_x", "lin_vel_y", "ang_vel_z")},
         "command_filter_tau": float(velocity.get("command_filter_tau", 0.0)),
         "arm_goals": float(env["commands"]["arm_targets"]["arm_goal_prob"]) > 0.0,
-        # LocoManip-Marl-Direct-v0's arm goals (ArmTargetsCommandCfg): riding on the pelvis (pelvis_fixed_goals), and
-        # the velocity command live through them (independent_of_legs); written only when set
-        **({"arm_goal_frame": "pelvis"} if env["commands"]["arm_targets"].get("pelvis_fixed_goals") else {}),
+        # the arm goals (ArmTargetsCommand): riding on the pelvis (written for a run that trained them), and the
+        # velocity command live through them (ArmTargetsCommandCfg.independent_of_legs; written only when set)
+        **({"arm_goal_frame": "pelvis"} if float(env["commands"]["arm_targets"]["arm_goal_prob"]) > 0.0 else {}),
         **({"arm_goal_keeps_walking": True} if env["commands"]["arm_targets"].get("independent_of_legs") else {}),
         # each actor's observation terms in order (MarlMujoco builds the vectors from them)
         **{f"{agent}_obs_terms": [name for name, term in env["observations"][agent].items()

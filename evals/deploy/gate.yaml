@@ -29,7 +29,7 @@ bag_replay:                  # evals/deploy/bag_replay.py: real bags through the
 
 stress:                      # evals/deploy/stress_mujoco.py
   zero_fall_cells: [nominal, hw, hang, hang_hw]   # conditions whose cells must not fall at all (standard grid)
-  long_conditions: [nominal, hw_no_gyro, hw, hang, hang_hw]   # 180 s stands, zero command: no falls
+  long_conditions: [nominal, hw, hang, hang_hw]   # 180 s stands, zero command: no falls
   small60_conditions: [nominal, hw, hang, hang_hw, strength085]  # a small command after a 60 s stand: no falls
   seeds: 8
   pp_seeds: 4                # the pre-pose engage grid: every cell passes its own marks

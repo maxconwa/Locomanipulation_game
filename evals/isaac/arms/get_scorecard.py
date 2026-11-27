@@ -184,7 +184,6 @@ def main(env_cfg, agent_cfg: dict):
     runner.agent.enable_training_mode(False, apply_to_models=True)
     robot = base.scene["robot"]
     arm = base.command_manager.get_term("arm_targets")
-    arm._judge_kernels = lambda ended: None
     arm.goals_enabled, arm.goals_enabled_at = True, None
     arm.cfg.offtable_prob = 1.0 if args_cli.offtable else 0.0
     arm.cfg.rest_goal_prob = 0.0
@@ -204,7 +203,7 @@ def main(env_cfg, agent_cfg: dict):
     ref = json.load(open(ref_base + ".json")) if (not args_cli.ik_only and outputs.cached(ref_base)) else None
     res.update(
         backend="isaac", body="arms", run=runs.name(run_dir), step=runs.step_of(checkpoint), checkpoint=checkpoint,
-        task=args_cli.task, trainer=runs.trainer(run_dir), overrides=replayed + hydra_args,
+        task=args_cli.task, overrides=replayed + hydra_args,
         stochastic=args_cli.stochastic, ik_only=args_cli.ik_only, offtable=args_cli.offtable,
         other_policy=(f"legs policy {legs_ckpt}" if coupled else None),
         reach_tol=[float(arm.cfg.reach_pos_tol), float(arm.cfg.reach_rot_tol)],
