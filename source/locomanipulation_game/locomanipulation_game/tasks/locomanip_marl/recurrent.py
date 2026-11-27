@@ -10,6 +10,7 @@ stored first state); MarlRunner is skrl's Runner building both when the yaml's m
 from __future__ import annotations
 
 import itertools
+import math
 
 import torch
 import torch.nn as nn
@@ -93,6 +94,29 @@ class LSTMGaussianPolicy(GaussianMixin, Model):
         if self.skip_observations:
             features = torch.cat([features, observations], dim=-1)  # both env-major, in step order
         return self.net(features), {"log_std": self.log_std_parameter, "rnn": [h, c]}
+
+
+def caps20_delta(n_seq: int, length: int, dim: int, cfg: dict, device) -> torch.Tensor:
+    """A consistent 20 Hz motion of the hip rolls as the actor would observe it, one per sequence (n_seq * length,
+    dim), env-major: per sequence a frequency f ~ U(f_lo, f_hi) and per joint a phase; the joint's true velocity
+    amp sin(2 pi f t + phi) reaches the reported velocity (dq_idx) through the drivers' 2nd-order Butterworth at lag_hz
+    (its gain and phase at f) and the angle (q_idx) as its integral, -amp / (2 pi f) cos(2 pi f t + phi)."""
+    t = torch.arange(length, device=device, dtype=torch.float32) * cfg["dt"]
+    f = cfg["f_lo"] + (cfg["f_hi"] - cfg["f_lo"]) * torch.rand(n_seq, 1, 1, device=device)
+    n = len(cfg["dq_idx"])
+    phi = 2.0 * math.pi * torch.rand(n_seq, 1, n, device=device)
+    w = 2.0 * math.pi * f
+    arg = w * t.view(1, -1, 1) + phi
+    delta = torch.zeros(n_seq, length, dim, device=device)
+    if cfg.get("lag_hz"):
+        wc = 2.0 * math.pi * cfg["lag_hz"]
+        h = wc ** 2 / torch.complex(wc ** 2 - w ** 2, 2.0 * math.sqrt(0.5) * wc * w)  # the Butterworth at f
+        gain, lag = h.abs(), torch.angle(h)
+    else:
+        gain, lag = torch.ones_like(w), torch.zeros_like(w)
+    delta[:, :, cfg["dq_idx"]] = cfg["amp"] * gain * torch.sin(arg + lag)
+    delta[:, :, cfg["q_idx"]] = -cfg["amp"] / w * torch.cos(arg)
+    return delta.view(-1, dim)
 
 
 class RecurrentMAPPO(MAPPO):
@@ -245,7 +269,8 @@ class RecurrentMAPPO(MAPPO):
         batches = memory.sample_all(names=names, mini_batches=mini_batches, sequence_length=length)
         rnn_batches = memory.sample_all(names=self._rnn_names[uid], mini_batches=mini_batches, sequence_length=length)
 
-        cumulative_policy_loss = cumulative_entropy_loss = cumulative_value_loss = 0
+        cumulative_policy_loss = cumulative_entropy_loss = cumulative_value_loss = cumulative_caps_term = 0
+        caps_steps, caps_scale = 0, 0.0
         for epoch in range(self.cfg.learning_epochs[uid]):
             kl_divergences = []
             for batch, rnn_batch in zip(batches, rnn_batches):
@@ -281,6 +306,22 @@ class RecurrentMAPPO(MAPPO):
                     )
                     policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
 
+                    # caps20: the policy's change of mean action under a 20 Hz hip-roll motion of its inputs
+                    caps_loss = 0
+                    caps = (getattr(self, "caps20", None) or {}).get(uid)
+                    caps_scale = caps["weight"] * (caps["scale_fn"]() if caps and caps.get("scale_fn") else 1.0) if caps else 0.0
+                    if caps_scale > 0.0:
+                        delta = caps20_delta(sampled_observations.shape[0] // length, length,
+                                             sampled_observations.shape[-1], caps, self.device)
+                        perturbed = self._observation_preprocessor[uid](sampled_observations + delta, train=False)
+                        mean_p, _ = policy.compute({"observations": perturbed, "rnn": [s.transpose(0, 1) for s in rnn_batch],
+                                                    "terminated": sampled_terminated, "truncated": sampled_truncated},
+                                                   role="policy")
+                        caps_term = (mean_p - outputs["mean_actions"]).square().sum(-1).mean()
+                        caps_loss = caps_scale * caps_term
+                        cumulative_caps_term += caps_term.item()
+                        caps_steps += 1
+
                     predicted_values, _ = value.act(inputs, role="value")
                     if self.cfg.value_clip[uid] > 0:
                         predicted_values = sampled_values + torch.clip(
@@ -289,7 +330,7 @@ class RecurrentMAPPO(MAPPO):
                     value_loss = self.cfg.value_loss_scale[uid] * F.mse_loss(sampled_returns, predicted_values)
 
                 self.optimizers[uid].zero_grad()
-                self.scaler.scale(policy_loss + entropy_loss + value_loss).backward()
+                self.scaler.scale(policy_loss + entropy_loss + value_loss + caps_loss).backward()
                 if config.torch.is_distributed:
                     policy.reduce_parameters()
                     value.reduce_parameters()
@@ -320,6 +361,10 @@ class RecurrentMAPPO(MAPPO):
         self.track_data(f"Loss / Value loss ({uid})", cumulative_value_loss / steps)
         if self.cfg.entropy_loss_scale[uid]:
             self.track_data(f"Loss / Entropy loss ({uid})", cumulative_entropy_loss / steps)
+        if (getattr(self, "caps20", None) or {}).get(uid):
+            # the mean squared change of the mean action (action units^2) under the 20 Hz motion, and its weight now
+            self.track_data(f"Loss / CAPS20 term ({uid})", cumulative_caps_term / max(caps_steps, 1))
+            self.track_data(f"Loss / CAPS20 weight ({uid})", caps_scale)
         self.track_data(f"Policy / Standard deviation ({uid})", policy.distribution(role="policy").stddev.mean().item())
         if self.schedulers[uid]:
             self.track_data(f"Learning / Learning rate ({uid})", self.schedulers[uid].get_last_lr()[0])

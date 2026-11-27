@@ -47,6 +47,11 @@ log_std_bounds:
 # Critics trained on raw returns: skrl fits the value scaler to the critic's own predictions too, and it ran away
 # (the arms' in runs A-B, the legs' in fresh runs to a mean of 1e5-1e14).
 no_value_preprocessor: [arms, legs]
+# scripts/skrl/train.py configure_caps20: per agent, a penalty weight x the mean squared change of the mean action when
+# its observed hip-roll angle and velocity carry a 20 Hz motion (f ~ U(f_lo, f_hi), velocity amplitude amp rad/s,
+# through the drivers' velocity lag), ramped in with the env's action_accel_scale. 0: off
+caps20:
+  legs: {weight: 0.0, amp: 0.25, f_lo: 15.0, f_hi: 25.0, joints: [left_hip_roll_joint, right_hip_roll_joint], ramp: true}
 
 memory:
   class: RandomMemory

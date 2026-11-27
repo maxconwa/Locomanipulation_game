@@ -70,6 +70,36 @@ def bound_log_std(agent, bounds: dict):
     agent.update = update_and_project
 
 
+def configure_caps20(agent, env, cfg: dict | None):
+    """The yaml's caps20 ({agent: {weight, amp, f_lo, f_hi, joints, ramp}}): each agent's penalty on its mean action's
+    change under a 20 Hz motion of those joints' observed angle and velocity (recurrent.caps20_delta), so the policy
+    does not damp a joint on its lagged velocity at 20 Hz (the real robot's hip-roll loop, ~/bags/coop150k_2026-11-24).
+    The observation offsets come from the env's observation manager; with ramp (default) the weight follows the env's
+    action_accel_scale (0 until the robot walks, then up over 20k steps)."""
+    import re
+    from locomanipulation_game.assets.h1_2 import ALL_JOINTS_NAMES
+
+    u = env.unwrapped
+    agent.caps20 = {}
+    for uid, c in (cfg or {}).items():
+        if not c or not float(c.get("weight", 0.0)):
+            continue
+        offsets, o = {}, 0
+        for name, dims in zip(u.observation_manager.active_terms[uid], u.observation_manager.group_obs_term_dim[uid]):
+            offsets[name] = o
+            o += int(math.prod(dims))
+        joints = [ALL_JOINTS_NAMES.index(j) for j in c.get("joints", ["left_hip_roll_joint", "right_hip_roll_joint"])]
+        lagged = all(any(re.fullmatch(p, ALL_JOINTS_NAMES[j]) for p in u.cfg.joint_vel_lowpass_joints) for j in joints)
+        agent.caps20[uid] = {
+            "weight": float(c["weight"]), "amp": float(c.get("amp", 0.25)), "f_lo": float(c.get("f_lo", 15.0)),
+            "f_hi": float(c.get("f_hi", 25.0)), "dt": float(u.step_dt),
+            "q_idx": [offsets["joint_pos"] + j for j in joints], "dq_idx": [offsets["joint_vel"] + j for j in joints],
+            "lag_hz": float(u.cfg.joint_vel_lowpass_hz) if lagged else 0.0,
+            "scale_fn": (lambda: float(u.action_accel_scale)) if c.get("ramp", True) else None,
+        }
+        print(f"[INFO] caps20 {uid}: {({k: v for k, v in agent.caps20[uid].items() if k != 'scale_fn'})}, ramp {c.get('ramp', True)}")
+
+
 def drop_value_preprocessors(agent, uids):
     """Train these agents' critics on raw returns. Before loading a checkpoint, so the module is neither saved nor
     restored."""
@@ -146,6 +176,7 @@ def main(env_cfg, agent_cfg: dict):
         print(f"[INFO] Loading model checkpoint from: {args_cli.checkpoint}")
         runner.agent.load(os.path.abspath(args_cli.checkpoint))
     bound_log_std(runner.agent, runner.log_std_bounds)
+    configure_caps20(runner.agent, env, agent_cfg.get("caps20"))
 
     start_time = time.time()
     runner.run()
