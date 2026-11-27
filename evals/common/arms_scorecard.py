@@ -28,7 +28,8 @@ HOLD_S = 2.0      # s: the goal's last part, scored as the hold
 END_S = 0.25      # s: the end error's averaging window
 SMOOTH_S = 0.1    # s: the moving average that splits vibration (faster) from wobble (slower)
 REACH_POS = 0.05  # m: the time-to-reach threshold, the env's reach tolerance
-REACH_TOLS = {"5cm_20deg": (0.05, 0.35), "1mm_5deg": (0.001, math.radians(5.0))}
+REACH_TOLS = {"5cm_20deg": (0.05, 0.35), "1mm_5deg": (0.001, math.radians(5.0)),
+              "5cm": (0.05, math.inf), "10cm": (0.10, math.inf)}  # the last two: position only
 REACH_HOLD_S = 1.0
 TARGET_END_MM, TARGET_END_DEG = 4.0, 5.0  # the success criteria (memory success-criteria-legs-arms)
 
@@ -120,6 +121,10 @@ def _rows_of(res: dict, ref: dict | None, sec: str, prefix: str = "") -> list[Ro
             num(res.get("reached_at", {}).get("5cm_20deg")), ref_of(rr.get("5cm_20deg"))),
         Row(sec, prefix + "reached_1mm_5deg", "Reached 1 mm / 5 deg held 1 s, share",
             num(res.get("reached_at", {}).get("1mm_5deg")), ref_of(rr.get("1mm_5deg"))),
+        Row(sec, prefix + "reached_5cm", "Reached 5 cm (position only) held 1 s, share",
+            num(res.get("reached_at", {}).get("5cm")), ref_of(rr.get("5cm"))),
+        Row(sec, prefix + "reached_10cm", "Reached 10 cm (position only) held 1 s, share",
+            num(res.get("reached_at", {}).get("10cm")), ref_of(rr.get("10cm"))),
         Row(sec, prefix + "env_reached", "Reached at the env's own tolerance " + _tol(res) + ", share",
             num(res.get("env_reached")), ref_of((ref or {}).get("env_reached"))),
         Row(sec, prefix + "time_to_reach_s", "Time to within 5 cm, median (s)", num(res.get("time_to_reach_median")),
