@@ -50,15 +50,22 @@ class LowstateImuCfg:
     quat_noise_deg: float = 0.05
     """Std of a fresh roll and pitch noise rotation each policy step (measured 0.02-0.07 on 11-20; on 11-23 0.001 standing
     still, 0.025-0.046 walking; 0.1 until 2026-11-23)."""
-    quat_lag_s: tuple[float, float] = (0.0, 0.02)
-    """The firmware filter's lag under motion (unmeasured)."""
-    gyro_bias: tuple[float, float, float] = (0.005, 0.005, 0.02)
-    """rad/s, +- per axis (x, y, z)."""
-    gyro_noise: float = 0.03
-    """rad/s, std per sample: 1.5x the measured 0.009-0.023, a margin."""
-    vibration_per_target_rate: float = 4.0
-    """rad/s of gyro vibration std per rad of rms leg target change per policy step: 0.12-0.2 rad per step (the
-    2026-11-20 bang-bang) gives 0.5-0.8 rad/s, the measured 0.4-0.8."""
+    quat_lag_s: tuple[float, float] = (0.0, 0.005)
+    """The firmware filter's lag under motion: the quaternion's rate trails the gyro by 0-4 ms while walking (2026-11-23
+    and 11-24 bags, analysis/dr_audit/imu.py); (0, 0.02) until 2026-11-26, when it was unmeasured."""
+    gyro_bias_center: tuple[float, float, float] = (-0.0006, 0.0044, 0.0050)
+    """rad/s (x, y, z): the bias the robot's gyro reads standing still, the same in every bag from 11-23 to 11-24
+    (x -0.0004..-0.0007, y +0.0031..+0.0052, z +0.0048..+0.0053); lmg_deploy's IMU calibration rotates the gyro but
+    doesn't remove it. Zero until 2026-11-26, which put y at the edge of the +-0.005 draw."""
+    gyro_bias: tuple[float, float, float] = (0.003, 0.003, 0.005)
+    """rad/s, +- per axis (x, y, z) about gyro_bias_center; (0.005, 0.005, 0.02) about zero until 2026-11-26."""
+    gyro_noise: float = 0.015
+    """rad/s, std per sample: 1.5x the measured 0.009-0.012 standing (11-23's 18 min stand, 11-24); 0.03 until
+    2026-11-26."""
+    vibration_per_target_rate: float = 1.4
+    """rad/s of gyro vibration std per rad of rms leg target change per policy step. Measured 0.9-1.8 while walking
+    (2026-11-23 and 11-24: 18-26 Hz gyro 0.05-0.09 rad/s at 0.055-0.064 rad per step); times vibration_gain's 0.5-1.5,
+    0.7-2.1. 4.0 until 2026-11-26, from the 11-20 bang-bang (0.12-0.2 rad per step, 0.4-0.8 rad/s)."""
     vibration_gain: tuple[float, float] = (0.5, 1.5)
     vibration_hz: tuple[float, float] = (18.0, 26.0)
     """The shake's frequency (the head's was 21-23 Hz)."""
@@ -96,7 +103,8 @@ class LowstateImu:
         self.bias_quat[ids] = quat_from_euler_xyz(*(u(*(math.radians(v) for v in bias[k])) for k in ("roll", "pitch", "yaw")))
         self.lag[ids] = torch.round(u(*cfg.quat_lag_s) / self.dt).long().clamp(0, self.depth - 1)
         limit = torch.tensor(cfg.gyro_bias, device=self.device)
-        self.gyro_bias[ids] = (2.0 * torch.rand(m, 3, device=self.device) - 1.0) * limit
+        center = torch.tensor(cfg.gyro_bias_center, device=self.device)
+        self.gyro_bias[ids] = center + (2.0 * torch.rand(m, 3, device=self.device) - 1.0) * limit
         self.vib_gain[ids] = u(*cfg.vibration_gain)
         self.vib_hz[ids] = u(*cfg.vibration_hz)
         self.vib_phase[ids] = u(0.0, 2.0 * math.pi, 3)

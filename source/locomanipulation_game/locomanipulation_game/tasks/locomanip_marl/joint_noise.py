@@ -7,8 +7,15 @@ dq minus the derivative of q over 20 ms, the position noise q minus its 20 ms me
 - Walking (lmg_..._1440 / _1445, ~25 s each at the 0.70 s stride, legs' |dq| 0.55 rad/s mean): velocity noise 0.33-0.72
   on the hips and knees, 0.15-0.40 on the ankles, 0.05 on the arms; position noise 0.0012 (at most 0.0025). Noise-free
   MuJoCo walking gives 0.05 on the same measure, so this is the encoders', not the gait's own high frequencies.
-So the velocity noise grows with the joint's speed: a Gaussian of std floor + JOINT_VEL_NOISE_PER_SPEED x |dq| (about
-0.6 x the walking legs' 0.55 rad/s), the floor per joint group above the still robot's. Until 2026-11-23 every run
+So the velocity noise grows with the joint's speed: a Gaussian of std floor + per-speed x |dq|, both per joint group
+(JOINT_VEL_NOISE_FLOOR, JOINT_VEL_NOISE_PER_SPEED), the floor above the still robot's.
+
+Refitted 2026-11-26 (~/bags/coop150k_2026-11-24/analysis/dr_audit/velnoise.py, ankle_noise.py; the 11-23 and 11-24
+walks): most of the "noise" above on the hips and knees was the drivers' 21 Hz velocity lag (JOINT_VEL_LOWPASS_HZ),
+measured later. Against the derivative through that filter, which training now applies before this noise, the hips'
+and knees' residual is 0.03 + 0.03 |dq| (0.044 at 0.34 rad/s, 0.078 at 1.4, 0.11 at 2.7): 0.6 counted the lag twice,
+~10x too much at walking speed, so 0.06 there. The ankles (no lag) measure 0.12 + 0.23 |dq| (0.27 at 0.7 rad/s): 0.3,
+from 0.6. The arms were not refitted and keep 0.6. Standing still is unchanged (the floors). Until 2026-11-23 every run
 trained on uniform +-1.5 rad/s (std 0.87) on every joint and +-0.01 rad on the positions, 2.5x the walking robot's
 velocity noise and 100-1000x the standing one's: MuJoCo with that noise jittered its targets ~0.017 rad per step
 standing, the robot 0.001-0.002 (the engage grid's noise ablation, 2026-11-23).
@@ -38,8 +45,10 @@ except ImportError:  # loaded by path outside Isaac Lab (the MuJoCo evals): the 
 # about 2x the still robot's
 JOINT_VEL_NOISE_FLOOR = {r".*_ankle_.*_joint": 0.02, r".*_(shoulder|elbow|wrist)_.*_joint": 0.015}
 JOINT_VEL_NOISE_FLOOR_DEFAULT = 0.002
-# rad/s of velocity noise std per rad/s of the joint's speed
-JOINT_VEL_NOISE_PER_SPEED = 0.6
+# rad/s of velocity noise std per rad/s of the joint's speed, per joint group (first matching pattern; the default
+# otherwise): the hips and knees after their 21 Hz lag, the ankles; the arms not refitted (module docstring)
+JOINT_VEL_NOISE_PER_SPEED = {r".*_(hip_.*|knee)_joint": 0.06, r".*_ankle_.*_joint": 0.3}
+JOINT_VEL_NOISE_PER_SPEED_DEFAULT = 0.6
 # rad: the position noise, uniform +- (the walking robot's worst 0.0025)
 JOINT_POS_NOISE = 0.003
 # rad: each leg joint's encoder offset, uniform +- per reset (first matching pattern); joints not named draw none
@@ -51,8 +60,9 @@ def per_joint(names: list[str], table: dict[str, float], default: float) -> list
     return [next((v for p, v in table.items() if re.fullmatch(p, n)), default) for n in names]
 
 
-def joint_vel_noise_std(dq, floor, per_speed: float = JOINT_VEL_NOISE_PER_SPEED):
-    """The velocity noise's std at speeds dq (a tensor or an array): floor + per_speed * |dq|, per column."""
+def joint_vel_noise_std(dq, floor, per_speed):
+    """The velocity noise's std at speeds dq (a tensor or an array): floor + per_speed * |dq|, per column (floor and
+    per_speed one per column, or one for all)."""
     return floor + per_speed * abs(dq)
 
 
@@ -60,6 +70,8 @@ def speed_scaled_gaussian_noise(data: torch.Tensor, cfg: SpeedScaledNoiseCfg) ->
     """data plus Gaussian noise of std floor + per_speed * |data|, per column."""
     if not isinstance(cfg.floor, torch.Tensor) or cfg.floor.device != data.device:
         cfg.floor = torch.as_tensor(cfg.floor, dtype=data.dtype, device=data.device)
+    if not isinstance(cfg.per_speed, torch.Tensor) or cfg.per_speed.device != data.device:
+        cfg.per_speed = torch.as_tensor(cfg.per_speed, dtype=data.dtype, device=data.device)
     return data + torch.randn_like(data) * joint_vel_noise_std(data, cfg.floor, cfg.per_speed)
 
 
@@ -72,9 +84,10 @@ if NoiseCfg is not None:
 
         func = speed_scaled_gaussian_noise
         floor: torch.Tensor | list[float] | float = JOINT_VEL_NOISE_FLOOR_DEFAULT
-        per_speed: float = JOINT_VEL_NOISE_PER_SPEED
+        per_speed: torch.Tensor | list[float] | float = JOINT_VEL_NOISE_PER_SPEED_DEFAULT
 
     def joint_vel_noise(names: list[str], scale: float = 1.0) -> SpeedScaledNoiseCfg:
         """The encoders' velocity noise on the joints names, in that order, times scale."""
         floor = per_joint(names, JOINT_VEL_NOISE_FLOOR, JOINT_VEL_NOISE_FLOOR_DEFAULT)
-        return SpeedScaledNoiseCfg(floor=[scale * f for f in floor], per_speed=scale * JOINT_VEL_NOISE_PER_SPEED)
+        per_speed = per_joint(names, JOINT_VEL_NOISE_PER_SPEED, JOINT_VEL_NOISE_PER_SPEED_DEFAULT)
+        return SpeedScaledNoiseCfg(floor=[scale * f for f in floor], per_speed=[scale * k for k in per_speed])

@@ -206,6 +206,7 @@ class MarlMujoco:
     # then: MuJoCo's targets jittered ~0.017 rad per step standing on it, the robot's 0.001-0.002
     NOISE = {"lin_acc": 0.5, "ang_vel": 0.2, "grav": 0.05, "jpos": JN.JOINT_POS_NOISE, "jvel": 1.0, "wrist": 0.005}
     JVEL_FLOOR = np.array(JN.per_joint(ALL_NAMES, JN.JOINT_VEL_NOISE_FLOOR, JN.JOINT_VEL_NOISE_FLOOR_DEFAULT))
+    JVEL_PER_SPEED = np.array(JN.per_joint(ALL_NAMES, JN.JOINT_VEL_NOISE_PER_SPEED, JN.JOINT_VEL_NOISE_PER_SPEED_DEFAULT))
 
     def __init__(self, actors: dict, settings: dict, physics: str = "robocasa", assets: Path = C.DEFAULT_ASSETS,
                  model: mujoco.MjModel | None = None, pinned: bool = False, arms_hold_zero: bool = False):
@@ -631,7 +632,7 @@ class MarlMujoco:
     def noisy_dq(self, scale: float) -> np.ndarray:
         """The measured joint speeds with the encoders' noise (joint_noise.py) times scale."""
         dq = self.measured_dq()
-        std = JN.joint_vel_noise_std(dq, self.JVEL_FLOOR) * scale
+        std = JN.joint_vel_noise_std(dq, self.JVEL_FLOOR, self.JVEL_PER_SPEED) * scale
         return dq + std * self.rng.standard_normal(np.shape(dq))
 
     def observations(self) -> dict[str, np.ndarray]:

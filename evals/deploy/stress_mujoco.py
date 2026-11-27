@@ -171,7 +171,8 @@ class StressMujoco(MarlMujoco):
             ry = np.array([[math.cos(pt), 0, math.sin(pt)], [0, 1, 0], [-math.sin(pt), 0, math.cos(pt)]])
             rz = np.array([[math.cos(y), -math.sin(y), 0], [math.sin(y), math.cos(y), 0], [0, 0, 1]])
             self.R_bias = rz @ ry @ rx
-            self.gyro_bias = rng.uniform(-1, 1, 3) * np.array([0.005, 0.005, 0.02])
+            # training's draw (lowstate_imu.LowstateImuCfg: the robot's measured bias +- the range, since 2026-11-26)
+            self.gyro_bias = np.array([-0.0006, 0.0044, 0.0050]) + rng.uniform(-1, 1, 3) * np.array([0.003, 0.003, 0.005])
             self.NOISE = {**self.NOISE, "ang_vel": 0.0, "grav": 0.0}  # the model's own noise instead
             self.R_hist = deque(maxlen=int(round(LOWSTATE_LAG_MS / 1000 / m.opt.timestep)) + 1)
         self.weight = float(m.body_mass.sum() * -m.opt.gravity[2])

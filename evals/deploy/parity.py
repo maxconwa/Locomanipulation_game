@@ -107,6 +107,7 @@ def main(env_cfg, agent_cfg: dict):
     imu_model.quat_bias_deg = {"roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0)}
     imu_model.quat_noise_deg, imu_model.quat_lag_s, imu_model.gyro_noise = 0.0, (0.0, 0.0), 0.0
     imu_model.gyro_bias, imu_model.vibration_per_target_rate = (0.0, 0.0, 0.0), 0.0
+    imu_model.gyro_bias_center = (0.0, 0.0, 0.0)
     env_cfg.events.prepose = None  # the nominal resets
     if args.arm_goal_prob is not None:
         env_cfg.commands.arm_targets.arm_goal_prob = args.arm_goal_prob
