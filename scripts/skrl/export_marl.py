@@ -12,8 +12,8 @@ candidate folder under logs/):
                      every joint target into GOLEM's position e-stop range), gait_phase_cos, imu (the body its IMU
                      sat on and the gyro low-pass), and (evals.mujoco.common.read_deploy_settings) control_dt, kp, kd,
                      default_joint_pos, the per-joint action scales, max_ik_step, gait_period, zero_cmd_eps,
-                     command_ranges, command_filter_tau, engage_blend_s (the legs' engage blend, when the run had one), leg_action_lowpass_hz (the legs'
-                     target low-pass, when the run had one) and arm_goals (false: the run never trained an arm goal,
+                     command_ranges, command_filter_tau, engage_blend_s (the legs' engage blend, when the run had one) and
+                     arm_goals (false: the run never trained an arm goal,
                      and the deploy refuses one), arm_ik (mdp.IKPostureArmAction's IK, when the run used it); and the
                      source files.
   arm_seed_table.npz with arm_ik.posture_from_command: per arm the run's goal-table poses (poses_<arm>, pelvis frame,

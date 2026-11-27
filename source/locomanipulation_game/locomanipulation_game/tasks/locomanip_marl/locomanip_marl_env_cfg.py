@@ -156,11 +156,6 @@ PREPOSE_JOINT_RANGES = {
 ENGAGE_BLEND_S = 0.0
 ENGAGE_WINDOW_S = 1.0
 ENGAGE_SMOOTH_STD = 0.7
-# The legs' targets through a one-pole low-pass at this cutoff (Hz) before their bounds (mdp.BoundedJointPositionAction;
-# lmg_deploy's leg_action_lowpass_hz): 0.99 of the 1.4 Hz stride passes (8 deg lag), 0.40 at 20 Hz (35 deg). Since
-# 2026-11-24: Coop300k_s42 @ 150k dithered its leg targets on the robot (hip roll 0.10-0.12 rad per step, 36-38% of the
-# steps reversing, FastEnv60k 0.04 and 22%), which locked into a 20 Hz hip-roll loop the sim plants don't have
-LEGS_TARGET_LOWPASS_HZ = 8.0
 # the motors' gain and strength draws (mdp.randomize_actuator_scales)
 # The real ankles give about 0.2 rad under 13-17 Nm at kp 80 through their parallel linkage (2026-11-20's pre-pose):
 # softer than the MJCF's, so their gains are drawn wider and lower than the rest's
@@ -224,7 +219,6 @@ class MarlActionsCfg:
         target_margin=-GOLEM_TARGET_CLIP,
         torque_headroom=TORQUE_HEADROOM,
         engage_blend_s=ENGAGE_BLEND_S,
-        target_lowpass_hz=LEGS_TARGET_LOWPASS_HZ,
     )
     arm_pos = mdp.IKResidualArmActionCfg(
         asset_name="robot",
@@ -427,7 +421,8 @@ class LegsRewardsCfg:
     action_rate = RewTerm(func=mdp.action_term_rate_l2, weight=-0.1, params={"action_name": LEGS_ACTION})
     # the raw actions' second difference, |a_t - 2 a_t-1 + a_t-2|^2 (0 for the first two steps of an episode): a
     # reversal. Against action_rate's charge it costs 20 Hz content ~180x more than the 1.4 Hz stride's. Since
-    # 2026-11-24 (LEGS_TARGET_LOWPASS_HZ): Coop300k_s42 reversed its targets on 36-38% of the robot's steps
+    # 2026-11-24: Coop300k_s42 @ 150k reversed its leg targets on 36-38% of the robot's steps (hip roll 0.10-0.12 rad
+    # per step, FastEnv60k 0.04 and 22%), which locked into a 20 Hz hip-roll loop the sim plants don't have
     action_accel = RewTerm(func=mdp.action_term_accel_l2, weight=-0.1, params={"action_name": LEGS_ACTION})
     # the engage from the pre-pose (ENGAGE_SMOOTH_STD): at most 40 over its first second at weight 40, ~24 of it under
     # the noise; off by default (ENGAGE_BLEND_S)

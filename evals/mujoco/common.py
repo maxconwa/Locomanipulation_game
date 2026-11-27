@@ -134,9 +134,6 @@ def read_deploy_settings(run_dir: Path) -> dict:
     if env.get("joint_vel_lowpass_hz"):
         pose["joint_vel_lowpass"] = {"cutoff_hz": float(env["joint_vel_lowpass_hz"]),
                                      "joints": list(env.get("joint_vel_lowpass_joints") or [])}
-    # the legs' target low-pass (mdp.BoundedJointPositionAction target_lowpass_hz), when the run had one
-    if (actions.get("joint_pos") or {}).get("target_lowpass_hz"):
-        pose["leg_action_lowpass_hz"] = float(actions["joint_pos"]["target_lowpass_hz"])
     # the run's own, where the deploy template has one value for every run
     for key in ("residual_cutoff_hz", "ik_damping"):
         if (actions.get("arm_pos") or {}).get(key) is not None:

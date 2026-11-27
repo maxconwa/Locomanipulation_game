@@ -198,8 +198,6 @@ def main(env_cfg, agent_cfg: dict):
         if hasattr(ctrl, "blend_from"):  # lmg_deploy's engage blend, started where the env's started
             ctrl.blend_from = (legs_term._blend_from[i].double().cpu().numpy().copy()
                                if ctrl.engage_blend_steps else None)
-        if hasattr(ctrl, "legs_lowpass"):  # lmg_deploy's leg target low-pass, its state the env's
-            ctrl.legs_lowpass = legs_term._lowpass[i].double().cpu().numpy().copy()
 
     def compare(prefix, terms, deploy, trained):
         k = 0
@@ -216,8 +214,6 @@ def main(env_cfg, agent_cfg: dict):
     states = base.state()
     # the engage blend's length, steps: the export's (lmg_deploy without the blend: none) against the env's
     worst["engage_blend_steps"] = float(abs(getattr(ctrl, "engage_blend_steps", 0) - legs_term._blend_steps))
-    # the leg target low-pass's alpha: the export's (lmg_deploy without the filter: none, 1) against the env's
-    worst["legs_lowpass_alpha"] = float(abs(getattr(ctrl, "legs_lowpass_alpha", 1.0) - legs_term._lowpass_alpha))
     worst["rest_pose"] = float(np.abs(ctrl.rest_pose - arm.rest_pose_b.double().cpu().numpy()).max())
     for _ in range(args.steps):
         state = env_state()
