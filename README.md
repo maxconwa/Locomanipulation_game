@@ -88,8 +88,7 @@ under `Metrics/sport/`.
 
 Export into `~/GOLEM/core_ws/src/lmg_deploy/policies/h12/`, replacing what is there, build, and launch `lmg_sim` or
 `lmg_real` (GOLEM's `lmg_deploy` README). The deploy package keeps one policy per robot, one iteration at a time: old
-ones are deleted, not kept beside it. `logs/deploy_baselines/mid360v2` keeps the export the robot bags were recorded
-with, for the bag replays. The node runs at the policy's `control_dt` and reads the gains, stance, action scales, command
+ones are deleted, not kept beside it. The node runs at the policy's `control_dt` and reads the gains, stance, action scales, command
 filter and ranges from `export.yaml`.
 
 ## Gotchas

@@ -13,7 +13,7 @@
 # logs/candidates/status.txt; per run: logs/candidates/<name>_s<seed>/ (logs, the export in a folder of the same
 # name, the gate's reports gate_gpu/ and gate_cpu/ with each check's output); scorecards in logs/evals/<run>/. A gate
 # FAIL or NOT RUN is a FAILED line. Isaac in conda env_isaaclab; the gate in an env with mujoco, torch, scipy and
-# pyyaml (CPU_ENV, default base); its bag replay runs in GOLEM's ros container (docker). GOLEM: $GOLEM, kept on main.
+# pyyaml (CPU_ENV, default base). GOLEM: $GOLEM, kept on main.
 set -u
 cd "$(dirname "$0")/.."
 REPO=$PWD
@@ -22,7 +22,6 @@ STATUS=$OUT/status.txt
 CONDA_SH=${CONDA_SH:-$( [ -f $HOME/miniconda3/etc/profile.d/conda.sh ] && echo $HOME/miniconda3 || echo $HOME/anaconda3)/etc/profile.d/conda.sh}
 CPU_ENV=${CPU_ENV:-base}
 GOLEM=${GOLEM:-$HOME/GOLEM}
-# the bags the gate replays: evals/deploy/gate.yaml bag_replay
 source "$CONDA_SH"
 mkdir -p "$OUT"
 
@@ -49,7 +48,7 @@ cpu_checks() {  # $1 run name, $2 checkpoint, $3 export dir, $4 out dir: the gat
   local name=$1 ckpt=$2 export=$3 dir=$4
   conda activate "$CPU_ENV"
   if GOLEM=$GOLEM python -m evals.deploy.gate --checkpoint "$ckpt" --export "$export" --out "$dir/gate_cpu" \
-      --only metric_code,stress,bag_replay > "$dir/gate_cpu.log" 2>&1; then
+      --only metric_code,stress > "$dir/gate_cpu.log" 2>&1; then
     note "$name: deploy gate, CPU checks PASS ($dir/gate_cpu/report.md)"
   else
     fail "$name: deploy gate, CPU checks (see $dir/gate_cpu/report.md)"

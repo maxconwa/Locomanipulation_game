@@ -65,10 +65,7 @@ from evals.mujoco.common import load_deploy_cfg  # noqa: E402
 sys.path.insert(0, args.deploy_pkg)
 from lmg_deploy.controller import ARM_START, NUM_LEGS, MarlController, Mode, RobotState  # noqa: E402
 from lmg_deploy.kinematics import ArmKinematics  # noqa: E402
-try:  # GOLEM dac841b moved it out of livox_imu (deleted with the /livox/imu attitude path)
-    from lmg_deploy.gyro_lowpass import GyroLowpass as DeployGyroLowpass  # noqa: E402
-except ImportError:
-    from lmg_deploy.livox_imu import GyroLowpass as DeployGyroLowpass  # noqa: E402
+from lmg_deploy.gyro_lowpass import GyroLowpass as DeployGyroLowpass  # noqa: E402
 from lmg_deploy.networks import load_network  # noqa: E402
 import dataclasses  # noqa: E402
 ROBOT_STATE_FIELDS = {f.name for f in dataclasses.fields(RobotState)}

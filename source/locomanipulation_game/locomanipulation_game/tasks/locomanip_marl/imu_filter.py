@@ -1,10 +1,10 @@
-"""The policy's gyro low-pass, batched: GOLEM lmg_deploy.livox_imu.GyroLowpass (556a9e7) in torch, one filter per env.
+"""The policy's gyro low-pass, batched: GOLEM lmg_deploy.gyro_lowpass.GyroLowpass in torch, one filter per env.
 
 Per axis, a 2nd-order Butterworth at cutoff_hz: y'' + 2 zeta w y' + w^2 y = w^2 u, w = 2 pi cutoff_hz,
 zeta = 1/sqrt(2), state x = (y, y'), discretized exactly with a zero-order hold on u over the sample's dt:
 x <- Ad x + Bd u, Ad = exp(A dt), Bd = A^-1 (Ad - I) B. It starts, and restarts after reset(), at x = (u, 0) on the
-next sample. The env feeds it the IMU's angular velocity at every physics substep, as the deploy feeds it /livox/imu
-at 200 Hz; the same continuous filter at either rate.
+next sample. The env feeds it the IMU's angular velocity at every physics substep, as the deploy feeds it /lowstate's
+IMU at 500 Hz; the same continuous filter at either rate.
 """
 
 from __future__ import annotations

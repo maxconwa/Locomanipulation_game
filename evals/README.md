@@ -10,7 +10,7 @@ evals/
   common/    no simulator: the metric code, the scorecard format, the command program, run discovery, plots
   isaac/     get_video.py; legs/ and arms/: get_scorecard.py, get_plot.py; arms/steerability/ (on demand, --steerability: about 1.5 h)
   mujoco/    get_video.py; legs/ and arms/: get_scorecard.py, get_plot.py; sim.py (the policy loop in MuJoCo)
-  deploy/    gate.py + gate.yaml; golem/ (the run in GOLEM's sim); parity.py, bag_replay.py, stress_mujoco.py,
+  deploy/    gate.py + gate.yaml; golem/ (the run in GOLEM's sim); parity.py, stress_mujoco.py,
              test_sportmode_metrics.py
 ```
 

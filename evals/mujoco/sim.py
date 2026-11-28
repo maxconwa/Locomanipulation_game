@@ -164,7 +164,7 @@ def imu_bias_ranges(imu: dict) -> dict:
     return {k: tuple(v) for k, v in imu["residual_deg" if calibrated else "quat_bias_deg"].items()}
 
 class GyroLowpass:
-    """lmg_deploy.livox_imu.GyroLowpass: per axis, a 2nd-order Butterworth at cutoff_hz, exact ZOH discretization over
+    """lmg_deploy.gyro_lowpass.GyroLowpass: per axis, a 2nd-order Butterworth at cutoff_hz, exact ZOH discretization over
     each sample's dt, started (and restarted by reset) at x = (u, 0)."""
 
     ZETA = 1.0 / math.sqrt(2.0)
@@ -300,12 +300,13 @@ class MarlMujoco:
         self.pelvis = body("pelvis")
         self.wrists = [body("left_wrist_yaw_link"), body("right_wrist_yaw_link")]
         self.feet = [body("left_ankle_roll_link"), body("right_ankle_roll_link")]
-        # the run's IMU: the head's MID-360 chip, or the torso's
+        # the run's IMU: the torso's (lmg_deploy no longer reads the head's MID-360 chip)
         imu = settings.get("imu") or {}
-        head = imu.get("frame", "imu_link") != "imu_link"
+        if imu.get("frame", "imu_link") != "imu_link":
+            raise ValueError(f"the export's IMU is on {imu['frame']}: only the torso IMU (imu_link) is supported")
         sens = lambda n: m.sensor_adr[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SENSOR, n)]  # noqa: E731
-        self.imu_site = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "livox_imu_site" if head else "imu")
-        self.s_acc, self.s_gyro = (sens("livox_imu_acc"), sens("livox_imu_gyro")) if head else (sens("imu_acc"), sens("imu_gyro"))
+        self.imu_site = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "imu")
+        self.s_acc, self.s_gyro = sens("imu_acc"), sens("imu_gyro")
         self.foot_geoms = [set(np.nonzero(m.geom_bodyid == f)[0].tolist()) for f in self.feet]
         self.arm_cols = [self.vadr[13:20], self.vadr[20:27]]
         self.actors = actors
