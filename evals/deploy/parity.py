@@ -65,8 +65,10 @@ from evals.mujoco.common import load_deploy_cfg  # noqa: E402
 sys.path.insert(0, args.deploy_pkg)
 from lmg_deploy.controller import ARM_START, NUM_LEGS, MarlController, Mode, RobotState  # noqa: E402
 from lmg_deploy.kinematics import ArmKinematics  # noqa: E402
-from lmg_deploy.livox_imu import GyroLowpass as DeployGyroLowpass  # noqa: E402
+from lmg_deploy.gyro_lowpass import GyroLowpass as DeployGyroLowpass  # noqa: E402
 from lmg_deploy.networks import load_network  # noqa: E402
+import dataclasses  # noqa: E402
+ROBOT_STATE_FIELDS = {f.name for f in dataclasses.fields(RobotState)}
 
 args.checkpoint, RUN_DIR, args.task, _ = replay_run(args.checkpoint, args.task, hydra_args)
 torch.set_grad_enabled(False)
@@ -165,9 +167,9 @@ def main(env_cfg, agent_cfg: dict):
         dq = d.joint_vel[i].clone()
         if getattr(base, "joint_vel_lowpass", None) is not None:
             dq[base.joint_vel_lowpass_ids] = base.joint_vel_lowpass.output[i].to(dq.dtype)
+        extra = {"acc": imu.data.lin_acc_b[i].double().cpu().numpy()} if "acc" in ROBOT_STATE_FIELDS else {}  # GOLEM b56e2af dropped it
         return RobotState(q=d.joint_pos[i, ids].double().cpu().numpy(), dq=dq[ids].double().cpu().numpy(),
-                          quat=reported_quat(imu.data.quat_w[i]),
-                          gyro=gyro, acc=imu.data.lin_acc_b[i].double().cpu().numpy())
+                          quat=reported_quat(imu.data.quat_w[i]), gyro=gyro, **extra)
 
     def reported_quat(quat_w: torch.Tensor) -> np.ndarray:
         """The quaternion /lowstate would give: the true one, times the calibration's offset for a calibrated export."""

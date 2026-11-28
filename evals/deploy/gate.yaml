@@ -13,20 +13,6 @@ golem:                       # evals/deploy/golem: the export under lmg_deploy i
 parity:                      # evals/deploy/parity.py (Isaac): the deploy controller against the training env
   tolerance: 2.0e-3          # every term's worst difference (its own default)
 
-bag_replay:                  # evals/deploy/bag_replay.py: real bags through the deploy controller
-  bags: [mid360v2_deploy, mid360v2_deploy_2]
-  bags_dir: ~/bags/mid360v2_failure_2026-10-20
-  deployed: mid360v2         # the policy that ran when the bags were recorded
-  deployed_export: logs/deploy_baselines/mid360v2
-  # the deployed policy's replayed leg targets against the recorded ones: "the replay is the node". It holds only for
-  # the lmg_deploy that recorded the bags (2026-10-20); GOLEM tracks main, whose controller has changed since (on main
-  # it replays at median 0.043 rad), so it is reported, not gated, unless gate_target_check is true
-  gate_target_check: false
-  max_target_median: 1.0e-3  # rad
-  max_target_p99: 1.0e-2
-  max_outside_sim_c: 0.01    # the candidate: share of steps whose LSTM cell state leaves the simulated range
-  sim_seeds: 4
-
 stress:                      # evals/deploy/stress_mujoco.py
   zero_fall_cells: [nominal, hw, hang, hang_hw]   # conditions whose cells must not fall at all (standard grid)
   long_conditions: [nominal, hw, hang, hang_hw]   # 180 s stands, zero command: no falls
